@@ -56,8 +56,9 @@ pub mod vad;
 pub mod window;
 
 pub use audio::{
-    read_audio, read_wav, read_wav_bytes, write_audio, write_wav, write_wav_bytes, Audio,
-    WavStreamReader, WavStreamWriter,
+    ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,
+    estimate_file_memory_bytes, estimate_stream_memory_bytes, read_audio, read_wav, read_wav_bytes,
+    write_audio, write_wav, write_wav_bytes, Audio, WavStreamReader, WavStreamWriter,
 };
 pub use backend::{Backend, BackendOptions, ChannelMode, OnnxModelConfig, SgmseProfile};
 pub use decode::{decode_file, AudioFormat, DecodedPcm};

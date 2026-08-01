@@ -257,8 +257,21 @@ whole file:
 `--stream` currently supports filesystem WAV-to-WAV processing with the
 classical backend and independent channels. VAD, loudness normalization,
 mid/side or linked stereo processing, and AI/encoded output require the normal
-(non-streaming) path. The default block size is 8192 frames; noise profiling
-retains only a bounded leading segment before output begins.
+(non-streaming) path. The default block size is 8192 frames; use
+`--stream-frames N` to trade latency and working memory for throughput. Noise
+profiling retains only a bounded leading segment before output begins.
+
+For the normal (decoded, non-streaming) path, `--max-memory MB` performs a
+conservative preflight and decoded-working-set check before processing. The
+limit is per input file/worker; batch jobs can use memory concurrently, so
+lower `--jobs` when enforcing a process-wide budget. A streaming WAV job stays
+bounded by its block size and denoiser state, and the same option checks that
+bound:
+
+```sh
+denoize large.mp3 cleaned.wav --max-memory 1024
+denoize long-noisy.wav long-clean.wav --stream --stream-frames 4096 --max-memory 64
+```
 
 ## Desktop app
 
@@ -473,6 +486,8 @@ adaptive_noise = true
 vad = true
 loudness_lufs = -16.0
 true_peak_dbtp = -1.0
+# stream_frames = 8192
+# max_memory_mb = 1024
 ```
 
 ```sh

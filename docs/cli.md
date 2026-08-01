@@ -55,6 +55,8 @@ OPTIONS:
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
+        --stream-frames <N>   streaming block size in frames (default: 8192)
+        --max-memory <MB>     refuse inputs whose estimated working set exceeds MB
         --recursive           include subdirectories in batch mode
         --jobs <N>            concurrent batch workers (default: CPU count)
         --output-format <EXT> convert every batch output to this format

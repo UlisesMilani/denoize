@@ -1,7 +1,9 @@
 //! `denoize` command-line interface.
 
 use denoize::audio::{
-    read_audio, read_wav_bytes, write_audio, write_wav_bytes, WavStreamReader, WavStreamWriter,
+    ensure_memory_limit, estimate_audio_working_set_bytes, estimate_file_memory_bytes,
+    estimate_stream_memory_bytes, read_audio, read_wav_bytes, write_audio, write_wav_bytes,
+    WavStreamReader, WavStreamWriter,
 };
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
@@ -86,6 +88,8 @@ OPTIONS:
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
+        --stream-frames <N>   streaming block size in frames (default: 8192)
+        --max-memory <MB>     refuse inputs whose estimated working set exceeds MB
         --recursive           include subdirectories in batch mode
         --jobs <N>            concurrent batch workers (default: CPU count)
         --output-format <EXT> convert every batch output to this format
@@ -161,6 +165,8 @@ struct Overrides {
     sgmse_profile: Option<SgmseProfile>,
     batch: bool,
     stream: bool,
+    stream_frames: Option<usize>,
+    max_memory_mb: Option<usize>,
     recursive: bool,
     jobs: Option<usize>,
     output_format: Option<String>,
@@ -197,6 +203,8 @@ struct FileConfig {
     channels: Option<String>,
     batch: bool,
     stream: bool,
+    stream_frames: Option<usize>,
+    max_memory_mb: Option<usize>,
     recursive: bool,
     jobs: Option<usize>,
     output_format: Option<String>,
@@ -266,6 +274,8 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.true_peak_dbtp = config.true_peak_dbtp;
     ov.batch = config.batch;
     ov.stream = config.stream;
+    ov.stream_frames = config.stream_frames;
+    ov.max_memory_mb = config.max_memory_mb;
     ov.recursive = config.recursive;
     ov.jobs = config.jobs;
     ov.output_format = config.output_format;
@@ -273,6 +283,7 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.resume = config.resume;
     ov.no_progress = config.progress == Some(false);
     ov.no_metadata = config.preserve_metadata == Some(false);
+    validate_resource_options(&ov)?;
     Ok(ov)
 }
 
@@ -415,6 +426,8 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             }
             "--batch" => ov.batch = true,
             "--stream" => ov.stream = true,
+            "--stream-frames" => ov.stream_frames = Some(parse_value(args, &mut i, a)?),
+            "--max-memory" => ov.max_memory_mb = Some(parse_value(args, &mut i, a)?),
             "--recursive" => ov.recursive = true,
             "--jobs" => ov.jobs = Some(parse_value(args, &mut i, a)?),
             "--output-format" => ov.output_format = Some(parse_value(args, &mut i, a)?),
@@ -455,6 +468,16 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
     let input = input.ok_or("missing INPUT")?;
     let output = output.ok_or("missing OUTPUT audio path")?;
     Ok((input, output, ov))
+}
+
+fn validate_resource_options(ov: &Overrides) -> Result<(), String> {
+    if ov.max_memory_mb == Some(0) {
+        return Err("--max-memory must be at least 1 MiB".into());
+    }
+    if ov.stream_frames == Some(0) {
+        return Err("--stream-frames must be at least 1 frame".into());
+    }
+    Ok(())
 }
 
 fn build_config(ov: &Overrides, sample_rate: u32) -> DenoiserConfig {
@@ -639,6 +662,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_compare(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
+    validate_resource_options(&ov)?;
     if ov.batch {
         if ov.stream {
             return Err("--stream cannot be combined with --batch".into());
@@ -656,6 +680,7 @@ fn run_live(args: &[String]) -> Result<(), String> {
     let mut parseable = vec!["-".to_string(), "-".to_string()];
     parseable.extend_from_slice(args);
     let (_, _, ov) = parse_args(&parseable)?;
+    validate_resource_options(&ov)?;
     if ov.list_devices {
         let (inputs, outputs) = denoize::live::device_names()?;
         println!("Input devices:");
@@ -699,6 +724,11 @@ fn run_live(_args: &[String]) -> Result<(), String> {
 }
 
 fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
+    validate_resource_options(&ov)?;
+    if input != "-" {
+        let estimate = estimate_file_memory_bytes(std::path::Path::new(input))?;
+        ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
+    }
     let metadata = if input != "-" && !ov.no_metadata {
         denoize::metadata::read(std::path::Path::new(input))?
     } else {
@@ -708,10 +738,17 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
             .map_err(|error| format!("failed to read stdin: {error}"))?;
+        let estimate = (bytes.len() as u64).saturating_mul(8).max(1024 * 1024);
+        ensure_memory_limit(estimate, ov.max_memory_mb, "stdin input preflight")?;
         read_wav_bytes(bytes)?
     } else {
         read_audio(input)?
     };
+    ensure_memory_limit(
+        estimate_audio_working_set_bytes(&audio),
+        ov.max_memory_mb,
+        "decoded audio working set",
+    )?;
     let cfg = build_config(&ov, audio.sample_rate);
     let backend_choice = if ov.auto_backend {
         BackendChoice::Auto
@@ -817,6 +854,7 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
 }
 
 fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
+    validate_resource_options(&ov)?;
     if input == "-" || output == "-" {
         return Err("--stream requires filesystem WAV input and output paths".into());
     }
@@ -861,13 +899,24 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let mut reader = WavStreamReader::open(input_path)?;
     let spec = reader.spec();
     let cfg = build_config(&ov, spec.sample_rate);
+    let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
+    ensure_memory_limit(
+        estimate_stream_memory_bytes(
+            spec.channels as usize,
+            block_frames,
+            cfg.frame_size,
+            spec.sample_rate,
+        ),
+        ov.max_memory_mb,
+        "streaming working set",
+    )?;
     if cfg.vad {
         return Err("--stream does not support VAD; omit --mode speech or --vad".into());
     }
     if ov.report {
         println!(
             "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : classical\nstream     : enabled ({} frames/block)",
-            spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format, STREAM_BLOCK_FRAMES
+            spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format, block_frames
         );
         return Ok(());
     }
@@ -881,7 +930,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
         let mut writer = WavStreamWriter::create(&temporary, spec)?;
         let mut frames = 0usize;
-        while let Some(block) = reader.next_block(STREAM_BLOCK_FRAMES)? {
+        while let Some(block) = reader.next_block(block_frames)? {
             let block_frames = block.first().map(Vec::len).unwrap_or(0);
             let enhanced = processor.process_block(&block)?;
             writer.write_block(&enhanced)?;
@@ -1288,9 +1337,35 @@ mod streaming_tests {
 
     #[test]
     fn parses_stream_option() {
-        let (_, _, options) =
-            parse_args(&["input.wav".into(), "output.wav".into(), "--stream".into()]).unwrap();
+        let (_, _, options) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--stream".into(),
+            "--stream-frames".into(),
+            "4096".into(),
+            "--max-memory".into(),
+            "64".into(),
+        ])
+        .unwrap();
         assert!(options.stream);
+        assert_eq!(options.stream_frames, Some(4096));
+        assert_eq!(options.max_memory_mb, Some(64));
+    }
+
+    #[test]
+    fn rejects_zero_resource_limits() {
+        let error = validate_resource_options(&Overrides {
+            max_memory_mb: Some(0),
+            ..Overrides::default()
+        })
+        .unwrap_err();
+        assert!(error.contains("--max-memory"));
+        let error = validate_resource_options(&Overrides {
+            stream_frames: Some(0),
+            ..Overrides::default()
+        })
+        .unwrap_err();
+        assert!(error.contains("--stream-frames"));
     }
 
     #[test]
@@ -1324,6 +1399,7 @@ mod streaming_tests {
             output.to_str().unwrap(),
             Overrides {
                 stream: true,
+                stream_frames: Some(257),
                 ..Overrides::default()
             },
         )
@@ -1351,6 +1427,8 @@ strength = 0.42
 adaptive_noise = true
 vad = true
 preserve_metadata = false
+stream_frames = 4096
+max_memory_mb = 64
 "#,
             "test.toml",
         )
@@ -1360,6 +1438,8 @@ preserve_metadata = false
         assert_eq!(options.mode, Some(ProcessingMode::Speech));
         assert_eq!(options.strength, Some(0.42));
         assert!(options.adaptive_noise && options.vad && options.no_metadata);
+        assert_eq!(options.stream_frames, Some(4096));
+        assert_eq!(options.max_memory_mb, Some(64));
     }
 
     #[test]

@@ -6,6 +6,9 @@
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const MIN_MEMORY_ESTIMATE_BYTES: u64 = BYTES_PER_MIB;
+
 /// In-memory audio: one `Vec<f64>` per channel, plus format metadata.
 #[derive(Clone, Debug)]
 pub struct Audio {
@@ -33,6 +36,99 @@ impl Audio {
             sample_format: self.sample_format,
         }
     }
+}
+
+/// Estimate the bytes occupied by decoded planar samples and their small
+/// per-channel allocations.
+///
+/// This intentionally uses the vector lengths rather than the input file
+/// size: compressed inputs can expand substantially when decoded, and WAV
+/// files are promoted to `f64` samples before processing.
+pub fn estimate_audio_memory_bytes(audio: &Audio) -> u64 {
+    let samples = audio.channels.iter().fold(0u64, |total, channel| {
+        total.saturating_add(channel.len() as u64)
+    });
+    samples
+        .saturating_mul(std::mem::size_of::<f64>() as u64)
+        .saturating_add((audio.channels.len() as u64).saturating_mul(256))
+}
+
+/// Estimate the in-memory working set for the normal (non-streaming) path.
+///
+/// Processing retains the decoded input while constructing a second set of
+/// channel buffers and uses FFT scratch space. A conservative three-times
+/// multiplier gives `--max-memory` a useful guard without pretending to be an
+/// allocator-level measurement.
+pub fn estimate_audio_working_set_bytes(audio: &Audio) -> u64 {
+    estimate_audio_memory_bytes(audio)
+        .saturating_mul(3)
+        .max(MIN_MEMORY_ESTIMATE_BYTES)
+}
+
+/// Estimate the bounded working set of [`crate::denoiser::StreamingDenoiser`].
+///
+/// The stream keeps per-channel STFT state, a bounded profiling prefix, and a
+/// current input/output block. The estimate is deliberately conservative and
+/// scales with the configured block size rather than the total recording
+/// length.
+pub fn estimate_stream_memory_bytes(
+    channels: usize,
+    block_frames: usize,
+    frame_size: usize,
+    sample_rate: u32,
+) -> u64 {
+    let profile_frames = (sample_rate as u64)
+        .saturating_mul(3)
+        .saturating_div(2)
+        .saturating_add(frame_size as u64);
+    let per_channel_samples = (frame_size as u64)
+        .saturating_mul(96)
+        .saturating_add(profile_frames.saturating_mul(2));
+    let block_samples = (block_frames as u64)
+        .saturating_mul(channels as u64)
+        .saturating_mul(4);
+    per_channel_samples
+        .saturating_mul(channels as u64)
+        .saturating_add(block_samples)
+        .saturating_mul(std::mem::size_of::<f64>() as u64)
+        .max(MIN_MEMORY_ESTIMATE_BYTES)
+}
+
+/// Conservative preflight estimate for a filesystem input.
+///
+/// The normal path decodes to planar `f64` and may retain multiple channel
+/// buffers while processing. Eight times the encoded file size is therefore a
+/// useful upper-bound heuristic for rejecting obviously oversized inputs
+/// before decoding; a one-MiB floor keeps tiny files usable with a 1-MiB cap.
+pub fn estimate_file_memory_bytes<P: AsRef<std::path::Path>>(path: P) -> Result<u64, String> {
+    let size = std::fs::metadata(path.as_ref())
+        .map_err(|error| format!("read input metadata: {error}"))?
+        .len();
+    Ok(size.saturating_mul(8).max(MIN_MEMORY_ESTIMATE_BYTES))
+}
+
+/// Enforce an optional memory cap in MiB, returning a user-facing diagnostic.
+pub fn ensure_memory_limit(
+    estimated_bytes: u64,
+    max_memory_mb: Option<usize>,
+    context: &str,
+) -> Result<(), String> {
+    let Some(max_memory_mb) = max_memory_mb else {
+        return Ok(());
+    };
+    if max_memory_mb == 0 {
+        return Err("--max-memory must be at least 1 MiB".into());
+    }
+    let limit = (max_memory_mb as u64).saturating_mul(BYTES_PER_MIB);
+    if estimated_bytes > limit {
+        let estimated_mib = estimated_bytes
+            .saturating_add(BYTES_PER_MIB - 1)
+            .saturating_div(BYTES_PER_MIB);
+        return Err(format!(
+            "{context} requires approximately {estimated_mib} MiB, but --max-memory allows {max_memory_mb} MiB; use --stream for WAV or raise the limit"
+        ));
+    }
+    Ok(())
 }
 
 /// Read any supported audio file (WAV, MP3, M4A) into de-interleaved `f64` channels.
@@ -490,5 +586,35 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn memory_estimates_scale_with_audio_and_stream_blocks() {
+        let small = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1_000]],
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let large = Audio {
+            channels: vec![vec![0.0; 2_000], vec![0.0; 2_000]],
+            ..small.clone()
+        };
+        assert!(estimate_audio_memory_bytes(&small) > 0);
+        assert!(estimate_audio_memory_bytes(&large) > estimate_audio_memory_bytes(&small));
+        assert!(estimate_audio_working_set_bytes(&large) >= estimate_audio_memory_bytes(&large));
+        assert!(
+            estimate_stream_memory_bytes(2, 4_096, 2_048, 48_000)
+                > estimate_stream_memory_bytes(2, 1_024, 2_048, 48_000)
+        );
+    }
+
+    #[test]
+    fn memory_limit_reports_clear_overflow() {
+        let error = ensure_memory_limit(2 * 1024 * 1024, Some(1), "decoded audio").unwrap_err();
+        assert!(error.contains("decoded audio"));
+        assert!(error.contains("--max-memory allows 1 MiB"));
+        ensure_memory_limit(1024, Some(1), "decoded audio").unwrap();
+        ensure_memory_limit(2 * 1024 * 1024, None, "decoded audio").unwrap();
     }
 }
