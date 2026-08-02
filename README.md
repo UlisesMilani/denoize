@@ -45,11 +45,14 @@ models; spectral models and diffusion samplers require dedicated adapters.
 
 | Format | Decoder | Notes |
 |--------|---------|-------|
-| WAV | `hound` | 8–32 bit int / float |
+| WAV/BWF | `hound` | 8–32 bit int / float; BWF metadata chunks are preserved for supported tags |
+| RF64 | native RF64 reader | 64-bit-size PCM/WAVE, bounded chunk reads |
+| AIFF/AIFC | `symphonia` | PCM and supported AIFC codecs |
+| CAF | `symphonia` | PCM and ALAC/other supported CAF codecs |
 | MP3 | `nanomp3` (Pure Rust) | ID3 skip, no resampling |
-| M4A/AAC | `oxideav-aac` (Pure Rust) | MP4 demux + AAC-LC decode |
+| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | MP4 demux + AAC-LC/ALAC decode |
 | FLAC | `claxon` | Lossless FLAC |
-| Ogg Opus | `opus` + `ogg` | Mono/stereo; native 48 kHz decode |
+| Ogg Opus/Vorbis | `opus` + `ogg` / `symphonia` | Mono/stereo; native sample rate decode |
 
 ### Output formats
 

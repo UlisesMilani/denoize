@@ -4,7 +4,8 @@
 denoize 0.7.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
-Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
+Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
+Output: WAV, FLAC, Ogg Opus, MP3, M4A, AAC.
 
 USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
