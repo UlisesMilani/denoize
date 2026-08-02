@@ -99,7 +99,7 @@ fn append_interleaved_i16(channels: &mut [Vec<f64>], interleaved: &[i16], n_ch: 
     for f in 0..frames {
         for ch in 0..n_ch.min(channels.len()) {
             let v = interleaved[f * n_ch + ch] as f64 / 32768.0;
-            channels[ch].push(v.clamp(-1.0, 1.0));
+            channels[ch].push(crate::audio::sanitize_sample(v));
         }
     }
 }

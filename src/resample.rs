@@ -2,6 +2,8 @@
 
 use rubato::{FftFixedIn, Resampler};
 
+use crate::audio::sanitize_sample;
+
 const CHUNK_FRAMES: usize = 1024;
 const SUB_CHUNKS: usize = 2;
 
@@ -28,7 +30,29 @@ pub fn resample_channels(
     if input.iter().any(|channel| channel.len() != frames) {
         return Err("all channels must contain the same number of frames".into());
     }
-    if frames == 0 || from_rate == to_rate {
+    if frames == 0 {
+        return Ok(input.to_vec());
+    }
+
+    // The converter performs floating-point FFT arithmetic, so one invalid
+    // input sample would otherwise contaminate an entire block.  Keep the
+    // common finite path allocation-free while still making direct callers
+    // safe for NaN, infinity, and out-of-range amplitudes.
+    let needs_sanitization = input
+        .iter()
+        .flatten()
+        .any(|sample| !sample.is_finite() || *sample < -1.0 || *sample > 1.0);
+    let sanitized;
+    let input = if needs_sanitization {
+        sanitized = input
+            .iter()
+            .map(|channel| channel.iter().copied().map(sanitize_sample).collect())
+            .collect::<Vec<Vec<f64>>>();
+        &sanitized
+    } else {
+        input
+    };
+    if from_rate == to_rate {
         return Ok(input.to_vec());
     }
 
@@ -76,6 +100,9 @@ pub fn resample_channels(
         channel.drain(..delay.min(channel.len()));
         channel.truncate(expected);
         channel.resize(expected, 0.0);
+        for sample in channel {
+            *sample = sanitize_sample(*sample);
+        }
     }
     Ok(output)
 }
@@ -159,5 +186,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sanitizes_nonfinite_and_extreme_samples_before_conversion() {
+        let input = vec![vec![
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2.0,
+            -2.0,
+            0.25,
+        ]];
+        let output = resample_channels(&input, 48_000, 48_000).unwrap();
+        assert_eq!(output[0], vec![0.0, 0.0, 0.0, 1.0, -1.0, 0.25]);
     }
 }

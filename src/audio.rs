@@ -10,6 +10,20 @@ use std::io::{BufReader, BufWriter, Read, Seek, Write};
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const MIN_MEMORY_ESTIMATE_BYTES: u64 = BYTES_PER_MIB;
 
+/// Keep a decoded sample in the range accepted by the DSP and codecs.
+///
+/// Non-finite values cannot represent an audio sample and would otherwise
+/// poison FFT state, noise estimates, and container encoders.  Treat them as
+/// a short, safe silence instead of allowing them to propagate.
+#[inline]
+pub fn sanitize_sample(sample: f64) -> f64 {
+    if sample.is_finite() {
+        sample.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 /// In-memory audio: one `Vec<f64>` per channel, plus format metadata.
 #[derive(Clone, Debug)]
 pub struct Audio {
@@ -28,6 +42,26 @@ impl Audio {
 
     pub fn frames(&self) -> usize {
         self.channels.first().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Sanitize all in-memory samples in place.
+    ///
+    /// Finite values outside the normalized PCM range are clipped and NaN or
+    /// infinity is replaced by silence.  The return value is the number of
+    /// samples changed, which can be used for diagnostics without requiring a
+    /// second pass.
+    pub fn sanitize_samples(&mut self) -> usize {
+        let mut changed = 0;
+        for channel in &mut self.channels {
+            for sample in channel {
+                let sanitized = sanitize_sample(*sample);
+                if *sample != sanitized || !sample.is_finite() {
+                    changed += 1;
+                }
+                *sample = sanitized;
+            }
+        }
+        changed
     }
 
     /// Return the conventional layout for the planar channel order.
@@ -218,7 +252,7 @@ fn read_wav_reader<R: std::io::Read>(
                 .map(|s| s.map_err(|e| format!("read: {e}")))
                 .collect();
             for (i, v) in samples?.iter().enumerate() {
-                channels[i % nchan].push((*v as f64).clamp(-1.0, 1.0));
+                channels[i % nchan].push(sanitize_sample(*v as f64));
             }
         }
         SampleFormat::Int => {
@@ -228,7 +262,7 @@ fn read_wav_reader<R: std::io::Read>(
                     .map(|s| s.map_err(|e| format!("read: {e}")))
                     .collect();
                 for (i, v) in samples?.iter().enumerate() {
-                    channels[i % nchan].push((*v as f64 * inv).clamp(-1.0, 1.0));
+                    channels[i % nchan].push(sanitize_sample(*v as f64 * inv));
                 }
             } else {
                 let samples: Result<Vec<i32>, String> = reader
@@ -236,7 +270,7 @@ fn read_wav_reader<R: std::io::Read>(
                     .map(|s| s.map_err(|e| format!("read: {e}")))
                     .collect();
                 for (i, v) in samples?.iter().enumerate() {
-                    channels[i % nchan].push((*v as f64 * inv).clamp(-1.0, 1.0));
+                    channels[i % nchan].push(sanitize_sample(*v as f64 * inv));
                 }
             }
         }
@@ -344,6 +378,9 @@ pub fn write_audio<P: AsRef<std::path::Path>>(
 /// Write an [`Audio`] to a WAV file, preserving its bit depth / format.
 pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<(), String> {
     let path = path.as_ref();
+    if audio.channels() == 0 {
+        return Err("WAV output requires at least one channel".into());
+    }
     let spec = audio.wav_spec();
     let writer = WavWriter::create(path, spec).map_err(|e| format!("create: {e}"))?;
     write_wav_writer(writer, audio)?;
@@ -352,6 +389,9 @@ pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<()
 
 /// Encode a complete WAV into memory for stdout and network transports.
 pub fn write_wav_bytes(audio: &Audio) -> Result<Vec<u8>, String> {
+    if audio.channels() == 0 {
+        return Err("WAV output requires at least one channel".into());
+    }
     let mut bytes = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut bytes);
@@ -439,11 +479,7 @@ fn write_wav_writer<W: std::io::Write + std::io::Seek>(
         SampleFormat::Float => {
             for f in 0..frames {
                 for ch in 0..nchan {
-                    let v = audio.channels[ch]
-                        .get(f)
-                        .copied()
-                        .unwrap_or(0.0)
-                        .clamp(-1.0, 1.0);
+                    let v = sanitize_sample(audio.channels[ch].get(f).copied().unwrap_or(0.0));
                     writer
                         .write_sample(v as f32)
                         .map_err(|e| format!("write: {e}"))?;
@@ -457,11 +493,7 @@ fn write_wav_writer<W: std::io::Write + std::io::Seek>(
             if audio.bits_per_sample <= 16 {
                 for f in 0..frames {
                     for ch in 0..nchan {
-                        let v = audio.channels[ch]
-                            .get(f)
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(-1.0, 1.0);
+                        let v = sanitize_sample(audio.channels[ch].get(f).copied().unwrap_or(0.0));
                         let q = ((v * max).round() as i64).min(hi).max(lo);
                         writer
                             .write_sample(q as i16)
@@ -471,11 +503,7 @@ fn write_wav_writer<W: std::io::Write + std::io::Seek>(
             } else {
                 for f in 0..frames {
                     for ch in 0..nchan {
-                        let v = audio.channels[ch]
-                            .get(f)
-                            .copied()
-                            .unwrap_or(0.0)
-                            .clamp(-1.0, 1.0);
+                        let v = sanitize_sample(audio.channels[ch].get(f).copied().unwrap_or(0.0));
                         let q = ((v * max).round() as i64).min(hi).max(lo);
                         writer
                             .write_sample(q as i32)
@@ -553,26 +581,27 @@ impl<R: Read + Seek> WavStreamReader<R> {
         match self.spec.sample_format {
             SampleFormat::Float => {
                 for sample in self.reader.samples::<f32>().take(max_samples) {
-                    interleaved
-                        .push(sample.map_err(|e| format!("read: {e}"))?.clamp(-1.0, 1.0) as f64);
+                    interleaved.push(sanitize_sample(
+                        sample.map_err(|e| format!("read: {e}"))? as f64
+                    ));
                 }
             }
             SampleFormat::Int if self.spec.bits_per_sample <= 16 => {
                 let max = (1u64 << (self.spec.bits_per_sample - 1)) as f64;
                 let inv = 1.0 / max;
                 for sample in self.reader.samples::<i16>().take(max_samples) {
-                    interleaved.push(
-                        (sample.map_err(|e| format!("read: {e}"))? as f64 * inv).clamp(-1.0, 1.0),
-                    );
+                    interleaved.push(sanitize_sample(
+                        sample.map_err(|e| format!("read: {e}"))? as f64 * inv,
+                    ));
                 }
             }
             SampleFormat::Int => {
                 let max = (1u64 << (self.spec.bits_per_sample - 1)) as f64;
                 let inv = 1.0 / max;
                 for sample in self.reader.samples::<i32>().take(max_samples) {
-                    interleaved.push(
-                        (sample.map_err(|e| format!("read: {e}"))? as f64 * inv).clamp(-1.0, 1.0),
-                    );
+                    interleaved.push(sanitize_sample(
+                        sample.map_err(|e| format!("read: {e}"))? as f64 * inv,
+                    ));
                 }
             }
         }
@@ -638,7 +667,7 @@ impl<W: Write + Seek> WavStreamWriter<W> {
                 for frame in 0..frames {
                     for channel in channels {
                         self.writer
-                            .write_sample(channel[frame].clamp(-1.0, 1.0) as f32)
+                            .write_sample(sanitize_sample(channel[frame]) as f32)
                             .map_err(|e| format!("write: {e}"))?;
                     }
                 }
@@ -649,7 +678,7 @@ impl<W: Write + Seek> WavStreamWriter<W> {
                 let lo = -max as i64;
                 for frame in 0..frames {
                     for channel in channels {
-                        let value = channel[frame].clamp(-1.0, 1.0);
+                        let value = sanitize_sample(channel[frame]);
                         let quantized = ((value * max).round() as i64).min(hi).max(lo);
                         self.writer
                             .write_sample(quantized as i16)
@@ -663,7 +692,7 @@ impl<W: Write + Seek> WavStreamWriter<W> {
                 let lo = -max as i64;
                 for frame in 0..frames {
                     for channel in channels {
-                        let value = channel[frame].clamp(-1.0, 1.0);
+                        let value = sanitize_sample(channel[frame]);
                         let quantized = ((value * max).round() as i64).min(hi).max(lo);
                         self.writer
                             .write_sample(quantized as i32)
@@ -689,6 +718,84 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("denoize_audio_{}_{}", std::process::id(), name));
         p
+    }
+
+    #[test]
+    fn sanitize_samples_maps_nonfinite_and_extreme_values_to_safe_pcm() {
+        let mut audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                2.0,
+                -2.0,
+                0.25,
+            ]],
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+            channel_mask: None,
+        };
+        assert_eq!(audio.sanitize_samples(), 5);
+        assert_eq!(audio.channels[0], vec![0.0, 0.0, 0.0, 1.0, -1.0, 0.25]);
+    }
+
+    #[test]
+    fn wav_write_sanitizes_nonfinite_samples_and_supports_empty_frames() {
+        let path = tmp("nonfinite.wav");
+        let audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                2.0,
+                -2.0,
+                0.25,
+            ]],
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+            channel_mask: None,
+        };
+        write_wav(&path, &audio).unwrap();
+        let decoded = read_wav(&path).unwrap();
+        assert_eq!(decoded.channels[0][..5], [0.0, 0.0, 0.0, 1.0, -1.0]);
+        assert!((decoded.channels[0][5] - 0.25).abs() < 1e-6);
+        std::fs::remove_file(&path).unwrap();
+
+        let empty_path = tmp("empty.wav");
+        let empty = Audio {
+            sample_rate: 48_000,
+            channels: vec![Vec::new()],
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+            channel_mask: None,
+        };
+        write_wav(&empty_path, &empty).unwrap();
+        let decoded_empty = read_wav(&empty_path).unwrap();
+        assert_eq!(decoded_empty.channels(), 1);
+        assert_eq!(decoded_empty.frames(), 0);
+        std::fs::remove_file(empty_path).unwrap();
+    }
+
+    #[test]
+    fn wav_stream_writer_sanitizes_nonfinite_samples() {
+        let path = tmp("stream_nonfinite.wav");
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut writer = WavStreamWriter::create(&path, spec).unwrap();
+        writer
+            .write_block(&[vec![f64::NAN, f64::INFINITY, -2.0, 0.5]])
+            .unwrap();
+        writer.finalize().unwrap();
+        let decoded = read_wav(&path).unwrap();
+        assert_eq!(decoded.channels[0][..3], [0.0, 0.0, -1.0]);
+        assert!((decoded.channels[0][3] - 0.5).abs() < 1e-6);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

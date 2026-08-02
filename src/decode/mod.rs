@@ -235,7 +235,7 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
             destination.extend(
                 source
                     .into_iter()
-                    .map(|sample| (sample as f64).clamp(-1.0, 1.0)),
+                    .map(|sample| crate::audio::sanitize_sample(sample as f64)),
             );
         }
     }
@@ -472,7 +472,7 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                     };
                     signed as f64 / (1u64 << (bits_per_sample - 1)) as f64
                 };
-                channels[channel].push(value.clamp(-1.0, 1.0));
+                channels[channel].push(crate::audio::sanitize_sample(value));
             }
         }
         remaining -= wanted as u64;

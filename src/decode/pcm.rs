@@ -15,9 +15,15 @@ pub struct DecodedPcm {
 impl DecodedPcm {
     /// Wrap as [`crate::audio::Audio`] using 32-bit float metadata (full decode precision).
     pub fn into_audio(self) -> crate::audio::Audio {
+        let mut channels = self.channels;
+        for channel in &mut channels {
+            for sample in channel {
+                *sample = crate::audio::sanitize_sample(*sample);
+            }
+        }
         crate::audio::Audio {
             sample_rate: self.sample_rate,
-            channels: self.channels,
+            channels,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
             channel_mask: self.channel_mask,

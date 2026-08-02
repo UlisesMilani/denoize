@@ -59,8 +59,8 @@ pub mod window;
 pub use audio::{
     ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,
     estimate_file_memory_bytes, estimate_stream_memory_bytes, read_audio, read_wav, read_wav_bytes,
-    write_audio, write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamReader,
-    WavStreamWriter,
+    sanitize_sample, write_audio, write_wav, write_wav_bytes, write_wav_channel_mask, Audio,
+    WavStreamReader, WavStreamWriter,
 };
 pub use backend::{
     decode_mid_side, encode_mid_side, Backend, BackendOptions, ChannelMode, OnnxModelConfig,
@@ -152,6 +152,7 @@ pub fn denoise_audio_with_backend_config(
     backend_options: &BackendOptions,
 ) -> Result<std::time::Duration, String> {
     config.sample_rate = audio.sample_rate;
+    audio.sanitize_samples();
     let t0 = std::time::Instant::now();
     audio.channels = if config.vad {
         process_with_vad(
@@ -170,6 +171,7 @@ pub fn denoise_audio_with_backend_config(
             backend_options,
         )?
     };
+    audio.sanitize_samples();
     let elapsed = t0.elapsed();
     eprintln!(
         "denoize: {:?} | {}ch x {} frames ({:.2}s) in {:.2?} ({:.1}x realtime)",
@@ -243,5 +245,46 @@ mod vad_mix_tests {
         assert_eq!(vad_mix_weight(99, 100, 10), 0.0);
         assert_eq!(vad_mix_weight(50, 100, 10), 1.0);
         assert!((vad_mix_weight(5, 100, 10) - 0.5).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod input_safety_tests {
+    use super::*;
+
+    #[test]
+    fn high_level_processing_sanitizes_nonfinite_samples_and_keeps_empty_audio_safe() {
+        let mut audio = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![f64::NAN, f64::INFINITY, -f64::INFINITY, 2.0, -2.0]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        denoise_audio_with_backend_config(
+            &mut audio,
+            DenoiserConfig::default(16_000),
+            Backend::Classical,
+            &BackendOptions::default(),
+        )
+        .unwrap();
+        assert!(audio.channels[0].iter().all(|sample| sample.is_finite()));
+        assert!(audio.channels[0].iter().all(|sample| sample.abs() <= 1.0));
+
+        let mut empty = Audio {
+            sample_rate: 16_000,
+            channels: vec![Vec::new()],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        denoise_audio_with_backend_config(
+            &mut empty,
+            DenoiserConfig::default(16_000),
+            Backend::Classical,
+            &BackendOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(empty.frames(), 0);
     }
 }

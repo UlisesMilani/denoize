@@ -28,6 +28,9 @@ pub fn write_m4a_with_downmix<P: AsRef<Path>>(
     downmix: DownmixMode,
 ) -> Result<(), String> {
     let path = path.as_ref();
+    if audio.frames() == 0 {
+        return Err("M4A output requires at least one frame".into());
+    }
     let sample_rate = audio.sample_rate;
     let freq_index = sample_rate_to_index(sample_rate)?;
     let layout = lossy_channel_layout(audio, downmix)?;
