@@ -834,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "denoize"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "claxon",
  "cpal",
@@ -868,7 +868,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-desktop"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "denoize",
  "rayon",
