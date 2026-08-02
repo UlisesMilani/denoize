@@ -105,6 +105,29 @@ mod tests {
     }
 
     #[test]
+    fn true_peak_measurement_catches_intersample_overshoot() {
+        let sample_rate = 48_000;
+        let mut channel = Vec::with_capacity(sample_rate as usize * 2);
+        for index in 0..sample_rate as usize * 2 {
+            channel.push(if index % 2 == 0 { 0.9 } else { -0.9 });
+        }
+        let sample_peak = channel.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let audio = Audio {
+            sample_rate,
+            channels: vec![channel],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let (_, true_peak_dbtp) = measure(&audio).unwrap();
+        let sample_peak_dbtp = 20.0 * sample_peak.log10();
+        assert!(
+            true_peak_dbtp > sample_peak_dbtp + 0.01,
+            "true peak {true_peak_dbtp:.3} dBTP did not exceed sample peak {sample_peak_dbtp:.3} dB"
+        );
+    }
+
+    #[test]
     fn normalize_sanitizes_nonfinite_and_extreme_samples() {
         let mut audio = Audio {
             sample_rate: 48_000,

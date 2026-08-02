@@ -741,6 +741,21 @@ mod tests {
     }
 
     #[test]
+    fn finite_pcm_clipping_is_symmetric_and_idempotent() {
+        let input = [-1.25, -1.0, -0.5, 0.0, 0.5, 1.0, 1.25];
+        let clipped: Vec<_> = input.iter().copied().map(sanitize_sample).collect();
+        assert_eq!(clipped, [-1.0, -1.0, -0.5, 0.0, 0.5, 1.0, 1.0]);
+        assert_eq!(
+            clipped,
+            clipped
+                .iter()
+                .copied()
+                .map(sanitize_sample)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn wav_write_sanitizes_nonfinite_samples_and_supports_empty_frames() {
         let path = tmp("nonfinite.wav");
         let audio = Audio {
