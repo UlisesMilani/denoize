@@ -229,6 +229,8 @@ fn process_with_vad(
 }
 
 fn vad_mix_weight(offset: usize, length: usize, fade_frames: usize) -> f64 {
+    // Start and end at the attenuated signal so a processed region cannot
+    // introduce a discontinuity at either handoff.
     let from_start = offset.min(fade_frames) as f64 / fade_frames.max(1) as f64;
     let from_end =
         length.saturating_sub(offset + 1).min(fade_frames) as f64 / fade_frames.max(1) as f64;
@@ -237,7 +239,7 @@ fn vad_mix_weight(offset: usize, length: usize, fade_frames: usize) -> f64 {
 
 #[cfg(test)]
 mod vad_mix_tests {
-    use super::vad_mix_weight;
+    use super::{process_with_vad, vad, vad_mix_weight, Backend, BackendOptions, DenoiserConfig};
 
     #[test]
     fn fades_vad_region_edges_without_exceeding_unity() {
@@ -245,6 +247,140 @@ mod vad_mix_tests {
         assert_eq!(vad_mix_weight(99, 100, 10), 0.0);
         assert_eq!(vad_mix_weight(50, 100, 10), 1.0);
         assert!((vad_mix_weight(5, 100, 10) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fade_weights_are_bounded_monotonic_and_slope_limited() {
+        let fade_frames = 10;
+        let weights: Vec<_> = (0..100)
+            .map(|offset| vad_mix_weight(offset, 100, fade_frames))
+            .collect();
+
+        assert!(weights.iter().all(|weight| (0.0..=1.0).contains(weight)));
+        assert!(weights.windows(2).all(|pair| {
+            (pair[1] - pair[0]).abs() <= 1.0 / fade_frames as f64 + f64::EPSILON
+        }));
+        assert!(weights[..=fade_frames]
+            .windows(2)
+            .all(|pair| pair[1] >= pair[0]));
+        assert!(weights[fade_frames..]
+            .windows(2)
+            .all(|pair| pair[1] <= pair[0]));
+        assert_eq!(weights.first().copied(), Some(0.0));
+        assert_eq!(weights.last().copied(), Some(0.0));
+    }
+
+    fn test_config(sample_rate: u32) -> DenoiserConfig {
+        let mut config = DenoiserConfig::default(sample_rate);
+        config.vad = true;
+        config.vad_silence_gain = 0.2;
+        config.vad_speech_mix = 0.0;
+        config.sanitized()
+    }
+
+    #[test]
+    fn vad_applies_configured_gain_to_non_speech_audio() {
+        let sample_rate = 16_000;
+        let input: Vec<f64> = (0..sample_rate)
+            .map(|index| {
+                1.0e-5 * (2.0 * std::f64::consts::PI * 37.0 * index as f64
+                    / sample_rate as f64)
+                    .sin()
+            })
+            .collect();
+        assert!(vad::speech_regions(std::slice::from_ref(&input), sample_rate).is_empty());
+
+        let output = process_with_vad(
+            Backend::Classical,
+            std::slice::from_ref(&input),
+            sample_rate,
+            &test_config(sample_rate),
+            &BackendOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].len(), input.len());
+        for (actual, original) in output[0].iter().zip(&input) {
+            assert!((actual - original * 0.2).abs() < 1e-20);
+        }
+    }
+
+    #[test]
+    fn vad_crossfade_matches_expected_edges_without_clicks() {
+        let sample_rate = 16_000;
+        let frames = sample_rate as usize * 2;
+        let active_start = sample_rate as usize / 2;
+        let active_end = sample_rate as usize * 3 / 2;
+        let transition = sample_rate as usize / 20;
+        let input: Vec<f64> = (0..frames)
+            .map(|index| {
+                let envelope = if index < active_start.saturating_sub(transition) {
+                    0.0
+                } else if index < active_start {
+                    let position = (index - (active_start - transition)) as f64
+                        / transition as f64;
+                    let smooth = position * position * (3.0 - 2.0 * position);
+                    0.3 * smooth
+                } else if index < active_end {
+                    0.3
+                } else if index < active_end + transition {
+                    let position = (index - active_end) as f64 / transition as f64;
+                    let smooth = position * position * (3.0 - 2.0 * position);
+                    0.3 * (1.0 - smooth)
+                } else {
+                    0.0
+                };
+                envelope
+                    * (2.0 * std::f64::consts::PI * 80.0 * index as f64
+                        / sample_rate as f64)
+                        .sin()
+            })
+            .collect();
+        let regions = vad::speech_regions(std::slice::from_ref(&input), sample_rate);
+        assert!(!regions.is_empty());
+
+        let output = process_with_vad(
+            Backend::Classical,
+            std::slice::from_ref(&input),
+            sample_rate,
+            &test_config(sample_rate),
+            &BackendOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(output[0].len(), input.len());
+        assert!(output[0].iter().all(|sample| sample.is_finite()));
+
+        let silence_gain = 0.2;
+        let mut expected: Vec<f64> = input.iter().map(|sample| sample * silence_gain).collect();
+        for region in &regions {
+            for offset in 0..region.end.saturating_sub(region.start) {
+                let index = region.start + offset;
+                if index >= expected.len() {
+                    break;
+                }
+                let weight = vad_mix_weight(
+                    offset,
+                    region.end - region.start,
+                    sample_rate as usize / 50,
+                );
+                expected[index] = expected[index] * (1.0 - weight) + input[index] * weight;
+            }
+        }
+        for (actual, expected) in output[0].iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+
+        for region in regions {
+            if region.start > 0 {
+                let jump = (output[0][region.start] - output[0][region.start - 1]).abs();
+                assert!(jump < 0.02, "VAD start boundary jump: {jump}");
+            }
+            if region.end < output[0].len() {
+                let jump = (output[0][region.end] - output[0][region.end - 1]).abs();
+                assert!(jump < 0.02, "VAD end boundary jump: {jump}");
+            }
+        }
     }
 }
 
