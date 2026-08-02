@@ -3,13 +3,19 @@
 use std::path::Path;
 
 use lofty::config::WriteOptions;
+use lofty::error::ErrorKind;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::Tag;
 
 pub fn read(input: &Path) -> Result<Option<Tag>, String> {
-    let source = lofty::read_from_path(input)
-        .map_err(|error| format!("read metadata from {}: {error}", input.display()))?;
-    Ok(source.primary_tag().or_else(|| source.first_tag()).cloned())
+    match lofty::read_from_path(input) {
+        Ok(source) => Ok(source.primary_tag().or_else(|| source.first_tag()).cloned()),
+        // Lofty intentionally does not claim every audio container. Audio
+        // decoding still handles those containers, so an absent tag reader is
+        // equivalent to “no metadata” rather than a processing failure.
+        Err(error) if matches!(error.kind(), ErrorKind::UnknownFormat) => Ok(None),
+        Err(error) => Err(format!("read metadata from {}: {error}", input.display())),
+    }
 }
 
 pub fn write(mut tag: Tag, output: &Path) -> Result<(), String> {

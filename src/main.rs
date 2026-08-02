@@ -37,7 +37,8 @@ fn usage() -> String {
 denoize {VERSION} — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
-Input/output: WAV, FLAC, Ogg Opus, MP3, M4A (built in; no ffmpeg).
+Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
+Output: WAV, FLAC, Ogg Opus, MP3, M4A, AAC.
 
 USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
@@ -1181,7 +1182,22 @@ fn is_supported_audio_path(path: &std::path::Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg"
+                "wav"
+                    | "rf64"
+                    | "bwf"
+                    | "aif"
+                    | "aiff"
+                    | "aifc"
+                    | "caf"
+                    | "mp3"
+                    | "m4a"
+                    | "mp4"
+                    | "aac"
+                    | "flac"
+                    | "opus"
+                    | "ogg"
+                    | "oga"
+                    | "vorbis"
             )
         })
         .unwrap_or(false)
