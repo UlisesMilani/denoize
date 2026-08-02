@@ -127,12 +127,12 @@ where
 {
     let input = input.as_ref();
     let output = output.as_ref();
-    let tag = metadata::read(input)?;
+    let metadata = metadata::read_extended(input)?;
     let mut audio = read_audio(input)?;
     denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
     write_audio(output, &audio, encode_opts)?;
-    if let Some(tag) = tag {
-        metadata::write(tag, output)?;
+    if let Some(metadata) = metadata {
+        metadata::write_extended(metadata, output)?;
     }
     Ok(audio)
 }

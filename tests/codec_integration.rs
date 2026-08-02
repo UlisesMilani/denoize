@@ -1,9 +1,13 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use denoize::{decode_file, metadata, read_audio, write_audio, write_wav, Audio, EncodeOptions};
+use denoize::{Audio, EncodeOptions, decode_file, metadata, read_audio, write_audio, write_wav};
 use hound::SampleFormat;
 use lofty::config::WriteOptions;
+use lofty::id3::v2::{BinaryFrame, Frame, FrameId, Id3v2Tag};
+use lofty::ogg::VorbisComments;
+use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::tag::{Accessor, Tag, TagExt, TagType};
 
 struct TestWorkspace {
@@ -139,6 +143,136 @@ fn assert_tag(path: &Path) {
         .expect("output should contain a tag");
     assert_eq!(tag.title().as_deref(), Some("Integration fixture"));
     assert_eq!(tag.artist().as_deref(), Some("denoize tests"));
+}
+
+fn one_pixel_png() -> Vec<u8> {
+    // A valid 1x1 RGBA PNG. Keeping the fixture in the test avoids an
+    // external image/tool dependency while exercising cover-art bytes,
+    // MIME type, and picture type preservation.
+    vec![
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00,
+        0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+    ]
+}
+
+#[cfg(feature = "m4a-encode")]
+#[test]
+fn metadata_preserves_extended_fields_and_cover_art() {
+    let workspace = TestWorkspace::new();
+    let input = workspace.file("extended.flac");
+    let audio = fixture(2, 44_100 / 4);
+    write_audio(&input, &audio, EncodeOptions::default()).expect("write FLAC input");
+
+    let mut tag = Tag::new(TagType::VorbisComments);
+    tag.set_title("Extended title".into());
+    tag.set_artist("Extended artist".into());
+    tag.set_album("Extended album".into());
+    tag.set_genre("Electronic".into());
+    tag.set_comment("A detailed comment".into());
+    tag.set_track(3);
+    tag.set_track_total(12);
+    tag.push_picture(
+        Picture::unchecked(one_pixel_png())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(MimeType::Png)
+            .description("front")
+            .build(),
+    );
+    tag.save_to_path(&input, WriteOptions::default())
+        .expect("write extended FLAC metadata");
+
+    for extension in ["flac", "mp3"] {
+        let output = workspace.file(&format!("extended-copy.{extension}"));
+        write_audio(&output, &audio, EncodeOptions::default())
+            .unwrap_or_else(|error| panic!("write {extension}: {error}"));
+        assert!(metadata::copy(&input, &output).expect("copy extended metadata"));
+        let copied = metadata::read(&output)
+            .expect("read copied metadata")
+            .expect("copied metadata should exist");
+        assert_eq!(copied.title().as_deref(), Some("Extended title"));
+        assert_eq!(copied.artist().as_deref(), Some("Extended artist"));
+        assert_eq!(copied.album().as_deref(), Some("Extended album"));
+        assert_eq!(copied.genre().as_deref(), Some("Electronic"));
+        assert_eq!(copied.comment().as_deref(), Some("A detailed comment"));
+        assert_eq!(copied.track(), Some(3));
+        assert_eq!(copied.track_total(), Some(12));
+        assert_eq!(copied.picture_count(), 1, "{extension} picture count");
+        assert_eq!(copied.pictures()[0].data(), one_pixel_png().as_slice());
+        assert_eq!(copied.pictures()[0].pic_type(), PictureType::CoverFront);
+        assert_eq!(copied.pictures()[0].mime_type(), Some(&MimeType::Png));
+        assert_eq!(copied.pictures()[0].description(), Some("front"));
+    }
+}
+
+#[test]
+fn metadata_preserves_vorbis_custom_and_chapter_comments() {
+    let workspace = TestWorkspace::new();
+    let input = workspace.file("custom.flac");
+    let audio = fixture(1, 44_100 / 4);
+    write_audio(&input, &audio, EncodeOptions::default()).expect("write FLAC input");
+
+    let mut comments = VorbisComments::new();
+    comments.set_vendor("custom-vendor".into());
+    comments.push("TITLE".into(), "Chapter fixture".into());
+    comments.push("X-CUSTOM".into(), "retained value".into());
+    comments.push("CHAPTER001".into(), "00:00:00.000".into());
+    comments.push("CHAPTER001NAME".into(), "Introduction".into());
+    comments
+        .save_to_path(&input, WriteOptions::default())
+        .expect("write custom Vorbis comments");
+
+    for extension in ["flac", "opus"] {
+        let output = workspace.file(&format!("custom-copy.{extension}"));
+        write_audio(&output, &audio, EncodeOptions::default())
+            .unwrap_or_else(|error| panic!("write {extension}: {error}"));
+        assert!(metadata::copy(&input, &output).expect("copy custom comments"));
+        let bytes = std::fs::read(&output).expect("read copied comments");
+        for expected in [
+            b"X-CUSTOM=retained value".as_slice(),
+            b"CHAPTER001=00:00:00.000".as_slice(),
+            b"CHAPTER001NAME=Introduction".as_slice(),
+        ] {
+            assert!(
+                bytes
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "{extension} should contain {:?}",
+                String::from_utf8_lossy(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn metadata_preserves_id3_chapter_frames_on_mp3() {
+    let workspace = TestWorkspace::new();
+    let input = workspace.file("chapter-input.mp3");
+    let output = workspace.file("chapter-output.mp3");
+    let audio = fixture(1, 44_100 / 4);
+    write_audio(&input, &audio, EncodeOptions::default()).expect("write MP3 input");
+
+    let mut tag = Id3v2Tag::new();
+    tag.set_title("ID3 chapter fixture".into());
+    let mut chapter = b"intro\0".to_vec();
+    chapter.extend(0_u32.to_be_bytes());
+    chapter.extend(1_000_u32.to_be_bytes());
+    chapter.extend(u32::MAX.to_be_bytes());
+    chapter.extend(u32::MAX.to_be_bytes());
+    tag.insert(Frame::Binary(BinaryFrame::new(
+        FrameId::Valid(Cow::Borrowed("CHAP")),
+        chapter.clone(),
+    )));
+    tag.save_to_path(&input, WriteOptions::default())
+        .expect("write ID3 chapter frame");
+
+    write_audio(&output, &audio, EncodeOptions::default()).expect("write MP3 output");
+    assert!(metadata::copy(&input, &output).expect("copy ID3 chapter frame"));
+    let bytes = std::fs::read(&output).expect("read copied ID3 tag");
+    assert!(bytes.windows(4).any(|window| window == b"CHAP"));
+    assert!(bytes.windows(chapter.len()).any(|window| window == chapter));
 }
 
 #[test]
@@ -286,8 +420,10 @@ fn metadata_copies_across_wav_flac_and_mp3() {
         let output = workspace.file(&format!("tagged.{extension}"));
         write_audio(&output, &audio, EncodeOptions::default())
             .unwrap_or_else(|error| panic!("write {codec}: {error}"));
-        assert!(metadata::copy(&input, &output)
-            .unwrap_or_else(|error| panic!("copy metadata to {codec}: {error}")));
+        assert!(
+            metadata::copy(&input, &output)
+                .unwrap_or_else(|error| panic!("copy metadata to {codec}: {error}"))
+        );
         assert_tag(&output);
     }
 }

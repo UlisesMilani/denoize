@@ -731,7 +731,7 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
     }
     let metadata = if input != "-" && !ov.no_metadata {
-        denoize::metadata::read(std::path::Path::new(input))?
+        denoize::metadata::read_extended(std::path::Path::new(input))?
     } else {
         None
     };
@@ -845,7 +845,7 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         }
         std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
         if let Some(metadata) = metadata {
-            denoize::metadata::write(metadata, output_path)?;
+            denoize::metadata::write_extended(metadata, output_path)?;
         }
         if ov.json {
             println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, service::backend_name(result.backend), audio.channels(), audio.frames(), audio.sample_rate, result.elapsed.as_secs_f64() * 1000.0);
@@ -893,7 +893,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     }
 
     let metadata = if !ov.no_metadata {
-        denoize::metadata::read(input_path)?
+        denoize::metadata::read_extended(input_path)?
     } else {
         None
     };
@@ -954,7 +954,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     }
     std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write(metadata, output_path)?;
+        denoize::metadata::write_extended(metadata, output_path)?;
     }
     if ov.json {
         println!(

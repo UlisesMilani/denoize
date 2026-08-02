@@ -814,7 +814,7 @@ fn process_file(
     let input = Path::new(&request.input);
     let output = Path::new(&request.output);
     let metadata = if request.options.preserve_metadata {
-        denoize::metadata::read(input)?
+        denoize::metadata::read_extended(input)?
     } else {
         None
     };
@@ -900,7 +900,7 @@ fn process_file(
     std::fs::rename(&temporary, output)
         .map_err(|error| format!("出力を確定できません: {error}"))?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write(metadata, output)?;
+        denoize::metadata::write_extended(metadata, output)?;
     }
     Ok(output.to_string_lossy().into_owned())
 }
