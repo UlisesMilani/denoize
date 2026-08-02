@@ -496,10 +496,15 @@ Use `--no-metadata` for a clean output.
 denoize compare clean.wav noisy.wav enhanced.wav
 denoize compare clean.wav noisy.wav enhanced.wav --json
 denoize compare clean.wav noisy.wav enhanced.wav --html > report.html
+denoize metrics clean.wav enhanced.wav --json | jq '.artifact_scores'
 ```
 
 The report shows noisy and enhanced SI-SDR, SI-SNR, SNR, segmental SNR, and
-improvement deltas. Metrics requiring external models or licensed reference
+improvement deltas. It also screens for musical noise, pumping, transient loss,
+and stereo phase distortion. These artifact scores are deterministic
+dependency-free indicators in `[0, 1]` (lower is better), not perceptual
+listening-test replacements; phase distortion is reported only for stereo
+inputs. Metrics requiring external models or licensed reference
 implementations are explicitly marked as unmeasured.
 
 ### Configuration file
