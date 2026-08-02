@@ -1365,6 +1365,22 @@ mod tests {
     }
 
     #[test]
+    fn dc_block_removes_constant_offset_and_matches_streaming_state() {
+        let input = vec![0.25; 16_000];
+        let batch = Denoiser::dc_block(&input);
+        let tail_mean = batch[15_000..].iter().sum::<f64>() / 1_000.0;
+        assert!(tail_mean.abs() < 1e-5, "residual DC offset: {tail_mean}");
+
+        let mut stream = Denoiser::new(DenoiserConfig::default(16_000));
+        let streaming: Vec<_> = input
+            .iter()
+            .copied()
+            .map(|sample| stream.dc_block_sample(sample))
+            .collect();
+        assert_eq!(streaming, batch);
+    }
+
+    #[test]
     fn denoising_improves_snr() {
         let sr: u32 = 16000;
         let dur = 2.0;
