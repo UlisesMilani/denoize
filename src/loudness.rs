@@ -5,8 +5,8 @@
 //! momentary, short-term, integrated, and loudness-range measurements as well
 //! as the relative gate threshold and sample/true peaks.
 
-use crate::{sanitize_sample, Audio};
-use ebur128::{EbuR128, Mode};
+use crate::{channel_layout::ChannelPosition, sanitize_sample, Audio};
+use ebur128::{Channel as EbuChannel, EbuR128, Mode};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LoudnessReport {
@@ -138,6 +138,11 @@ fn create_analyzer(audio: &Audio, mode: Mode) -> Result<EbuR128, String> {
     }
     let mut analyzer = EbuR128::new(channels as u32, audio.sample_rate, mode)
         .map_err(|error| format!("initialize loudness analyzer: {error}"))?;
+    if let Some(channel_map) = ebur_channel_map(audio) {
+        analyzer
+            .set_channel_map(&channel_map)
+            .map_err(|error| format!("configure loudness channel map: {error}"))?;
+    }
     let mut interleaved = Vec::with_capacity(audio.frames() * channels);
     for frame in 0..audio.frames() {
         for channel in &audio.channels {
@@ -148,6 +153,48 @@ fn create_analyzer(audio: &Audio, mode: Mode) -> Result<EbuR128, String> {
         .add_frames_f64(&interleaved)
         .map_err(|error| format!("analyze loudness: {error}"))?;
     Ok(analyzer)
+}
+
+/// Translate the WAVE speaker mask into the channel positions understood by
+/// `ebur128`. In particular, LFE is explicitly marked `Unused`; treating a
+/// 2.1/5.1/7.1 LFE channel as a center channel would incorrectly raise LUFS.
+/// When an input has no usable mask, a known layout inferred from its channel
+/// count supplies the conventional positions. Unknown layouts retain the
+/// analyzer's conservative defaults.
+fn ebur_channel_map(audio: &Audio) -> Option<Vec<EbuChannel>> {
+    let channels = audio.channels();
+    let positions = audio
+        .effective_channel_mask()
+        .filter(|mask| mask.bits() != 0 && mask.channels() == channels)
+        .map(|mask| mask.positions())
+        .or_else(|| audio.channel_layout().mask().map(|mask| mask.positions()))?;
+    if positions.len() != channels {
+        return None;
+    }
+    Some(positions.into_iter().map(ebu_channel_position).collect())
+}
+
+fn ebu_channel_position(position: ChannelPosition) -> EbuChannel {
+    match position {
+        ChannelPosition::FrontLeft => EbuChannel::Left,
+        ChannelPosition::FrontRight => EbuChannel::Right,
+        ChannelPosition::FrontCenter => EbuChannel::Center,
+        ChannelPosition::Lfe1 => EbuChannel::Unused,
+        ChannelPosition::RearLeft => EbuChannel::LeftSurround,
+        ChannelPosition::RearRight => EbuChannel::RightSurround,
+        ChannelPosition::FrontLeftCenter => EbuChannel::MpSC,
+        ChannelPosition::FrontRightCenter => EbuChannel::MmSC,
+        ChannelPosition::RearCenter => EbuChannel::Mp180,
+        ChannelPosition::SideLeft => EbuChannel::Mp090,
+        ChannelPosition::SideRight => EbuChannel::Mm090,
+        ChannelPosition::TopCenter => EbuChannel::Up000,
+        ChannelPosition::TopFrontLeft => EbuChannel::Up030,
+        ChannelPosition::TopFrontCenter => EbuChannel::Up000,
+        ChannelPosition::TopFrontRight => EbuChannel::Um030,
+        ChannelPosition::TopRearLeft => EbuChannel::Up110,
+        ChannelPosition::TopRearCenter => EbuChannel::Up180,
+        ChannelPosition::TopRearRight => EbuChannel::Um110,
+    }
 }
 
 fn integrated_loudness(analyzer: &EbuR128) -> Result<f64, String> {
@@ -190,6 +237,8 @@ fn has_duration(audio: &Audio, milliseconds: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::channel_layout::ChannelLayout;
+
     use super::*;
 
     fn reference_stereo_sine() -> Audio {
@@ -208,6 +257,28 @@ mod tests {
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
             channel_mask: None,
+        }
+    }
+
+    fn sine_channel(sample_rate: u32, seconds: usize, amplitude: f64) -> Vec<f64> {
+        (0..sample_rate as usize * seconds)
+            .map(|index| {
+                let time = index as f64 / sample_rate as f64;
+                amplitude * (2.0 * std::f64::consts::PI * 440.0 * time).sin()
+            })
+            .collect()
+    }
+
+    fn multichannel_audio(
+        channels: Vec<Vec<f64>>,
+        channel_mask: Option<crate::channel_layout::ChannelMask>,
+    ) -> Audio {
+        Audio {
+            sample_rate: 48_000,
+            channels,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask,
         }
     }
 
@@ -295,6 +366,63 @@ mod tests {
         assert!(metrics.momentary_lufs.is_some());
         assert!(metrics.short_term_lufs.is_none());
         assert!(metrics.loudness_range_lu.is_none());
+    }
+
+    #[test]
+    fn excludes_lfe_from_multichannel_loudness() {
+        let sample_rate = 48_000;
+        let frames = sample_rate as usize * 2;
+        let lfe_only = multichannel_audio(
+            vec![vec![0.0; frames], vec![0.0; frames], vec![1.0; frames]],
+            ChannelLayout::TwoPointOne.mask(),
+        );
+        assert!(measure(&lfe_only).is_err());
+
+        let stereo = multichannel_audio(
+            vec![
+                sine_channel(sample_rate, 2, 0.1),
+                sine_channel(sample_rate, 2, 0.1),
+            ],
+            ChannelLayout::Stereo.mask(),
+        );
+        let stereo_with_lfe = multichannel_audio(
+            vec![
+                stereo.channels[0].clone(),
+                stereo.channels[1].clone(),
+                vec![1.0; frames],
+            ],
+            ChannelLayout::TwoPointOne.mask(),
+        );
+        let (stereo_lufs, _) = measure(&stereo).unwrap();
+        let (with_lfe_lufs, _) = measure(&stereo_with_lfe).unwrap();
+        assert!((stereo_lufs - with_lfe_lufs).abs() < 1e-6);
+    }
+
+    #[test]
+    fn applies_bs1770_surround_weight_and_scans_every_true_peak_channel() {
+        let sample_rate = 48_000;
+        let frames = sample_rate as usize * 2;
+        let mask = ChannelLayout::FivePointZero.mask();
+        let mut front_channels = vec![vec![0.0; frames]; 5];
+        front_channels[0] = sine_channel(sample_rate, 2, 0.1);
+        let mut surround_channels = vec![vec![0.0; frames]; 5];
+        surround_channels[3] = sine_channel(sample_rate, 2, 0.1);
+        let (front_lufs, _) = measure(&multichannel_audio(front_channels, mask)).unwrap();
+        let (surround_lufs, _) = measure(&multichannel_audio(surround_channels, mask)).unwrap();
+        let surround_gain_db = 10.0 * 1.41f64.log10();
+        assert!((surround_lufs - front_lufs - surround_gain_db).abs() < 0.05);
+
+        let mut true_peak_channels = vec![vec![0.0; frames]; 8];
+        for (index, sample) in true_peak_channels[7].iter_mut().enumerate() {
+            *sample = if index % 2 == 0 { 0.9 } else { -0.9 };
+        }
+        let metrics = measure_detailed(&multichannel_audio(
+            true_peak_channels,
+            ChannelLayout::SevenPointOne.mask(),
+        ))
+        .unwrap();
+        assert!((metrics.sample_peak_dbfs - 20.0 * 0.9f64.log10()).abs() < 1e-6);
+        assert!(metrics.true_peak_dbtp > metrics.sample_peak_dbfs + 0.01);
     }
 
     #[test]
