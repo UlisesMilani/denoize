@@ -88,6 +88,8 @@ OPTIONS:
         --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
+        --deterministic       serialize processing for reproducible audio output
+        --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
         --stream-frames <N>   streaming block size in frames (default: 8192)
@@ -166,6 +168,8 @@ struct Overrides {
     onnx_sample_rate: Option<u32>,
     channel_mode: Option<ChannelMode>,
     sgmse_profile: Option<SgmseProfile>,
+    deterministic: bool,
+    seed: Option<u64>,
     batch: bool,
     stream: bool,
     stream_frames: Option<usize>,
@@ -205,6 +209,8 @@ struct FileConfig {
     true_peak_dbtp: Option<f64>,
     channels: Option<String>,
     downmix: Option<String>,
+    deterministic: bool,
+    seed: Option<u64>,
     batch: bool,
     stream: bool,
     stream_frames: Option<usize>,
@@ -281,6 +287,11 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.quality = config.quality.map(|value| value.to_ascii_lowercase());
     ov.loudness_lufs = config.loudness_lufs;
     ov.true_peak_dbtp = config.true_peak_dbtp;
+    ov.deterministic = config.deterministic;
+    ov.seed = config.seed;
+    if ov.seed.is_some() {
+        ov.deterministic = true;
+    }
     ov.batch = config.batch;
     ov.stream = config.stream;
     ov.stream_frames = config.stream_frames;
@@ -438,6 +449,11 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                         "unknown SGMSE profile: {profile} (expected fast, balanced, or quality)"
                     )
                 })?);
+            }
+            "--deterministic" => ov.deterministic = true,
+            "--seed" => {
+                ov.seed = Some(parse_value(args, &mut i, a)?);
+                ov.deterministic = true;
             }
             "--batch" => ov.batch = true,
             "--stream" => ov.stream = true,
@@ -742,6 +758,8 @@ fn run_live(args: &[String]) -> Result<(), String> {
         }),
         channel_mode: ov.channel_mode.unwrap_or_default(),
         sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
+        deterministic: ov.deterministic,
+        seed: ov.seed,
     };
     denoize::live::run(denoize::live::LiveConfig {
         input_device: ov.input_device,
@@ -833,6 +851,8 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         }),
         channel_mode: ov.channel_mode.unwrap_or_default(),
         sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
+        deterministic: ov.deterministic,
+        seed: ov.seed,
     };
     let result = service::process_audio(
         &mut audio,
@@ -1069,57 +1089,54 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     let finished = AtomicUsize::new(0);
     let skipped = AtomicUsize::new(0);
     let started = Instant::now();
-    let process = || {
-        files
-            .par_iter()
-            .map(|path| {
-                if CANCELLED.load(Ordering::SeqCst) {
-                    return Err("cancelled".into());
-                }
-                let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
-                let mut destination = output_dir.join(relative);
-                if let Some(extension) = output_extension {
-                    destination.set_extension(extension);
-                }
-                let state_key = relative.to_string_lossy().replace('\\', "/");
-                if ov.resume && completed_paths.contains(&state_key) && destination.is_file() {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    report_batch_progress(&finished, files.len(), started, path, "skipped", ov);
-                    return Ok::<_, String>((path.clone(), destination));
-                }
-                if let Some(parent) = destination.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("create {}: {e}", parent.display()))?;
-                }
-                let mut options = ov.clone();
-                options.batch = false;
-                options.json = false;
-                run_one(
-                    &path.to_string_lossy(),
-                    &destination.to_string_lossy(),
-                    options,
-                )?;
-                if let Some(file) = &state_file {
-                    use std::io::Write;
-                    let mut file = file.lock().map_err(|_| "resume state lock poisoned")?;
-                    writeln!(file, "{state_key}")
-                        .map_err(|error| format!("write resume state: {error}"))?;
-                    file.flush()
-                        .map_err(|error| format!("flush resume state: {error}"))?;
-                }
-                report_batch_progress(&finished, files.len(), started, path, "completed", ov);
-                Ok::<_, String>((path.clone(), destination))
-            })
-            .collect::<Vec<_>>()
+    let process_file = |path: &std::path::PathBuf| {
+        if CANCELLED.load(Ordering::SeqCst) {
+            return Err("cancelled".into());
+        }
+        let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
+        let mut destination = output_dir.join(relative);
+        if let Some(extension) = output_extension {
+            destination.set_extension(extension);
+        }
+        let state_key = relative.to_string_lossy().replace('\\', "/");
+        if ov.resume && completed_paths.contains(&state_key) && destination.is_file() {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            report_batch_progress(&finished, files.len(), started, path, "skipped", ov);
+            return Ok::<_, String>((path.clone(), destination));
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        let mut options = ov.clone();
+        options.batch = false;
+        options.json = false;
+        run_one(
+            &path.to_string_lossy(),
+            &destination.to_string_lossy(),
+            options,
+        )?;
+        if let Some(file) = &state_file {
+            use std::io::Write;
+            let mut file = file.lock().map_err(|_| "resume state lock poisoned")?;
+            writeln!(file, "{state_key}")
+                .map_err(|error| format!("write resume state: {error}"))?;
+            file.flush()
+                .map_err(|error| format!("flush resume state: {error}"))?;
+        }
+        report_batch_progress(&finished, files.len(), started, path, "completed", ov);
+        Ok::<_, String>((path.clone(), destination))
     };
-    let results = if let Some(jobs) = ov.jobs {
+    let results = if ov.deterministic {
+        files.iter().map(process_file).collect::<Vec<_>>()
+    } else if let Some(jobs) = ov.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
             .map_err(|e| format!("create batch worker pool: {e}"))?
-            .install(process)
+            .install(|| files.par_iter().map(process_file).collect::<Vec<_>>())
     } else {
-        process()
+        files.par_iter().map(process_file).collect::<Vec<_>>()
     };
     let succeeded = results.iter().filter(|result| result.is_ok()).count();
     let failures: Vec<_> = results
@@ -1326,6 +1343,46 @@ mod batch_tests {
     }
 
     #[test]
+    fn deterministic_batch_is_byte_stable_even_with_multiple_requested_jobs() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        for (name, frequency) in [("a.wav", 220.0), ("b.wav", 440.0)] {
+            let audio = denoize::Audio {
+                sample_rate: 16_000,
+                channels: vec![(0..3_200)
+                    .map(|index| {
+                        (2.0 * std::f64::consts::PI * frequency * index as f64 / 16_000.0)
+                            .sin()
+                            * 0.2
+                    })
+                    .collect()],
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+                channel_mask: None,
+            };
+            denoize::write_audio(input.join(name), &audio, EncodeOptions::default()).unwrap();
+        }
+        let options = Overrides {
+            batch: true,
+            deterministic: true,
+            force: true,
+            jobs: Some(8),
+            no_progress: true,
+            ..Overrides::default()
+        };
+
+        run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
+        let first_a = std::fs::read(output.join("a.wav")).unwrap();
+        let first_b = std::fs::read(output.join("b.wav")).unwrap();
+        run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
+        assert_eq!(first_a, std::fs::read(output.join("a.wav")).unwrap());
+        assert_eq!(first_b, std::fs::read(output.join("b.wav")).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn resume_skips_outputs_recorded_as_complete() {
         let root = temporary_directory();
         let input = root.join("input");
@@ -1485,6 +1542,8 @@ adaptive_noise = true
 vad = true
 preserve_metadata = false
 downmix = "stereo"
+deterministic = true
+seed = 12345
 stream_frames = 4096
 max_memory_mb = 64
 "#,
@@ -1492,6 +1551,8 @@ max_memory_mb = 64
         )
         .unwrap();
         assert!(options.auto_backend);
+        assert!(options.deterministic);
+        assert_eq!(options.seed, Some(12345));
         assert_eq!(options.downmix, Some(DownmixMode::Stereo));
         assert_eq!(options.preset, Some(Preset::HiFi));
         assert_eq!(options.mode, Some(ProcessingMode::Speech));
@@ -1542,6 +1603,19 @@ max_memory_mb = 64
         ])
         .unwrap();
         assert_eq!(options.downmix, Some(DownmixMode::Stereo));
+    }
+
+    #[test]
+    fn parses_deterministic_seed_and_implies_mode() {
+        let (_, _, options) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--seed".into(),
+            "42".into(),
+        ])
+        .unwrap();
+        assert!(options.deterministic);
+        assert_eq!(options.seed, Some(42));
     }
 }
 

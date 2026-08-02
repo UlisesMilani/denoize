@@ -46,6 +46,10 @@ struct ProcessOptions {
     onnx_model: Option<String>,
     onnx_sample_rate: u32,
     sgmse_profile: String,
+    #[serde(default)]
+    deterministic: bool,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -342,41 +346,46 @@ fn start_batch(
         let succeeded = AtomicUsize::new(0);
         let skipped = AtomicUsize::new(0);
         let failures = Mutex::new(Vec::<String>::new());
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(request.jobs).build();
-        let run = || {
-            items.par_iter().for_each(|batch_item| {
-                if cancelled.load(Ordering::SeqCst) { return; }
-                if request.resume && completed.contains(&batch_item.state_key) && batch_item.output.is_file() {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                    emit_batch_item(&app, job_id, "skipped", batch_item, current, total, started, None);
-                    return;
-                }
-                let process_request = ProcessRequest {
-                    input: batch_item.input.to_string_lossy().into_owned(),
-                    output: batch_item.output.to_string_lossy().into_owned(),
-                    options: request.options.clone(),
-                };
-                let result = validate_request(&process_request.input, &process_request.output, &process_request.options)
-                    .and_then(|_| process_file(&process_request, &cancelled, |_, _| {}));
+        let process_item = |batch_item: &BatchItem| {
+            if cancelled.load(Ordering::SeqCst) { return; }
+            if request.resume && completed.contains(&batch_item.state_key) && batch_item.output.is_file() {
+                skipped.fetch_add(1, Ordering::Relaxed);
                 let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                match result {
-                    Ok(_) => {
-                        succeeded.fetch_add(1, Ordering::Relaxed);
-                        if let Some(file) = &state_file {
-                            if let Ok(mut file) = file.lock() { let _ = writeln!(file, "{}", batch_item.state_key); }
-                        }
-                        emit_batch_item(&app, job_id, "completed", batch_item, current, total, started, None);
+                emit_batch_item(&app, job_id, "skipped", batch_item, current, total, started, None);
+                return;
+            }
+            let process_request = ProcessRequest {
+                input: batch_item.input.to_string_lossy().into_owned(),
+                output: batch_item.output.to_string_lossy().into_owned(),
+                options: request.options.clone(),
+            };
+            let result = validate_request(&process_request.input, &process_request.output, &process_request.options)
+                .and_then(|_| process_file(&process_request, &cancelled, |_, _| {}));
+            let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+            match result {
+                Ok(_) => {
+                    succeeded.fetch_add(1, Ordering::Relaxed);
+                    if let Some(file) = &state_file {
+                        if let Ok(mut file) = file.lock() { let _ = writeln!(file, "{}", batch_item.state_key); }
                     }
-                    Err(error) if error == "cancelled" => {}
-                    Err(error) => {
-                        if let Ok(mut list) = failures.lock() { list.push(format!("{}: {error}", batch_item.input.display())); }
-                        emit_batch_item(&app, job_id, "failed", batch_item, current, total, started, Some(error));
-                    }
+                    emit_batch_item(&app, job_id, "completed", batch_item, current, total, started, None);
                 }
-            });
+                Err(error) if error == "cancelled" => {}
+                Err(error) => {
+                    if let Ok(mut list) = failures.lock() { list.push(format!("{}: {error}", batch_item.input.display())); }
+                    emit_batch_item(&app, job_id, "failed", batch_item, current, total, started, Some(error));
+                }
+            }
         };
-        match pool { Ok(pool) => pool.install(run), Err(error) => failures.lock().unwrap().push(error.to_string()) }
+        if request.options.deterministic {
+            items.iter().for_each(process_item);
+        } else {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(request.jobs).build();
+            match pool {
+                Ok(pool) => pool.install(|| items.par_iter().for_each(process_item)),
+                Err(error) => failures.lock().unwrap().push(error.to_string()),
+            }
+        }
         if cancelled.load(Ordering::SeqCst) {
             emit_progress(
                 &app,
@@ -509,6 +518,8 @@ fn start_live(app: AppHandle, state: State<'_, AppState>, request: LiveRequest) 
         onnx: request.options.onnx_model.as_ref().map(|path| OnnxModelConfig { path: path.into(), sample_rate: request.options.onnx_sample_rate }),
         channel_mode: ChannelMode::parse(&request.options.channel_mode).ok_or("不明なチャンネルモードです")?,
         sgmse_profile: SgmseProfile::parse(&request.options.sgmse_profile).ok_or("不明なSGMSEプロファイルです")?,
+        deterministic: request.options.deterministic,
+        seed: request.options.seed,
     })?;
     let denoiser = processing_config(&request.options, 48_000)?;
     let running = Arc::new(AtomicBool::new(true));
@@ -849,6 +860,8 @@ fn process_file(
                 request.options.sgmse_profile
             )
         })?,
+        deterministic: request.options.deterministic,
+        seed: request.options.seed,
     };
     progress(2, "ラウドネスと出力を準備しています");
     service::process_audio(
@@ -1061,6 +1074,8 @@ mod tests {
             onnx_model: None,
             onnx_sample_rate: 16_000,
             sgmse_profile: "balanced".into(),
+            deterministic: false,
+            seed: None,
         }
     }
 

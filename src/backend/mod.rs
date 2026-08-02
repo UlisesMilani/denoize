@@ -156,6 +156,17 @@ pub struct BackendOptions {
     pub channel_mode: ChannelMode,
     /// SGMSE+ diffusion budget.
     pub sgmse_profile: SgmseProfile,
+    /// Serialize backend work that can otherwise run in parallel.
+    ///
+    /// This is the processing-side part of reproducible output mode. It keeps
+    /// channel inference and batch scheduling in a stable order. Container
+    /// timestamps and diagnostic timings are not affected by this flag.
+    pub deterministic: bool,
+    /// Optional seed for stochastic backends such as SGMSE+.
+    ///
+    /// Supplying a seed makes the stochastic sampler repeatable. `None` uses
+    /// the backend's stable default seed for backwards-compatible output.
+    pub seed: Option<u64>,
 }
 
 impl Backend {
@@ -345,7 +356,7 @@ fn process_channels_independent(
             let config = backend_options.onnx.as_ref().ok_or_else(|| {
                 "ONNX backend requires a model path (CLI: --onnx-model <PATH>)".to_string()
             })?;
-            onnx::process(channels, sample_rate, config)
+            onnx::process(channels, sample_rate, config, backend_options.deterministic)
         }
         #[cfg(feature = "mpsenet")]
         Backend::MpSenet => {
@@ -374,7 +385,13 @@ fn process_channels_independent(
             let config = backend_options.onnx.as_ref().ok_or_else(|| {
                 "SGMSE+ backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
             })?;
-            sgmse::process(channels, sample_rate, config, backend_options.sgmse_profile)
+            sgmse::process(
+                channels,
+                sample_rate,
+                config,
+                backend_options.sgmse_profile,
+                backend_options.seed,
+            )
         }
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => {

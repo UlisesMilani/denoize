@@ -308,7 +308,8 @@ Single-file processing also provides local waveform previews, RMS-matched
 before/after switching, click-to-seek, and configurable section looping.
 Desktop settings are restored automatically, can be stored as named presets,
 and can be imported or exported as CLI-compatible TOML. Recent input files are
-kept locally for quick reuse.
+kept locally for quick reuse. The single-file and batch views also expose a
+reproducibility mode that serializes processing and uses stable model seeds.
 Audio files and folders can be dropped onto the single-file or batch input
 zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
@@ -515,6 +516,8 @@ adaptive_noise = true
 vad = true
 loudness_lufs = -16.0
 true_peak_dbtp = -1.0
+# deterministic = true  # serialize processing for reproducible output
+# seed = 12345          # optional SGMSE sampler seed (implies deterministic)
 # stream_frames = 8192
 # max_memory_mb = 1024
 ```
@@ -522,6 +525,12 @@ true_peak_dbtp = -1.0
 ```sh
 denoize input.wav output.flac --config denoize.toml --strength 0.55
 ```
+
+Use `--deterministic` when an audio result must be reproducible across runs.
+The mode serializes channel/model and batch scheduling and uses a stable
+stochastic-backend seed. `--seed N` selects an explicit SGMSE+ seed and implies
+the mode. Diagnostic elapsed times and progress messages are intentionally not
+part of the reproducibility guarantee.
 
 ### Batch progress and recovery
 
@@ -558,6 +567,11 @@ denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::Classical)?;
 // With DeepFilterNet (GitHub/source build with --features full)
 denoise_file_with_backend("noisy.wav", "clean.wav", cfg, Backend::DeepFilter)?;
 ```
+
+For embedders that use `denoise_file_with_backend_config`, set
+`BackendOptions { deterministic: true, ..Default::default() }` to serialize
+model/channel work. Set `seed: Some(value)` to reproduce SGMSE+ sampling with
+an explicit seed.
 
 ## Roadmap status
 

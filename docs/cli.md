@@ -55,6 +55,8 @@ OPTIONS:
         --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
+        --deterministic       serialize processing for reproducible audio output
+        --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
         --stream-frames <N>   streaming block size in frames (default: 8192)
