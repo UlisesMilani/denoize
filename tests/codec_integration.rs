@@ -64,6 +64,75 @@ fn assert_duration(decoded: &denoize::decode::DecodedPcm, input: &Audio, codec: 
     );
 }
 
+fn assert_decoded_duration(
+    decoded: &denoize::decode::DecodedPcm,
+    input: &denoize::decode::DecodedPcm,
+    codec: &str,
+) {
+    let input_seconds = input.frames() as f64 / input.sample_rate as f64;
+    let output_seconds = decoded.frames() as f64 / decoded.sample_rate as f64;
+    assert!(
+        (output_seconds - input_seconds).abs() < 0.2,
+        "{codec} duration changed from {input_seconds:.3}s to {output_seconds:.3}s"
+    );
+}
+
+#[derive(Clone, Copy)]
+struct CodecSpec {
+    extension: &'static str,
+    label: &'static str,
+}
+
+fn supported_codecs() -> Vec<CodecSpec> {
+    let mut codecs = vec![
+        CodecSpec {
+            extension: "wav",
+            label: "WAV",
+        },
+        CodecSpec {
+            extension: "flac",
+            label: "FLAC",
+        },
+        CodecSpec {
+            extension: "opus",
+            label: "Ogg Opus",
+        },
+        CodecSpec {
+            extension: "mp3",
+            label: "MP3",
+        },
+    ];
+
+    add_optional_codecs(&mut codecs);
+    codecs
+}
+
+#[cfg(feature = "m4a-encode")]
+fn add_optional_codecs(codecs: &mut Vec<CodecSpec>) {
+    codecs.extend([
+        CodecSpec {
+            extension: "m4a",
+            label: "M4A",
+        },
+        CodecSpec {
+            extension: "aac",
+            label: "ADTS AAC",
+        },
+    ]);
+}
+
+#[cfg(not(feature = "m4a-encode"))]
+fn add_optional_codecs(_codecs: &mut Vec<CodecSpec>) {}
+
+fn audio_from_decoded(decoded: &denoize::decode::DecodedPcm) -> Audio {
+    Audio {
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels.clone(),
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    }
+}
+
 fn assert_tag(path: &Path) {
     let tag = metadata::read(path)
         .expect("read output metadata")
@@ -113,6 +182,64 @@ fn stereo_lossy_codecs_preserve_channel_layout_and_duration() {
             decode_file(&output).unwrap_or_else(|error| panic!("decode {codec}: {error}"));
         assert_eq!(decoded.n_channels(), 2, "{codec} channel count");
         assert_duration(&decoded, &input, codec);
+    }
+}
+
+#[test]
+fn all_supported_codecs_roundtrip_matrix() {
+    let workspace = TestWorkspace::new();
+    let input = fixture(2, 44_100 / 2);
+    let codecs = supported_codecs();
+    let mut sources = Vec::with_capacity(codecs.len());
+
+    for codec in &codecs {
+        let path = workspace.file(&format!("source-{}.{}", codec.extension, codec.extension));
+        write_audio(&path, &input, EncodeOptions::default())
+            .unwrap_or_else(|error| panic!("write {} source: {error}", codec.label));
+        sources.push((*codec, path));
+    }
+
+    for (input_codec, input_path) in &sources {
+        let decoded_input = decode_file(input_path)
+            .unwrap_or_else(|error| panic!("decode {} source: {error}", input_codec.label));
+        assert_eq!(
+            decoded_input.n_channels(),
+            2,
+            "{} input channels",
+            input_codec.label
+        );
+
+        for output_codec in &codecs {
+            let output_path = workspace.file(&format!(
+                "matrix-{}-to-{}.{}",
+                input_codec.extension, output_codec.extension, output_codec.extension
+            ));
+            let audio = audio_from_decoded(&decoded_input);
+            write_audio(&output_path, &audio, EncodeOptions::default()).unwrap_or_else(|error| {
+                panic!(
+                    "encode {} -> {}: {error}",
+                    input_codec.label, output_codec.label
+                )
+            });
+            let decoded_output = decode_file(&output_path).unwrap_or_else(|error| {
+                panic!(
+                    "decode {} -> {}: {error}",
+                    input_codec.label, output_codec.label
+                )
+            });
+            assert_eq!(
+                decoded_output.n_channels(),
+                decoded_input.n_channels(),
+                "{} -> {} channel count",
+                input_codec.label,
+                output_codec.label
+            );
+            assert_decoded_duration(
+                &decoded_output,
+                &decoded_input,
+                &format!("{} -> {}", input_codec.label, output_codec.label),
+            );
+        }
     }
 }
 
