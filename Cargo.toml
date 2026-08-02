@@ -29,6 +29,9 @@ ndarray = { version = "0.15", optional = true }
 tract-onnx = { version = "0.22.3", optional = true }
 rustfft = { version = "6.4", optional = true }
 kaldi-native-fbank = { version = "0.1.0", optional = true }
+audio_samples = { version = "2.0.1", optional = true, default-features = false }
+audio_samples_qoe = { version = "0.1.3", optional = true }
+ndarray-visqol = { package = "ndarray", version = "0.17.2", optional = true }
 nanomp3 = "0.1.1"
 shine-rs = "0.1.3"
 oxideav-aac = "0.1.6"
@@ -61,10 +64,11 @@ bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
+visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray-visqol"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
 live = ["dep:cpal"]
 fdk-aac-encoder = ["dep:fdk-aac-rust"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "m4a-encode"]
+full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "m4a-encode", "visqol"]
 
 [dev-dependencies]
 prost = "0.11"
@@ -80,5 +84,5 @@ strip = true
 opt-level = 1
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn"]
+features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
 rustdoc-args = ["--cfg", "docsrs"]

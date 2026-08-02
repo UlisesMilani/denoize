@@ -49,6 +49,7 @@ pub mod models;
 pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
+pub mod quality;
 pub mod resample;
 pub mod service;
 pub mod stft;
@@ -72,6 +73,7 @@ pub use decode::{decode_file, AudioFormat, DecodedPcm};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
+pub use quality::QualityMetrics;
 pub use window::{WindowParams, WindowType};
 
 /// Denoise a WAV file end-to-end, writing the result to `output`.

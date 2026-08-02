@@ -504,8 +504,22 @@ improvement deltas. It also screens for musical noise, pumping, transient loss,
 and stereo phase distortion. These artifact scores are deterministic
 dependency-free indicators in `[0, 1]` (lower is better), not perceptual
 listening-test replacements; phase distortion is reported only for stereo
-inputs. Metrics requiring external models or licensed reference
-implementations are explicitly marked as unmeasured.
+inputs.
+
+STOI is calculated natively for sufficiently long reference/test pairs and is
+reported in `[0, 1]` (higher is better). ViSQOL MOS-LQO is available in the
+pure-Rust build when the optional feature is enabled:
+
+```sh
+cargo install denoize --features visqol
+denoize metrics clean.wav enhanced.wav --json | jq '{stoi, visqol, pesq}'
+```
+
+ViSQOL is a full-reference MOS estimate in `[1, 5]`. PESQ is intentionally
+left as `null`: the ITU-T P.862 reference implementation and conformance
+material require a separately licensed external adapter and are not bundled
+with denoize. Inputs that are too short or a disabled optional implementation
+are represented as `null` rather than preventing the rest of the report.
 
 ### Configuration file
 
