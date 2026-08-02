@@ -138,6 +138,7 @@ mod tests {
             channels: vec![samples],
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
         };
         let path = std::env::temp_dir().join(format!("denoize-fdk-{}.m4a", std::process::id()));
         write_m4a_fdk(&path, &audio, 128_000).unwrap();

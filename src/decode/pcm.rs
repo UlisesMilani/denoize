@@ -8,6 +8,8 @@
 pub struct DecodedPcm {
     pub sample_rate: u32,
     pub channels: Vec<Vec<f64>>,
+    /// WAVE speaker mask when the source decoder/container exposes one.
+    pub channel_mask: Option<crate::channel_layout::ChannelMask>,
 }
 
 impl DecodedPcm {
@@ -18,6 +20,7 @@ impl DecodedPcm {
             channels: self.channels,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
+            channel_mask: self.channel_mask,
         }
     }
 
@@ -31,7 +34,25 @@ impl DecodedPcm {
 
     /// Return the conventional layout for the decoded planar channel order.
     pub fn channel_layout(&self) -> crate::channel_layout::ChannelLayout {
-        crate::channel_layout::ChannelLayout::from_channel_count(self.n_channels())
+        self.channel_mask
+            .filter(|mask| mask.channels() == self.n_channels())
+            .map(crate::channel_layout::ChannelLayout::from_channel_mask)
+            .unwrap_or_else(|| {
+                crate::channel_layout::ChannelLayout::from_channel_count(self.n_channels())
+            })
+    }
+
+    pub fn effective_channel_mask(&self) -> Option<crate::channel_layout::ChannelMask> {
+        match self.channel_mask {
+            Some(mask) if mask.bits() == 0 || mask.channels() == self.n_channels() => Some(mask),
+            Some(_) => None,
+            None => self.channel_layout().mask(),
+        }
+    }
+
+    pub fn pan_info(&self) -> Option<Vec<crate::channel_layout::PanInfo>> {
+        self.effective_channel_mask()
+            .map(crate::channel_layout::ChannelMask::pan)
     }
 
     /// Ensure all channels have equal length (pad shorter with silence).
@@ -84,6 +105,7 @@ mod tests {
         let mut pcm = DecodedPcm {
             sample_rate: 48000,
             channels: vec![vec![1.0], vec![2.0, 3.0, 4.0]],
+            channel_mask: None,
         };
         pcm.normalize_lengths();
         assert_eq!(pcm.channels[0], vec![1.0, 0.0, 0.0]);

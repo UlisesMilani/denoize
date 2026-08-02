@@ -225,6 +225,7 @@ mod tests {
                 .collect()],
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
         };
         let noisy = Audio {
             sample_rate: clean.sample_rate,
@@ -235,6 +236,7 @@ mod tests {
                 .collect()],
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
         };
         let enhanced = Audio {
             sample_rate: clean.sample_rate,
@@ -245,6 +247,7 @@ mod tests {
                 .collect()],
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
         };
 
         let report = ComparisonReport::compare(&clean, &noisy, &enhanced).unwrap();

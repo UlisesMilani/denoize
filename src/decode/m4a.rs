@@ -78,6 +78,7 @@ pub fn decode_m4a(path: &Path) -> Result<DecodedPcm, String> {
     Ok(DecodedPcm {
         sample_rate,
         channels,
+        channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(n_ch).mask(),
     })
 }
 

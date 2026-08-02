@@ -3,6 +3,7 @@
 //! Decoded compressed audio is promoted to `f64` planar PCM at native sample rate
 //! (see [`crate::decode`]) before denoising. WAV write preserves bit depth.
 
+use crate::channel_layout::{ChannelLayout, ChannelMask, PanInfo};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 
@@ -16,6 +17,8 @@ pub struct Audio {
     pub channels: Vec<Vec<f64>>,
     pub bits_per_sample: u16,
     pub sample_format: SampleFormat,
+    /// WAVE speaker mask, when the source container supplied one.
+    pub channel_mask: Option<ChannelMask>,
 }
 
 impl Audio {
@@ -32,8 +35,25 @@ impl Audio {
     /// The channel count is always preserved by denoize's lossless paths.  A
     /// file-specific channel mask, when present, is additional metadata and
     /// does not change the PCM channel order inferred here.
-    pub fn channel_layout(&self) -> crate::channel_layout::ChannelLayout {
-        crate::channel_layout::ChannelLayout::from_channel_count(self.channels())
+    pub fn channel_layout(&self) -> ChannelLayout {
+        self.channel_mask
+            .filter(|mask| mask.channels() == self.channels())
+            .map(ChannelLayout::from_channel_mask)
+            .unwrap_or_else(|| ChannelLayout::from_channel_count(self.channels()))
+    }
+
+    /// Return the source mask, or the conventional mask for a known layout.
+    pub fn effective_channel_mask(&self) -> Option<ChannelMask> {
+        match self.channel_mask {
+            Some(mask) if mask.bits() == 0 || mask.channels() == self.channels() => Some(mask),
+            Some(_) => None,
+            None => self.channel_layout().mask(),
+        }
+    }
+
+    /// Return one speaker pan coordinate per planar channel.
+    pub fn pan_info(&self) -> Option<Vec<PanInfo>> {
+        self.effective_channel_mask().map(ChannelMask::pan)
     }
 
     /// A `WavSpec` matching this audio for writing.
@@ -164,17 +184,22 @@ pub fn read_audio<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
 
 /// Read a WAV file into de-interleaved `f64` channels.
 pub fn read_wav<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
+    let channel_mask = read_wav_channel_mask(path.as_ref())?;
     let reader = WavReader::open(&path).map_err(|e| format!("open: {e}"))?;
-    read_wav_reader(reader)
+    read_wav_reader(reader, channel_mask)
 }
 
 /// Read WAV data supplied by a pipe or another in-memory source.
 pub fn read_wav_bytes(bytes: Vec<u8>) -> Result<Audio, String> {
+    let channel_mask = read_wav_channel_mask_bytes(&bytes)?;
     let reader = WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| format!("open: {e}"))?;
-    read_wav_reader(reader)
+    read_wav_reader(reader, channel_mask)
 }
 
-fn read_wav_reader<R: std::io::Read>(mut reader: WavReader<R>) -> Result<Audio, String> {
+fn read_wav_reader<R: std::io::Read>(
+    mut reader: WavReader<R>,
+    channel_mask: Option<ChannelMask>,
+) -> Result<Audio, String> {
     let spec = reader.spec();
     let nchan = spec.channels as usize;
     if nchan == 0 {
@@ -222,7 +247,89 @@ fn read_wav_reader<R: std::io::Read>(mut reader: WavReader<R>) -> Result<Audio, 
         channels,
         bits_per_sample: spec.bits_per_sample,
         sample_format: spec.sample_format,
+        channel_mask,
     })
+}
+
+/// Read the optional WAVE_FORMAT_EXTENSIBLE speaker mask without relying on
+/// hound's intentionally small `WavSpec` abstraction.
+fn read_wav_channel_mask(path: &std::path::Path) -> Result<Option<ChannelMask>, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("open WAV header: {error}"))?;
+    let mut header = [0u8; 12];
+    if file.read_exact(&mut header).is_err() || &header[8..12] != b"WAVE" {
+        return Ok(None);
+    }
+    loop {
+        let mut chunk = [0u8; 8];
+        match file.read_exact(&mut chunk) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(format!("read WAV chunk header: {error}")),
+        }
+        let size = u32::from_le_bytes(chunk[4..8].try_into().expect("WAV chunk size")) as usize;
+        if &chunk[..4] == b"fmt " {
+            if size < 40 {
+                return Ok(None);
+            }
+            if size > 1 << 20 {
+                return Err("WAV fmt chunk is too large".into());
+            }
+            let mut body = vec![0u8; size];
+            file.read_exact(&mut body)
+                .map_err(|error| format!("read WAV fmt chunk: {error}"))?;
+            return parse_wav_channel_mask_fmt(&body);
+        }
+        use std::io::{Seek, SeekFrom};
+        let skip = size.saturating_add(size & 1);
+        file.seek(SeekFrom::Current(
+            i64::try_from(skip).map_err(|_| "WAV chunk is too large to seek".to_string())?,
+        ))
+        .map_err(|error| format!("skip WAV chunk: {error}"))?;
+    }
+}
+
+fn read_wav_channel_mask_bytes(bytes: &[u8]) -> Result<Option<ChannelMask>, String> {
+    if bytes.len() < 12 || &bytes[8..12] != b"WAVE" {
+        return Ok(None);
+    }
+    let mut offset = 12usize;
+    while offset.saturating_add(8) <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let body_start = offset + 8;
+        let body_end = body_start.saturating_add(size);
+        if body_end > bytes.len() {
+            break;
+        }
+        if id == b"fmt " && size >= 40 {
+            let body = &bytes[body_start..body_end];
+            return parse_wav_channel_mask_fmt(body);
+        }
+        offset = body_end.saturating_add(size & 1);
+    }
+    Ok(None)
+}
+
+fn parse_wav_channel_mask_fmt(body: &[u8]) -> Result<Option<ChannelMask>, String> {
+    if body.len() < 40 {
+        return Ok(None);
+    }
+    let format_tag = u16::from_le_bytes(body[0..2].try_into().expect("WAV format tag"));
+    if format_tag != 0xfffe {
+        return Ok(None);
+    }
+    let channels = u16::from_le_bytes(body[2..4].try_into().expect("WAV channel count")) as usize;
+    let mask_bits = u32::from_le_bytes(body[20..24].try_into().expect("WAV channel mask"));
+    let mask = ChannelMask::from_bits(mask_bits)
+        .ok_or_else(|| format!("WAV channel mask 0x{mask_bits:08x} is invalid"))?;
+    if mask.bits() != 0 && mask.channels() != channels {
+        return Err(format!(
+            "WAV channel mask has {} positions but fmt declares {channels} channels",
+            mask.channels()
+        ));
+    }
+    Ok(Some(mask))
 }
 
 /// Write an [`Audio`] to a file; format is inferred from the extension (`.wav`, `.mp3`, `.m4a`).
@@ -236,9 +343,11 @@ pub fn write_audio<P: AsRef<std::path::Path>>(
 
 /// Write an [`Audio`] to a WAV file, preserving its bit depth / format.
 pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<(), String> {
+    let path = path.as_ref();
     let spec = audio.wav_spec();
     let writer = WavWriter::create(path, spec).map_err(|e| format!("create: {e}"))?;
-    write_wav_writer(writer, audio)
+    write_wav_writer(writer, audio)?;
+    patch_wav_channel_mask_file(path, audio)
 }
 
 /// Encode a complete WAV into memory for stdout and network transports.
@@ -250,7 +359,73 @@ pub fn write_wav_bytes(audio: &Audio) -> Result<Vec<u8>, String> {
             WavWriter::new(cursor, audio.wav_spec()).map_err(|e| format!("create: {e}"))?;
         write_wav_writer(writer, audio)?;
     }
+    patch_wav_channel_mask_bytes(&mut bytes, audio)?;
     Ok(bytes)
+}
+
+/// Hound writes a valid WAVE_FORMAT_EXTENSIBLE header for multichannel files,
+/// but intentionally uses a count-based mask. Replace that field with the
+/// source mask (or zero for an unknown layout) after the samples are finalized.
+fn patch_wav_channel_mask_file(path: &std::path::Path, audio: &Audio) -> Result<(), String> {
+    write_wav_channel_mask(path, audio.channels(), audio.effective_channel_mask())
+}
+
+/// Set the WAVE speaker mask in an already-finalized multichannel WAV file.
+/// This is used by the bounded streaming path, whose writer receives only a
+/// `WavSpec` while the input mask is kept as lightweight header metadata.
+pub fn write_wav_channel_mask(
+    path: impl AsRef<std::path::Path>,
+    channels: usize,
+    channel_mask: Option<ChannelMask>,
+) -> Result<(), String> {
+    if channels <= 2 {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.as_ref())
+        .map_err(|error| format!("open WAV header for channel mask: {error}"))?;
+    use std::io::{Seek, SeekFrom};
+    let mut header = [0u8; 44];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("read WAV header for channel mask: {error}"))?;
+    if &header[..4] != b"RIFF"
+        || &header[8..12] != b"WAVE"
+        || &header[12..16] != b"fmt "
+        || u32::from_le_bytes(header[16..20].try_into().expect("WAV fmt size")) < 40
+        || u16::from_le_bytes(header[20..22].try_into().expect("WAV format tag")) != 0xfffe
+    {
+        return Err("multichannel WAV output is not WAVE_FORMAT_EXTENSIBLE".into());
+    }
+    file.seek(SeekFrom::Start(40))
+        .map_err(|error| format!("seek WAV channel mask: {error}"))?;
+    let bits = channel_mask
+        .filter(|mask| mask.bits() == 0 || mask.channels() == channels)
+        .map_or(0, ChannelMask::bits);
+    file.write_all(&bits.to_le_bytes())
+        .map_err(|error| format!("write WAV channel mask: {error}"))
+}
+
+fn patch_wav_channel_mask_bytes(bytes: &mut [u8], audio: &Audio) -> Result<(), String> {
+    if audio.channels() <= 2 {
+        return Ok(());
+    }
+    if bytes.len() < 44 || &bytes[12..16] != b"fmt " {
+        return Err("WAV output has no fmt chunk to store channel mask".into());
+    }
+    let fmt_size = u32::from_le_bytes(bytes[16..20].try_into().expect("WAV fmt size"));
+    if fmt_size < 40
+        || u16::from_le_bytes(bytes[20..22].try_into().expect("WAV format tag")) != 0xfffe
+    {
+        return Err("multichannel WAV output is not WAVE_FORMAT_EXTENSIBLE".into());
+    }
+    let bits = audio
+        .effective_channel_mask()
+        .filter(|mask| mask.bits() == 0 || mask.channels() == audio.channels())
+        .map_or(0, ChannelMask::bits);
+    bytes[40..44].copy_from_slice(&bits.to_le_bytes());
+    Ok(())
 }
 
 fn write_wav_writer<W: std::io::Write + std::io::Seek>(
@@ -319,20 +494,29 @@ fn write_wav_writer<W: std::io::Write + std::io::Seek>(
 pub struct WavStreamReader<R: Read + Seek> {
     reader: WavReader<R>,
     spec: WavSpec,
+    channel_mask: Option<ChannelMask>,
 }
 
 impl WavStreamReader<BufReader<std::fs::File>> {
     /// Open a filesystem WAV for bounded-memory reading.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, String> {
+        let channel_mask = read_wav_channel_mask(path.as_ref())?;
         let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
         let reader = WavReader::new(BufReader::new(file)).map_err(|e| format!("open: {e}"))?;
-        Self::from_reader(reader)
+        Self::from_reader_with_mask(reader, channel_mask)
     }
 }
 
 impl<R: Read + Seek> WavStreamReader<R> {
     /// Wrap an existing seekable WAV source.
     pub fn from_reader(reader: WavReader<R>) -> Result<Self, String> {
+        Self::from_reader_with_mask(reader, None)
+    }
+
+    fn from_reader_with_mask(
+        reader: WavReader<R>,
+        channel_mask: Option<ChannelMask>,
+    ) -> Result<Self, String> {
         let spec = reader.spec();
         if spec.channels == 0 {
             return Err("0 channels".into());
@@ -343,11 +527,19 @@ impl<R: Read + Seek> WavStreamReader<R> {
                 spec.bits_per_sample
             ));
         }
-        Ok(Self { reader, spec })
+        Ok(Self {
+            reader,
+            spec,
+            channel_mask,
+        })
     }
 
     pub fn spec(&self) -> WavSpec {
         self.spec
+    }
+
+    pub fn channel_mask(&self) -> Option<ChannelMask> {
+        self.channel_mask
     }
 
     /// Read up to `max_frames`, returning `None` only at clean end-of-file.
@@ -604,6 +796,7 @@ mod tests {
             channels: vec![vec![0.0; 1_000]],
             bits_per_sample: 16,
             sample_format: SampleFormat::Int,
+            channel_mask: None,
         };
         let large = Audio {
             channels: vec![vec![0.0; 2_000], vec![0.0; 2_000]],
@@ -625,12 +818,44 @@ mod tests {
             channels: vec![vec![0.0; 2]; 6],
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
+            channel_mask: None,
         };
         assert_eq!(
             audio.channel_layout(),
             crate::channel_layout::ChannelLayout::FivePointOne
         );
         assert_eq!(audio.channels(), audio.channel_layout().channels());
+    }
+
+    #[test]
+    fn multichannel_wav_roundtrip_preserves_explicit_speaker_mask() {
+        let path = tmp("mask_roundtrip.wav");
+        let mask = ChannelMask::from_bits(
+            ChannelMask::FRONT_LEFT
+                | ChannelMask::FRONT_RIGHT
+                | ChannelMask::FRONT_CENTER
+                | ChannelMask::LFE1
+                | ChannelMask::SIDE_LEFT
+                | ChannelMask::SIDE_RIGHT,
+        )
+        .unwrap();
+        let audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0, 0.1]; 6],
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+            channel_mask: Some(mask),
+        };
+        write_wav(&path, &audio).unwrap();
+        let decoded = read_wav(&path).unwrap();
+        assert_eq!(decoded.channel_mask, Some(mask));
+        assert_eq!(decoded.channel_layout(), ChannelLayout::Unknown(6));
+        let pan = decoded.pan_info().unwrap();
+        assert_eq!(pan.len(), 6);
+        assert_eq!(pan[4].azimuth_degrees, -90.0);
+        let bytes = write_wav_bytes(&audio).unwrap();
+        assert_eq!(read_wav_bytes(bytes).unwrap().channel_mask, Some(mask));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

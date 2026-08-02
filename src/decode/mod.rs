@@ -179,6 +179,17 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
         .as_ref()
         .and_then(|params| params.audio())
         .ok_or_else(|| "audio track has no codec parameters".to_string())?;
+    let channel_mask = codec_params
+        .channels
+        .as_ref()
+        .and_then(|channels| match channels {
+        symphonia::core::audio::Channels::Positioned(position) => {
+            u32::try_from(position.bits())
+                .ok()
+                .and_then(crate::channel_layout::ChannelMask::from_bits)
+            }
+            _ => None,
+        });
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|error| format!("decoder: {error}"))?;
@@ -233,6 +244,7 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
     Ok(DecodedPcm {
         sample_rate,
         channels,
+        channel_mask,
     })
 }
 
@@ -334,7 +346,8 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                     u16::from_le_bytes(body[12..14].try_into().expect("fixed block align"));
                 let bits_per_sample =
                     u16::from_le_bytes(body[14..16].try_into().expect("fixed bit depth"));
-                let (format_tag, bits_per_sample) = if format_tag == 0xfffe {
+                let extensible = format_tag == 0xfffe;
+                let (format_tag, bits_per_sample) = if extensible {
                     if body.len() < 40 {
                         return Err("RF64 extensible fmt chunk is truncated".into());
                     }
@@ -353,12 +366,28 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                 if !matches!(format_tag, 1 | 3) {
                     return Err(format!("RF64 codec format 0x{format_tag:04x} is unsupported; only PCM and IEEE float are supported"));
                 }
+                let channel_mask = if extensible {
+                    let bits =
+                        u32::from_le_bytes(body[20..24].try_into().expect("fixed channel mask"));
+                    let mask = crate::channel_layout::ChannelMask::from_bits(bits)
+                        .ok_or_else(|| format!("RF64 channel mask 0x{bits:08x} is invalid"))?;
+                    if mask.bits() != 0 && mask.channels() != channels as usize {
+                        return Err(format!(
+                            "RF64 channel mask has {} positions but fmt declares {channels} channels",
+                            mask.channels()
+                        ));
+                    }
+                    Some(mask)
+                } else {
+                    None
+                };
                 format = Some((
                     format_tag == 3,
                     channels as usize,
                     sample_rate,
                     block_align as usize,
                     bits_per_sample,
+                    channel_mask,
                 ));
             }
             b"data" => {
@@ -389,7 +418,7 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
         }
     }
 
-    let (is_float, channel_count, sample_rate, block_align, bits_per_sample) =
+    let (is_float, channel_count, sample_rate, block_align, bits_per_sample, channel_mask) =
         format.ok_or_else(|| "RF64 fmt chunk not found".to_string())?;
     let data_offset = data_offset.ok_or_else(|| "RF64 data chunk not found".to_string())?;
     let data_size = data_size.ok_or_else(|| "RF64 data size not found".to_string())?;
@@ -452,6 +481,7 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
     Ok(DecodedPcm {
         sample_rate,
         channels,
+        channel_mask,
     })
 }
 
@@ -475,6 +505,7 @@ fn decode_flac(path: &Path) -> Result<DecodedPcm, String> {
     Ok(DecodedPcm {
         sample_rate: info.sample_rate,
         channels: output,
+        channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(channels).mask(),
     })
 }
 
@@ -492,6 +523,7 @@ fn decode_wav(path: &Path) -> Result<DecodedPcm, String> {
     Ok(DecodedPcm {
         sample_rate: audio.sample_rate,
         channels: audio.channels,
+        channel_mask: audio.channel_mask,
     })
 }
 

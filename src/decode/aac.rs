@@ -23,8 +23,11 @@ pub fn decode_adts(path: &Path) -> Result<DecodedPcm, String> {
             }
         }
     }
+    let channel_mask =
+        crate::channel_layout::ChannelLayout::from_channel_count(channels.len()).mask();
     Ok(DecodedPcm {
         sample_rate,
         channels,
+        channel_mask,
     })
 }

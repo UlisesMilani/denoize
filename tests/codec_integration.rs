@@ -58,6 +58,7 @@ fn fixture(channels: usize, frames: usize) -> Audio {
         channels,
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
+        channel_mask: None,
     }
 }
 
@@ -136,6 +137,7 @@ fn audio_from_decoded(decoded: &denoize::decode::DecodedPcm) -> Audio {
         channels: decoded.channels.clone(),
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
+        channel_mask: decoded.channel_mask,
     }
 }
 

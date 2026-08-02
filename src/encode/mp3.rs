@@ -108,6 +108,7 @@ mod tests {
             channels: vec![l, r],
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
+            channel_mask: None,
         }
     }
 

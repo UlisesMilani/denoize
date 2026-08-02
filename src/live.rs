@@ -121,6 +121,7 @@ where
                 channels,
                 bits_per_sample: 32,
                 sample_format: hound::SampleFormat::Float,
+                channel_mask: None,
             };
             if let Err(error) = denoise_audio_with_backend_config(
                 &mut audio,
