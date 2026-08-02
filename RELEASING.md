@@ -57,7 +57,7 @@ draft.
 The same release check can be run against an existing release with:
 
 ```sh
-bash scripts/verify-release-assets.sh v0.6.0
+bash scripts/verify-release-assets.sh v0.7.0
 ```
 
 Pull requests also run the desktop packaging matrix on Linux, macOS (Intel and
