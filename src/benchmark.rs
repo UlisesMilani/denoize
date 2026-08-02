@@ -38,8 +38,12 @@ pub struct BenchmarkReport {
     pub correlation_error: Option<f64>,
     /// Dependency-free artifact-screening indicators.
     pub artifact_scores: ArtifactReport,
+    /// Native STOI score in `[0, 1]` when the input is long enough.
     pub stoi: Option<f64>,
+    /// PESQ is `None` unless a separately licensed external adapter is used.
     pub pesq: Option<f64>,
+    /// ViSQOL MOS-LQO (`[1, 5]`) when built with the `visqol` feature.
+    pub visqol: Option<f64>,
     pub elapsed_ms: Option<f64>,
     pub peak_rss_bytes: Option<u64>,
 }
@@ -51,6 +55,7 @@ impl BenchmarkReport {
         let r = downmix(reference, frames);
         let t = downmix(test, frames);
         let artifact_scores = ArtifactReport::compare(reference, test)?;
+        let quality_metrics = crate::quality::QualityMetrics::compare(reference, test);
         let (side_sdr, correlation_error) = if reference.channels.len() == 2 {
             let rs = side(reference, frames);
             let ts = side(test, frames);
@@ -78,19 +83,20 @@ impl BenchmarkReport {
             stereo_side_sdr_db: side_sdr,
             correlation_error,
             artifact_scores,
-            stoi: None,
-            pesq: None,
+            stoi: quality_metrics.stoi,
+            pesq: quality_metrics.pesq,
+            visqol: quality_metrics.visqol,
             elapsed_ms: None,
             peak_rss_bytes: None,
         })
     }
 
     pub fn json(&self) -> String {
-        format!("{{\"frames\":{},\"sample_rate\":{},\"channels\":{},\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"artifact_scores\":{},\"stoi\":{},\"pesq\":{},\"elapsed_ms\":{},\"peak_rss_bytes\":{}}}", self.frames, self.sample_rate, self.channels, self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, optional(self.stereo_side_sdr_db), optional(self.correlation_error), self.artifact_scores.json(), optional(self.stoi), optional(self.pesq), optional(self.elapsed_ms), self.peak_rss_bytes.map_or_else(|| "null".into(), |v| v.to_string()))
+        format!("{{\"frames\":{},\"sample_rate\":{},\"channels\":{},\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"artifact_scores\":{},\"stoi\":{},\"pesq\":{},\"visqol\":{},\"elapsed_ms\":{},\"peak_rss_bytes\":{}}}", self.frames, self.sample_rate, self.channels, self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, optional(self.stereo_side_sdr_db), optional(self.correlation_error), self.artifact_scores.json(), optional(self.stoi), optional(self.pesq), optional(self.visqol), optional(self.elapsed_ms), self.peak_rss_bytes.map_or_else(|| "null".into(), |v| v.to_string()))
     }
 
     pub fn markdown(&self) -> String {
-        format!("| Metric | Value |\n|---|---:|\n| SI-SDR | {:.3} dB |\n| SI-SNR | {:.3} dB |\n| SNR | {:.3} dB |\n| Segmental SNR | {:.3} dB |\n| Stereo side SDR | {} |\n| Correlation error | {} |\n| Musical-noise score (0=none) | {:.3} |\n| Pumping score (0=none) | {:.3} |\n| Transient-loss score (0=none) | {:.3} |\n| Phase-distortion score (0=none) | {} |\n| STOI | {} |\n| PESQ | {} |", self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, db(self.stereo_side_sdr_db), display(self.correlation_error, 6), self.artifact_scores.musical_noise_score, self.artifact_scores.pumping_score, self.artifact_scores.transient_loss_score, display(self.artifact_scores.phase_distortion_score, 3), display(self.stoi, 4), display(self.pesq, 3))
+        format!("| Metric | Value |\n|---|---:|\n| SI-SDR | {:.3} dB |\n| SI-SNR | {:.3} dB |\n| SNR | {:.3} dB |\n| Segmental SNR | {:.3} dB |\n| Stereo side SDR | {} |\n| Correlation error | {} |\n| Musical-noise score (0=none) | {:.3} |\n| Pumping score (0=none) | {:.3} |\n| Transient-loss score (0=none) | {:.3} |\n| Phase-distortion score (0=none) | {} |\n| STOI (0–1, higher is better) | {} |\n| PESQ (licensed adapter required) | {} |\n| ViSQOL MOS-LQO (1–5) | {} |", self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, db(self.stereo_side_sdr_db), display(self.correlation_error, 6), self.artifact_scores.musical_noise_score, self.artifact_scores.pumping_score, self.artifact_scores.transient_loss_score, display(self.artifact_scores.phase_distortion_score, 3), display(self.stoi, 4), display(self.pesq, 3), display(self.visqol, 3))
     }
 }
 
@@ -156,12 +162,14 @@ impl ComparisonReport {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"musical_noise_score\":{:.6},\"pumping_score\":{:.6},\"transient_loss_score\":{:.6},\"phase_distortion_score\":{}}}}}",
+            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stoi\":{},\"visqol\":{},\"musical_noise_score\":{:.6},\"pumping_score\":{:.6},\"transient_loss_score\":{:.6},\"phase_distortion_score\":{}}}}}",
             self.noisy.json(), self.enhanced.json(),
             self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
             self.enhanced.si_snr_db - self.noisy.si_snr_db,
             self.enhanced.snr_db - self.noisy.snr_db,
             self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+            optional_difference(self.enhanced.stoi, self.noisy.stoi),
+            optional_difference(self.enhanced.visqol, self.noisy.visqol),
             self.noisy.artifact_scores.musical_noise_score - self.enhanced.artifact_scores.musical_noise_score,
             self.noisy.artifact_scores.pumping_score - self.enhanced.artifact_scores.pumping_score,
             self.noisy.artifact_scores.transient_loss_score - self.enhanced.artifact_scores.transient_loss_score,
@@ -171,11 +179,13 @@ impl ComparisonReport {
 
     pub fn markdown(&self) -> String {
         format!(
-            "| Metric | Noisy | Enhanced | Improvement |\n|---|---:|---:|---:|\n| SI-SDR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SI-SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Segmental SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Musical-noise score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Pumping score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Transient-loss score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Phase-distortion score (lower is better) | {} | {} | {} |\n\nArtifact scores are deterministic screening indicators in [0, 1], not perceptual listening-test scores. STOI, PESQ, and DNSMOS: not measured (no external model or licensed reference implementation configured).",
+            "| Metric | Noisy | Enhanced | Improvement |\n|---|---:|---:|---:|\n| SI-SDR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SI-SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Segmental SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| STOI (higher is better) | {} | {} | {} |\n| ViSQOL MOS-LQO (higher is better) | {} | {} | {} |\n| Musical-noise score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Pumping score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Transient-loss score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Phase-distortion score (lower is better) | {} | {} | {} |\n\nArtifact scores are deterministic screening indicators in [0, 1], not perceptual listening-test scores. STOI is implemented natively. ViSQOL is measured when the `visqol` feature is enabled. PESQ remains unavailable because its ITU-T reference implementation requires a separately licensed external adapter.",
             self.noisy.si_sdr_db, self.enhanced.si_sdr_db, self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
             self.noisy.si_snr_db, self.enhanced.si_snr_db, self.enhanced.si_snr_db - self.noisy.si_snr_db,
             self.noisy.snr_db, self.enhanced.snr_db, self.enhanced.snr_db - self.noisy.snr_db,
             self.noisy.segmental_snr_db, self.enhanced.segmental_snr_db, self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+            display(self.noisy.stoi, 4), display(self.enhanced.stoi, 4), display(optional_difference_value(self.enhanced.stoi, self.noisy.stoi), 4),
+            display(self.noisy.visqol, 3), display(self.enhanced.visqol, 3), display(optional_difference_value(self.enhanced.visqol, self.noisy.visqol), 3),
             self.noisy.artifact_scores.musical_noise_score, self.enhanced.artifact_scores.musical_noise_score, self.noisy.artifact_scores.musical_noise_score - self.enhanced.artifact_scores.musical_noise_score,
             self.noisy.artifact_scores.pumping_score, self.enhanced.artifact_scores.pumping_score, self.noisy.artifact_scores.pumping_score - self.enhanced.artifact_scores.pumping_score,
             self.noisy.artifact_scores.transient_loss_score, self.enhanced.artifact_scores.transient_loss_score, self.noisy.artifact_scores.transient_loss_score - self.enhanced.artifact_scores.transient_loss_score,
@@ -199,7 +209,7 @@ impl ComparisonReport {
                 format!("<tr>{cells}</tr>")
             })
             .collect::<String>();
-        format!("<!doctype html><meta charset=\"utf-8\"><title>denoize comparison</title><style>body{{font-family:system-ui;max-width:900px;margin:3rem auto}}table{{border-collapse:collapse}}td,th{{padding:.5rem 1rem;border:1px solid #ccc;text-align:right}}td:first-child{{text-align:left}}</style><h1>denoize quality comparison</h1><table><thead><tr><th>Metric</th><th>Noisy</th><th>Enhanced</th><th>Improvement</th></tr></thead><tbody>{rows}</tbody></table><p>Artifact scores are deterministic screening indicators in [0, 1], lower is better. STOI, PESQ, and DNSMOS were not measured.</p>")
+        format!("<!doctype html><meta charset=\"utf-8\"><title>denoize comparison</title><style>body{{font-family:system-ui;max-width:900px;margin:3rem auto}}table{{border-collapse:collapse}}td,th{{padding:.5rem 1rem;border:1px solid #ccc;text-align:right}}td:first-child{{text-align:left}}</style><h1>denoize quality comparison</h1><table><thead><tr><th>Metric</th><th>Noisy</th><th>Enhanced</th><th>Improvement</th></tr></thead><tbody>{rows}</tbody></table><p>Artifact scores are deterministic screening indicators in [0, 1], lower is better. STOI is native; ViSQOL requires the <code>visqol</code> feature; PESQ requires a separately licensed external adapter.</p>")
     }
 }
 
@@ -620,7 +630,11 @@ mod tests {
         assert!(report.enhanced.snr_db > report.noisy.snr_db);
         assert!(report.json().contains("\"improvement\""));
         assert!(report.json().contains("\"artifact_scores\""));
+        assert!(report.json().contains("\"stoi\""));
+        assert!(report.json().contains("\"visqol\""));
         assert!(report.markdown().contains("Segmental SNR"));
+        assert!(report.markdown().contains("STOI"));
+        assert!(report.markdown().contains("ViSQOL"));
         assert!(report.markdown().contains("Musical-noise score"));
         assert!(report.html().starts_with("<!doctype html>"));
     }
