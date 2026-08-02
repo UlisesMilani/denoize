@@ -17,7 +17,7 @@ USAGE:
 
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
-    -b, --backend <NAME>     auto|classical|rnnoise|onnx|mpsenet|bsrnn|mossformer2|sgmse|gtcrn  (default: classical)
+    -b, --backend <NAME>     auto|classical  (default: classical)
     -a, --algorithm <NAME>   omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
         --mode <NAME>        speech|music|ambient processing intent
