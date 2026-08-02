@@ -3,7 +3,7 @@ use denoize::benchmark::ComparisonReport;
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, Backend, BackendOptions, ChannelMode, EncodeOptions, OnnxModelConfig,
+    AacEncoder, Backend, BackendOptions, ChannelMode, DownmixMode, EncodeOptions, OnnxModelConfig,
     OutputFormat, SgmseProfile,
 };
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ struct ProcessOptions {
     adaptive_noise: bool,
     vad: bool,
     channel_mode: String,
+    downmix: String,
     loudness_lufs: Option<f64>,
     true_peak_dbtp: f64,
     preserve_metadata: bool,
@@ -783,6 +784,9 @@ fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Resu
     if options.mp3_bitrate_kbps < 32 || options.aac_bitrate_kbps < 32 {
         return Err("ビットレートは32kbps以上にしてください".into());
     }
+    if DownmixMode::parse(&options.downmix).is_none() {
+        return Err("ダウンミックスは preserve または stereo を指定してください".into());
+    }
     let backend = if options.backend == "auto" {
         None
     } else {
@@ -867,6 +871,8 @@ fn process_file(
             "fdk" => AacEncoder::Fdk,
             other => return Err(format!("不明なAACエンコーダー: {other}")),
         },
+        downmix: DownmixMode::parse(&request.options.downmix)
+            .ok_or_else(|| "ダウンミックスは preserve または stereo を指定してください".to_string())?,
     };
     progress(3, "ファイルを書き出しています");
     let filename = output
@@ -1044,6 +1050,7 @@ mod tests {
             adaptive_noise: false,
             vad: false,
             channel_mode: "linked".into(),
+            downmix: "preserve".into(),
             loudness_lufs: None,
             true_peak_dbtp: -1.0,
             preserve_metadata: true,

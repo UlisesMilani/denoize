@@ -35,6 +35,7 @@ pub mod audio;
 pub mod backend;
 pub mod benchmark;
 pub mod bessel;
+pub mod channel_layout;
 pub mod decode;
 pub mod denoiser;
 pub mod encode;
@@ -61,9 +62,10 @@ pub use audio::{
     write_audio, write_wav, write_wav_bytes, Audio, WavStreamReader, WavStreamWriter,
 };
 pub use backend::{Backend, BackendOptions, ChannelMode, OnnxModelConfig, SgmseProfile};
+pub use channel_layout::ChannelLayout;
 pub use decode::{decode_file, AudioFormat, DecodedPcm};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
-pub use encode::{AacEncoder, EncodeOptions, OutputFormat};
+pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
 pub use window::{WindowParams, WindowType};
 

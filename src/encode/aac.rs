@@ -1,6 +1,7 @@
 //! Raw AAC-LC in ADTS encoding.
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
+use super::DownmixMode;
 use crate::Audio;
 use oxideav_aac_encoder::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 use std::io::Write;
@@ -11,14 +12,23 @@ pub fn write_adts_aac<P: AsRef<Path>>(
     audio: &Audio,
     bitrate_bps: u32,
 ) -> Result<(), String> {
-    let layout = lossy_channel_layout(audio)?;
+    write_adts_aac_with_downmix(path, audio, bitrate_bps, DownmixMode::Preserve)
+}
+
+pub fn write_adts_aac_with_downmix<P: AsRef<Path>>(
+    path: P,
+    audio: &Audio,
+    bitrate_bps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
+    let layout = lossy_channel_layout(audio, downmix)?;
     let mut encoder = StreamEncoder::new(EncoderConfig {
         sample_rate: audio.sample_rate,
         channels: layout.count,
         bitrate: bitrate_bps,
     })
     .map_err(|error| format!("AAC encoder init: {error}"))?;
-    let pcm = planar_f64_to_interleaved_i16(audio, layout);
+    let pcm = planar_f64_to_interleaved_i16(audio, layout)?;
     let frame_samples = FRAME_LEN * layout.count as usize;
     let mut output = std::io::BufWriter::new(
         std::fs::File::create(path).map_err(|error| format!("create AAC: {error}"))?,

@@ -27,6 +27,15 @@ impl Audio {
         self.channels.first().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Return the conventional layout for the planar channel order.
+    ///
+    /// The channel count is always preserved by denoize's lossless paths.  A
+    /// file-specific channel mask, when present, is additional metadata and
+    /// does not change the PCM channel order inferred here.
+    pub fn channel_layout(&self) -> crate::channel_layout::ChannelLayout {
+        crate::channel_layout::ChannelLayout::from_channel_count(self.channels())
+    }
+
     /// A `WavSpec` matching this audio for writing.
     fn wav_spec(&self) -> WavSpec {
         WavSpec {
@@ -607,6 +616,21 @@ mod tests {
             estimate_stream_memory_bytes(2, 4_096, 2_048, 48_000)
                 > estimate_stream_memory_bytes(2, 1_024, 2_048, 48_000)
         );
+    }
+
+    #[test]
+    fn reports_standard_surround_layouts_without_mixing_channels() {
+        let audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0; 2]; 6],
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        assert_eq!(
+            audio.channel_layout(),
+            crate::channel_layout::ChannelLayout::FivePointOne
+        );
+        assert_eq!(audio.channels(), audio.channel_layout().channels());
     }
 
     #[test]

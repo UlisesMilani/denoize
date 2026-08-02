@@ -7,12 +7,23 @@ use shine_rs::{Mp3Encoder, Mp3EncoderConfig, StereoMode, SUPPORTED_BITRATES};
 use crate::audio::Audio;
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
+use super::DownmixMode;
 
 /// Default MP3 bitrate (kbps).
 pub const DEFAULT_MP3_BITRATE: u32 = 192;
 
 /// Write planar `f64` audio to an MP3 file.
 pub fn write_mp3<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_kbps: u32) -> Result<(), String> {
+    write_mp3_with_downmix(path, audio, bitrate_kbps, DownmixMode::Preserve)
+}
+
+/// Write planar `f64` audio to MP3 with an explicit surround downmix policy.
+pub fn write_mp3_with_downmix<P: AsRef<Path>>(
+    path: P,
+    audio: &Audio,
+    bitrate_kbps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
     let path = path.as_ref();
     if !shine_rs::SUPPORTED_SAMPLE_RATES.contains(&audio.sample_rate) {
         return Err(format!(
@@ -22,7 +33,7 @@ pub fn write_mp3<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_kbps: u32) -> R
         ));
     }
 
-    let layout = lossy_channel_layout(audio)?;
+    let layout = lossy_channel_layout(audio, downmix)?;
     let bitrate = pick_mp3_bitrate(bitrate_kbps, audio.sample_rate);
     let stereo_mode = if layout.is_stereo {
         StereoMode::JointStereo
@@ -39,7 +50,7 @@ pub fn write_mp3<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_kbps: u32) -> R
         original: true,
     };
 
-    let pcm = planar_f64_to_interleaved_i16(audio, layout);
+    let pcm = planar_f64_to_interleaved_i16(audio, layout)?;
     let mut encoder = Mp3Encoder::new(config).map_err(|e| format!("mp3 encoder: {e}"))?;
 
     let mut mp3 = Vec::new();

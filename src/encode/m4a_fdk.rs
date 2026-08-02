@@ -15,13 +15,23 @@ use crate::audio::Audio;
 
 use super::m4a::sample_rate_to_index;
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
+use super::DownmixMode;
 
 pub fn write_m4a_fdk<P: AsRef<Path>>(
     path: P,
     audio: &Audio,
     bitrate_bps: u32,
 ) -> Result<(), String> {
-    let layout = lossy_channel_layout(audio)?;
+    write_m4a_fdk_with_downmix(path, audio, bitrate_bps, DownmixMode::Preserve)
+}
+
+pub fn write_m4a_fdk_with_downmix<P: AsRef<Path>>(
+    path: P,
+    audio: &Audio,
+    bitrate_bps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
+    let layout = lossy_channel_layout(audio, downmix)?;
     let mut parameters = PureRustEncoderParameters::new(layout.count as usize);
     for (parameter, value) in [
         (EncoderParameter::AudioObjectType, 2),
@@ -45,7 +55,7 @@ pub fn write_m4a_fdk<P: AsRef<Path>>(
     let frame_length = encoder.input_samples_per_channel();
     let channel_count = layout.count as usize;
     let input_length = frame_length * channel_count;
-    let mut pcm: Vec<f32> = planar_f64_to_interleaved_i16(audio, layout)
+    let mut pcm: Vec<f32> = planar_f64_to_interleaved_i16(audio, layout)?
         .into_iter()
         .map(|sample| sample as f32 / 32768.0)
         .collect();

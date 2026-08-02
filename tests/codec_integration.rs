@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use denoize::{Audio, EncodeOptions, decode_file, metadata, read_audio, write_audio, write_wav};
+use denoize::{
+    decode_file, metadata, read_audio, write_audio, write_wav, Audio, DownmixMode, EncodeOptions,
+};
 use hound::SampleFormat;
 use lofty::config::WriteOptions;
 use lofty::id3::v2::{BinaryFrame, Frame, FrameId, Id3v2Tag};
@@ -300,6 +302,38 @@ fn wav_and_flac_preserve_multichannel_shape() {
             .map(|(expected, actual)| (expected - actual).abs())
             .fold(0.0, f64::max);
         assert!(max_error < 2.0 / 32_768.0, "FLAC PCM error {max_error}");
+    }
+}
+
+#[test]
+fn surround_layouts_are_preserved_or_explicitly_downmixed() {
+    let workspace = TestWorkspace::new();
+    for (channels, layout_name) in [(6, "5.1"), (8, "7.1")] {
+        let input = fixture(channels, 4_000);
+        assert_eq!(input.channel_layout().to_string(), layout_name);
+
+        let lossless = workspace.file(&format!("surround-{channels}.flac"));
+        write_audio(&lossless, &input, EncodeOptions::default()).expect("write surround FLAC");
+        let decoded = decode_file(&lossless).expect("decode surround FLAC");
+        assert_eq!(decoded.n_channels(), channels);
+        assert_eq!(decoded.channel_layout().to_string(), layout_name);
+
+        for extension in ["mp3", "opus"] {
+            let rejected = workspace.file(&format!("surround-{channels}.{extension}"));
+            let error = write_audio(&rejected, &input, EncodeOptions::default()).unwrap_err();
+            assert!(
+                error.contains("--downmix stereo"),
+                "unexpected {extension} error: {error}"
+            );
+
+            let downmixed = workspace.file(&format!("surround-{channels}-stereo.{extension}"));
+            let mut options = EncodeOptions::default();
+            options.downmix = DownmixMode::Stereo;
+            write_audio(&downmixed, &input, options).expect("explicit surround downmix");
+            let decoded = decode_file(&downmixed).expect("decode downmixed output");
+            assert_eq!(decoded.n_channels(), 2);
+            assert_duration(&decoded, &input, "explicit surround downmix");
+        }
     }
 }
 

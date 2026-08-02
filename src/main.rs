@@ -8,8 +8,8 @@ use denoize::audio::{
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode, EncodeOptions, OnnxModelConfig,
-    SgmseProfile, StreamingDenoiser, WindowType,
+    AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode, DownmixMode, EncodeOptions,
+    OnnxModelConfig, SgmseProfile, StreamingDenoiser, WindowType,
 };
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -81,6 +81,7 @@ OPTIONS:
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
         --aac-encoder <NAME> oxide|fdk (default: oxide)
+        --downmix <MODE>     preserve|stereo (default: preserve; lossy outputs reject surround unless explicit)
         --loudness <LUFS>     normalize integrated loudness after denoising
         --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
@@ -158,6 +159,7 @@ struct Overrides {
     mp3_bitrate_kbps: Option<u32>,
     m4a_bitrate_kbps: Option<u32>,
     aac_encoder: Option<AacEncoder>,
+    downmix: Option<DownmixMode>,
     loudness_lufs: Option<f64>,
     true_peak_dbtp: Option<f64>,
     onnx_model: Option<String>,
@@ -202,6 +204,7 @@ struct FileConfig {
     loudness_lufs: Option<f64>,
     true_peak_dbtp: Option<f64>,
     channels: Option<String>,
+    downmix: Option<String>,
     batch: bool,
     stream: bool,
     stream_frames: Option<usize>,
@@ -261,6 +264,11 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
             ChannelMode::parse(&name)
                 .ok_or_else(|| format!("unknown channel mode in config: {name}"))?,
         );
+    }
+    if let Some(name) = config.downmix {
+        ov.downmix = Some(DownmixMode::parse(&name).ok_or_else(|| {
+            format!("unknown downmix mode in config: {name} (expected preserve or stereo)")
+        })?);
     }
     ov.strength = config.strength;
     ov.profile_ms = config.profile_ms;
@@ -403,6 +411,12 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                 let name: String = parse_value(args, &mut i, a)?;
                 ov.aac_encoder = Some(AacEncoder::parse(&name).ok_or_else(|| {
                     format!("unknown AAC encoder: {name} (expected oxide or fdk)")
+                })?);
+            }
+            "--downmix" => {
+                let mode: String = parse_value(args, &mut i, a)?;
+                ov.downmix = Some(DownmixMode::parse(&mode).ok_or_else(|| {
+                    format!("unknown downmix mode: {mode} (expected preserve or stereo)")
                 })?);
             }
             "--loudness" => ov.loudness_lufs = Some(parse_value(args, &mut i, a)?),
@@ -611,6 +625,7 @@ fn print_report(input: &str, audio: &denoize::Audio, cfg: &DenoiserConfig, backe
         audio.bits_per_sample,
         audio.sample_format,
     );
+    println!("layout     : {}", audio.channel_layout());
     println!("backend    : {backend:?}");
     println!("algorithm  : {:?}", cfg.algorithm);
     println!(
@@ -787,6 +802,9 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     }
     if let Some(encoder) = ov.aac_encoder {
         enc.aac_encoder = encoder;
+    }
+    if let Some(downmix) = ov.downmix {
+        enc.downmix = downmix;
     }
 
     let backend_options = BackendOptions {
@@ -1443,6 +1461,7 @@ strength = 0.42
 adaptive_noise = true
 vad = true
 preserve_metadata = false
+downmix = "stereo"
 stream_frames = 4096
 max_memory_mb = 64
 "#,
@@ -1450,6 +1469,7 @@ max_memory_mb = 64
         )
         .unwrap();
         assert!(options.auto_backend);
+        assert_eq!(options.downmix, Some(DownmixMode::Stereo));
         assert_eq!(options.preset, Some(Preset::HiFi));
         assert_eq!(options.mode, Some(ProcessingMode::Speech));
         assert_eq!(options.strength, Some(0.42));
@@ -1487,6 +1507,18 @@ max_memory_mb = 64
         assert_eq!(options.backend, Some(Backend::Classical));
         assert!(!options.auto_backend);
         assert_eq!(options.strength, Some(0.75));
+    }
+
+    #[test]
+    fn parses_explicit_downmix_mode() {
+        let (_, _, options) = parse_args(&[
+            "input.wav".into(),
+            "output.mp3".into(),
+            "--downmix".into(),
+            "stereo".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.downmix, Some(DownmixMode::Stereo));
     }
 }
 

@@ -4,11 +4,27 @@ use opus::{Application, Bitrate, Channels, Encoder};
 use std::borrow::Cow;
 use std::path::Path;
 
-pub fn write_ogg_opus(path: &Path, audio: &Audio, bitrate: u32) -> Result<(), String> {
-    if audio.channels() == 0 || audio.channels() > 2 {
-        return Err("Opus supports mono or stereo input".into());
-    }
-    let converted = crate::resample::resample_channels(&audio.channels, audio.sample_rate, 48_000)?;
+use super::pcm::{downmix_to_stereo, lossy_channel_layout};
+use super::DownmixMode;
+
+pub fn write_ogg_opus(
+    path: &Path,
+    audio: &Audio,
+    bitrate: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
+    let source_channels = if audio.channels() > 2 {
+        // Validate the explicit policy and known layout before rendering.
+        lossy_channel_layout(audio, downmix)?;
+        downmix_to_stereo(audio)?
+    } else {
+        if audio.channels() == 0 {
+            return Err("Opus requires at least one channel".into());
+        }
+        audio.channels.clone()
+    };
+    let converted =
+        crate::resample::resample_channels(&source_channels, audio.sample_rate, 48_000)?;
     let count = converted.len();
     let channels = if count == 1 {
         Channels::Mono
