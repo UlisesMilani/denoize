@@ -102,7 +102,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div class="stack side-stack">
             <article class="card compact">
               <div class="card-heading"><div><span class="step">03</span><h2>出力</h2></div></div>
-              <label>ステレオ処理<select id="channels"><option value="independent">独立</option><option value="linked" selected>ステレオリンク</option><option value="mid-side">Mid / Side</option></select></label>
+              <label>チャンネル処理<select id="channels"><option value="independent">独立</option><option value="linked" selected>ステレオリンク</option><option value="mid-side">Mid / Side</option></select></label>
+              <label>サラウンド出力<select id="downmix"><option value="preserve" selected>レイアウトを保持（非対応時は停止）</option><option value="stereo">明示的にステレオへダウンミックス</option></select></label>
               <div class="form-grid two"><label>MP3 kbps<input id="mp3-bitrate" type="number" value="192" min="32"></label><label>AAC kbps<input id="aac-bitrate" type="number" value="192" min="32"></label></div>
               <label>AACエンコーダー<select id="aac-encoder"><option value="oxide">OxideAV</option></select></label>
               <label class="toggle inline"><input id="loudness-enabled" type="checkbox"><span></span><div><b>ラウドネス正規化</b></div></label>
@@ -174,7 +175,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
-const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "channels", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
+const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
 type SavedValues = Record<string, string | number | boolean>;
 
 function captureSettings(): SavedValues {
@@ -274,6 +275,7 @@ function options() {
     adaptiveNoise: $<HTMLInputElement>("#adaptive").checked,
     vad: $<HTMLInputElement>("#vad").checked,
     channelMode: $<HTMLSelectElement>("#channels").value,
+    downmix: $<HTMLSelectElement>("#downmix").value,
     loudnessLufs: $<HTMLInputElement>("#loudness-enabled").checked ? Number($<HTMLInputElement>("#loudness").value) : null,
     truePeakDbtp: Number($<HTMLInputElement>("#true-peak").value),
     preserveMetadata: $<HTMLInputElement>("#metadata").checked,
@@ -344,7 +346,7 @@ function exportConfig() {
   const values = captureSettings();
   return {
     backend: values.backend, preset: values.preset, mode: values.mode, strength: Number(values.strength),
-    adaptive_noise: values.adaptive, vad: values.vad, channels: values.channels,
+    adaptive_noise: values.adaptive, vad: values.vad, channels: values.channels, downmix: values.downmix,
     loudness_lufs: values["loudness-enabled"] ? Number(values.loudness) : null,
     true_peak_dbtp: Number(values["true-peak"]), preserve_metadata: values.metadata, force: values.force,
     mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
@@ -360,7 +362,7 @@ $("#import-config").addEventListener("click", async () => {
   try {
     const path = await open({ multiple: false, filters: [{ name: "TOML", extensions: ["toml"] }] }); if (typeof path !== "string") return;
     const config = await invoke<Record<string, string | number | boolean>>("load_gui_config", { path });
-    const map: Record<string, string> = { adaptive_noise: "adaptive", channels: "channels", loudness_lufs: "loudness", true_peak_dbtp: "true-peak", preserve_metadata: "metadata", mp3_bitrate_kbps: "mp3-bitrate", m4a_bitrate_kbps: "aac-bitrate", aac_encoder: "aac-encoder", onnx_model: "model-path", onnx_rate: "onnx-rate", sgmse_profile: "sgmse-profile" };
+    const map: Record<string, string> = { adaptive_noise: "adaptive", channels: "channels", downmix: "downmix", loudness_lufs: "loudness", true_peak_dbtp: "true-peak", preserve_metadata: "metadata", mp3_bitrate_kbps: "mp3-bitrate", m4a_bitrate_kbps: "aac-bitrate", aac_encoder: "aac-encoder", onnx_model: "model-path", onnx_rate: "onnx-rate", sgmse_profile: "sgmse-profile" };
     const values: SavedValues = {}; for (const [key, value] of Object.entries(config)) values[map[key] ?? key] = value;
     if (config.loudness_lufs != null) values["loudness-enabled"] = true;
     applySettings(values); saveSettings(); showToast("設定を読み込みました");

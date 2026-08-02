@@ -17,15 +17,39 @@ mod opus;
 mod pcm;
 
 #[cfg(feature = "m4a-encode")]
-pub use aac::write_adts_aac;
+pub use aac::{write_adts_aac, write_adts_aac_with_downmix};
 #[cfg(feature = "m4a-encode")]
-pub use m4a::write_m4a;
+pub use m4a::{write_m4a, write_m4a_with_downmix};
 #[cfg(feature = "fdk-aac-encoder")]
-pub use m4a_fdk::write_m4a_fdk;
-pub use mp3::{write_mp3, DEFAULT_MP3_BITRATE};
+pub use m4a_fdk::{write_m4a_fdk, write_m4a_fdk_with_downmix};
+pub use mp3::{write_mp3, write_mp3_with_downmix, DEFAULT_MP3_BITRATE};
 
 /// Default AAC bitrate (bps, not kbps).
 pub const DEFAULT_M4A_BITRATE: u32 = 192_000;
+
+/// Policy for reducing a surround input to a codec's supported channel count.
+///
+/// `Preserve` is deliberately the default: a 5.1/7.1 input must never be
+/// silently mixed into stereo.  Select `Stereo` only when that loss of spatial
+/// channels is intentional.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DownmixMode {
+    /// Refuse an output codec that cannot represent the input layout.
+    #[default]
+    Preserve,
+    /// Explicitly render a standard surround layout to stereo.
+    Stereo,
+}
+
+impl DownmixMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "preserve" | "none" | "off" => Some(Self::Preserve),
+            "stereo" | "2" | "on" => Some(Self::Stereo),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AacEncoder {
@@ -91,6 +115,8 @@ pub struct EncodeOptions {
     /// AAC constant bitrate in bps.
     pub m4a_bitrate_bps: u32,
     pub aac_encoder: AacEncoder,
+    /// Explicit policy for multichannel lossy outputs.
+    pub downmix: DownmixMode,
 }
 
 impl Default for EncodeOptions {
@@ -99,6 +125,7 @@ impl Default for EncodeOptions {
             mp3_bitrate_kbps: DEFAULT_MP3_BITRATE,
             m4a_bitrate_bps: DEFAULT_M4A_BITRATE,
             aac_encoder: AacEncoder::Oxide,
+            downmix: DownmixMode::Preserve,
         }
     }
 }
@@ -113,17 +140,29 @@ pub fn write_audio<P: AsRef<Path>>(
     match OutputFormat::from_path(path)? {
         OutputFormat::Wav => write_wav(path, audio),
         OutputFormat::Flac => write_flac(path, audio),
-        OutputFormat::OggOpus => opus::write_ogg_opus(path, audio, 128_000),
-        OutputFormat::Mp3 => write_mp3(path, audio, options.mp3_bitrate_kbps),
+        OutputFormat::OggOpus => opus::write_ogg_opus(path, audio, 128_000, options.downmix),
+        OutputFormat::Mp3 => {
+            write_mp3_with_downmix(path, audio, options.mp3_bitrate_kbps, options.downmix)
+        }
         OutputFormat::M4a => {
             #[cfg(feature = "m4a-encode")]
             {
                 match options.aac_encoder {
-                    AacEncoder::Oxide => write_m4a(path, audio, options.m4a_bitrate_bps),
+                    AacEncoder::Oxide => write_m4a_with_downmix(
+                        path,
+                        audio,
+                        options.m4a_bitrate_bps,
+                        options.downmix,
+                    ),
                     AacEncoder::Fdk => {
                         #[cfg(feature = "fdk-aac-encoder")]
                         {
-                            write_m4a_fdk(path, audio, options.m4a_bitrate_bps)
+                            write_m4a_fdk_with_downmix(
+                                path,
+                                audio,
+                                options.m4a_bitrate_bps,
+                                options.downmix,
+                            )
                         }
                         #[cfg(not(feature = "fdk-aac-encoder"))]
                         {
@@ -147,7 +186,7 @@ pub fn write_audio<P: AsRef<Path>>(
                             .into(),
                     );
                 }
-                write_adts_aac(path, audio, options.m4a_bitrate_bps)
+                write_adts_aac_with_downmix(path, audio, options.m4a_bitrate_bps, options.downmix)
             }
             #[cfg(not(feature = "m4a-encode"))]
             {

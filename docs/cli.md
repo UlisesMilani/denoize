@@ -48,6 +48,7 @@ OPTIONS:
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
         --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
         --aac-encoder <NAME> oxide|fdk (default: oxide)
+        --downmix <MODE>     preserve|stereo (default: preserve; lossy outputs reject surround unless explicit)
         --loudness <LUFS>     normalize integrated loudness after denoising
         --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)

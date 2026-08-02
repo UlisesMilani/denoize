@@ -13,13 +13,24 @@ use oxideav_aac_encoder::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 use crate::audio::Audio;
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
+use super::DownmixMode;
 
 /// Write planar `f64` audio to an M4A file.
 pub fn write_m4a<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_bps: u32) -> Result<(), String> {
+    write_m4a_with_downmix(path, audio, bitrate_bps, DownmixMode::Preserve)
+}
+
+/// Write planar `f64` audio to M4A with an explicit surround downmix policy.
+pub fn write_m4a_with_downmix<P: AsRef<Path>>(
+    path: P,
+    audio: &Audio,
+    bitrate_bps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
     let path = path.as_ref();
     let sample_rate = audio.sample_rate;
     let freq_index = sample_rate_to_index(sample_rate)?;
-    let layout = lossy_channel_layout(audio)?;
+    let layout = lossy_channel_layout(audio, downmix)?;
 
     let chan_conf = if layout.is_stereo {
         ChannelConfig::Stereo
@@ -35,7 +46,7 @@ pub fn write_m4a<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_bps: u32) -> Re
     let mut encoder =
         StreamEncoder::new(enc_config).map_err(|e| format!("aac encoder init: {e}"))?;
 
-    let pcm = planar_f64_to_interleaved_i16(audio, layout);
+    let pcm = planar_f64_to_interleaved_i16(audio, layout)?;
     let out_ch = layout.count as usize;
     let hop = FRAME_LEN * out_ch;
 

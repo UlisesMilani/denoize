@@ -64,6 +64,14 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | FLAC | `flacenc` | Lossless, pure Rust |
 | Ogg Opus | `opus` + `ogg` | 128 kbps, mono/stereo |
 
+Channel order is kept planar and unchanged through WAV/FLAC and denoising. The
+standard layouts mono, stereo, 2.1, quad, 5.0, 5.1, 6.1, and 7.1 are reported
+when their channel count is recognized. MP3, M4A, and ADTS AAC encoders in the
+current release accept only mono/stereo; surround input is rejected instead of
+being mixed implicitly. Use `--downmix stereo` when a documented, explicit
+surround-to-stereo render is intended (LFE is not copied into the full-range
+stereo pair).
+
 ```sh
 # MP3 / M4A input and output — no manual ffmpeg conversion
 denoize noisy.mp3 clean.mp3 -p hifi
@@ -99,6 +107,7 @@ denoize noisy.wav clean.wav -b gtcrn
 
 # Stereo coupling, pipes, metrics, and directory batches
 denoize stereo.wav clean.flac --channels linked
+denoize surround-5.1.wav stereo.mp3 --downmix stereo
 cat noisy.wav | denoize - - > clean.wav
 denoize metrics reference.wav clean.wav --json
 denoize recordings/ cleaned/ --batch

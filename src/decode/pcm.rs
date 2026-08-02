@@ -29,6 +29,11 @@ impl DecodedPcm {
         self.channels.first().map(|c| c.len()).unwrap_or(0)
     }
 
+    /// Return the conventional layout for the decoded planar channel order.
+    pub fn channel_layout(&self) -> crate::channel_layout::ChannelLayout {
+        crate::channel_layout::ChannelLayout::from_channel_count(self.n_channels())
+    }
+
     /// Ensure all channels have equal length (pad shorter with silence).
     pub fn normalize_lengths(&mut self) {
         let max = self.channels.iter().map(Vec::len).max().unwrap_or(0);
