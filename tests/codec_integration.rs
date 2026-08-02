@@ -355,6 +355,97 @@ fn stereo_lossy_codecs_preserve_channel_layout_and_duration() {
     }
 }
 
+fn pcm_format_fixture(
+    sample_rate: u32,
+    bits_per_sample: u16,
+    sample_format: SampleFormat,
+) -> Audio {
+    let values = [
+        -1.0, -0.9375, -0.5, -0.125, 0.0, 0.125, 0.5, 0.9375, 0.9999, 1.0,
+    ];
+    let channels = (0..2)
+        .map(|channel| {
+            values
+                .iter()
+                .cycle()
+                .take(257)
+                .enumerate()
+                .map(|(frame, value)| {
+                    let sign = if (frame + channel) % 2 == 0 {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    value * sign
+                })
+                .collect()
+        })
+        .collect();
+    Audio {
+        sample_rate,
+        channels,
+        bits_per_sample,
+        sample_format,
+        channel_mask: None,
+    }
+}
+
+fn expected_pcm_sample(value: f64, bits_per_sample: u16, sample_format: SampleFormat) -> f64 {
+    let value = value.clamp(-1.0, 1.0);
+    match sample_format {
+        SampleFormat::Float => (value as f32) as f64,
+        SampleFormat::Int => {
+            let max = (1u64 << (bits_per_sample - 1)) as f64;
+            let quantized = (value * max).round().clamp(-(max as i64) as f64, max - 1.0);
+            quantized / max
+        }
+    }
+}
+
+#[test]
+fn wav_pcm_format_and_sample_rate_matrix_roundtrips() {
+    let workspace = TestWorkspace::new();
+    let formats = [
+        (8, SampleFormat::Int, 1.0 / 128.0 + 1e-9),
+        (16, SampleFormat::Int, 1.0 / 32_768.0 + 1e-9),
+        (24, SampleFormat::Int, 1.0 / 8_388_608.0 + 1e-9),
+        (32, SampleFormat::Int, 1.0 / 2_147_483_648.0 + 1e-9),
+        (32, SampleFormat::Float, 2e-7),
+    ];
+    let sample_rates = [8_000, 12_345, 22_050, 44_100, 48_000, 96_000];
+
+    for &sample_rate in &sample_rates {
+        for &(bits_per_sample, sample_format, tolerance) in &formats {
+            let input = pcm_format_fixture(sample_rate, bits_per_sample, sample_format);
+            let path = workspace.file(&format!(
+                "pcm-{sample_rate}-{bits_per_sample}-{}.wav",
+                match sample_format {
+                    SampleFormat::Int => "int",
+                    SampleFormat::Float => "float",
+                }
+            ));
+            write_wav(&path, &input).unwrap_or_else(|error| {
+                panic!(
+                    "write {sample_rate} Hz {bits_per_sample}-bit {sample_format:?} WAV: {error}"
+                )
+            });
+            let decoded = read_audio(&path).expect("read WAV matrix fixture");
+
+            assert_eq!(decoded.sample_rate, sample_rate);
+            assert_eq!(decoded.bits_per_sample, bits_per_sample);
+            assert_eq!(decoded.sample_format, sample_format);
+            assert_eq!(decoded.channels(), input.channels());
+            assert_eq!(decoded.frames(), input.frames());
+            for (expected_channel, actual_channel) in input.channels.iter().zip(&decoded.channels) {
+                for (&expected, &actual) in expected_channel.iter().zip(actual_channel) {
+                    let expected = expected_pcm_sample(expected, bits_per_sample, sample_format);
+                    assert!((actual - expected).abs() <= tolerance);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn all_supported_codecs_roundtrip_matrix() {
     let workspace = TestWorkspace::new();

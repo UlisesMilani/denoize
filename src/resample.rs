@@ -127,4 +127,37 @@ mod tests {
         let output = resample_channels(&[channel.clone(), channel], 44_100, 48_000).unwrap();
         assert_eq!(output[0], output[1]);
     }
+
+    #[test]
+    fn supports_arbitrary_sample_rate_pairs() {
+        // Include both conventional rates and a deliberately non-standard
+        // rate to make sure conversion does not rely on a fixed codec table.
+        let rates = [8_000, 12_345, 22_050, 32_000, 44_100, 48_000, 96_000];
+        let frames = 1_001usize;
+        let input: Vec<f64> = (0..frames)
+            .map(|frame| (TAU * 997.0 * frame as f64 / 44_100.0).sin() * 0.5)
+            .collect();
+
+        for &from_rate in &rates {
+            for &to_rate in &rates {
+                if from_rate == to_rate {
+                    continue;
+                }
+                let output = resample(&input, from_rate, to_rate).unwrap_or_else(|error| {
+                    panic!("{from_rate} Hz -> {to_rate} Hz conversion failed: {error}")
+                });
+                let expected = ((frames as u128 * to_rate as u128 + from_rate as u128 / 2)
+                    / from_rate as u128) as usize;
+                assert_eq!(
+                    output.len(),
+                    expected,
+                    "{from_rate} Hz -> {to_rate} Hz output length"
+                );
+                assert!(
+                    output.iter().all(|sample| sample.is_finite()),
+                    "{from_rate} Hz -> {to_rate} Hz produced a non-finite sample"
+                );
+            }
+        }
+    }
 }
