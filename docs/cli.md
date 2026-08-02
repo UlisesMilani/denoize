@@ -65,7 +65,7 @@ OPTIONS:
         --resume              skip completed files recorded by batch state
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
-        --no-metadata         do not copy input tags/artwork to the output
+        --no-metadata         do not copy input tags/artwork/chapters to the output
         --input-device <NAME> live capture device (default: system default)
         --output-device <NAME> live playback device (default: system default)
         --chunk-ms <MS>       live processing chunk duration (default: 100)

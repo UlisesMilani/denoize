@@ -458,10 +458,19 @@ container or an ffmpeg conversion step. M4A and raw AAC share
 
 ### Metadata preservation
 
-File processing preserves the input's primary metadata tag after encoding.
-Native tags are retained for same-format output; conversions remap common
-fields such as title, artist, album, date, ReplayGain, comments, and artwork to
-the destination container's tag type. Use `--no-metadata` for a clean output.
+File processing merges all readable input tags (for example ID3v2/ID3v1 and
+APE tags) and remaps the complete set of recognized fields—title, artist,
+album, track/disc numbers, dates, ReplayGain, lyrics, comments, and artwork—to
+the destination container's tag type. Cover art bytes, MIME type, picture type,
+and description are retained by formats that support embedded pictures.
+
+For FLAC and Ogg outputs, arbitrary Vorbis Comment fields are copied verbatim,
+including the standard `CHAPTER001`/`CHAPTER001NAME` chapter-comment convention.
+When the source and destination use the same native container, format-specific
+ID3v2 frames (including `CHAP`/`CTOC`) and MP4 atoms are retained as well. A
+conversion to a different tag family keeps fields with a defined destination
+mapping; container-specific fields without one cannot be represented there.
+Use `--no-metadata` for a clean output.
 
 ### Quality comparison
 
