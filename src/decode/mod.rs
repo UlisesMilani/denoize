@@ -183,8 +183,10 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
         .channels
         .as_ref()
         .and_then(|channels| match channels {
-            symphonia::core::audio::Channels::Positioned(position) => {
-                crate::channel_layout::ChannelMask::from_bits(position.bits() as u32)
+        symphonia::core::audio::Channels::Positioned(position) => {
+            u32::try_from(position.bits())
+                .ok()
+                .and_then(crate::channel_layout::ChannelMask::from_bits)
             }
             _ => None,
         });
