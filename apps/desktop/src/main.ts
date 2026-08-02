@@ -95,6 +95,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                 <label class="toggle"><input id="vad" type="checkbox"><span></span><div><b>音声区間検出</b><small>無音区間の処理を最適化</small></div></label>
                 <label class="toggle"><input id="metadata" type="checkbox" checked><span></span><div><b>メタデータ保持</b><small>タグとアートワークをコピー</small></div></label>
                 <label class="toggle"><input id="force" type="checkbox"><span></span><div><b>上書きを許可</b><small>既存の出力を置換</small></div></label>
+                <label class="toggle"><input id="deterministic" type="checkbox"><span></span><div><b>再現性モード</b><small>同じ入力・設定から同じ音声を生成</small></div></label>
               </div>
             </article>
           </div>
@@ -175,7 +176,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
-const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
+const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
 type SavedValues = Record<string, string | number | boolean>;
 
 function captureSettings(): SavedValues {
@@ -286,6 +287,7 @@ function options() {
     onnxModel: $<HTMLInputElement>("#model-path").value || null,
     onnxSampleRate: Number($<HTMLInputElement>("#onnx-rate").value),
     sgmseProfile: $<HTMLSelectElement>("#sgmse-profile").value,
+    deterministic: $<HTMLInputElement>("#deterministic").checked,
   };
 }
 
@@ -352,6 +354,7 @@ function exportConfig() {
     mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
     aac_encoder: values["aac-encoder"], onnx_model: values["model-path"] || null,
     onnx_rate: Number(values["onnx-rate"]), sgmse_profile: values["sgmse-profile"],
+    deterministic: values.deterministic,
   };
 }
 $("#export-config").addEventListener("click", async () => {

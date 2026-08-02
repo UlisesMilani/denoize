@@ -16,6 +16,7 @@ pub fn process(
     channels: &[Vec<f64>],
     input_sample_rate: u32,
     config: &OnnxModelConfig,
+    deterministic: bool,
 ) -> Result<Vec<Vec<f64>>, String> {
     if config.sample_rate == 0 {
         return Err("ONNX model sample rate must be greater than zero".into());
@@ -36,18 +37,27 @@ pub fn process(
         return Ok(model_inputs);
     }
     let (model, shape) = load_model(model_inputs[0].len(), config)?;
-    model_inputs
-        .par_iter()
-        .zip(channels.par_iter())
-        .map(|(model_input, original)| {
-            let model_output = run_model(model_input, &shape, &model)?;
-            let mut output =
-                crate::resample::resample(&model_output, config.sample_rate, input_sample_rate)?;
-            output.truncate(original.len());
-            output.resize(original.len(), 0.0);
-            Ok(output)
-        })
-        .collect()
+    let process_channel = |(model_input, original): (&Vec<f64>, &Vec<f64>)| {
+        let model_output = run_model(model_input, &shape, &model)?;
+        let mut output =
+            crate::resample::resample(&model_output, config.sample_rate, input_sample_rate)?;
+        output.truncate(original.len());
+        output.resize(original.len(), 0.0);
+        Ok(output)
+    };
+    if deterministic {
+        model_inputs
+            .iter()
+            .zip(channels.iter())
+            .map(process_channel)
+            .collect()
+    } else {
+        model_inputs
+            .par_iter()
+            .zip(channels.par_iter())
+            .map(process_channel)
+            .collect()
+    }
 }
 
 fn load_model(
@@ -143,7 +153,7 @@ mod tests {
             path: std::path::PathBuf::from("definitely-missing-model.onnx"),
             sample_rate: 16_000,
         };
-        let error = process(&[vec![0.0]], 16_000, &config).unwrap_err();
+        let error = process(&[vec![0.0]], 16_000, &config, false).unwrap_err();
         assert!(error.contains("does not exist"));
     }
 
@@ -176,7 +186,7 @@ mod tests {
             sample_rate: 16_000,
         };
         let input = vec![vec![-0.5, 0.0, 0.25, 0.75]];
-        let output = process(&input, 16_000, &config).unwrap();
+        let output = process(&input, 16_000, &config, false).unwrap();
         std::fs::remove_file(path).unwrap();
 
         assert_eq!(output.len(), 1);
@@ -184,6 +194,34 @@ mod tests {
         for (actual, expected) in output[0].iter().zip(&input[0]) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn deterministic_mode_keeps_multichannel_output_byte_stable() {
+        let model = identity_model();
+        let mut bytes = Vec::new();
+        model.encode(&mut bytes).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "denoize-deterministic-{}-{}.onnx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let config = OnnxModelConfig {
+            path: path.clone(),
+            sample_rate: 16_000,
+        };
+        let input = vec![
+            vec![-0.5, 0.0, 0.25, 0.75],
+            vec![0.5, -0.25, 0.0, 0.125],
+        ];
+        let first = process(&input, 16_000, &config, true).unwrap();
+        let second = process(&input, 16_000, &config, true).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(first, second);
     }
 
     fn identity_model() -> ModelProto {

@@ -20,13 +20,14 @@ const SIGMA_MIN: f32 = 0.05;
 const SIGMA_MAX: f32 = 0.5;
 const EPSILON: f32 = 0.03;
 const CORRECTOR_SNR: f32 = 0.5;
-const DEFAULT_SEED: u64 = 0x5347_4d53_452b_0030;
+pub(crate) const DEFAULT_SEED: u64 = 0x5347_4d53_452b_0030;
 
 pub fn process(
     channels: &[Vec<f64>],
     input_sample_rate: u32,
     config: &OnnxModelConfig,
     profile: SgmseProfile,
+    seed: Option<u64>,
 ) -> Result<Vec<Vec<f64>>, String> {
     if config.sample_rate != MODEL_RATE {
         return Err(format!(
@@ -59,7 +60,7 @@ pub fn process(
                 channel,
                 input_sample_rate,
                 frames,
-                DEFAULT_SEED.wrapping_add(index as u64),
+                seed.unwrap_or(DEFAULT_SEED).wrapping_add(index as u64),
                 profile.steps(),
                 &model,
             )
@@ -457,6 +458,12 @@ mod tests {
             .unwrap()
         };
         assert_eq!(run(), run());
+
+        let alternate = sample(&noisy, 64, 43, 30, |state, _| {
+            Ok(vec![Complex32::default(); state.len()])
+        })
+        .unwrap();
+        assert_ne!(run(), alternate);
     }
 
     #[test]
