@@ -13,6 +13,9 @@ pub fn write_ogg_opus(
     bitrate: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
+    if audio.frames() == 0 {
+        return Err("Opus output requires at least one frame".into());
+    }
     let source_channels = if audio.channels() > 2 {
         // Validate the explicit policy and known layout before rendering.
         lossy_channel_layout(audio, downmix)?;

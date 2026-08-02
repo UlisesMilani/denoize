@@ -1,6 +1,6 @@
 //! EBU R128 integrated-loudness normalization with a true-peak ceiling.
 
-use crate::Audio;
+use crate::{sanitize_sample, Audio};
 use ebur128::{EbuR128, Mode};
 
 #[derive(Clone, Copy, Debug)]
@@ -30,7 +30,7 @@ pub fn normalize(
     let gain = 10f64.powf(gain_db / 20.0);
     for channel in &mut audio.channels {
         for sample in channel {
-            *sample *= gain;
+            *sample = sanitize_sample(*sample * gain);
         }
     }
     let (output_lufs, true_peak_dbtp) = measure(audio)?;
@@ -56,7 +56,7 @@ pub fn measure(audio: &Audio) -> Result<(f64, f64), String> {
     let mut interleaved = Vec::with_capacity(audio.frames() * channels);
     for frame in 0..audio.frames() {
         for channel in &audio.channels {
-            interleaved.push(channel.get(frame).copied().unwrap_or(0.0));
+            interleaved.push(sanitize_sample(channel.get(frame).copied().unwrap_or(0.0)));
         }
     }
     analyzer
@@ -102,5 +102,22 @@ mod tests {
         let report = normalize(&mut audio, -20.0, -1.0).unwrap();
         assert!((report.output_lufs + 20.0).abs() < 0.1);
         assert!(report.true_peak_dbtp <= -1.0 + 1e-6);
+    }
+
+    #[test]
+    fn normalize_sanitizes_nonfinite_and_extreme_samples() {
+        let mut audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.1; 48_000]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        audio.channels[0][0] = f64::NAN;
+        audio.channels[0][1] = f64::INFINITY;
+        audio.channels[0][2] = 1e300;
+        normalize(&mut audio, -20.0, -1.0).unwrap();
+        assert!(audio.channels[0].iter().all(|sample| sample.is_finite()));
+        assert!(audio.channels[0].iter().all(|sample| sample.abs() <= 1.0));
     }
 }

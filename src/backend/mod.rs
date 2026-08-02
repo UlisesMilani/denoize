@@ -4,6 +4,17 @@ mod classical;
 
 use std::path::PathBuf;
 
+use crate::audio::sanitize_sample;
+
+#[inline]
+fn finite_sample(sample: f64) -> f64 {
+    if sample.is_finite() {
+        sample
+    } else {
+        0.0
+    }
+}
+
 const MID_SIDE_SCALE: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 pub use classical::process_classical;
@@ -75,8 +86,10 @@ pub fn encode_mid_side(left: &[f64], right: &[f64]) -> Result<(Vec<f64>, Vec<f64
         Vec::with_capacity(left.len()),
     );
     for (&left, &right) in left.iter().zip(right) {
-        mid.push((left + right) * MID_SIDE_SCALE);
-        side.push((left - right) * MID_SIDE_SCALE);
+        let left = sanitize_sample(left);
+        let right = sanitize_sample(right);
+        mid.push(finite_sample((left + right) * MID_SIDE_SCALE));
+        side.push(finite_sample((left - right) * MID_SIDE_SCALE));
     }
     Ok((mid, side))
 }
@@ -88,8 +101,10 @@ pub fn decode_mid_side(mid: &[f64], side: &[f64]) -> Result<(Vec<f64>, Vec<f64>)
     }
     let (mut left, mut right) = (Vec::with_capacity(mid.len()), Vec::with_capacity(mid.len()));
     for (&mid, &side) in mid.iter().zip(side) {
-        left.push((mid + side) * MID_SIDE_SCALE);
-        right.push((mid - side) * MID_SIDE_SCALE);
+        let mid = finite_sample(mid);
+        let side = finite_sample(side);
+        left.push(finite_sample((mid + side) * MID_SIDE_SCALE));
+        right.push(finite_sample((mid - side) * MID_SIDE_SCALE));
     }
     Ok((left, right))
 }
@@ -214,22 +229,42 @@ pub fn process_channels(
     classical_cfg: &crate::denoiser::DenoiserConfig,
     backend_options: &BackendOptions,
 ) -> Result<Vec<Vec<f64>>, String> {
-    if channels.len() == 2 && backend_options.channel_mode != ChannelMode::Independent {
-        return process_stereo(
+    let needs_sanitization = channels
+        .iter()
+        .flatten()
+        .any(|sample| !sample.is_finite() || *sample < -1.0 || *sample > 1.0);
+    let sanitized;
+    let channels = if needs_sanitization {
+        sanitized = channels
+            .iter()
+            .map(|channel| channel.iter().copied().map(sanitize_sample).collect())
+            .collect::<Vec<Vec<f64>>>();
+        &sanitized
+    } else {
+        channels
+    };
+    let result = if channels.len() == 2 && backend_options.channel_mode != ChannelMode::Independent
+    {
+        process_stereo(
             backend,
             channels,
             sample_rate,
             classical_cfg,
             backend_options,
-        );
-    }
-    process_channels_independent(
-        backend,
-        channels,
-        sample_rate,
-        classical_cfg,
-        backend_options,
-    )
+        )
+    } else {
+        process_channels_independent(
+            backend,
+            channels,
+            sample_rate,
+            classical_cfg,
+            backend_options,
+        )
+    }?;
+    Ok(result
+        .into_iter()
+        .map(|channel| channel.into_iter().map(sanitize_sample).collect())
+        .collect())
 }
 
 fn process_stereo(

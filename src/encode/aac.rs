@@ -21,6 +21,9 @@ pub fn write_adts_aac_with_downmix<P: AsRef<Path>>(
     bitrate_bps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
+    if audio.frames() == 0 {
+        return Err("AAC output requires at least one frame".into());
+    }
     let layout = lossy_channel_layout(audio, downmix)?;
     let mut encoder = StreamEncoder::new(EncoderConfig {
         sample_rate: audio.sample_rate,

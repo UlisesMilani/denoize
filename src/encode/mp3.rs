@@ -25,6 +25,9 @@ pub fn write_mp3_with_downmix<P: AsRef<Path>>(
     downmix: DownmixMode,
 ) -> Result<(), String> {
     let path = path.as_ref();
+    if audio.frames() == 0 {
+        return Err("MP3 output requires at least one frame".into());
+    }
     if !shine_rs::SUPPORTED_SAMPLE_RATES.contains(&audio.sample_rate) {
         return Err(format!(
             "MP3 encode: unsupported sample rate {} Hz (supported: {:?})",

@@ -312,8 +312,12 @@ fn build_output(
     }
     let result = match format {
         SampleFormat::F32 => stream!(f32, |x: f32| x),
-        SampleFormat::I16 => stream!(i16, |x: f32| (x.clamp(-1.0, 1.0) * 32767.0) as i16),
-        SampleFormat::U16 => stream!(u16, |x: f32| ((x.clamp(-1.0, 1.0) + 1.0) * 32767.5) as u16),
+        SampleFormat::I16 => stream!(i16, |x: f32| {
+            (crate::audio::sanitize_sample(x as f64) * 32767.0) as i16
+        }),
+        SampleFormat::U16 => stream!(u16, |x: f32| {
+            ((crate::audio::sanitize_sample(x as f64) + 1.0) * 32767.5) as u16
+        }),
         other => return Err(format!("unsupported live output sample format: {other:?}")),
     };
     result.map_err(|e| format!("build output stream: {e}"))

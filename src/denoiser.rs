@@ -56,6 +56,7 @@
 
 use std::collections::VecDeque;
 
+use crate::audio::sanitize_sample;
 use crate::fft::Complex;
 use crate::gain::{compute_gain, multiband_specsub_gains, Algorithm, GainParams, SpecSubLaw};
 use crate::noise::{NoiseConfig, NoiseEstimator};
@@ -936,10 +937,11 @@ impl Denoiser {
     /// Denoise a single (mono) channel of `f64` samples in `[-1, 1]`.
     pub fn process_channel(&mut self, input: &[f64]) -> Vec<f64> {
         self.reset_for_channel();
+        let sanitized: Vec<f64> = input.iter().copied().map(sanitize_sample).collect();
         let mut x: Vec<f64> = if self.config.dc_block {
-            Self::dc_block(input)
+            Self::dc_block(&sanitized)
         } else {
-            input.to_vec()
+            sanitized
         };
         if self.config.pre_emphasis {
             x = self.pre_emphasize(&x);
@@ -1003,6 +1005,9 @@ impl Denoiser {
         // De-emphasis (must be applied after reconstruction to invert pre-emphasis correctly)
         if self.config.pre_emphasis {
             result = self.de_emphasize(&result);
+        }
+        for sample in &mut result {
+            *sample = sanitize_sample(*sample);
         }
         result
     }
@@ -1086,7 +1091,7 @@ impl ChannelStream {
 
     #[inline]
     fn transform_sample(&mut self, sample: f64) -> f64 {
-        let mut value = sample;
+        let mut value = sanitize_sample(sample);
         if self.denoiser.config.dc_block {
             value = self.denoiser.dc_block_sample(value);
         }
@@ -1326,6 +1331,37 @@ mod tests {
             sn += e * e;
         }
         10.0 * (sc / sn.max(1e-300)).log10()
+    }
+
+    #[test]
+    fn nonfinite_extreme_and_silent_inputs_remain_safe() {
+        let mut config = DenoiserConfig::default(16_000);
+        config.frame_size = 256;
+        config.overlap = 0.75;
+        config.profile_ms = -1.0;
+        config.dc_block = true;
+        config.pre_emphasis = true;
+        let mut input = vec![0.0; 1_023];
+        input[0] = f64::NAN;
+        input[1] = f64::INFINITY;
+        input[2] = f64::NEG_INFINITY;
+        input[3] = 1e300;
+        input[4] = -1e300;
+        input[5] = 0.35;
+
+        let mut denoiser = Denoiser::new(config.clone());
+        let output = denoiser.process_channel(&input);
+        assert_eq!(output.len(), input.len());
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(output.iter().all(|sample| sample.abs() <= 1.0));
+
+        let mut silent_denoiser = Denoiser::new(config);
+        let silence = silent_denoiser.process_channel(&vec![0.0; 1_023]);
+        assert!(silence.iter().all(|sample| sample.is_finite()));
+        assert!(silence.iter().all(|sample| sample.abs() <= 1e-12));
+
+        let mut empty_denoiser = Denoiser::new(DenoiserConfig::default(16_000));
+        assert!(empty_denoiser.process_channel(&[]).is_empty());
     }
 
     #[test]

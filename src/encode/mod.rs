@@ -70,7 +70,7 @@ impl AacEncoder {
 
 use std::path::Path;
 
-use crate::audio::{write_wav, Audio};
+use crate::audio::{sanitize_sample, write_wav, Audio};
 
 /// Output container inferred from file extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,6 +200,12 @@ pub fn write_audio<P: AsRef<Path>>(
 }
 
 fn write_flac(path: &Path, audio: &Audio) -> Result<(), String> {
+    if audio.channels() == 0 {
+        return Err("FLAC output requires at least one channel".into());
+    }
+    if audio.frames() == 0 {
+        return Err("FLAC output requires at least one frame".into());
+    }
     use flacenc::component::BitRepr;
     use flacenc::error::Verify;
     let bits = audio.bits_per_sample.clamp(8, 24) as usize;
@@ -208,7 +214,7 @@ fn write_flac(path: &Path, audio: &Audio) -> Result<(), String> {
     for frame in 0..audio.frames() {
         for channel in &audio.channels {
             samples.push(
-                (channel[frame].clamp(-1.0, 1.0) * scale)
+                (sanitize_sample(channel[frame]) * scale)
                     .round()
                     .clamp(-scale, scale - 1.0) as i32,
             );

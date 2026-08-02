@@ -1,6 +1,6 @@
 //! PCM conversion helpers for lossy encoders (MP3 / M4A).
 
-use crate::audio::Audio;
+use crate::audio::{sanitize_sample, Audio};
 use crate::channel_layout::{ChannelLayout, ChannelPosition};
 
 use super::DownmixMode;
@@ -122,7 +122,7 @@ fn downmix_frame(audio: &Audio, frame: usize) -> Result<(f64, f64), String> {
     let mut left = 0.0;
     let mut right = 0.0;
     let mut add = |index: usize, left_gain: f64, right_gain: f64| {
-        let sample = audio.channels[index].get(frame).copied().unwrap_or(0.0);
+        let sample = sanitize_sample(audio.channels[index].get(frame).copied().unwrap_or(0.0));
         left += sample * left_gain;
         right += sample * right_gain;
     };
@@ -135,7 +135,7 @@ fn downmix_frame(audio: &Audio, frame: usize) -> Result<(f64, f64), String> {
         })?;
         add(index, left_gain, right_gain);
     }
-    Ok((left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0)))
+    Ok((sanitize_sample(left), sanitize_sample(right)))
 }
 
 /// Conservative ITU-style gains for a WAVE speaker position. LFE is omitted
@@ -175,7 +175,7 @@ fn sample_at(audio: &Audio, frame: usize, ch: usize, n_in: usize) -> f64 {
 
 #[inline]
 fn f64_to_i16(v: f64) -> i16 {
-    let q = (v.clamp(-1.0, 1.0) * 32767.0).round() as i32;
+    let q = (sanitize_sample(v) * 32767.0).round() as i32;
     q.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 

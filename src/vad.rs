@@ -1,5 +1,7 @@
 //! Lightweight energy VAD and speech-region segmentation.
 
+use crate::audio::sanitize_sample;
+
 /// Inclusive-exclusive sample range containing speech plus context padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpeechRegion {
@@ -21,6 +23,7 @@ pub fn speech_regions(channels: &[Vec<f64>], sample_rate: u32) -> Vec<SpeechRegi
         let mut count = 0usize;
         for channel in channels {
             for sample in &channel[start.min(channel.len())..end.min(channel.len())] {
+                let sample = sanitize_sample(*sample);
                 energy += sample * sample;
                 count += 1;
             }

@@ -31,6 +31,9 @@ pub fn write_m4a_fdk_with_downmix<P: AsRef<Path>>(
     bitrate_bps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
+    if audio.frames() == 0 {
+        return Err("M4A output requires at least one frame".into());
+    }
     let layout = lossy_channel_layout(audio, downmix)?;
     let mut parameters = PureRustEncoderParameters::new(layout.count as usize);
     for (parameter, value) in [
