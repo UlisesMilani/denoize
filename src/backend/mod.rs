@@ -4,6 +4,8 @@ mod classical;
 
 use std::path::PathBuf;
 
+const MID_SIDE_SCALE: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
 pub use classical::process_classical;
 
 /// Denoising backend selection.
@@ -57,6 +59,39 @@ pub enum ChannelMode {
     StereoLinked,
     /// Transform left/right to mid/side, denoise both, then reconstruct.
     MidSide,
+}
+
+/// Encode equal-length stereo channels into an energy-preserving mid/side pair.
+///
+/// Both components use the same `1/sqrt(2)` normalization, so the transform is
+/// orthonormal and the original left/right samples can be recovered exactly
+/// (up to floating-point roundoff) with [`decode_mid_side`].
+pub fn encode_mid_side(left: &[f64], right: &[f64]) -> Result<(Vec<f64>, Vec<f64>), String> {
+    if left.len() != right.len() {
+        return Err("stereo channels must contain the same number of frames".into());
+    }
+    let (mut mid, mut side) = (
+        Vec::with_capacity(left.len()),
+        Vec::with_capacity(left.len()),
+    );
+    for (&left, &right) in left.iter().zip(right) {
+        mid.push((left + right) * MID_SIDE_SCALE);
+        side.push((left - right) * MID_SIDE_SCALE);
+    }
+    Ok((mid, side))
+}
+
+/// Decode an energy-preserving mid/side pair back to equal-length stereo.
+pub fn decode_mid_side(mid: &[f64], side: &[f64]) -> Result<(Vec<f64>, Vec<f64>), String> {
+    if mid.len() != side.len() {
+        return Err("mid and side channels must contain the same number of frames".into());
+    }
+    let (mut left, mut right) = (Vec::with_capacity(mid.len()), Vec::with_capacity(mid.len()));
+    for (&mid, &side) in mid.iter().zip(side) {
+        left.push((mid + side) * MID_SIDE_SCALE);
+        right.push((mid - side) * MID_SIDE_SCALE);
+    }
+    Ok((left, right))
 }
 
 impl ChannelMode {
@@ -237,11 +272,7 @@ fn process_stereo(
             Ok(result)
         }
         ChannelMode::MidSide => {
-            let side: Vec<f64> = channels[0]
-                .iter()
-                .zip(&channels[1])
-                .map(|(left, right)| (left - right) * 0.5)
-                .collect();
+            let (mid, side) = encode_mid_side(&channels[0], &channels[1])?;
             let processed = process_channels_independent(
                 backend,
                 &[mid, side],
@@ -249,18 +280,11 @@ fn process_stereo(
                 classical_cfg,
                 backend_options,
             )?;
-            Ok(vec![
-                processed[0]
-                    .iter()
-                    .zip(&processed[1])
-                    .map(|(mid, side)| mid + side)
-                    .collect(),
-                processed[0]
-                    .iter()
-                    .zip(&processed[1])
-                    .map(|(mid, side)| mid - side)
-                    .collect(),
-            ])
+            if processed.len() != 2 {
+                return Err("mid-side backend must return exactly two channels".into());
+            }
+            let (left, right) = decode_mid_side(&processed[0], &processed[1])?;
+            Ok(vec![left, right])
         }
         ChannelMode::Independent => unreachable!(),
     }
@@ -367,6 +391,26 @@ mod channel_tests {
             ChannelMode::parse("independent"),
             Some(ChannelMode::Independent)
         );
+    }
+
+    #[test]
+    fn mid_side_transform_roundtrips_stereo() {
+        let left = vec![0.0, 0.25, -0.75, 1.0];
+        let right = vec![0.5, -0.25, 0.75, -1.0];
+        let (mid, side) = encode_mid_side(&left, &right).unwrap();
+        let (decoded_left, decoded_right) = decode_mid_side(&mid, &side).unwrap();
+        for (actual, expected) in decoded_left.iter().zip(&left) {
+            assert!((actual - expected).abs() < 1e-14);
+        }
+        for (actual, expected) in decoded_right.iter().zip(&right) {
+            assert!((actual - expected).abs() < 1e-14);
+        }
+    }
+
+    #[test]
+    fn mid_side_rejects_mismatched_lengths() {
+        assert!(encode_mid_side(&[0.0], &[]).is_err());
+        assert!(decode_mid_side(&[0.0], &[]).is_err());
     }
 
     #[test]

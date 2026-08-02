@@ -1,7 +1,7 @@
 //! PCM conversion helpers for lossy encoders (MP3 / M4A).
 
 use crate::audio::Audio;
-use crate::channel_layout::ChannelLayout;
+use crate::channel_layout::{ChannelLayout, ChannelPosition};
 
 use super::DownmixMode;
 
@@ -37,7 +37,12 @@ pub fn lossy_channel_layout(audio: &Audio, downmix: DownmixMode) -> Result<Encod
                     audio.channel_layout()
                 ));
             }
-            if matches!(audio.channel_layout(), ChannelLayout::Unknown(_)) {
+            let has_explicit_positions = audio
+                .channel_mask
+                .is_some_and(|mask| mask.bits() != 0 && mask.channels() == n);
+            if matches!(audio.channel_layout(), ChannelLayout::Unknown(_))
+                && !has_explicit_positions
+            {
                 return Err(format!(
                     "cannot safely downmix unknown {}-channel layout; use a lossless output",
                     n
@@ -100,8 +105,20 @@ pub(crate) fn downmix_to_stereo(audio: &Audio) -> Result<Vec<Vec<f64>>, String> 
 /// low-frequency effects channel into full-range stereo is a common source of
 /// clipping and an unintended tonal change.
 fn downmix_frame(audio: &Audio, frame: usize) -> Result<(f64, f64), String> {
-    const SURROUND_GAIN: f64 = std::f64::consts::FRAC_1_SQRT_2;
-    let layout = audio.channel_layout();
+    let mask = audio.effective_channel_mask().ok_or_else(|| {
+        format!(
+            "cannot safely downmix unknown {}-channel layout; use a lossless output",
+            audio.channels()
+        )
+    })?;
+    let positions = mask.positions();
+    if positions.len() != audio.channels() {
+        return Err(format!(
+            "channel mask describes {} channels, but PCM has {}",
+            positions.len(),
+            audio.channels()
+        ));
+    }
     let mut left = 0.0;
     let mut right = 0.0;
     let mut add = |index: usize, left_gain: f64, right_gain: f64| {
@@ -109,57 +126,38 @@ fn downmix_frame(audio: &Audio, frame: usize) -> Result<(f64, f64), String> {
         left += sample * left_gain;
         right += sample * right_gain;
     };
-
-    match layout {
-        ChannelLayout::TwoPointOne => {
-            add(0, 1.0, 0.0);
-            add(1, 0.0, 1.0);
-        }
-        ChannelLayout::Quad => {
-            add(0, 1.0, 0.0);
-            add(1, 0.0, 1.0);
-            add(2, SURROUND_GAIN, 0.0);
-            add(3, 0.0, SURROUND_GAIN);
-        }
-        ChannelLayout::FivePointZero => {
-            add(0, 1.0, 0.0);
-            add(1, 0.0, 1.0);
-            add(2, SURROUND_GAIN, SURROUND_GAIN);
-            add(3, SURROUND_GAIN, 0.0);
-            add(4, 0.0, SURROUND_GAIN);
-        }
-        ChannelLayout::FivePointOne => {
-            add(0, 1.0, 0.0);
-            add(1, 0.0, 1.0);
-            add(2, SURROUND_GAIN, SURROUND_GAIN);
-            // Channel 3 is LFE and is deliberately not mixed.
-            add(4, SURROUND_GAIN, 0.0);
-            add(5, 0.0, SURROUND_GAIN);
-        }
-        ChannelLayout::SixPointOne => {
-            add(0, 1.0, 0.0);
-            add(1, 0.0, 1.0);
-            add(2, SURROUND_GAIN, SURROUND_GAIN);
-            // Channel 3 is LFE and is deliberately not mixed.
-            add(4, 0.5, 0.5);
-            add(5, SURROUND_GAIN, 0.0);
-            add(6, 0.0, SURROUND_GAIN);
-        }
-        ChannelLayout::SevenPointOne => {
-            add(0, 1.0, 0.0);
-            add(1, 0.0, 1.0);
-            add(2, SURROUND_GAIN, SURROUND_GAIN);
-            // Channel 3 is LFE and is deliberately not mixed.
-            add(4, SURROUND_GAIN, 0.0);
-            add(5, 0.0, SURROUND_GAIN);
-            add(6, SURROUND_GAIN, 0.0);
-            add(7, 0.0, SURROUND_GAIN);
-        }
-        other => {
-            return Err(format!("cannot safely downmix {other} layout to stereo"));
-        }
+    for (index, position) in positions.into_iter().enumerate() {
+        let (left_gain, right_gain) = position_downmix_gains(position).ok_or_else(|| {
+            format!(
+                "cannot safely downmix {} channel position",
+                position.label()
+            )
+        })?;
+        add(index, left_gain, right_gain);
     }
     Ok((left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0)))
+}
+
+/// Conservative ITU-style gains for a WAVE speaker position. LFE is omitted
+/// intentionally; height channels are projected to their nearest horizontal
+/// speaker pair rather than silently dropped.
+fn position_downmix_gains(position: ChannelPosition) -> Option<(f64, f64)> {
+    const SURROUND_GAIN: f64 = std::f64::consts::FRAC_1_SQRT_2;
+    Some(match position {
+        ChannelPosition::FrontLeft => (1.0, 0.0),
+        ChannelPosition::FrontRight => (0.0, 1.0),
+        ChannelPosition::FrontCenter => (SURROUND_GAIN, SURROUND_GAIN),
+        ChannelPosition::Lfe1 => (0.0, 0.0),
+        ChannelPosition::RearLeft | ChannelPosition::SideLeft => (SURROUND_GAIN, 0.0),
+        ChannelPosition::RearRight | ChannelPosition::SideRight => (0.0, SURROUND_GAIN),
+        ChannelPosition::RearCenter => (0.5, 0.5),
+        ChannelPosition::FrontLeftCenter => (0.75, 0.25),
+        ChannelPosition::FrontRightCenter => (0.25, 0.75),
+        ChannelPosition::TopCenter | ChannelPosition::TopRearCenter => (0.5, 0.5),
+        ChannelPosition::TopFrontLeft | ChannelPosition::TopRearLeft => (SURROUND_GAIN, 0.0),
+        ChannelPosition::TopFrontRight | ChannelPosition::TopRearRight => (0.0, SURROUND_GAIN),
+        ChannelPosition::TopFrontCenter => (SURROUND_GAIN, SURROUND_GAIN),
+    })
 }
 
 #[inline]
@@ -192,6 +190,7 @@ mod tests {
             channels: vec![vals.to_vec()],
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
+            channel_mask: None,
         }
     }
 
@@ -217,6 +216,7 @@ mod tests {
             channels: vec![vec![1.0], vec![0.0], vec![0.0], vec![1.0]],
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
+            channel_mask: None,
         };
         let pcm = planar_f64_to_interleaved_i16(
             &a,
@@ -238,7 +238,38 @@ mod tests {
             channels: vec![vec![0.0; 1]; 9],
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
+            channel_mask: None,
         };
         assert!(lossy_channel_layout(&a, DownmixMode::Preserve).is_err());
+    }
+
+    #[test]
+    fn side_surround_mask_is_downmixed_by_position() {
+        let mask = crate::channel_layout::ChannelMask::from_bits(
+            crate::channel_layout::ChannelMask::FRONT_LEFT
+                | crate::channel_layout::ChannelMask::FRONT_RIGHT
+                | crate::channel_layout::ChannelMask::FRONT_CENTER
+                | crate::channel_layout::ChannelMask::LFE1
+                | crate::channel_layout::ChannelMask::SIDE_LEFT
+                | crate::channel_layout::ChannelMask::SIDE_RIGHT,
+        )
+        .unwrap();
+        let a = Audio {
+            sample_rate: 44100,
+            channels: vec![
+                vec![0.0],
+                vec![0.0],
+                vec![0.0],
+                vec![0.0],
+                vec![1.0],
+                vec![1.0],
+            ],
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+            channel_mask: Some(mask),
+        };
+        let stereo = downmix_to_stereo(&a).unwrap();
+        assert!(stereo[0][0] > 0.0);
+        assert!(stereo[1][0] > 0.0);
     }
 }

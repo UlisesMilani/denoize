@@ -3,7 +3,7 @@
 use denoize::audio::{
     ensure_memory_limit, estimate_audio_working_set_bytes, estimate_file_memory_bytes,
     estimate_stream_memory_bytes, read_audio, read_wav_bytes, write_audio, write_wav_bytes,
-    WavStreamReader, WavStreamWriter,
+    write_wav_channel_mask, WavStreamReader, WavStreamWriter,
 };
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
@@ -626,6 +626,25 @@ fn print_report(input: &str, audio: &denoize::Audio, cfg: &DenoiserConfig, backe
         audio.sample_format,
     );
     println!("layout     : {}", audio.channel_layout());
+    if let Some(mask) = audio.channel_mask {
+        println!("mask       : {mask}");
+    }
+    if let Some(pan) = audio.pan_info() {
+        let positions = pan
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                format!(
+                    "ch{}={:.0}°/{:.0}°",
+                    index + 1,
+                    info.azimuth_degrees,
+                    info.elevation_degrees
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("pan        : {positions}");
+    }
     println!("backend    : {backend:?}");
     println!("algorithm  : {:?}", cfg.algorithm);
     println!(
@@ -917,6 +936,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     };
     let mut reader = WavStreamReader::open(input_path)?;
     let spec = reader.spec();
+    let channel_mask = reader.channel_mask();
     let cfg = build_config(&ov, spec.sample_rate);
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
     ensure_memory_limit(
@@ -958,6 +978,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         let tail = processor.finish()?;
         writer.write_block(&tail)?;
         writer.finalize()?;
+        write_wav_channel_mask(&temporary, spec.channels as usize, channel_mask)?;
         Ok(frames)
     })();
     let frames = match result {
@@ -1283,6 +1304,7 @@ mod batch_tests {
             channels: vec![vec![0.0; 3_200]],
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
         };
         denoize::write_audio(
             input.join("nested/sample.wav"),
@@ -1314,6 +1336,7 @@ mod batch_tests {
             channels: vec![vec![0.0; 1_600]],
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
         };
         denoize::write_audio(input.join("sample.wav"), &audio, EncodeOptions::default()).unwrap();
         let options = Overrides {

@@ -69,6 +69,7 @@ mod tests {
                 .collect()],
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
         };
         let path = std::env::temp_dir().join(format!("denoize-adts-{}.aac", std::process::id()));
         write_adts_aac(&path, &audio, 128_000).unwrap();

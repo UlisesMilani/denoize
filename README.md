@@ -70,7 +70,15 @@ when their channel count is recognized. MP3, M4A, and ADTS AAC encoders in the
 current release accept only mono/stereo; surround input is rejected instead of
 being mixed implicitly. Use `--downmix stereo` when a documented, explicit
 surround-to-stereo render is intended (LFE is not copied into the full-range
-stereo pair).
+stereo pair). WAVE_FORMAT_EXTENSIBLE speaker masks are read, preserved, and
+written for multichannel WAV files; `--report` also shows each channel's
+azimuth/elevation pan coordinate. A non-standard but valid mask is used for
+position-aware downmixing instead of being guessed from the channel count.
+
+Stereo processing can be selected with `--channels mid-side`. This uses a
+reversible, energy-preserving Mid/Side transform (`M=(L+R)/sqrt(2)`,
+`S=(L-R)/sqrt(2)`) and reconstructs the original channel order and speaker
+metadata after denoising.
 
 ```sh
 # MP3 / M4A input and output — no manual ffmpeg conversion

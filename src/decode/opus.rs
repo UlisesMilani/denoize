@@ -49,5 +49,6 @@ pub fn decode_ogg_opus(path: &Path) -> Result<DecodedPcm, String> {
     Ok(DecodedPcm {
         sample_rate: 48_000,
         channels: output,
+        channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(count).mask(),
     })
 }

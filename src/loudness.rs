@@ -97,6 +97,7 @@ mod tests {
             channels: vec![channel],
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
         };
         let report = normalize(&mut audio, -20.0, -1.0).unwrap();
         assert!((report.output_lufs + 20.0).abs() < 0.1);
