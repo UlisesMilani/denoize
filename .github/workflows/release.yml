@@ -23,21 +23,24 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Validate Cargo version
+      - name: Validate release provenance and versions
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          package_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
-          crate_version=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.crates-io.toml)
-          tag_version=${GITHUB_REF_NAME#v}
-          if [[ "$tag_version" != "$package_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $package_version" >&2
+          tag_commit=$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")
+          git fetch --no-tags origin \
+            "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor \
+            "$tag_commit" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+            echo "Tag $GITHUB_REF_NAME commit $tag_commit is not on origin/${DEFAULT_BRANCH}" >&2
             exit 1
           fi
-          if [[ "$tag_version" != "$crate_version" ]]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.crates-io.toml version $crate_version" >&2
-            exit 1
-          fi
+          echo "Tag $GITHUB_REF_NAME commit $tag_commit is on origin/${DEFAULT_BRANCH}"
+          bash scripts/verify-release-version.sh "$GITHUB_REF_NAME"
 
       - name: Run release tests
         run: cargo test --locked --all-targets --features full
@@ -258,7 +261,7 @@ jobs:
 
   publish-crate:
     name: Publish crates.io package
-    needs: build
+    needs: [build, desktop-build]
     runs-on: ubuntu-latest
     environment: crates-io
     steps:

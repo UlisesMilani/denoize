@@ -26,6 +26,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Verify synchronized release versions
+        run: bash scripts/verify-release-version.sh
+
       - name: Test all features
         run: cargo test --locked --all-targets --features full
 
@@ -33,7 +36,7 @@ jobs:
         run: bash scripts/publish-crates-io.sh --test
 
       - name: Check release scripts
-        run: bash -n scripts/generate-cli-docs.sh scripts/publish-crates-io.sh scripts/verify-release-assets.sh
+        run: bash -n scripts/generate-cli-docs.sh scripts/publish-crates-io.sh scripts/verify-release-assets.sh scripts/verify-release-version.sh
 
   cli-docs:
     name: CLI documentation
