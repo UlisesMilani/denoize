@@ -49,6 +49,8 @@ type LiveEvent = {
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
 let activeJob: number | null = null;
+let pendingJobKind: "file" | "batch" | null = null;
+let pendingJobEvents: JobProgress[] = [];
 let comparison: Comparison | null = null;
 let activeModelJob: number | null = null;
 const previews: { input?: PreviewData; output?: PreviewData } = {};
@@ -461,8 +463,7 @@ $("#start-process").addEventListener("click", async () => {
   try {
     const input = $<HTMLInputElement>("#input-path").value, output = $<HTMLInputElement>("#output-path").value;
     if (!input || !output) throw new Error("入力と出力を選択してください");
-    activeJob = await invoke<number>("start_process", { request: { input, output, options: options() } });
-    setJobUi(true, "process");
+    await beginJob("file", "start_process", { input, output, options: options() });
   } catch (error) { showToast(errorText(error), true); }
 });
 $("#cancel-process").addEventListener("click", () => cancelActive());
@@ -487,8 +488,7 @@ $("#start-batch").addEventListener("click", async () => {
   try {
     if ((!batchInputs.length && !batchInputDir) || !batchOutput) throw new Error("入力と出力フォルダを選択してください");
     batchStatuses.clear(); $("#batch-results").innerHTML = ""; $("#batch-results").classList.remove("hidden");
-    activeJob = await invoke<number>("start_batch", { request: { inputs: batchInputs, inputDir: batchInputDir || null, outputDir: batchOutput, outputFormat: $<HTMLSelectElement>("#batch-format").value, recursive: $<HTMLInputElement>("#batch-recursive").checked, jobs: Number($<HTMLInputElement>("#batch-jobs").value), resume: $<HTMLInputElement>("#batch-resume").checked, options: { ...options(), force: $<HTMLInputElement>("#batch-force").checked } } });
-    setJobUi(true, "batch");
+    await beginJob("batch", "start_batch", { inputs: batchInputs, inputDir: batchInputDir || null, outputDir: batchOutput, outputFormat: $<HTMLSelectElement>("#batch-format").value, recursive: $<HTMLInputElement>("#batch-recursive").checked, jobs: Number($<HTMLInputElement>("#batch-jobs").value), resume: $<HTMLInputElement>("#batch-resume").checked, options: { ...options(), force: $<HTMLInputElement>("#batch-force").checked } });
   } catch (error) { showToast(errorText(error), true); }
 });
 $("#cancel-batch").addEventListener("click", () => cancelActive());
@@ -661,15 +661,44 @@ listen<LiveEvent>("live-status", ({ payload }) => {
   }
 });
 
-listen<JobProgress>("job-progress", ({ payload }) => {
-  if (payload.jobId !== activeJob) return;
+const jobProgressReady = listen<JobProgress>("job-progress", ({ payload }) => {
+  if (payload.jobId === activeJob) {
+    handleJobProgress(payload);
+  } else if (payload.kind === pendingJobKind) {
+    pendingJobEvents.push(payload);
+  }
+});
+function handleJobProgress(payload: JobProgress) {
   if (payload.kind === "batch" && payload.item && payload.itemStatus) renderBatchResult(payload);
   updateProgress(payload);
   if (["completed", "failed", "cancelled"].includes(payload.status)) {
     if (payload.kind === "file" && payload.status === "completed" && payload.output) void preparePreview("output", payload.output);
     activeJob = null; setJobUi(false, payload.kind); showToast(payload.error ?? payload.message, payload.status === "failed");
   }
-});
+}
+async function beginJob(kind: "file" | "batch", command: "start_process" | "start_batch", request: unknown) {
+  await jobProgressReady;
+  if (activeJob !== null || pendingJobKind !== null) throw new Error("別の処理が実行中です");
+  pendingJobKind = kind;
+  pendingJobEvents = [];
+  setJobUi(true, kind);
+  setCancelEnabled(false, kind);
+  let jobId: number;
+  try {
+    jobId = await invoke<number>(command, { request });
+  } catch (error) {
+    pendingJobKind = null;
+    pendingJobEvents = [];
+    setJobUi(false, kind);
+    throw error;
+  }
+  activeJob = jobId;
+  setCancelEnabled(true, kind);
+  const buffered = pendingJobEvents.filter((event) => event.jobId === jobId);
+  pendingJobKind = null;
+  pendingJobEvents = [];
+  buffered.forEach(handleJobProgress);
+}
 function updateProgress(progress: JobProgress) {
   const percent = Math.round(progress.fraction * 100);
   $("#progress-percent").textContent = `${percent}%`; $("#progress-message").textContent = progress.message;
@@ -687,6 +716,9 @@ function setJobUi(running: boolean, kind: string) {
     $("#idle-state").classList.toggle("hidden", running); $("#job-state").classList.toggle("hidden", !running);
     $("#start-process").classList.toggle("hidden", running); $("#cancel-process").classList.toggle("hidden", !running);
   } else { $("#start-batch").classList.toggle("hidden", running); $("#cancel-batch").classList.toggle("hidden", !running); }
+}
+function setCancelEnabled(enabled: boolean, kind: "file" | "batch") {
+  $<HTMLButtonElement>(kind === "batch" ? "#cancel-batch" : "#cancel-process").disabled = !enabled;
 }
 async function cancelActive() { if (activeJob !== null) try { await invoke("cancel_job", { jobId: activeJob }); } catch (error) { showToast(errorText(error), true); } }
 function escapeHtml(value: string) { return value.replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]!); }
