@@ -507,6 +507,10 @@ dependency-free indicators in `[0, 1]` (lower is better), not perceptual
 listening-test replacements; phase distortion is reported only for stereo
 inputs.
 
+When a dB metric is undefined for a silent or otherwise degenerate reference,
+the report uses a finite `-120 dB` floor so JSON output remains valid and
+machine-readable.
+
 STOI is calculated natively for sufficiently long reference/test pairs and is
 reported in `[0, 1]` (higher is better). ViSQOL MOS-LQO is available in the
 pure-Rust build when the optional feature is enabled:
