@@ -1193,6 +1193,30 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     Ok(())
 }
 
+enum BatchFileOutcome {
+    Completed,
+    Skipped,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BatchCounts {
+    succeeded: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+fn count_batch_results<E>(results: &[Result<BatchFileOutcome, E>]) -> BatchCounts {
+    let mut counts = BatchCounts::default();
+    for result in results {
+        match result {
+            Ok(BatchFileOutcome::Completed) => counts.succeeded += 1,
+            Ok(BatchFileOutcome::Skipped) => counts.skipped += 1,
+            Err(_) => counts.failed += 1,
+        }
+    }
+    counts
+}
+
 fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     use rayon::prelude::*;
 
@@ -1251,9 +1275,8 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         None
     };
     let finished = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
     let started = Instant::now();
-    let process_file = |path: &std::path::PathBuf| {
+    let process_file = |path: &std::path::PathBuf| -> Result<BatchFileOutcome, String> {
         if CANCELLED.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
@@ -1264,9 +1287,8 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         }
         let state_key = relative.to_string_lossy().replace('\\', "/");
         if ov.resume && completed_paths.contains(&state_key) && destination.is_file() {
-            skipped.fetch_add(1, Ordering::Relaxed);
             report_batch_progress(&finished, files.len(), started, path, "skipped", ov);
-            return Ok::<_, String>((path.clone(), destination));
+            return Ok(BatchFileOutcome::Skipped);
         }
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)
@@ -1289,7 +1311,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
                 .map_err(|error| format!("flush resume state: {error}"))?;
         }
         report_batch_progress(&finished, files.len(), started, path, "completed", ov);
-        Ok::<_, String>((path.clone(), destination))
+        Ok(BatchFileOutcome::Completed)
     };
     let results = if ov.deterministic {
         files.iter().map(process_file).collect::<Vec<_>>()
@@ -1302,28 +1324,28 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     } else {
         files.par_iter().map(process_file).collect::<Vec<_>>()
     };
-    let succeeded = results.iter().filter(|result| result.is_ok()).count();
+    let counts = count_batch_results(&results);
     let failures: Vec<_> = results
         .iter()
         .filter_map(|result| result.as_ref().err())
         .collect();
+    debug_assert_eq!(counts.failed, failures.len());
     if ov.json {
         println!(
             "{}",
             batch_summary_json_line(
                 files.len(),
-                succeeded,
-                skipped.load(Ordering::Relaxed),
-                failures.len(),
+                counts.succeeded,
+                counts.skipped,
+                counts.failed,
                 CANCELLED.load(Ordering::SeqCst),
                 output,
             )
         );
     } else {
         eprintln!(
-            "denoize: batch complete: {succeeded} succeeded ({} skipped), {} failed",
-            skipped.load(Ordering::Relaxed),
-            failures.len()
+            "denoize: batch complete: {} succeeded ({} skipped), {} failed",
+            counts.succeeded, counts.skipped, counts.failed
         );
         for error in &failures {
             eprintln!("denoize: batch error: {error}");
@@ -1573,6 +1595,25 @@ mod batch_tests {
         assert_eq!(normalize_output_extension(".flac").unwrap(), "flac");
         assert_eq!(normalize_output_extension("aac").unwrap(), "aac");
         assert!(normalize_output_extension("wma").is_err());
+    }
+
+    #[test]
+    fn batch_counts_distinguish_completed_skipped_and_failed_results() {
+        let results = [
+            Ok(BatchFileOutcome::Completed),
+            Ok(BatchFileOutcome::Skipped),
+            Err("processing failed"),
+            Err("cancelled"),
+        ];
+
+        assert_eq!(
+            count_batch_results(&results),
+            BatchCounts {
+                succeeded: 1,
+                skipped: 1,
+                failed: 2,
+            }
+        );
     }
 
     #[test]
