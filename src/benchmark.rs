@@ -60,14 +60,15 @@ impl BenchmarkReport {
             let rs = side(reference, frames);
             let ts = side(test, frames);
             (
-                Some(si_sdr(&rs, &ts)),
+                Some(finite_db(si_sdr(&rs, &ts))),
                 Some(
                     (correlation(
                         &reference.channels[0][..frames],
                         &reference.channels[1][..frames],
                     ) - correlation(&test.channels[0][..frames], &test.channels[1][..frames]))
                     .abs(),
-                ),
+                )
+                .filter(|value| value.is_finite()),
             )
         } else {
             (None, None)
@@ -76,10 +77,10 @@ impl BenchmarkReport {
             frames,
             sample_rate: reference.sample_rate,
             channels: reference.channels.len(),
-            si_sdr_db: si_sdr(&r, &t),
-            si_snr_db: si_snr(&r, &t),
-            snr_db: snr(&r, &t),
-            segmental_snr_db: segmental_snr(&r, &t, reference.sample_rate),
+            si_sdr_db: finite_db(si_sdr(&r, &t)),
+            si_snr_db: finite_db(si_snr(&r, &t)),
+            snr_db: finite_db(snr(&r, &t)),
+            segmental_snr_db: finite_db(segmental_snr(&r, &t, reference.sample_rate)),
             stereo_side_sdr_db: side_sdr,
             correlation_error,
             artifact_scores,
@@ -92,7 +93,7 @@ impl BenchmarkReport {
     }
 
     pub fn json(&self) -> String {
-        format!("{{\"frames\":{},\"sample_rate\":{},\"channels\":{},\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"artifact_scores\":{},\"stoi\":{},\"pesq\":{},\"visqol\":{},\"elapsed_ms\":{},\"peak_rss_bytes\":{}}}", self.frames, self.sample_rate, self.channels, self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, optional(self.stereo_side_sdr_db), optional(self.correlation_error), self.artifact_scores.json(), optional(self.stoi), optional(self.pesq), optional(self.visqol), optional(self.elapsed_ms), self.peak_rss_bytes.map_or_else(|| "null".into(), |v| v.to_string()))
+        format!("{{\"frames\":{},\"sample_rate\":{},\"channels\":{},\"si_sdr_db\":{},\"si_snr_db\":{},\"snr_db\":{},\"segmental_snr_db\":{},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"artifact_scores\":{},\"stoi\":{},\"pesq\":{},\"visqol\":{},\"elapsed_ms\":{},\"peak_rss_bytes\":{}}}", self.frames, self.sample_rate, self.channels, json_number(self.si_sdr_db), json_number(self.si_snr_db), json_number(self.snr_db), json_number(self.segmental_snr_db), optional(self.stereo_side_sdr_db), optional(self.correlation_error), self.artifact_scores.json(), optional(self.stoi), optional(self.pesq), optional(self.visqol), optional(self.elapsed_ms), self.peak_rss_bytes.map_or_else(|| "null".into(), |v| v.to_string()))
     }
 
     pub fn markdown(&self) -> String {
@@ -137,10 +138,10 @@ impl ArtifactReport {
     /// Return the machine-readable representation used by benchmark reports.
     pub fn json(&self) -> String {
         format!(
-            "{{\"musical_noise_score\":{:.6},\"pumping_score\":{:.6},\"transient_loss_score\":{:.6},\"phase_distortion_score\":{}}}",
-            self.musical_noise_score,
-            self.pumping_score,
-            self.transient_loss_score,
+            "{{\"musical_noise_score\":{},\"pumping_score\":{},\"transient_loss_score\":{},\"phase_distortion_score\":{}}}",
+            json_number(self.musical_noise_score),
+            json_number(self.pumping_score),
+            json_number(self.transient_loss_score),
             optional(self.phase_distortion_score),
         )
     }
@@ -162,20 +163,20 @@ impl ComparisonReport {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"stoi\":{},\"pesq\":{},\"visqol\":{},\"musical_noise_score\":{:.6},\"pumping_score\":{:.6},\"transient_loss_score\":{:.6},\"phase_distortion_score\":{}}}}}",
+            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{},\"si_snr_db\":{},\"snr_db\":{},\"segmental_snr_db\":{},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"stoi\":{},\"pesq\":{},\"visqol\":{},\"musical_noise_score\":{},\"pumping_score\":{},\"transient_loss_score\":{},\"phase_distortion_score\":{}}}}}",
             self.noisy.json(), self.enhanced.json(),
-            self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
-            self.enhanced.si_snr_db - self.noisy.si_snr_db,
-            self.enhanced.snr_db - self.noisy.snr_db,
-            self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+            json_number(self.enhanced.si_sdr_db - self.noisy.si_sdr_db),
+            json_number(self.enhanced.si_snr_db - self.noisy.si_snr_db),
+            json_number(self.enhanced.snr_db - self.noisy.snr_db),
+            json_number(self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db),
             optional_difference(self.enhanced.stereo_side_sdr_db, self.noisy.stereo_side_sdr_db),
             optional_difference(self.noisy.correlation_error, self.enhanced.correlation_error),
             optional_difference(self.enhanced.stoi, self.noisy.stoi),
             optional_difference(self.enhanced.pesq, self.noisy.pesq),
             optional_difference(self.enhanced.visqol, self.noisy.visqol),
-            self.noisy.artifact_scores.musical_noise_score - self.enhanced.artifact_scores.musical_noise_score,
-            self.noisy.artifact_scores.pumping_score - self.enhanced.artifact_scores.pumping_score,
-            self.noisy.artifact_scores.transient_loss_score - self.enhanced.artifact_scores.transient_loss_score,
+            json_number(self.noisy.artifact_scores.musical_noise_score - self.enhanced.artifact_scores.musical_noise_score),
+            json_number(self.noisy.artifact_scores.pumping_score - self.enhanced.artifact_scores.pumping_score),
+            json_number(self.noisy.artifact_scores.transient_loss_score - self.enhanced.artifact_scores.transient_loss_score),
             optional_difference(self.noisy.artifact_scores.phase_distortion_score, self.enhanced.artifact_scores.phase_distortion_score),
         )
     }
@@ -223,14 +224,32 @@ impl ComparisonReport {
     }
 }
 
+fn json_number(value: f64) -> String {
+    if value.is_finite() {
+        format!("{value:.6}")
+    } else {
+        "null".into()
+    }
+}
+
+fn finite_db(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        -120.0
+    }
+}
+
 fn optional(v: Option<f64>) -> String {
-    v.map_or_else(|| "null".into(), |v| format!("{v:.6}"))
+    v.map_or_else(|| "null".into(), json_number)
 }
 fn display(v: Option<f64>, precision: usize) -> String {
-    v.map_or_else(|| "n/a".into(), |v| format!("{v:.precision$}"))
+    v.filter(|value| value.is_finite())
+        .map_or_else(|| "n/a".into(), |v| format!("{v:.precision$}"))
 }
 fn db(v: Option<f64>) -> String {
-    v.map_or_else(|| "n/a".into(), |v| format!("{v:.3} dB"))
+    v.filter(|value| value.is_finite())
+        .map_or_else(|| "n/a".into(), |v| format!("{v:.3} dB"))
 }
 
 fn optional_difference(a: Option<f64>, b: Option<f64>) -> String {
@@ -239,7 +258,10 @@ fn optional_difference(a: Option<f64>, b: Option<f64>) -> String {
 
 fn optional_difference_value(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(a - b),
+        (Some(a), Some(b)) if a.is_finite() && b.is_finite() => {
+            let difference = a - b;
+            difference.is_finite().then_some(difference)
+        }
         _ => None,
     }
 }
@@ -656,6 +678,22 @@ mod tests {
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("Transient-loss score"));
         assert!(html.contains("Phase-distortion score"));
+    }
+
+    #[test]
+    fn silent_comparison_metrics_stay_finite_and_json_safe() {
+        let audio = mono(vec![0.0; 1600]);
+        let report = ComparisonReport::compare(&audio, &audio, &audio).unwrap();
+        for metrics in [&report.noisy, &report.enhanced] {
+            assert!(metrics.si_sdr_db.is_finite());
+            assert!(metrics.si_snr_db.is_finite());
+            assert!(metrics.snr_db.is_finite());
+            assert!(metrics.segmental_snr_db.is_finite());
+        }
+        let json = report.json();
+        assert!(!json.contains("NaN"));
+        assert!(!json.contains("inf"));
+        assert!(json.contains("\"si_sdr_db\":-120.000000"));
     }
 
     fn mono(samples: Vec<f64>) -> Audio {
