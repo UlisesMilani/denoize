@@ -1018,6 +1018,7 @@ dependencies = [
  "rubato 0.16.2",
  "rustfft",
  "serde",
+ "serde_json",
  "sha2",
  "shine-rs",
  "symphonia",
