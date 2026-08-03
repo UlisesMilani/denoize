@@ -499,6 +499,11 @@ denoize compare clean.wav noisy.wav enhanced.wav --html > report.html
 denoize metrics clean.wav enhanced.wav --json | jq '.artifact_scores'
 ```
 
+Quality metrics require sample-aligned PCM. Every input must have a non-zero
+matching sample rate, the same channel count and frame count, and equal-length
+channels within each file. Denoize rejects truncated or ragged inputs instead
+of silently scoring only their common prefix.
+
 The report shows noisy and enhanced SI-SDR, SI-SNR, SNR, segmental SNR, stereo
 side SDR, inter-channel correlation error, STOI, PESQ, ViSQOL, and improvement
 deltas. It also screens for musical noise, pumping, transient loss, and stereo
