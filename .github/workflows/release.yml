@@ -185,10 +185,10 @@ jobs:
             bundles: deb,appimage
           - os: macos-15-intel
             target: x86_64-apple-darwin
-            bundles: dmg
+            bundles: app,dmg
           - os: macos-14
             target: aarch64-apple-darwin
-            bundles: dmg
+            bundles: app,dmg
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: msi,nsis
@@ -230,6 +230,7 @@ jobs:
           prerelease: false
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
+          retryAttempts: 3
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
   publish:
