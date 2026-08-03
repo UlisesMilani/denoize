@@ -51,7 +51,7 @@ pub struct BenchmarkReport {
 impl BenchmarkReport {
     pub fn compare(reference: &Audio, test: &Audio) -> Result<Self, String> {
         validate_pair(reference, test)?;
-        let frames = reference.frames().min(test.frames());
+        let frames = reference.frames();
         let r = downmix(reference, frames);
         let t = downmix(test, frames);
         let artifact_scores = ArtifactReport::compare(reference, test)?;
@@ -106,7 +106,7 @@ impl ArtifactReport {
     /// screening indicators.
     pub fn compare(reference: &Audio, test: &Audio) -> Result<Self, String> {
         validate_pair(reference, test)?;
-        let frames = reference.frames().min(test.frames());
+        let frames = reference.frames();
         let ref_mix = downmix(reference, frames);
         let test_mix = downmix(test, frames);
         let observations = collect_artifact_observations(reference, test, &ref_mix, &test_mix);
@@ -155,6 +155,8 @@ pub struct ComparisonReport {
 
 impl ComparisonReport {
     pub fn compare(clean: &Audio, noisy: &Audio, enhanced: &Audio) -> Result<Self, String> {
+        validate_pair(clean, noisy).map_err(|error| format!("noisy comparison: {error}"))?;
+        validate_pair(clean, enhanced).map_err(|error| format!("enhanced comparison: {error}"))?;
         Ok(Self {
             noisy: BenchmarkReport::compare(clean, noisy)?,
             enhanced: BenchmarkReport::compare(clean, enhanced)?,
@@ -267,16 +269,53 @@ fn optional_difference_value(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 }
 
 fn validate_pair(reference: &Audio, test: &Audio) -> Result<(), String> {
+    let reference_frames = validate_audio_shape(reference, "reference")?;
+    let test_frames = validate_audio_shape(test, "test")?;
     if reference.sample_rate != test.sample_rate {
-        return Err("benchmark sample rates differ".into());
+        return Err(format!(
+            "benchmark sample rates differ: reference is {} Hz, test is {} Hz",
+            reference.sample_rate, test.sample_rate
+        ));
     }
-    if reference.channels.len() != test.channels.len() || reference.channels.is_empty() {
-        return Err("benchmark channel counts differ or are empty".into());
+    if reference.channels.len() != test.channels.len() {
+        return Err(format!(
+            "benchmark channel counts differ: reference has {}, test has {}",
+            reference.channels.len(),
+            test.channels.len()
+        ));
     }
-    if reference.frames().min(test.frames()) == 0 {
-        return Err("benchmark inputs are empty".into());
+    if reference_frames != test_frames {
+        return Err(format!(
+            "benchmark frame counts differ: reference has {reference_frames}, test has {test_frames}"
+        ));
     }
     Ok(())
+}
+
+fn validate_audio_shape(audio: &Audio, name: &str) -> Result<usize, String> {
+    if audio.sample_rate == 0 {
+        return Err(format!("benchmark {name} sample rate is zero"));
+    }
+    let Some(first) = audio.channels.first() else {
+        return Err(format!("benchmark {name} has no channels"));
+    };
+    let frames = first.len();
+    if let Some((channel, actual)) = audio
+        .channels
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(channel, samples)| (channel, samples.len()))
+        .find(|(_, actual)| *actual != frames)
+    {
+        return Err(format!(
+            "benchmark {name} channels have inconsistent frame counts: channel 0 has {frames}, channel {channel} has {actual}"
+        ));
+    }
+    if frames == 0 {
+        return Err(format!("benchmark {name} has no frames"));
+    }
+    Ok(frames)
 }
 
 #[derive(Default)]
@@ -694,6 +733,112 @@ mod tests {
         assert!(!json.contains("NaN"));
         assert!(!json.contains("inf"));
         assert!(json.contains("\"si_sdr_db\":-120.000000"));
+    }
+
+    #[test]
+    fn rejects_truncated_benchmark_input() {
+        let reference = mono(vec![0.0; 1600]);
+        let test = mono(vec![0.0; 800]);
+        let error = BenchmarkReport::compare(&reference, &test).unwrap_err();
+        assert_eq!(
+            error,
+            "benchmark frame counts differ: reference has 1600, test has 800"
+        );
+        let artifact_error = ArtifactReport::compare(&reference, &test).unwrap_err();
+        assert_eq!(artifact_error, error);
+    }
+
+    #[test]
+    fn comparison_identifies_truncated_noisy_and_enhanced_inputs() {
+        let clean = mono(vec![0.0; 1600]);
+        let truncated = mono(vec![0.0; 800]);
+
+        let noisy_error = ComparisonReport::compare(&clean, &truncated, &clean).unwrap_err();
+        assert_eq!(
+            noisy_error,
+            "noisy comparison: benchmark frame counts differ: reference has 1600, test has 800"
+        );
+
+        let enhanced_error = ComparisonReport::compare(&clean, &clean, &truncated).unwrap_err();
+        assert_eq!(
+            enhanced_error,
+            "enhanced comparison: benchmark frame counts differ: reference has 1600, test has 800"
+        );
+    }
+
+    #[test]
+    fn rejects_ragged_channels_without_panicking() {
+        let reference = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1600], vec![0.0; 800]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let test = stereo(vec![0.0; 1600], vec![0.0; 1600]);
+        let error = BenchmarkReport::compare(&reference, &test).unwrap_err();
+        assert_eq!(
+            error,
+            "benchmark reference channels have inconsistent frame counts: channel 0 has 1600, channel 1 has 800"
+        );
+
+        let valid = stereo(vec![0.0; 1600], vec![0.0; 1600]);
+        let ragged_test = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1600], vec![0.0; 800]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let error = BenchmarkReport::compare(&valid, &ragged_test).unwrap_err();
+        assert_eq!(
+            error,
+            "benchmark test channels have inconsistent frame counts: channel 0 has 1600, channel 1 has 800"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_sample_rate() {
+        let mut reference = mono(vec![0.0; 1600]);
+        reference.sample_rate = 0;
+        let test = mono(vec![0.0; 1600]);
+        let error = BenchmarkReport::compare(&reference, &test).unwrap_err();
+        assert_eq!(error, "benchmark reference sample rate is zero");
+    }
+
+    #[test]
+    fn rejects_empty_or_mismatched_benchmark_shapes() {
+        let valid = mono(vec![0.0; 1600]);
+        let no_channels = Audio {
+            sample_rate: 16_000,
+            channels: Vec::new(),
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        assert_eq!(
+            BenchmarkReport::compare(&no_channels, &valid).unwrap_err(),
+            "benchmark reference has no channels"
+        );
+
+        let no_frames = mono(Vec::new());
+        assert_eq!(
+            BenchmarkReport::compare(&valid, &no_frames).unwrap_err(),
+            "benchmark test has no frames"
+        );
+
+        let mut different_rate = valid.clone();
+        different_rate.sample_rate = 48_000;
+        assert_eq!(
+            BenchmarkReport::compare(&valid, &different_rate).unwrap_err(),
+            "benchmark sample rates differ: reference is 16000 Hz, test is 48000 Hz"
+        );
+
+        let stereo_test = stereo(vec![0.0; 1600], vec![0.0; 1600]);
+        assert_eq!(
+            BenchmarkReport::compare(&valid, &stereo_test).unwrap_err(),
+            "benchmark channel counts differ: reference has 1, test has 2"
+        );
     }
 
     fn mono(samples: Vec<f64>) -> Audio {
