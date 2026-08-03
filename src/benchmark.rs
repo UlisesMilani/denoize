@@ -162,13 +162,16 @@ impl ComparisonReport {
 
     pub fn json(&self) -> String {
         format!(
-            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stoi\":{},\"visqol\":{},\"musical_noise_score\":{:.6},\"pumping_score\":{:.6},\"transient_loss_score\":{:.6},\"phase_distortion_score\":{}}}}}",
+            "{{\"noisy\":{},\"enhanced\":{},\"improvement\":{{\"si_sdr_db\":{:.6},\"si_snr_db\":{:.6},\"snr_db\":{:.6},\"segmental_snr_db\":{:.6},\"stereo_side_sdr_db\":{},\"correlation_error\":{},\"stoi\":{},\"pesq\":{},\"visqol\":{},\"musical_noise_score\":{:.6},\"pumping_score\":{:.6},\"transient_loss_score\":{:.6},\"phase_distortion_score\":{}}}}}",
             self.noisy.json(), self.enhanced.json(),
             self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
             self.enhanced.si_snr_db - self.noisy.si_snr_db,
             self.enhanced.snr_db - self.noisy.snr_db,
             self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+            optional_difference(self.enhanced.stereo_side_sdr_db, self.noisy.stereo_side_sdr_db),
+            optional_difference(self.noisy.correlation_error, self.enhanced.correlation_error),
             optional_difference(self.enhanced.stoi, self.noisy.stoi),
+            optional_difference(self.enhanced.pesq, self.noisy.pesq),
             optional_difference(self.enhanced.visqol, self.noisy.visqol),
             self.noisy.artifact_scores.musical_noise_score - self.enhanced.artifact_scores.musical_noise_score,
             self.noisy.artifact_scores.pumping_score - self.enhanced.artifact_scores.pumping_score,
@@ -179,12 +182,15 @@ impl ComparisonReport {
 
     pub fn markdown(&self) -> String {
         format!(
-            "| Metric | Noisy | Enhanced | Improvement |\n|---|---:|---:|---:|\n| SI-SDR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SI-SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Segmental SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| STOI (higher is better) | {} | {} | {} |\n| ViSQOL MOS-LQO (higher is better) | {} | {} | {} |\n| Musical-noise score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Pumping score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Transient-loss score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Phase-distortion score (lower is better) | {} | {} | {} |\n\nArtifact scores are deterministic screening indicators in [0, 1], not perceptual listening-test scores. STOI is implemented natively. ViSQOL is measured when the `visqol` feature is enabled. PESQ remains unavailable because its ITU-T reference implementation requires a separately licensed external adapter.",
+            "| Metric | Noisy | Enhanced | Improvement |\n|---|---:|---:|---:|\n| SI-SDR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SI-SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Segmental SNR | {:.3} dB | {:.3} dB | {:+.3} dB |\n| Stereo side SDR (higher is better) | {} | {} | {} |\n| Correlation error (lower is better) | {} | {} | {} |\n| STOI (higher is better) | {} | {} | {} |\n| PESQ (higher is better; licensed adapter) | {} | {} | {} |\n| ViSQOL MOS-LQO (higher is better) | {} | {} | {} |\n| Musical-noise score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Pumping score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Transient-loss score (lower is better) | {:.3} | {:.3} | {:+.3} |\n| Phase-distortion score (lower is better) | {} | {} | {} |\n\nArtifact scores are deterministic screening indicators in [0, 1], not perceptual listening-test scores. STOI is implemented natively. ViSQOL is measured when the `visqol` feature is enabled. PESQ remains unavailable because its ITU-T reference implementation requires a separately licensed external adapter.",
             self.noisy.si_sdr_db, self.enhanced.si_sdr_db, self.enhanced.si_sdr_db - self.noisy.si_sdr_db,
             self.noisy.si_snr_db, self.enhanced.si_snr_db, self.enhanced.si_snr_db - self.noisy.si_snr_db,
             self.noisy.snr_db, self.enhanced.snr_db, self.enhanced.snr_db - self.noisy.snr_db,
             self.noisy.segmental_snr_db, self.enhanced.segmental_snr_db, self.enhanced.segmental_snr_db - self.noisy.segmental_snr_db,
+            db(self.noisy.stereo_side_sdr_db), db(self.enhanced.stereo_side_sdr_db), db(optional_difference_value(self.enhanced.stereo_side_sdr_db, self.noisy.stereo_side_sdr_db)),
+            display(self.noisy.correlation_error, 6), display(self.enhanced.correlation_error, 6), display(optional_difference_value(self.noisy.correlation_error, self.enhanced.correlation_error), 6),
             display(self.noisy.stoi, 4), display(self.enhanced.stoi, 4), display(optional_difference_value(self.enhanced.stoi, self.noisy.stoi), 4),
+            display(self.noisy.pesq, 3), display(self.enhanced.pesq, 3), display(optional_difference_value(self.enhanced.pesq, self.noisy.pesq), 3),
             display(self.noisy.visqol, 3), display(self.enhanced.visqol, 3), display(optional_difference_value(self.enhanced.visqol, self.noisy.visqol), 3),
             self.noisy.artifact_scores.musical_noise_score, self.enhanced.artifact_scores.musical_noise_score, self.noisy.artifact_scores.musical_noise_score - self.enhanced.artifact_scores.musical_noise_score,
             self.noisy.artifact_scores.pumping_score, self.enhanced.artifact_scores.pumping_score, self.noisy.artifact_scores.pumping_score - self.enhanced.artifact_scores.pumping_score,
@@ -635,9 +641,15 @@ mod tests {
         assert!(report.json().contains("\"improvement\""));
         assert!(report.json().contains("\"artifact_scores\""));
         assert!(report.json().contains("\"stoi\""));
+        assert!(report.json().contains("\"pesq\""));
+        assert!(report.json().contains("\"stereo_side_sdr_db\""));
+        assert!(report.json().contains("\"correlation_error\""));
         assert!(report.json().contains("\"visqol\""));
         assert!(report.markdown().contains("Segmental SNR"));
+        assert!(report.markdown().contains("Stereo side SDR"));
+        assert!(report.markdown().contains("Correlation error"));
         assert!(report.markdown().contains("STOI"));
+        assert!(report.markdown().contains("PESQ"));
         assert!(report.markdown().contains("ViSQOL"));
         assert!(report.markdown().contains("Musical-noise score"));
         let html = report.html();

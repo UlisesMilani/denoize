@@ -499,9 +499,10 @@ denoize compare clean.wav noisy.wav enhanced.wav --html > report.html
 denoize metrics clean.wav enhanced.wav --json | jq '.artifact_scores'
 ```
 
-The report shows noisy and enhanced SI-SDR, SI-SNR, SNR, segmental SNR, and
-improvement deltas. It also screens for musical noise, pumping, transient loss,
-and stereo phase distortion. These artifact scores are deterministic
+The report shows noisy and enhanced SI-SDR, SI-SNR, SNR, segmental SNR, stereo
+side SDR, inter-channel correlation error, STOI, PESQ, ViSQOL, and improvement
+deltas. It also screens for musical noise, pumping, transient loss, and stereo
+phase distortion. These artifact scores are deterministic
 dependency-free indicators in `[0, 1]` (lower is better), not perceptual
 listening-test replacements; phase distortion is reported only for stereo
 inputs.
