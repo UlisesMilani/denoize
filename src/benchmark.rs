@@ -198,7 +198,11 @@ impl ComparisonReport {
             .markdown()
             .lines()
             .skip(2)
-            .take(8)
+            // Keep the HTML export in lockstep with every metric row in the
+            // Markdown report.  A fixed row count silently dropped the
+            // transient-loss and phase-distortion metrics when they were
+            // added to the comparison report.
+            .take_while(|line| !line.is_empty())
             .map(|line| {
                 let cells = line
                     .trim_matches('|')
@@ -636,7 +640,10 @@ mod tests {
         assert!(report.markdown().contains("STOI"));
         assert!(report.markdown().contains("ViSQOL"));
         assert!(report.markdown().contains("Musical-noise score"));
-        assert!(report.html().starts_with("<!doctype html>"));
+        let html = report.html();
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("Transient-loss score"));
+        assert!(html.contains("Phase-distortion score"));
     }
 
     fn mono(samples: Vec<f64>) -> Audio {
