@@ -361,23 +361,26 @@ this repository with its primary `Cargo.toml`.
 
 ### Publishing a release
 
-1. Set the same version in `Cargo.toml` and `Cargo.crates-io.toml`, then update
-   `Cargo.lock`.
-2. Commit and push the version change.
-3. Create and push a matching tag:
+1. Synchronize the root/crates.io manifests and lockfile, the desktop npm and
+   Tauri manifests/configuration and lockfiles, and the generated CLI banner.
+2. Run `bash scripts/verify-release-version.sh` to check all 11 version fields.
+3. Commit and push the version change.
+4. Create the tag from a commit on the default branch and push it:
 
 ```sh
 git tag -a v0.1.0 -m "denoize v0.1.0"
 git push origin v0.1.0
 ```
 
-The `GitHub Release` workflow validates that the tag matches `Cargo.toml`, runs
-the full test suite, builds all supported platforms, attaches archives and
-checksums, signs desktop updater artifacts, and publishes generated release
-notes. Installed desktop apps check the signed `latest.json` feed on startup;
-updates are only installed after user confirmation. The updater private key is
-kept in the `TAURI_SIGNING_PRIVATE_KEY` repository secret. A failed build leaves
-the release as a draft so it cannot expose an incomplete asset set.
+The `GitHub Release` workflow verifies that the tag is on the default branch and
+matches every release version field, runs the full test suite, and builds all
+CLI and desktop targets before publishing the crates.io package. It then checks
+all archives, checksums, signatures, and updater metadata before publishing the
+draft release and generated notes. Installed desktop apps check the signed
+`latest.json` feed on startup; updates are only installed after user
+confirmation. The updater private key is kept in the
+`TAURI_SIGNING_PRIVATE_KEY` repository secret. A failed build leaves the release
+as a draft and cannot publish the crate before every target has built.
 
 ## CLI highlights
 
