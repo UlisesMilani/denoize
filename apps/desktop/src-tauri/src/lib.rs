@@ -460,31 +460,37 @@ fn start_batch(
             };
             let result = validate_request(&process_request.input, &process_request.output, &process_request.options)
                 .and_then(|_| process_file(&process_request, &cancelled, |_, _| {}));
-            let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
             match result {
                 Ok(_) => {
                     succeeded.fetch_add(1, Ordering::Relaxed);
                     if let Some(file) = &state_file {
                         if let Ok(mut file) = file.lock() { let _ = writeln!(file, "{}", batch_item.state_key); }
                     }
+                    let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
                     emit_batch_item(&app, job_id, "completed", batch_item, current, total, started, None);
                 }
                 Err(error) if error == "cancelled" => {}
                 Err(error) => {
                     if let Ok(mut list) = failures.lock() { list.push(format!("{}: {error}", batch_item.input.display())); }
+                    let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
                     emit_batch_item(&app, job_id, "failed", batch_item, current, total, started, Some(error));
                 }
             }
         };
-        if request.options.deterministic {
+        let pool_error = if request.options.deterministic {
             items.iter().for_each(process_item);
+            None
         } else {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(request.jobs).build();
             match pool {
-                Ok(pool) => pool.install(|| items.par_iter().for_each(process_item)),
-                Err(error) => failures.lock().unwrap().push(error.to_string()),
+                Ok(pool) => {
+                    pool.install(|| items.par_iter().for_each(process_item));
+                    None
+                }
+                Err(error) => Some(error.to_string()),
             }
-        }
+        };
+        let current = finished.load(Ordering::SeqCst);
         if cancelled.load(Ordering::SeqCst) {
             emit_progress(
                 &app,
@@ -492,27 +498,45 @@ fn start_batch(
                 "batch",
                 "cancelled",
                 "バッチをキャンセルしました",
-                0,
+                current,
                 total,
                 started,
                 None,
                 None,
             );
-        } else {
-            let failure_count = failures.lock().map(|list| list.len()).unwrap_or(0);
-            let success_count = succeeded.load(Ordering::Relaxed);
-            let skipped_count = skipped.load(Ordering::Relaxed);
+        } else if let Some(error) = pool_error {
             emit_progress(
                 &app,
                 job_id,
                 "batch",
-                "completed",
-                &format!("完了 {success_count} · スキップ {skipped_count} · 失敗 {failure_count}"),
+                "failed",
+                "バッチを開始できませんでした",
+                current,
                 total,
+                started,
+                Some(request.output_dir.clone()),
+                Some(format!("並列処理を開始できませんでした: {error}")),
+            );
+        } else {
+            let failure_count = failures.lock().map(|list| list.len()).unwrap_or(0);
+            let success_count = succeeded.load(Ordering::Relaxed);
+            let skipped_count = skipped.load(Ordering::Relaxed);
+            let BatchTerminalOutcome {
+                status,
+                message,
+                error,
+            } = batch_terminal_outcome(success_count, skipped_count, failure_count);
+            emit_progress(
+                &app,
+                job_id,
+                "batch",
+                status,
+                &message,
+                current,
                 total,
                 started,
                 Some(request.output_dir),
-                None,
+                error,
             );
         }
         if let Ok(mut jobs) = jobs.lock() {
@@ -520,6 +544,37 @@ fn start_batch(
         }
     });
     Ok(job_id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BatchTerminalOutcome {
+    status: &'static str,
+    message: String,
+    error: Option<String>,
+}
+
+fn batch_terminal_outcome(
+    success_count: usize,
+    skipped_count: usize,
+    failure_count: usize,
+) -> BatchTerminalOutcome {
+    let message =
+        format!("完了 {success_count} · スキップ {skipped_count} · 失敗 {failure_count}");
+    if failure_count == 0 {
+        BatchTerminalOutcome {
+            status: "completed",
+            message,
+            error: None,
+        }
+    } else {
+        BatchTerminalOutcome {
+            status: "failed",
+            message,
+            error: Some(format!(
+                "{failure_count}件のファイルを処理できませんでした"
+            )),
+        }
+    }
 }
 
 fn collect_batch_items(request: &BatchRequest, extension: &str) -> Result<Vec<BatchItem>, String> {
@@ -1272,6 +1327,36 @@ mod tests {
             NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
         ));
         assert!(read_batch_state(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn successful_batch_has_completed_terminal_outcome() {
+        let outcome = batch_terminal_outcome(3, 1, 0);
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.message, "完了 3 · スキップ 1 · 失敗 0");
+        assert_eq!(outcome.error, None);
+    }
+
+    #[test]
+    fn mixed_batch_has_failed_terminal_outcome() {
+        let outcome = batch_terminal_outcome(2, 1, 1);
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.message, "完了 2 · スキップ 1 · 失敗 1");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("1件のファイルを処理できませんでした")
+        );
+    }
+
+    #[test]
+    fn all_failed_batch_has_failed_terminal_outcome() {
+        let outcome = batch_terminal_outcome(0, 0, 3);
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.message, "完了 0 · スキップ 0 · 失敗 3");
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("3件のファイルを処理できませんでした")
+        );
     }
 
     #[test]
