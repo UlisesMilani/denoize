@@ -53,6 +53,7 @@ pub mod quality;
 pub mod resample;
 pub mod service;
 pub mod stft;
+mod stoi_resample;
 pub mod stream;
 pub mod vad;
 pub mod window;

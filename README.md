@@ -517,7 +517,7 @@ the report uses a finite `-120 dB` floor so JSON output remains valid and
 machine-readable.
 
 STOI is calculated natively for sufficiently long reference/test pairs and is
-reported in `[0, 1]` (higher is better). ViSQOL MOS-LQO is available in the
+reported in `[-1, 1]` (higher is better). ViSQOL MOS-LQO is available in the
 pure-Rust build when the optional feature is enabled:
 
 ```sh
