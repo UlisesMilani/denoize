@@ -11,7 +11,7 @@ use denoize::{
     AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode, DownmixMode, EncodeOptions,
     OnnxModelConfig, SgmseProfile, StreamingDenoiser, WindowType,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -20,6 +20,133 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_BLOCK_FRAMES: usize = 8192;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+#[derive(Serialize)]
+struct ProcessResultJson<'a> {
+    input: &'a str,
+    output: &'a str,
+    backend: &'a str,
+    channels: usize,
+    frames: usize,
+    sample_rate: u32,
+    elapsed_ms: f64,
+}
+
+#[derive(Serialize)]
+struct StreamResultJson<'a> {
+    input: &'a str,
+    output: &'a str,
+    backend: &'static str,
+    channels: u16,
+    frames: usize,
+    sample_rate: u32,
+    stream: bool,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+enum BatchJson<'a> {
+    Progress {
+        status: &'a str,
+        completed: usize,
+        total: usize,
+        elapsed_seconds: f64,
+        eta_seconds: f64,
+        input: &'a str,
+    },
+    Summary {
+        total: usize,
+        succeeded: usize,
+        skipped: usize,
+        failed: usize,
+        cancelled: bool,
+        output: &'a str,
+    },
+}
+
+fn serialize_json_line<T: Serialize + ?Sized>(payload: &T) -> String {
+    serde_json::to_string(payload).expect("fixed CLI JSON payload must serialize")
+}
+
+fn round_to_three_decimals(value: f64) -> f64 {
+    format!("{value:.3}")
+        .parse()
+        .expect("formatted JSON number must parse")
+}
+
+fn process_result_json_line(
+    input: &str,
+    output: &str,
+    backend: &str,
+    channels: usize,
+    frames: usize,
+    sample_rate: u32,
+    elapsed_ms: f64,
+) -> String {
+    serialize_json_line(&ProcessResultJson {
+        input,
+        output,
+        backend,
+        channels,
+        frames,
+        sample_rate,
+        elapsed_ms: round_to_three_decimals(elapsed_ms),
+    })
+}
+
+fn stream_result_json_line(
+    input: &str,
+    output: &str,
+    channels: u16,
+    frames: usize,
+    sample_rate: u32,
+) -> String {
+    serialize_json_line(&StreamResultJson {
+        input,
+        output,
+        backend: "classical",
+        channels,
+        frames,
+        sample_rate,
+        stream: true,
+    })
+}
+
+fn batch_progress_json_line(
+    status: &str,
+    completed: usize,
+    total: usize,
+    elapsed_seconds: f64,
+    eta_seconds: f64,
+    input: &str,
+) -> String {
+    serialize_json_line(&BatchJson::Progress {
+        status,
+        completed,
+        total,
+        elapsed_seconds: round_to_three_decimals(elapsed_seconds),
+        eta_seconds: round_to_three_decimals(eta_seconds),
+        input,
+    })
+}
+
+fn batch_summary_json_line(
+    total: usize,
+    succeeded: usize,
+    skipped: usize,
+    failed: usize,
+    cancelled: bool,
+    output: &str,
+) -> String {
+    serialize_json_line(&BatchJson::Summary {
+        total,
+        succeeded,
+        skipped,
+        failed,
+        cancelled,
+        output,
+    })
+}
 
 fn install_cancel_handler() -> Result<(), String> {
     CANCEL_HANDLER
@@ -931,7 +1058,18 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
             denoize::metadata::write_extended(metadata, output_path)?;
         }
         if ov.json {
-            println!("{{\"input\":{:?},\"output\":{:?},\"backend\":{:?},\"channels\":{},\"frames\":{},\"sample_rate\":{},\"elapsed_ms\":{:.3}}}", input, output, service::backend_name(result.backend), audio.channels(), audio.frames(), audio.sample_rate, result.elapsed.as_secs_f64() * 1000.0);
+            println!(
+                "{}",
+                process_result_json_line(
+                    input,
+                    output,
+                    service::backend_name(result.backend),
+                    audio.channels(),
+                    audio.frames(),
+                    audio.sample_rate,
+                    result.elapsed.as_secs_f64() * 1_000.0,
+                )
+            );
         }
     }
     Ok(())
@@ -1043,8 +1181,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     }
     if ov.json {
         println!(
-            "{{\"input\":{:?},\"output\":{:?},\"backend\":\"classical\",\"channels\":{},\"frames\":{},\"sample_rate\":{},\"stream\":true}}",
-            input, output, spec.channels, frames, spec.sample_rate
+            "{}",
+            stream_result_json_line(input, output, spec.channels, frames, spec.sample_rate)
         );
     } else {
         eprintln!(
@@ -1171,13 +1309,15 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         .collect();
     if ov.json {
         println!(
-            "{{\"event\":\"summary\",\"total\":{},\"succeeded\":{},\"skipped\":{},\"failed\":{},\"cancelled\":{},\"output\":{:?}}}",
-            files.len(),
-            succeeded,
-            skipped.load(Ordering::Relaxed),
-            failures.len(),
-            CANCELLED.load(Ordering::SeqCst),
-            output
+            "{}",
+            batch_summary_json_line(
+                files.len(),
+                succeeded,
+                skipped.load(Ordering::Relaxed),
+                failures.len(),
+                CANCELLED.load(Ordering::SeqCst),
+                output,
+            )
         );
     } else {
         eprintln!(
@@ -1224,9 +1364,10 @@ fn report_batch_progress(
         elapsed / count as f64 * total.saturating_sub(count) as f64
     };
     if ov.json {
+        let input = path.to_string_lossy();
         println!(
-            "{{\"event\":\"progress\",\"status\":{:?},\"completed\":{},\"total\":{},\"elapsed_seconds\":{:.3},\"eta_seconds\":{:.3},\"input\":{:?}}}",
-            status, count, total, elapsed, eta, path.to_string_lossy()
+            "{}",
+            batch_progress_json_line(status, count, total, elapsed, eta, input.as_ref())
         );
     } else if !ov.no_progress {
         eprintln!(
@@ -1294,6 +1435,104 @@ fn normalize_output_extension(value: &str) -> Result<&str, String> {
         Ok(extension)
     } else {
         Err(format!("unsupported --output-format: {value}"))
+    }
+}
+
+#[cfg(test)]
+mod json_output_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const SPECIAL_INPUT: &str = "input-cafe\u{301}-quote\"-slash\\-line\n-control\u{1}.wav";
+    const SPECIAL_OUTPUT: &str = "output-cafe\u{301}-quote\"-slash\\-line\n-control\u{2}.wav";
+
+    fn parse_json_line(line: &str) -> Value {
+        assert!(
+            !line.contains("\\u{"),
+            "Rust escape leaked into JSON: {line}"
+        );
+        assert!(
+            !line.contains('\n'),
+            "serialized JSON line contains a physical newline"
+        );
+        serde_json::from_str(line).expect("CLI output must be valid JSON")
+    }
+
+    #[test]
+    fn process_result_json_round_trips_special_paths() {
+        let value = parse_json_line(&process_result_json_line(
+            SPECIAL_INPUT,
+            SPECIAL_OUTPUT,
+            "classical",
+            2,
+            48_001,
+            48_000,
+            1.2345,
+        ));
+
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
+        assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
+        assert_eq!(value["backend"].as_str(), Some("classical"));
+        assert_eq!(value["channels"].as_u64(), Some(2));
+        assert_eq!(value["frames"].as_u64(), Some(48_001));
+        assert_eq!(value["sample_rate"].as_u64(), Some(48_000));
+        assert_eq!(value["elapsed_ms"].as_f64(), Some(1.234));
+    }
+
+    #[test]
+    fn stream_result_json_round_trips_special_paths() {
+        let value = parse_json_line(&stream_result_json_line(
+            SPECIAL_INPUT,
+            SPECIAL_OUTPUT,
+            2,
+            8_193,
+            44_100,
+        ));
+
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
+        assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
+        assert_eq!(value["backend"].as_str(), Some("classical"));
+        assert_eq!(value["channels"].as_u64(), Some(2));
+        assert_eq!(value["frames"].as_u64(), Some(8_193));
+        assert_eq!(value["sample_rate"].as_u64(), Some(44_100));
+        assert_eq!(value["stream"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn batch_progress_json_round_trips_special_paths() {
+        let value = parse_json_line(&batch_progress_json_line(
+            "completed",
+            3,
+            5,
+            1.23456,
+            0.45678,
+            SPECIAL_INPUT,
+        ));
+
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["event"].as_str(), Some("progress"));
+        assert_eq!(value["status"].as_str(), Some("completed"));
+        assert_eq!(value["completed"].as_u64(), Some(3));
+        assert_eq!(value["total"].as_u64(), Some(5));
+        assert_eq!(value["elapsed_seconds"].as_f64(), Some(1.235));
+        assert_eq!(value["eta_seconds"].as_f64(), Some(0.457));
+        assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
+    }
+
+    #[test]
+    fn batch_summary_json_round_trips_special_paths() {
+        let value = parse_json_line(&batch_summary_json_line(7, 4, 2, 1, false, SPECIAL_OUTPUT));
+
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["event"].as_str(), Some("summary"));
+        assert_eq!(value["total"].as_u64(), Some(7));
+        assert_eq!(value["succeeded"].as_u64(), Some(4));
+        assert_eq!(value["skipped"].as_u64(), Some(2));
+        assert_eq!(value["failed"].as_u64(), Some(1));
+        assert_eq!(value["cancelled"].as_bool(), Some(false));
+        assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
     }
 }
 
