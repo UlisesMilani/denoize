@@ -38,7 +38,7 @@ pub struct BenchmarkReport {
     pub correlation_error: Option<f64>,
     /// Dependency-free artifact-screening indicators.
     pub artifact_scores: ArtifactReport,
-    /// Native STOI score in `[0, 1]` when the input is long enough.
+    /// Native STOI score in `[-1, 1]` when the input is long enough.
     pub stoi: Option<f64>,
     /// PESQ is `None` unless a separately licensed external adapter is used.
     pub pesq: Option<f64>,
@@ -97,7 +97,7 @@ impl BenchmarkReport {
     }
 
     pub fn markdown(&self) -> String {
-        format!("| Metric | Value |\n|---|---:|\n| SI-SDR | {:.3} dB |\n| SI-SNR | {:.3} dB |\n| SNR | {:.3} dB |\n| Segmental SNR | {:.3} dB |\n| Stereo side SDR | {} |\n| Correlation error | {} |\n| Musical-noise score (0=none) | {:.3} |\n| Pumping score (0=none) | {:.3} |\n| Transient-loss score (0=none) | {:.3} |\n| Phase-distortion score (0=none) | {} |\n| STOI (0–1, higher is better) | {} |\n| PESQ (licensed adapter required) | {} |\n| ViSQOL MOS-LQO (1–5) | {} |", self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, db(self.stereo_side_sdr_db), display(self.correlation_error, 6), self.artifact_scores.musical_noise_score, self.artifact_scores.pumping_score, self.artifact_scores.transient_loss_score, display(self.artifact_scores.phase_distortion_score, 3), display(self.stoi, 4), display(self.pesq, 3), display(self.visqol, 3))
+        format!("| Metric | Value |\n|---|---:|\n| SI-SDR | {:.3} dB |\n| SI-SNR | {:.3} dB |\n| SNR | {:.3} dB |\n| Segmental SNR | {:.3} dB |\n| Stereo side SDR | {} |\n| Correlation error | {} |\n| Musical-noise score (0=none) | {:.3} |\n| Pumping score (0=none) | {:.3} |\n| Transient-loss score (0=none) | {:.3} |\n| Phase-distortion score (0=none) | {} |\n| STOI (-1–1, higher is better) | {} |\n| PESQ (licensed adapter required) | {} |\n| ViSQOL MOS-LQO (1–5) | {} |", self.si_sdr_db, self.si_snr_db, self.snr_db, self.segmental_snr_db, db(self.stereo_side_sdr_db), display(self.correlation_error, 6), self.artifact_scores.musical_noise_score, self.artifact_scores.pumping_score, self.artifact_scores.transient_loss_score, display(self.artifact_scores.phase_distortion_score, 3), display(self.stoi, 4), display(self.pesq, 3), display(self.visqol, 3))
     }
 }
 
