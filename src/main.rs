@@ -205,9 +205,15 @@ struct FileConfig {
     smoothing: Option<f64>,
     makeup_db: Option<f64>,
     quality: Option<String>,
+    mp3_bitrate_kbps: Option<u32>,
+    m4a_bitrate_kbps: Option<u32>,
+    aac_encoder: Option<String>,
     loudness_lufs: Option<f64>,
     true_peak_dbtp: Option<f64>,
+    onnx_model: Option<String>,
+    onnx_rate: Option<u32>,
     channels: Option<String>,
+    sgmse_profile: Option<String>,
     downmix: Option<String>,
     deterministic: bool,
     seed: Option<u64>,
@@ -276,6 +282,18 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
             format!("unknown downmix mode in config: {name} (expected preserve or stereo)")
         })?);
     }
+    if let Some(name) = config.aac_encoder {
+        ov.aac_encoder = Some(AacEncoder::parse(&name).ok_or_else(|| {
+            format!("unknown AAC encoder in config: {name} (expected oxide or fdk)")
+        })?);
+    }
+    if let Some(profile) = config.sgmse_profile {
+        ov.sgmse_profile = Some(SgmseProfile::parse(&profile).ok_or_else(|| {
+            format!(
+                "unknown SGMSE profile in config: {profile} (expected fast, balanced, or quality)"
+            )
+        })?);
+    }
     ov.strength = config.strength;
     ov.profile_ms = config.profile_ms;
     ov.adaptive_noise = config.adaptive_noise;
@@ -285,8 +303,16 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.smoothing = config.smoothing;
     ov.makeup = config.makeup_db;
     ov.quality = config.quality.map(|value| value.to_ascii_lowercase());
+    ov.mp3_bitrate_kbps = config.mp3_bitrate_kbps;
+    ov.m4a_bitrate_kbps = config.m4a_bitrate_kbps;
     ov.loudness_lufs = config.loudness_lufs;
-    ov.true_peak_dbtp = config.true_peak_dbtp;
+    ov.true_peak_dbtp = if config.loudness_lufs.is_none() && config.true_peak_dbtp == Some(-1.0) {
+        None
+    } else {
+        config.true_peak_dbtp
+    };
+    ov.onnx_model = config.onnx_model;
+    ov.onnx_sample_rate = config.onnx_rate;
     ov.deterministic = config.deterministic;
     ov.seed = config.seed;
     if ov.seed.is_some() {
@@ -1560,6 +1586,78 @@ max_memory_mb = 64
         assert!(options.adaptive_noise && options.vad && options.no_metadata);
         assert_eq!(options.stream_frames, Some(4096));
         assert_eq!(options.max_memory_mb, Some(64));
+    }
+
+    #[test]
+    fn parses_desktop_exported_config() {
+        let options = parse_config(
+            r#"
+backend = "auto"
+preset = "hifi"
+mode = "speech"
+strength = 0.42
+adaptive_noise = true
+vad = true
+channels = "linked"
+downmix = "stereo"
+loudness_lufs = -16.0
+true_peak_dbtp = -1.0
+preserve_metadata = false
+force = true
+mp3_bitrate_kbps = 256
+m4a_bitrate_kbps = 224
+aac_encoder = "oxide"
+onnx_model = "model.onnx"
+onnx_rate = 48000
+sgmse_profile = "quality"
+deterministic = true
+"#,
+            "desktop.toml",
+        )
+        .unwrap();
+
+        assert!(options.auto_backend);
+        assert_eq!(options.preset, Some(Preset::HiFi));
+        assert_eq!(options.mode, Some(ProcessingMode::Speech));
+        assert_eq!(options.strength, Some(0.42));
+        assert!(options.adaptive_noise);
+        assert!(options.vad);
+        assert_eq!(options.channel_mode, Some(ChannelMode::StereoLinked));
+        assert_eq!(options.downmix, Some(DownmixMode::Stereo));
+        assert_eq!(options.loudness_lufs, Some(-16.0));
+        assert_eq!(options.true_peak_dbtp, Some(-1.0));
+        assert!(options.no_metadata);
+        assert!(options.force);
+        assert_eq!(options.mp3_bitrate_kbps, Some(256));
+        assert_eq!(options.m4a_bitrate_kbps, Some(224));
+        assert_eq!(options.aac_encoder, Some(AacEncoder::Oxide));
+        assert_eq!(options.onnx_model.as_deref(), Some("model.onnx"));
+        assert_eq!(options.onnx_sample_rate, Some(48_000));
+        assert_eq!(options.sgmse_profile, Some(SgmseProfile::Quality));
+        assert!(options.deterministic);
+    }
+
+    #[test]
+    fn rejects_invalid_desktop_enum_values() {
+        let error = parse_config("aac_encoder = \"invalid\"", "desktop.toml").unwrap_err();
+        assert!(error.contains("unknown AAC encoder in config: invalid"));
+
+        let error = parse_config("sgmse_profile = \"invalid\"", "desktop.toml").unwrap_err();
+        assert!(error.contains("unknown SGMSE profile in config: invalid"));
+    }
+
+    #[test]
+    fn accepts_legacy_desktop_true_peak_without_loudness() {
+        let options = parse_config(
+            "true_peak_dbtp = -1.0\nmp3_bitrate_kbps = 192\n",
+            "legacy-desktop.toml",
+        )
+        .unwrap();
+        assert_eq!(options.loudness_lufs, None);
+        assert_eq!(options.true_peak_dbtp, None);
+
+        let explicit = parse_config("true_peak_dbtp = -0.5", "manual.toml").unwrap();
+        assert_eq!(explicit.true_peak_dbtp, Some(-0.5));
     }
 
     #[test]
