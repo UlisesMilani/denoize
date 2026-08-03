@@ -323,19 +323,19 @@ async function init() {
   window.setTimeout(() => void checkForUpdate(false), 1500);
 }
 
-function updateBackendSettings() {
+function updateBackendSettings(useDescriptorRate = false) {
   const selected = $<HTMLSelectElement>("#backend").value;
   const descriptor = appInfo.backends.find(({ name }) => name === selected);
   const needsModel = descriptor?.externalModel ?? false;
   $("#backend-settings").classList.toggle("hidden", !needsModel);
   $("#sgmse-profile-field").classList.toggle("hidden", selected !== "sgmse");
-  if (descriptor?.sampleRate) $<HTMLInputElement>("#onnx-rate").value = String(descriptor.sampleRate);
+  if (useDescriptorRate && descriptor?.sampleRate) $<HTMLInputElement>("#onnx-rate").value = String(descriptor.sampleRate);
   $("#backend-hint").textContent = selected === "sgmse"
     ? "変換済みSGMSE+モデルと推論ステップ数を指定します。"
     : needsModel ? "このバックエンド用に変換したONNXモデルが必要です。" : "";
 }
 
-$("#backend").addEventListener("change", updateBackendSettings);
+$("#backend").addEventListener("change", () => updateBackendSettings(true));
 $("#choose-model").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
   if (typeof path !== "string") return;
@@ -360,11 +360,12 @@ $("#reset-config").addEventListener("click", () => { localStorage.removeItem(SET
 
 function exportConfig() {
   const values = captureSettings();
+  const loudnessEnabled = Boolean(values["loudness-enabled"]);
   return {
     backend: values.backend, preset: values.preset, mode: values.mode, strength: Number(values.strength),
     adaptive_noise: values.adaptive, vad: values.vad, channels: values.channels, downmix: values.downmix,
-    loudness_lufs: values["loudness-enabled"] ? Number(values.loudness) : null,
-    true_peak_dbtp: Number(values["true-peak"]), preserve_metadata: values.metadata, force: values.force,
+    loudness_lufs: loudnessEnabled ? Number(values.loudness) : null,
+    true_peak_dbtp: loudnessEnabled ? Number(values["true-peak"]) : null, preserve_metadata: values.metadata, force: values.force,
     mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
     aac_encoder: values["aac-encoder"], onnx_model: values["model-path"] || null,
     onnx_rate: Number(values["onnx-rate"]), sgmse_profile: values["sgmse-profile"],
@@ -381,8 +382,12 @@ $("#import-config").addEventListener("click", async () => {
     const config = await invoke<Record<string, string | number | boolean>>("load_gui_config", { path });
     const map: Record<string, string> = { adaptive_noise: "adaptive", channels: "channels", downmix: "downmix", loudness_lufs: "loudness", true_peak_dbtp: "true-peak", preserve_metadata: "metadata", mp3_bitrate_kbps: "mp3-bitrate", m4a_bitrate_kbps: "aac-bitrate", aac_encoder: "aac-encoder", onnx_model: "model-path", onnx_rate: "onnx-rate", sgmse_profile: "sgmse-profile" };
     const values: SavedValues = {}; for (const [key, value] of Object.entries(config)) values[map[key] ?? key] = value;
-    if (config.loudness_lufs != null) values["loudness-enabled"] = true;
-    applySettings(values); saveSettings(); showToast("設定を読み込みました");
+    const modelPath = typeof config.onnx_model === "string" ? config.onnx_model : null;
+    values["loudness-enabled"] = config.loudness_lufs != null;
+    values.loudness = config.loudness_lufs ?? -16;
+    values["true-peak"] = config.true_peak_dbtp ?? -1;
+    values["model-path"] = modelPath ?? "";
+    applySettings(values); setPath("#model-path", "#model-path-display", modelPath); saveSettings(); showToast("設定を読み込みました");
   } catch (error) { showToast(errorText(error), true); }
 });
 
