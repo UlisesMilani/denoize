@@ -1645,8 +1645,32 @@ mod tests {
 
     #[test]
     fn relative_destination_is_fixed_at_creation_time() {
-        let output = AtomicOutput::new("relative-output.wav").unwrap();
-        let expected = fs::canonicalize(".").unwrap().join("relative-output.wav");
+        #[cfg(unix)]
+        let (_directory, destination, expected) = {
+            let directory = tempfile::tempdir().unwrap();
+            let current = fs::canonicalize(".").unwrap();
+            let parent = fs::canonicalize(directory.path()).unwrap();
+            let mut destination = std::path::PathBuf::new();
+            for component in current.components() {
+                if matches!(component, std::path::Component::Normal(_)) {
+                    destination.push("..");
+                }
+            }
+            destination.push(parent.strip_prefix("/").unwrap());
+            destination.push("relative-output.wav");
+            let expected = parent.join("relative-output.wav");
+            (directory, destination, expected)
+        };
+
+        #[cfg(not(unix))]
+        let (destination, expected) = {
+            let destination = std::path::PathBuf::from("relative-output.wav");
+            let expected = fs::canonicalize(".").unwrap().join(&destination);
+            (destination, expected)
+        };
+
+        assert!(!destination.is_absolute());
+        let output = AtomicOutput::new(&destination).unwrap();
 
         assert_eq!(output.destination, expected);
         assert!(output.destination.is_absolute());
