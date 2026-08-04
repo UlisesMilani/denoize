@@ -1413,8 +1413,12 @@ mod tests {
         let destination = shared.join("output.wav");
 
         let output = AtomicOutput::new(&destination).unwrap();
+        let canonical_shared = fs::canonicalize(&shared).unwrap();
 
-        assert_eq!(output.temporary_path().parent(), Some(shared.as_path()));
+        assert_eq!(
+            output.temporary_path().parent(),
+            Some(canonical_shared.as_path())
+        );
     }
 
     #[cfg(target_os = "linux")]
