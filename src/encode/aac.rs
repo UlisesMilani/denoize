@@ -7,6 +7,8 @@ use oxideav_aac_encoder::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 use std::io::Write;
 use std::path::Path;
 
+use crate::atomic_output::{AtomicOutput, CommitMode};
+
 pub fn write_adts_aac<P: AsRef<Path>>(
     path: P,
     audio: &Audio,
@@ -17,6 +19,17 @@ pub fn write_adts_aac<P: AsRef<Path>>(
 
 pub fn write_adts_aac_with_downmix<P: AsRef<Path>>(
     path: P,
+    audio: &Audio,
+    bitrate_bps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
+    let mut output = AtomicOutput::new(path)?;
+    write_adts_aac_to_writer(output.file_mut(), audio, bitrate_bps, downmix)?;
+    output.commit(CommitMode::Replace)
+}
+
+pub(super) fn write_adts_aac_to_writer<W: Write>(
+    output: W,
     audio: &Audio,
     bitrate_bps: u32,
     downmix: DownmixMode,
@@ -33,9 +46,7 @@ pub fn write_adts_aac_with_downmix<P: AsRef<Path>>(
     .map_err(|error| format!("AAC encoder init: {error}"))?;
     let pcm = planar_f64_to_interleaved_i16(audio, layout)?;
     let frame_samples = FRAME_LEN * layout.count as usize;
-    let mut output = std::io::BufWriter::new(
-        std::fs::File::create(path).map_err(|error| format!("create AAC: {error}"))?,
-    );
+    let mut output = std::io::BufWriter::new(output);
     for input in pcm.chunks(frame_samples) {
         let frame = encoder
             .encode_frame(input)

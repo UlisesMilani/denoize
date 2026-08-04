@@ -11,10 +11,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 
-use lofty::config::{GlobalOptions, WriteOptions, apply_global_options};
+use crate::atomic_output::{AtomicOutput, CommitMode};
+use lofty::config::{apply_global_options, GlobalOptions, WriteOptions};
 use lofty::error::ErrorKind;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::Tag;
@@ -80,14 +81,34 @@ pub fn read(input: &Path) -> Result<Option<Tag>, String> {
 
 /// Write an extended metadata snapshot to an encoded output file.
 pub fn write_extended(metadata: Metadata, output: &Path) -> Result<(), String> {
+    let mut transaction = AtomicOutput::new(output)?;
+    let fixed_output = transaction.destination_path().to_path_buf();
+    let mut source = File::open(&fixed_output)
+        .map_err(|error| format!("open output metadata from {}: {error}", output.display()))?;
+    std::io::copy(&mut source, transaction.file_mut())
+        .map_err(|error| format!("stage output metadata from {}: {error}", output.display()))?;
+    drop(source);
+    write_extended_to_file(metadata, transaction.file_mut())?;
+    transaction.commit(CommitMode::Replace)
+}
+
+/// Write an extended metadata snapshot through an existing file handle.
+///
+/// The caller should provide a private staged file: failures can leave this
+/// handle partially modified, while a separately managed destination remains
+/// untouched until the stage is committed.
+pub fn write_extended_to_file(metadata: Metadata, output: &mut File) -> Result<(), String> {
     configure_lofty();
 
     let Metadata {
         mut tag,
         vorbis_comments,
     } = metadata;
-    let mut destination = lofty::read_from_path(output)
-        .map_err(|error| format!("read output metadata from {}: {error}", output.display()))?;
+    output
+        .rewind()
+        .map_err(|error| format!("rewind output metadata: {error}"))?;
+    let mut destination =
+        lofty::read_from(&mut *output).map_err(|error| format!("read output metadata: {error}"))?;
     let target_type = destination.primary_tag_type();
     if tag.tag_type() != target_type {
         tag.re_map(target_type);
@@ -95,8 +116,8 @@ pub fn write_extended(metadata: Metadata, output: &Path) -> Result<(), String> {
     let has_pictures = tag.picture_count() > 0;
     destination.insert_tag(tag);
     destination
-        .save_to_path(output, WriteOptions::default())
-        .map_err(|error| format!("write metadata to {}: {error}", output.display()))?;
+        .save_to(&mut *output, WriteOptions::default())
+        .map_err(|error| format!("write output metadata: {error}"))?;
 
     if let Some(source_comments) = vorbis_comments {
         // A generic Vorbis writer already serializes pictures from Tag. Avoid
@@ -377,16 +398,26 @@ fn merge_vorbis_comments(
 
 fn apply_vorbis_comments(
     source: &VorbisCommentsSnapshot,
-    output: &Path,
+    output: &mut File,
     skip_picture_comments: bool,
 ) -> Result<(), String> {
-    let bytes = fs::read(output)
-        .map_err(|error| format!("read output metadata from {}: {error}", output.display()))?;
-    if bytes.starts_with(b"fLaC") {
-        return rewrite_flac_comments(&bytes, source, output, skip_picture_comments);
-    }
-    if bytes.starts_with(b"OggS") {
-        return rewrite_ogg_comments(&bytes, source, output, skip_picture_comments);
+    output
+        .rewind()
+        .map_err(|error| format!("rewind raw output metadata: {error}"))?;
+    let mut bytes = Vec::new();
+    output
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read raw output metadata: {error}"))?;
+
+    let rewritten = if bytes.starts_with(b"fLaC") {
+        rewrite_flac_comments(&bytes, source, skip_picture_comments)?
+    } else if bytes.starts_with(b"OggS") {
+        rewrite_ogg_comments(&bytes, source, skip_picture_comments)?
+    } else {
+        None
+    };
+    if let Some(rewritten) = rewritten {
+        replace_file_contents(output, &rewritten)?;
     }
     Ok(())
 }
@@ -394,11 +425,10 @@ fn apply_vorbis_comments(
 fn rewrite_flac_comments(
     bytes: &[u8],
     source: &VorbisCommentsSnapshot,
-    output: &Path,
     skip_picture_comments: bool,
-) -> Result<(), String> {
+) -> Result<Option<Vec<u8>>, String> {
     let Some(mut blocks) = parse_flac_blocks(bytes) else {
-        return Ok(());
+        return Ok(None);
     };
     let existing = blocks
         .iter()
@@ -434,7 +464,7 @@ fn rewrite_flac_comments(
         rewritten.extend(body);
     }
     rewritten.extend(&bytes[audio_offset..]);
-    replace_file(output, &rewritten)
+    Ok(Some(rewritten))
 }
 
 fn flac_audio_offset(bytes: &[u8]) -> Option<usize> {
@@ -456,9 +486,8 @@ fn flac_audio_offset(bytes: &[u8]) -> Option<usize> {
 fn rewrite_ogg_comments(
     bytes: &[u8],
     source: &VorbisCommentsSnapshot,
-    output: &Path,
     skip_picture_comments: bool,
-) -> Result<(), String> {
+) -> Result<Option<Vec<u8>>, String> {
     let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
     let mut packets = Vec::new();
     let mut target_serial = None;
@@ -495,13 +524,10 @@ fn rewrite_ogg_comments(
     }
 
     if !replaced {
-        return Ok(());
+        return Ok(None);
     }
 
-    let temp = temporary_path(output);
-    let file = File::create(&temp)
-        .map_err(|error| format!("create temporary metadata file {}: {error}", temp.display()))?;
-    let mut writer = ogg::PacketWriter::new(std::io::BufWriter::new(file));
+    let mut writer = ogg::PacketWriter::new(Cursor::new(Vec::with_capacity(bytes.len())));
     for (data, serial, granule, last) in packets {
         let end = if last {
             ogg::PacketWriteEndInfo::EndStream
@@ -512,31 +538,22 @@ fn rewrite_ogg_comments(
             .write_packet(Cow::Owned(data), serial, end, granule)
             .map_err(|error| format!("write Ogg metadata: {error}"))?;
     }
-    let mut file = writer
-        .into_inner()
-        .into_inner()
-        .map_err(|error| format!("flush temporary metadata file: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("flush Ogg metadata: {error}"))?;
-    drop(file);
-    fs::rename(&temp, output)
-        .map_err(|error| format!("replace Ogg metadata in {}: {error}", output.display()))
+    Ok(Some(writer.into_inner().into_inner()))
 }
 
-fn temporary_path(output: &Path) -> std::path::PathBuf {
-    let name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("output");
-    output.with_file_name(format!(".{name}.metadata.part"))
-}
-
-fn replace_file(output: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = temporary_path(output);
-    fs::write(&temp, bytes)
-        .map_err(|error| format!("write temporary metadata file {}: {error}", temp.display()))?;
-    fs::rename(&temp, output)
-        .map_err(|error| format!("replace metadata in {}: {error}", output.display()))
+fn replace_file_contents(output: &mut File, bytes: &[u8]) -> Result<(), String> {
+    output
+        .set_len(0)
+        .map_err(|error| format!("truncate raw output metadata: {error}"))?;
+    output
+        .rewind()
+        .map_err(|error| format!("rewind raw output metadata: {error}"))?;
+    output
+        .write_all(bytes)
+        .map_err(|error| format!("write raw output metadata: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("flush raw output metadata: {error}"))
 }
 
 #[cfg(test)]
@@ -582,5 +599,133 @@ mod tests {
         bytes.extend([0, 0, 0, 0]);
         let blocks = parse_flac_blocks(&bytes).unwrap();
         assert_eq!(blocks, vec![(0, vec![0, 0, 0, 0])]);
+    }
+
+    #[test]
+    fn vorbis_comments_are_rewritten_through_file_handle() {
+        let destination = VorbisCommentsSnapshot::new(
+            "destination vendor that is deliberately longer".into(),
+            vec![("TITLE".into(), "Existing title".into())],
+        );
+        let comment = serialize_comment_body(&destination).unwrap();
+        let comment_len = u32::try_from(comment.len()).unwrap();
+
+        let mut original = b"fLaC".to_vec();
+        original.extend([0, 0, 0, 0]); // Empty STREAMINFO fixture block.
+        original.extend([
+            0x84,
+            (comment_len >> 16) as u8,
+            (comment_len >> 8) as u8,
+            comment_len as u8,
+        ]);
+        original.extend(comment);
+        original.extend(b"audio-payload");
+
+        let mut output = tempfile::tempfile().unwrap();
+        output.write_all(&original).unwrap();
+        let source =
+            VorbisCommentsSnapshot::new("v".into(), vec![("X-CUSTOM".into(), "retained".into())]);
+        apply_vorbis_comments(&source, &mut output, false).unwrap();
+
+        output.rewind().unwrap();
+        let mut rewritten = Vec::new();
+        output.read_to_end(&mut rewritten).unwrap();
+        assert!(rewritten.ends_with(b"audio-payload"));
+        let comments = parse_flac_comments(&rewritten).unwrap();
+        assert_eq!(comments.vendor, "v");
+        assert!(comments
+            .items
+            .contains(&("TITLE".into(), "Existing title".into())));
+        assert!(comments
+            .items
+            .contains(&("X-CUSTOM".into(), "retained".into())));
+    }
+
+    #[test]
+    fn raw_rewrite_error_leaves_file_handle_unchanged() {
+        let destination = VorbisCommentsSnapshot::new("destination".into(), Vec::new());
+        let comment = serialize_comment_body(&destination).unwrap();
+        let comment_len = u32::try_from(comment.len()).unwrap();
+        let mut original = b"fLaC".to_vec();
+        original.extend([0, 0, 0, 0]);
+        original.extend([
+            0x84,
+            (comment_len >> 16) as u8,
+            (comment_len >> 8) as u8,
+            comment_len as u8,
+        ]);
+        original.extend(comment);
+        original.extend(b"audio-payload");
+
+        let mut output = tempfile::tempfile().unwrap();
+        output.write_all(&original).unwrap();
+        let oversized = VorbisCommentsSnapshot::new("v".repeat(0x0100_0000), Vec::new());
+        let error = apply_vorbis_comments(&oversized, &mut output, false).unwrap_err();
+        assert_eq!(error, "FLAC metadata block exceeds the 24-bit size limit");
+
+        output.rewind().unwrap();
+        let mut after = Vec::new();
+        output.read_to_end(&mut after).unwrap();
+        assert_eq!(after, original);
+    }
+
+    #[test]
+    fn write_extended_commits_metadata_without_leaving_a_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("output.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&output, spec).unwrap();
+        writer.write_sample(0_i16).unwrap();
+        writer.finalize().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut tag = Tag::new(TagType::RiffInfo);
+        tag.set_title("committed title".into());
+        write(tag, &output).unwrap();
+
+        let saved = read(&output).unwrap().unwrap();
+        assert_eq!(saved.title().as_deref(), Some("committed title"));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn write_extended_rolls_back_when_staged_metadata_fails() {
+        let mut output = tempfile::NamedTempFile::new().unwrap();
+        let original = b"not an audio container";
+        output.write_all(original).unwrap();
+        output.flush().unwrap();
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("must not be published".into());
+        assert!(write_extended(
+            Metadata {
+                tag,
+                vorbis_comments: Some(VorbisCommentsSnapshot::new(
+                    "vendor".into(),
+                    vec![("X-CUSTOM".into(), "value".into())],
+                )),
+            },
+            output.path(),
+        )
+        .is_err());
+        assert_eq!(fs::read(output.path()).unwrap(), original.to_vec());
     }
 }

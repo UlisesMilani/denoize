@@ -1000,10 +1000,12 @@ dependencies = [
  "ctrlc",
  "deep_filter",
  "ebur128",
+ "exacl",
  "fdk-aac-rust",
  "flacenc",
  "hound",
  "kaldi-native-fbank",
+ "libc",
  "lofty",
  "mp4",
  "nanomp3",
@@ -1022,9 +1024,11 @@ dependencies = [
  "sha2",
  "shine-rs",
  "symphonia",
+ "tempfile",
  "toml 0.8.2",
  "tract-onnx 0.22.3",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1360,6 +1364,18 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exacl"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8de9e551ced9d700a31dacb8b168129640240fcd7a279a3fa4d59608b84ebcae"
+dependencies = [
+ "bitflags 2.13.1",
+ "log",
+ "scopeguard",
+ "uuid",
 ]
 
 [[package]]
@@ -5470,7 +5486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -569,9 +569,19 @@ part of the reproducibility guarantee.
 Batch runs show completed files, elapsed time, and ETA. `--resume` records
 successful outputs in `.denoize-state` under the output directory and skips
 them on the next run. Ctrl+C stops scheduling new files; each output is first
-written to a temporary file so an interrupted encode cannot replace a valid
-destination. Use `--no-progress` for quiet operation or `--json` for NDJSON
-progress and summary records.
+written to a randomly named private file in the destination directory. Audio and
+metadata are completed there before one atomic commit, so an interrupted or
+failed encode leaves an existing destination unchanged. Without `--force`,
+the destination is checked again at commit time to prevent concurrent
+overwrites. On Unix, output paths through non-sticky shared-writable or
+untrusted-owner directories are rejected before staging. Extended ACLs that
+grant additional access are also rejected, as are network or userspace
+filesystems whose ACLs cannot be verified safely. On Windows, atomic private
+staging requires an ACL-capable filesystem such as NTFS; FAT and exFAT output
+paths are rejected before encoding. Use `--no-progress` for quiet operation or
+`--json` for NDJSON progress and summary records. On Unix, `--force` also
+refuses to replace an existing file with an extended ACL or a different owner,
+avoiding a silent loss or weakening of its access policy.
 
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter

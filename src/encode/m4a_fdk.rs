@@ -1,6 +1,6 @@
 //! Optional Fraunhofer FDK-AAC encoder with MP4/M4A muxing.
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use fdk_aac_rust::encoder::{
@@ -11,6 +11,7 @@ use mp4::{
     Mp4Writer, TrackConfig, TrackType,
 };
 
+use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::audio::Audio;
 
 use super::m4a::sample_rate_to_index;
@@ -27,6 +28,17 @@ pub fn write_m4a_fdk<P: AsRef<Path>>(
 
 pub fn write_m4a_fdk_with_downmix<P: AsRef<Path>>(
     path: P,
+    audio: &Audio,
+    bitrate_bps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
+    let mut output = AtomicOutput::new(path)?;
+    write_m4a_fdk_to_writer(output.file_mut(), audio, bitrate_bps, downmix)?;
+    output.commit(CommitMode::Replace)
+}
+
+pub(super) fn write_m4a_fdk_to_writer<W: Write + Seek>(
+    output: W,
     audio: &Audio,
     bitrate_bps: u32,
     downmix: DownmixMode,
@@ -64,8 +76,7 @@ pub fn write_m4a_fdk_with_downmix<P: AsRef<Path>>(
         .collect();
     pcm.resize(pcm.len().div_ceil(input_length) * input_length, 0.0);
 
-    let file = std::fs::File::create(path).map_err(|error| format!("create m4a: {error}"))?;
-    let writer = BufWriter::new(file);
+    let writer = BufWriter::new(output);
     let brand = |value: &str| {
         value
             .parse::<FourCC>()
@@ -120,7 +131,11 @@ pub fn write_m4a_fdk_with_downmix<P: AsRef<Path>>(
         pts += frame_length as u64;
     }
     mp4.write_end()
-        .map_err(|error| format!("mp4 finalize: {error}"))
+        .map_err(|error| format!("mp4 finalize: {error}"))?;
+    let mut output = mp4.into_writer();
+    output
+        .flush()
+        .map_err(|error| format!("mp4 flush: {error}"))
 }
 
 #[cfg(test)]

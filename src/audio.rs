@@ -3,9 +3,11 @@
 //! Decoded compressed audio is promoted to `f64` planar PCM at native sample rate
 //! (see [`crate::decode`]) before denoising. WAV write preserves bit depth.
 
+use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::channel_layout::{ChannelLayout, ChannelMask, PanInfo};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const MIN_MEMORY_ESTIMATE_BYTES: u64 = BYTES_PER_MIB;
@@ -378,13 +380,30 @@ pub fn write_audio<P: AsRef<std::path::Path>>(
 /// Write an [`Audio`] to a WAV file, preserving its bit depth / format.
 pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<(), String> {
     let path = path.as_ref();
+    let mut output = AtomicOutput::new(path)?;
+    write_wav_to_file(output.file_mut(), audio)?;
+    output.commit(CommitMode::Replace)
+}
+
+/// Write an [`Audio`] to an already-open WAV file without reopening its path.
+///
+/// The file is rewound and truncated before encoding. It must be open for
+/// reading as well as writing when a multichannel speaker mask is required.
+pub fn write_wav_to_file(file: &mut File, audio: &Audio) -> Result<(), String> {
     if audio.channels() == 0 {
         return Err("WAV output requires at least one channel".into());
     }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek WAV output: {e}"))?;
+    file.set_len(0)
+        .map_err(|e| format!("truncate WAV output: {e}"))?;
     let spec = audio.wav_spec();
-    let writer = WavWriter::create(path, spec).map_err(|e| format!("create: {e}"))?;
-    write_wav_writer(writer, audio)?;
-    patch_wav_channel_mask_file(path, audio)
+    {
+        let writer =
+            WavWriter::new(BufWriter::new(&mut *file), spec).map_err(|e| format!("create: {e}"))?;
+        write_wav_writer(writer, audio)?;
+    }
+    write_wav_channel_mask_to_file(file, audio.channels(), audio.effective_channel_mask())
 }
 
 /// Encode a complete WAV into memory for stdout and network transports.
@@ -403,13 +422,6 @@ pub fn write_wav_bytes(audio: &Audio) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Hound writes a valid WAVE_FORMAT_EXTENSIBLE header for multichannel files,
-/// but intentionally uses a count-based mask. Replace that field with the
-/// source mask (or zero for an unknown layout) after the samples are finalized.
-fn patch_wav_channel_mask_file(path: &std::path::Path, audio: &Audio) -> Result<(), String> {
-    write_wav_channel_mask(path, audio.channels(), audio.effective_channel_mask())
-}
-
 /// Set the WAVE speaker mask in an already-finalized multichannel WAV file.
 /// This is used by the bounded streaming path, whose writer receives only a
 /// `WavSpec` while the input mask is kept as lightweight header metadata.
@@ -426,7 +438,23 @@ pub fn write_wav_channel_mask(
         .write(true)
         .open(path.as_ref())
         .map_err(|error| format!("open WAV header for channel mask: {error}"))?;
-    use std::io::{Seek, SeekFrom};
+    write_wav_channel_mask_to_file(&mut file, channels, channel_mask)
+}
+
+/// Set the WAVE speaker mask through an already-open file handle.
+///
+/// Keeping this operation on the original handle prevents the finalized WAV
+/// from being replaced between encoding and the header update.
+pub fn write_wav_channel_mask_to_file(
+    file: &mut File,
+    channels: usize,
+    channel_mask: Option<ChannelMask>,
+) -> Result<(), String> {
+    if channels <= 2 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek WAV header for channel mask: {error}"))?;
     let mut header = [0u8; 44];
     file.read_exact(&mut header)
         .map_err(|error| format!("read WAV header for channel mask: {error}"))?;
@@ -444,7 +472,9 @@ pub fn write_wav_channel_mask(
         .filter(|mask| mask.bits() == 0 || mask.channels() == channels)
         .map_or(0, ChannelMask::bits);
     file.write_all(&bits.to_le_bytes())
-        .map_err(|error| format!("write WAV channel mask: {error}"))
+        .map_err(|error| format!("write WAV channel mask: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("flush WAV channel mask: {error}"))
 }
 
 fn patch_wav_channel_mask_bytes(bytes: &mut [u8], audio: &Audio) -> Result<(), String> {
@@ -631,13 +661,17 @@ impl WavStreamWriter<BufWriter<std::fs::File>> {
     /// Create a filesystem WAV for bounded-memory writing.
     pub fn create<P: AsRef<std::path::Path>>(path: P, spec: WavSpec) -> Result<Self, String> {
         let file = std::fs::File::create(path).map_err(|e| format!("create: {e}"))?;
-        let writer =
-            WavWriter::new(BufWriter::new(file), spec).map_err(|e| format!("create: {e}"))?;
-        Self::from_writer(writer, spec)
+        Self::from_sink(BufWriter::new(file), spec)
     }
 }
 
 impl<W: Write + Seek> WavStreamWriter<W> {
+    /// Create a streaming WAV writer over an existing seekable sink.
+    pub fn from_sink(sink: W, spec: WavSpec) -> Result<Self, String> {
+        let writer = WavWriter::new(sink, spec).map_err(|e| format!("create: {e}"))?;
+        Self::from_writer(writer, spec)
+    }
+
     /// Wrap an existing WAV sink.
     pub fn from_writer(writer: WavWriter<W>, spec: WavSpec) -> Result<Self, String> {
         if spec.channels == 0 {

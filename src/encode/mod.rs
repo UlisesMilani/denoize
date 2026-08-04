@@ -68,9 +68,12 @@ impl AacEncoder {
     }
 }
 
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::audio::{sanitize_sample, write_wav, Audio};
+use crate::atomic_output::{AtomicOutput, CommitMode};
+use crate::audio::{sanitize_sample, write_wav_to_file, Audio};
 
 /// Output container inferred from file extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,19 +140,43 @@ pub fn write_audio<P: AsRef<Path>>(
     options: EncodeOptions,
 ) -> Result<(), String> {
     let path = path.as_ref();
-    match OutputFormat::from_path(path)? {
-        OutputFormat::Wav => write_wav(path, audio),
-        OutputFormat::Flac => write_flac(path, audio),
-        OutputFormat::OggOpus => opus::write_ogg_opus(path, audio, 128_000, options.downmix),
+    let format = OutputFormat::from_path(path)?;
+    let mut output = AtomicOutput::new(path)?;
+    write_audio_to_file(output.file_mut(), format, audio, options)?;
+    output.commit(CommitMode::Replace)
+}
+
+/// Write audio to an already-open file using an explicitly selected format.
+///
+/// The file is rewound and truncated before any encoded bytes are written, so
+/// callers can safely use a securely-created staging file without reopening a
+/// predictable path.
+pub fn write_audio_to_file(
+    file: &mut File,
+    format: OutputFormat,
+    audio: &Audio,
+    options: EncodeOptions,
+) -> Result<(), String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek output: {error}"))?;
+    file.set_len(0)
+        .map_err(|error| format!("truncate output: {error}"))?;
+
+    match format {
+        OutputFormat::Wav => write_wav_to_file(file, audio),
+        OutputFormat::Flac => write_flac_to_writer(&mut *file, audio),
+        OutputFormat::OggOpus => {
+            opus::write_ogg_opus_to_writer(&mut *file, audio, 128_000, options.downmix)
+        }
         OutputFormat::Mp3 => {
-            write_mp3_with_downmix(path, audio, options.mp3_bitrate_kbps, options.downmix)
+            mp3::write_mp3_to_writer(&mut *file, audio, options.mp3_bitrate_kbps, options.downmix)
         }
         OutputFormat::M4a => {
             #[cfg(feature = "m4a-encode")]
             {
                 match options.aac_encoder {
-                    AacEncoder::Oxide => write_m4a_with_downmix(
-                        path,
+                    AacEncoder::Oxide => m4a::write_m4a_to_writer(
+                        &mut *file,
                         audio,
                         options.m4a_bitrate_bps,
                         options.downmix,
@@ -157,8 +184,8 @@ pub fn write_audio<P: AsRef<Path>>(
                     AacEncoder::Fdk => {
                         #[cfg(feature = "fdk-aac-encoder")]
                         {
-                            write_m4a_fdk_with_downmix(
-                                path,
+                            m4a_fdk::write_m4a_fdk_to_writer(
+                                &mut *file,
                                 audio,
                                 options.m4a_bitrate_bps,
                                 options.downmix,
@@ -173,7 +200,6 @@ pub fn write_audio<P: AsRef<Path>>(
             }
             #[cfg(not(feature = "m4a-encode"))]
             {
-                let _ = options;
                 Err("M4A output is unavailable in the crates.io build; use WAV/MP3 or a GitHub release binary".into())
             }
         }
@@ -186,7 +212,12 @@ pub fn write_audio<P: AsRef<Path>>(
                             .into(),
                     );
                 }
-                write_adts_aac_with_downmix(path, audio, options.m4a_bitrate_bps, options.downmix)
+                aac::write_adts_aac_to_writer(
+                    &mut *file,
+                    audio,
+                    options.m4a_bitrate_bps,
+                    options.downmix,
+                )
             }
             #[cfg(not(feature = "m4a-encode"))]
             {
@@ -196,10 +227,13 @@ pub fn write_audio<P: AsRef<Path>>(
                 )
             }
         }
-    }
+    }?;
+
+    file.flush()
+        .map_err(|error| format!("flush output: {error}"))
 }
 
-fn write_flac(path: &Path, audio: &Audio) -> Result<(), String> {
+fn write_flac_to_writer<W: Write>(mut output: W, audio: &Audio) -> Result<(), String> {
     if audio.channels() == 0 {
         return Err("FLAC output requires at least one channel".into());
     }
@@ -235,7 +269,10 @@ fn write_flac(path: &Path, audio: &Audio) -> Result<(), String> {
     stream
         .write(&mut sink)
         .map_err(|e| format!("FLAC serialize: {e}"))?;
-    std::fs::write(path, sink.as_slice()).map_err(|e| format!("FLAC write: {e}"))
+    output
+        .write_all(sink.as_slice())
+        .map_err(|e| format!("FLAC write: {e}"))?;
+    output.flush().map_err(|e| format!("FLAC flush: {e}"))
 }
 
 #[cfg(test)]
@@ -264,5 +301,29 @@ mod tests {
             OutputFormat::from_path(Path::new("out.opus")).unwrap(),
             OutputFormat::OggOpus
         );
+    }
+
+    #[test]
+    fn failed_path_encode_preserves_existing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("output.wav");
+        std::fs::write(&destination, b"existing output").unwrap();
+        let invalid_audio = Audio {
+            sample_rate: 48_000,
+            channels: Vec::new(),
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+
+        let error =
+            write_audio(&destination, &invalid_audio, EncodeOptions::default()).unwrap_err();
+
+        assert!(error.contains("at least one channel"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing output");
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".denoize-")));
     }
 }

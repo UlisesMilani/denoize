@@ -116,6 +116,21 @@ jobs:
           rustup default stable
           rustup target add "${{ matrix.target }}"
 
+      - name: Test Windows output commit paths
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --lib atomic_output::tests
+          cargo test --locked --no-default-features --test cli_output_commit
+          cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features --features live --lib
+
+      - name: Test macOS output commit paths
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          cargo test --locked --no-default-features --lib atomic_output::tests
+          cargo test --locked --no-default-features --test cli_output_commit
+
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci

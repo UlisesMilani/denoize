@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use denoize::{
-    decode_file, metadata, read_audio, write_audio, write_wav, Audio, DownmixMode, EncodeOptions,
+    decode_file, metadata, read_audio, write_audio, write_audio_transactional, write_wav, Audio,
+    CommitMode, DownmixMode, EncodeOptions,
 };
 use hound::SampleFormat;
 use lofty::config::WriteOptions;
@@ -227,12 +228,20 @@ fn metadata_preserves_vorbis_custom_and_chapter_comments() {
     comments
         .save_to_path(&input, WriteOptions::default())
         .expect("write custom Vorbis comments");
+    let metadata_snapshot = metadata::read_extended(&input)
+        .expect("read custom comments")
+        .expect("custom comments are present");
 
     for extension in ["flac", "opus"] {
         let output = workspace.file(&format!("custom-copy.{extension}"));
-        write_audio(&output, &audio, EncodeOptions::default())
-            .unwrap_or_else(|error| panic!("write {extension}: {error}"));
-        assert!(metadata::copy(&input, &output).expect("copy custom comments"));
+        write_audio_transactional(
+            &output,
+            &audio,
+            EncodeOptions::default(),
+            Some(metadata_snapshot.clone()),
+            CommitMode::Replace,
+        )
+        .unwrap_or_else(|error| panic!("write transactional {extension}: {error}"));
         let bytes = std::fs::read(&output).expect("read copied comments");
         for expected in [
             b"X-CUSTOM=retained value".as_slice(),
@@ -247,6 +256,10 @@ fn metadata_preserves_vorbis_custom_and_chapter_comments() {
                 String::from_utf8_lossy(expected)
             );
         }
+        assert!(std::fs::read_dir(&workspace.path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".denoize-")));
     }
 }
 
