@@ -4,7 +4,7 @@ version = "0.32.0"
 description = "Desktop interface for denoize"
 authors = ["denoize"]
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.96"
 
 [lib]
 name = "denoize_desktop_lib"

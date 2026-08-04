@@ -2,6 +2,7 @@ use denoize::audio::{read_audio, write_audio};
 use denoize::benchmark::{BenchmarkReport, ComparisonReport};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::encode::write_audio_to_file;
+use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
     AacEncoder, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode, DownmixMode,
@@ -168,6 +169,114 @@ struct ModelProgress {
     downloaded: u64,
     total: Option<u64>,
     fraction: Option<f64>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelActionOptions {
+    #[serde(default)]
+    offline: bool,
+    source_url: Option<String>,
+    proxy_url: Option<String>,
+    #[serde(default)]
+    direct: bool,
+    bearer_token: Option<String>,
+    basic_username: Option<String>,
+    basic_password: Option<String>,
+    source_path: Option<String>,
+}
+
+fn model_action_options(
+    input: Option<ModelActionOptions>,
+) -> Result<(ModelDownloadOptions, Option<PathBuf>), String> {
+    model_action_options_with_environment(input, |name| std::env::var(name).ok())
+}
+
+fn model_action_options_with_environment<F>(
+    input: Option<ModelActionOptions>,
+    mut read_environment: F,
+) -> Result<(ModelDownloadOptions, Option<PathBuf>), String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let input = input.unwrap_or_default();
+    let source_url = trimmed_value(input.source_url);
+    let proxy_url = trimmed_value(input.proxy_url);
+    let bearer_token = trimmed_value(input.bearer_token);
+    let basic_username = trimmed_value(input.basic_username);
+    let basic_password = input.basic_password.filter(|value| !value.is_empty());
+    let source_path = input
+        .source_path
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+
+    if input.direct && proxy_url.is_some() {
+        return Err("プロキシURLと直接接続は同時に指定できません".into());
+    }
+    if bearer_token.is_some() && (basic_username.is_some() || basic_password.is_some()) {
+        return Err("Bearer認証とBasic認証は同時に指定できません".into());
+    }
+    let authentication = if let Some(token) = bearer_token {
+        Some(ModelAuthentication::Bearer(token))
+    } else {
+        match (basic_username, basic_password) {
+            (Some(username), Some(password)) => {
+                Some(ModelAuthentication::Basic { username, password })
+            }
+            (None, None) => None,
+            _ => return Err("Basic認証のユーザー名とパスワードは両方指定してください".into()),
+        }
+    };
+
+    if source_path.is_some() {
+        if input.offline
+            || source_url.is_some()
+            || proxy_url.is_some()
+            || input.direct
+            || authentication.is_some()
+        {
+            return Err(
+                "ローカルファイルはネットワーク・認証オプションと同時に指定できません".into(),
+            );
+        }
+        return Ok((ModelDownloadOptions::default(), source_path));
+    }
+
+    let overrides_authentication = authentication.is_some();
+    let mut options = ModelDownloadOptions::from_env_with(|name| {
+        let overridden = match name {
+            "DENOIZE_MODEL_OFFLINE" => input.offline,
+            "DENOIZE_MODEL_URL" => source_url.is_some(),
+            "DENOIZE_MODEL_PROXY" => input.direct || proxy_url.is_some(),
+            "DENOIZE_MODEL_BEARER_TOKEN" | "DENOIZE_MODEL_USERNAME" | "DENOIZE_MODEL_PASSWORD" => {
+                overrides_authentication
+            }
+            _ => false,
+        };
+        (!overridden).then(|| read_environment(name)).flatten()
+    })?;
+    if input.offline {
+        options.offline = true;
+    }
+    if source_url.is_some() {
+        options.source_url = source_url;
+    }
+    if input.direct {
+        options.proxy = ModelProxy::Disabled;
+    } else if let Some(url) = proxy_url {
+        options.proxy = ModelProxy::Url(url);
+    }
+    if authentication.is_some() {
+        options.authentication = authentication;
+    }
+    Ok((options, source_path))
+}
+
+fn trimmed_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -797,35 +906,59 @@ fn model_action(
     state: State<'_, AppState>,
     name: String,
     action: String,
+    options: Option<ModelActionOptions>,
 ) -> Result<u64, String> {
     let model = denoize::models::find(&name).ok_or_else(|| format!("不明なモデル: {name}"))?;
     if !matches!(action.as_str(), "install" | "update" | "verify" | "remove") {
         return Err(format!("不明な操作: {action}"));
     }
+    let (download_options, source_path) = if matches!(action.as_str(), "install" | "update") {
+        model_action_options(options)?
+    } else {
+        (ModelDownloadOptions::default(), None)
+    };
+    if source_path.is_some() && action == "update" {
+        return Err("ローカルファイルは導入操作でのみ使用できます".into());
+    }
     let (job_id, cancelled) = register_job(&state)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         emit_model_progress(&app, job_id, &name, "running", "準備しています", 0, None);
+        let progress_message = if source_path.is_some() {
+            "ローカルモデルを検証しています"
+        } else {
+            "モデルをダウンロードしています"
+        };
         let progress = |downloaded, total| {
             emit_model_progress(
                 &app,
                 job_id,
                 &name,
                 "running",
-                "モデルをダウンロードしています",
+                progress_message,
                 downloaded,
                 total,
             );
         };
         let result = match action.as_str() {
-            "install" => denoize::models::install_with_progress(
-                model,
-                || cancelled.is_cancelled(),
-                progress,
-            )
+            "install" => match source_path {
+                Some(source) => denoize::models::install_from_file_with_progress(
+                    model,
+                    source,
+                    || cancelled.is_cancelled(),
+                    progress,
+                ),
+                None => denoize::models::install_with_options_and_progress(
+                    model,
+                    &download_options,
+                    || cancelled.is_cancelled(),
+                    progress,
+                ),
+            }
             .map(|path| path.display().to_string()),
-            "update" => denoize::models::update_with_progress(
+            "update" => denoize::models::update_with_options_and_progress(
                 model,
+                &download_options,
                 || cancelled.is_cancelled(),
                 progress,
             )
@@ -1340,6 +1473,130 @@ mod tests {
     #[test]
     fn invalid_backend_is_rejected() {
         assert!(Backend::parse("missing").is_none());
+    }
+
+    #[test]
+    fn model_action_options_deserialize_camel_case_and_build_policy() {
+        let input: ModelActionOptions = serde_json::from_value(serde_json::json!({
+            "offline": true,
+            "sourceUrl": " https://models.example.test/model.onnx ",
+            "proxyUrl": "http://proxy.example.test:8080",
+            "basicUsername": "alice",
+            "basicPassword": " secret "
+        }))
+        .unwrap();
+        let (options, source) = model_action_options(Some(input)).unwrap();
+        assert!(options.offline);
+        assert_eq!(
+            options.source_url.as_deref(),
+            Some("https://models.example.test/model.onnx")
+        );
+        assert_eq!(
+            options.proxy,
+            ModelProxy::Url("http://proxy.example.test:8080".into())
+        );
+        match options.authentication {
+            Some(ModelAuthentication::Basic { username, password }) => {
+                assert_eq!(username, "alice");
+                assert_eq!(password, " secret ");
+            }
+            _ => panic!("expected basic authentication"),
+        }
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn model_action_options_inherit_download_environment_defaults() {
+        let (options, source) = model_action_options_with_environment(None, |name| {
+            Some(
+                match name {
+                    "DENOIZE_MODEL_OFFLINE" => "true",
+                    "DENOIZE_MODEL_URL" => "https://mirror.example.test/model.onnx",
+                    "DENOIZE_MODEL_PROXY" => "http://proxy.example.test:8080",
+                    "DENOIZE_MODEL_BEARER_TOKEN" => "environment-token",
+                    _ => return None,
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        assert!(options.offline);
+        assert_eq!(
+            options.source_url.as_deref(),
+            Some("https://mirror.example.test/model.onnx")
+        );
+        assert_eq!(
+            options.proxy,
+            ModelProxy::Url("http://proxy.example.test:8080".into())
+        );
+        assert!(matches!(
+            options.authentication,
+            Some(ModelAuthentication::Bearer(ref token)) if token == "environment-token"
+        ));
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn model_action_options_reject_local_and_network_controls() {
+        let input = ModelActionOptions {
+            source_path: Some("/tmp/model.onnx".into()),
+            proxy_url: Some("http://proxy.example.test:8080".into()),
+            ..Default::default()
+        };
+        assert!(model_action_options_with_environment(Some(input), |_| {
+            panic!("a local install must not read download environment variables")
+        })
+        .unwrap_err()
+        .contains("同時に指定できません"));
+    }
+
+    #[test]
+    fn model_action_options_reject_conflicting_authentication() {
+        let input = ModelActionOptions {
+            bearer_token: Some("token".into()),
+            basic_username: Some("alice".into()),
+            basic_password: Some("secret".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_action_options(Some(input)).unwrap_err(),
+            "Bearer認証とBasic認証は同時に指定できません"
+        );
+    }
+
+    #[test]
+    fn model_action_options_reject_partial_basic_authentication() {
+        let input = ModelActionOptions {
+            basic_username: Some("alice".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            model_action_options(Some(input)).unwrap_err(),
+            "Basic認証のユーザー名とパスワードは両方指定してください"
+        );
+    }
+
+    #[test]
+    fn model_action_options_support_direct_connections() {
+        let input = ModelActionOptions {
+            direct: true,
+            ..Default::default()
+        };
+        let (options, _) = model_action_options(Some(input)).unwrap();
+        assert_eq!(options.proxy, ModelProxy::Disabled);
+    }
+
+    #[test]
+    fn model_action_options_reject_proxy_with_direct_connection() {
+        let input = ModelActionOptions {
+            proxy_url: Some("http://proxy.example.test:8080".into()),
+            direct: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            model_action_options(Some(input)).unwrap_err(),
+            "プロキシURLと直接接続は同時に指定できません"
+        );
     }
 
     #[test]

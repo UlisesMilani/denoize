@@ -26,6 +26,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
       - name: Verify synchronized release versions
         run: bash scripts/verify-release-version.sh
 
@@ -45,6 +50,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
       - name: Verify generated CLI reference
         run: bash scripts/generate-cli-docs.sh --check
 
@@ -54,6 +64,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
 
       - name: Install Tauri system dependencies
         run: |

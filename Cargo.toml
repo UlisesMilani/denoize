@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/penguin425/denoize"
 homepage = "https://github.com/penguin425/denoize"
 documentation = "https://docs.rs/denoize"
-rust-version = "1.87"
+rust-version = "1.96"
 keywords = ["audio", "denoise", "dsp", "stft", "noise-reduction"]
 categories = ["multimedia::audio", "science"]
 
@@ -39,7 +39,11 @@ oxideav-aac-encoder = { git = "https://github.com/OxideAV/oxideav-aac", rev = "e
 mp4 = "0.14.0"
 rubato = "0.16.2"
 sha2 = "0.10.9"
-ureq = { version = "2.12.1", features = ["tls"] }
+base64 = "0.22.1"
+fs2 = "0.4.3"
+percent-encoding = "2.3.2"
+ureq = { version = "2.12.1", features = ["tls", "native-certs"] }
+url = "2.5.8"
 claxon = "0.4.3"
 flacenc = "0.5.1"
 opus = "0.3.1"
