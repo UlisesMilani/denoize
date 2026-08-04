@@ -2,13 +2,13 @@ use crate::Audio;
 use ogg::writing::{PacketWriteEndInfo, PacketWriter};
 use opus::{Application, Bitrate, Channels, Encoder};
 use std::borrow::Cow;
-use std::path::Path;
+use std::io::{BufWriter, Write};
 
 use super::pcm::{downmix_to_stereo, lossy_channel_layout};
 use super::DownmixMode;
 
-pub fn write_ogg_opus(
-    path: &Path,
+pub(super) fn write_ogg_opus_to_writer<W: Write>(
+    output: W,
     audio: &Audio,
     bitrate: u32,
     downmix: DownmixMode,
@@ -42,8 +42,7 @@ pub fn write_ogg_opus(
     let pre_skip = encoder
         .get_lookahead()
         .map_err(|e| format!("Opus lookahead: {e}"))? as u16;
-    let file = std::fs::File::create(path).map_err(|e| format!("Opus create: {e}"))?;
-    let mut writer = PacketWriter::new(std::io::BufWriter::new(file));
+    let mut writer = PacketWriter::new(BufWriter::new(output));
     let serial = 0x444e_5a45;
     let mut head = b"OpusHead".to_vec();
     head.extend([1, count as u8]);
@@ -88,5 +87,6 @@ pub fn write_ogg_opus(
             .write_packet(Cow::Owned(packet), serial, end, granule)
             .map_err(|e| format!("Ogg write: {e}"))?;
     }
-    Ok(())
+    let mut output = writer.into_inner();
+    output.flush().map_err(|e| format!("Ogg flush: {e}"))
 }

@@ -1,9 +1,11 @@
 //! MP3 encode via `shine-rs` (Pure Rust, LGPL-2.0).
 
+use std::io::Write;
 use std::path::Path;
 
 use shine_rs::{Mp3Encoder, Mp3EncoderConfig, StereoMode, SUPPORTED_BITRATES};
 
+use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::audio::Audio;
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
@@ -24,7 +26,17 @@ pub fn write_mp3_with_downmix<P: AsRef<Path>>(
     bitrate_kbps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
-    let path = path.as_ref();
+    let mut output = AtomicOutput::new(path)?;
+    write_mp3_to_writer(output.file_mut(), audio, bitrate_kbps, downmix)?;
+    output.commit(CommitMode::Replace)
+}
+
+pub(super) fn write_mp3_to_writer<W: Write>(
+    mut output: W,
+    audio: &Audio,
+    bitrate_kbps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
     if audio.frames() == 0 {
         return Err("MP3 output requires at least one frame".into());
     }
@@ -65,8 +77,10 @@ pub fn write_mp3_with_downmix<P: AsRef<Path>>(
     }
     mp3.extend(encoder.finish().map_err(|e| format!("mp3 finish: {e}"))?);
 
-    std::fs::write(path, &mp3).map_err(|e| format!("write mp3: {e}"))?;
-    Ok(())
+    output
+        .write_all(&mp3)
+        .map_err(|e| format!("write mp3: {e}"))?;
+    output.flush().map_err(|e| format!("flush mp3: {e}"))
 }
 
 fn pick_mp3_bitrate(requested: u32, sample_rate: u32) -> u32 {

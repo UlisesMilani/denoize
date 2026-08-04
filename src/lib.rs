@@ -31,6 +31,7 @@
 //!
 //! Build with all backends: `cargo build --release --features full`
 
+pub mod atomic_output;
 pub mod audio;
 pub mod backend;
 pub mod benchmark;
@@ -58,6 +59,7 @@ pub mod stream;
 pub mod vad;
 pub mod window;
 
+pub use atomic_output::{AtomicOutput, CommitMode};
 pub use audio::{
     ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,
     estimate_file_memory_bytes, estimate_stream_memory_bytes, read_audio, read_wav, read_wav_bytes,
@@ -76,6 +78,25 @@ pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
 pub use quality::QualityMetrics;
 pub use window::{WindowParams, WindowType};
+
+/// Encode audio and optional metadata into a staged file, then publish it in
+/// one filesystem commit.
+pub fn write_audio_transactional(
+    output: impl AsRef<std::path::Path>,
+    audio: &Audio,
+    encode_options: EncodeOptions,
+    metadata_snapshot: Option<metadata::Metadata>,
+    commit_mode: CommitMode,
+) -> Result<(), String> {
+    let output = output.as_ref();
+    let format = OutputFormat::from_path(output)?;
+    let mut transaction = AtomicOutput::new(output)?;
+    encode::write_audio_to_file(transaction.file_mut(), format, audio, encode_options)?;
+    if let Some(metadata_snapshot) = metadata_snapshot {
+        metadata::write_extended_to_file(metadata_snapshot, transaction.file_mut())?;
+    }
+    transaction.commit(commit_mode)
+}
 
 /// Denoise a WAV file end-to-end, writing the result to `output`.
 pub fn denoise_file<P1, P2>(input: P1, output: P2, config: DenoiserConfig) -> Result<Audio, String>
@@ -140,10 +161,7 @@ where
     let metadata = metadata::read_extended(input)?;
     let mut audio = read_audio(input)?;
     denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
-    write_audio(output, &audio, encode_opts)?;
-    if let Some(metadata) = metadata {
-        metadata::write_extended(metadata, output)?;
-    }
+    write_audio_transactional(output, &audio, encode_opts, metadata, CommitMode::Replace)?;
     Ok(audio)
 }
 

@@ -1,10 +1,11 @@
 use denoize::audio::{read_audio, write_audio};
 use denoize::benchmark::{BenchmarkReport, ComparisonReport};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
+use denoize::encode::write_audio_to_file;
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, Backend, BackendOptions, ChannelMode, DownmixMode, EncodeOptions, OnnxModelConfig,
-    OutputFormat, SgmseProfile,
+    AacEncoder, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode, DownmixMode,
+    EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -21,8 +22,38 @@ static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct AppState {
-    jobs: Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    jobs: Arc<Mutex<HashMap<u64, Arc<JobControl>>>>,
     live: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+#[derive(Default)]
+struct JobControl {
+    cancelled: AtomicBool,
+    commit_gate: Mutex<()>,
+}
+
+impl JobControl {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn cancel(&self) -> Result<(), String> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| "出力確定状態を取得できません")?;
+        self.cancelled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn commit(&self, transaction: AtomicOutput, mode: CommitMode) -> Result<(), String> {
+        let _commit_guard = self
+            .commit_gate
+            .lock()
+            .map_err(|_| "出力確定状態を取得できません")?;
+        check_cancelled(self)?;
+        transaction.commit(mode)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -327,7 +358,7 @@ fn start_process(
     request: ProcessRequest,
 ) -> Result<u64, String> {
     validate_request(&request.input, &request.output, &request.options)?;
-    let (job_id, cancelled) = register_job(&state)?;
+    let (job_id, control) = register_job(&state)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
@@ -343,7 +374,7 @@ fn start_process(
             None,
             None,
         );
-        let result = process_file(&request, &cancelled, |stage, message| {
+        let result = process_file(&request, &control, |stage, message| {
             emit_progress(
                 &app, job_id, "file", "running", message, stage, 4, started, None, None,
             );
@@ -415,7 +446,7 @@ fn start_batch(
     if items.is_empty() {
         return Err("対応する音声ファイルがありません".into());
     }
-    let (job_id, cancelled) = register_job(&state)?;
+    let (job_id, control) = register_job(&state)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
@@ -446,7 +477,7 @@ fn start_batch(
         let skipped = AtomicUsize::new(0);
         let failures = Mutex::new(Vec::<String>::new());
         let process_item = |batch_item: &BatchItem| {
-            if cancelled.load(Ordering::SeqCst) { return; }
+            if control.is_cancelled() { return; }
             if request.resume && completed.contains(&batch_item.state_key) && batch_item.output.is_file() {
                 skipped.fetch_add(1, Ordering::Relaxed);
                 let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
@@ -459,7 +490,7 @@ fn start_batch(
                 options: request.options.clone(),
             };
             let result = validate_request(&process_request.input, &process_request.output, &process_request.options)
-                .and_then(|_| process_file(&process_request, &cancelled, |_, _| {}));
+                .and_then(|_| process_file(&process_request, &control, |_, _| {}));
             match result {
                 Ok(_) => {
                     succeeded.fetch_add(1, Ordering::Relaxed);
@@ -491,7 +522,7 @@ fn start_batch(
             }
         };
         let current = finished.load(Ordering::SeqCst);
-        if cancelled.load(Ordering::SeqCst) {
+        if control.is_cancelled() {
             emit_progress(
                 &app,
                 job_id,
@@ -644,9 +675,8 @@ fn cancel_job(state: State<'_, AppState>, job_id: u64) -> Result<(), String> {
         .jobs
         .lock()
         .map_err(|_| "ジョブ状態を取得できません")?;
-    let flag = jobs.get(&job_id).ok_or("実行中のジョブが見つかりません")?;
-    flag.store(true, Ordering::SeqCst);
-    Ok(())
+    let control = jobs.get(&job_id).ok_or("実行中のジョブが見つかりません")?;
+    control.cancel()
 }
 
 #[tauri::command]
@@ -790,13 +820,13 @@ fn model_action(
         let result = match action.as_str() {
             "install" => denoize::models::install_with_progress(
                 model,
-                || cancelled.load(Ordering::Relaxed),
+                || cancelled.is_cancelled(),
                 progress,
             )
             .map(|path| path.display().to_string()),
             "update" => denoize::models::update_with_progress(
                 model,
-                || cancelled.load(Ordering::Relaxed),
+                || cancelled.is_cancelled(),
                 progress,
             )
             .map(|path| path.display().to_string()),
@@ -914,7 +944,7 @@ fn save_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|error| format!("{path} を保存できません: {error}"))
 }
 
-fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<AtomicBool>), String> {
+fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<JobControl>), String> {
     if state
         .live
         .lock()
@@ -924,7 +954,7 @@ fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<AtomicBool>), S
         return Err("ライブ処理を停止してから開始してください".into());
     }
     let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
-    let cancelled = Arc::new(AtomicBool::new(false));
+    let control = Arc::new(JobControl::default());
     let mut jobs = state
         .jobs
         .lock()
@@ -932,8 +962,8 @@ fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<AtomicBool>), S
     if !jobs.is_empty() {
         return Err("別の処理が実行中です。完了またはキャンセル後に再試行してください".into());
     }
-    jobs.insert(job_id, Arc::clone(&cancelled));
-    Ok((job_id, cancelled))
+    jobs.insert(job_id, Arc::clone(&control));
+    Ok((job_id, control))
 }
 
 fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Result<(), String> {
@@ -941,8 +971,17 @@ fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Resu
         return Err("入力ファイルが存在しません".into());
     }
     OutputFormat::from_path(Path::new(output))?;
-    if Path::new(output).exists() && !options.force {
-        return Err("出力ファイルが既に存在します。「上書きを許可」を有効にしてください".into());
+    if !options.force {
+        match std::fs::symlink_metadata(output) {
+            Ok(_) => {
+                return Err(
+                    "出力ファイルが既に存在します。「上書きを許可」を有効にしてください"
+                        .into(),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("出力先を確認できません: {error}")),
+        }
     }
     if !(0.0..=1.0).contains(&options.strength) {
         return Err("強度は0〜1で指定してください".into());
@@ -977,10 +1016,10 @@ fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Resu
 
 fn process_file(
     request: &ProcessRequest,
-    cancelled: &AtomicBool,
+    control: &JobControl,
     progress: impl Fn(usize, &'static str),
 ) -> Result<String, String> {
-    check_cancelled(cancelled)?;
+    check_cancelled(control)?;
     let input = Path::new(&request.input);
     let output = Path::new(&request.output);
     let metadata = if request.options.preserve_metadata {
@@ -990,7 +1029,7 @@ fn process_file(
     };
     let mut audio = read_audio(input)?;
     progress(1, "ノイズ除去を実行しています");
-    check_cancelled(cancelled)?;
+    check_cancelled(control)?;
     let config = processing_config(&request.options, audio.sample_rate)?;
     let backend = if request.options.backend == "auto" {
         BackendChoice::Auto
@@ -1030,7 +1069,7 @@ fn process_file(
             true_peak_dbtp: request.options.true_peak_dbtp,
         },
     )?;
-    check_cancelled(cancelled)?;
+    check_cancelled(control)?;
     let encode = EncodeOptions {
         mp3_bitrate_kbps: request.options.mp3_bitrate_kbps,
         m4a_bitrate_bps: request.options.aac_bitrate_kbps.saturating_mul(1000),
@@ -1043,39 +1082,23 @@ fn process_file(
             .ok_or_else(|| "ダウンミックスは preserve または stereo を指定してください".to_string())?,
     };
     progress(3, "ファイルを書き出しています");
-    let filename = output
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or("無効な出力ファイル名です")?;
-    let temporary = output
-        .with_file_name(format!(".denoize-gui-{filename}.part"))
-        .with_extension(
-            output
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("wav"),
-        );
-    if let Some(parent) = output.parent() {
+    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("出力フォルダを作成できません: {error}"))?;
     }
-    if let Err(error) = write_audio(&temporary, &audio, encode) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if cancelled.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err("cancelled".into());
-    }
-    if output.exists() {
-        std::fs::remove_file(output)
-            .map_err(|error| format!("既存の出力を置換できません: {error}"))?;
-    }
-    std::fs::rename(&temporary, output)
-        .map_err(|error| format!("出力を確定できません: {error}"))?;
+    let format = OutputFormat::from_path(output)?;
+    let mut transaction = AtomicOutput::new(output)?;
+    write_audio_to_file(transaction.file_mut(), format, &audio, encode)?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write_extended(metadata, output)?;
+        denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
     }
+    progress(4, "出力を確定しています");
+    let commit_mode = if request.options.force {
+        CommitMode::Replace
+    } else {
+        CommitMode::NoClobber
+    };
+    control.commit(transaction, commit_mode)?;
     Ok(output.to_string_lossy().into_owned())
 }
 
@@ -1097,8 +1120,8 @@ fn processing_config(options: &ProcessOptions, sample_rate: u32) -> Result<Denoi
     Ok(config)
 }
 
-fn check_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
-    if cancelled.load(Ordering::SeqCst) {
+fn check_cancelled(control: &JobControl) -> Result<(), String> {
+    if control.is_cancelled() {
         Err("cancelled".into())
     } else {
         Ok(())
@@ -1209,6 +1232,77 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn create(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "denoize-gui-{label}-{}-{}",
+                std::process::id(),
+                NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self { path }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+
+        fn assert_no_staged_outputs(&self) {
+            let staged: Vec<_> = std::fs::read_dir(&self.path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .filter(|name| name.to_string_lossy().starts_with(".denoize-"))
+                .collect();
+            assert!(staged.is_empty(), "staged outputs remain: {staged:?}");
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_test_wav(path: &Path) {
+        let mut samples = Vec::with_capacity(3_200);
+        for index in 0..1_600 {
+            let sample = if index % 80 < 40 {
+                1_000_i16
+            } else {
+                -1_000_i16
+            };
+            samples.extend(sample.to_le_bytes());
+        }
+        let mut wav = Vec::with_capacity(44 + samples.len());
+        wav.extend(b"RIFF");
+        wav.extend((36_u32 + samples.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16_u32.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(16_000_u32.to_le_bytes());
+        wav.extend(32_000_u32.to_le_bytes());
+        wav.extend(2_u16.to_le_bytes());
+        wav.extend(16_u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((samples.len() as u32).to_le_bytes());
+        wav.extend(samples);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn classical_options(force: bool) -> ProcessOptions {
+        let mut options = options();
+        options.backend = "classical".into();
+        options.preserve_metadata = false;
+        options.force = force;
+        options
+    }
+
     fn options() -> ProcessOptions {
         ProcessOptions {
             backend: "auto".into(),
@@ -1246,6 +1340,92 @@ mod tests {
     #[test]
     fn invalid_backend_is_rejected() {
         assert!(Backend::parse("missing").is_none());
+    }
+
+    #[test]
+    fn no_force_rechecks_destination_when_committing() {
+        let directory = TestDirectory::create("commit-race");
+        let input = directory.join("input.wav");
+        let output = directory.join("output.wav");
+        write_test_wav(&input);
+        let request = ProcessRequest {
+            input: input.to_string_lossy().into_owned(),
+            output: output.to_string_lossy().into_owned(),
+            options: classical_options(false),
+        };
+        validate_request(&request.input, &request.output, &request.options).unwrap();
+
+        let result = process_file(&request, &JobControl::default(), |stage, _| {
+            if stage == 3 {
+                std::fs::write(&output, b"racing writer").unwrap();
+            }
+        });
+
+        assert!(result.unwrap_err().contains("output already exists"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"racing writer");
+        directory.assert_no_staged_outputs();
+    }
+
+    #[test]
+    fn cancellation_before_commit_preserves_existing_output() {
+        let directory = TestDirectory::create("cancel-commit");
+        let input = directory.join("input.wav");
+        let output = directory.join("output.wav");
+        write_test_wav(&input);
+        std::fs::write(&output, b"existing output").unwrap();
+        let request = ProcessRequest {
+            input: input.to_string_lossy().into_owned(),
+            output: output.to_string_lossy().into_owned(),
+            options: classical_options(true),
+        };
+        let control = Arc::new(JobControl::default());
+        let worker_control = Arc::clone(&control);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            process_file(&request, &worker_control, |stage, _| {
+                if stage == 4 {
+                    ready_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                }
+            })
+        });
+
+        ready_rx.recv().unwrap();
+        control.cancel().unwrap();
+        resume_tx.send(()).unwrap();
+        let result = worker.join().unwrap();
+
+        assert_eq!(result.unwrap_err(), "cancelled");
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing output");
+        directory.assert_no_staged_outputs();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_gui_stage_symlink_does_not_clobber_its_target() {
+        let directory = TestDirectory::create("stage-symlink");
+        let input = directory.join("input.wav");
+        let output = directory.join("output.wav");
+        let victim = directory.join("victim.bin");
+        let legacy_stage = directory.join(".denoize-gui-output.wav.wav");
+        write_test_wav(&input);
+        std::fs::write(&victim, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, &legacy_stage).unwrap();
+        let request = ProcessRequest {
+            input: input.to_string_lossy().into_owned(),
+            output: output.to_string_lossy().into_owned(),
+            options: classical_options(false),
+        };
+
+        process_file(&request, &JobControl::default(), |_, _| {}).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        assert!(std::fs::symlink_metadata(&legacy_stage)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(read_audio(&output).is_ok());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! M4A (AAC-LC in MP4) encode — Pure-Rust `oxideav-aac` + `mp4` muxer.
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
 
 use mp4::{
@@ -10,6 +10,7 @@ use mp4::{
 use oxideav_aac_encoder::adts::ADTS_HEADER_BYTES_NO_CRC;
 use oxideav_aac_encoder::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 
+use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::audio::Audio;
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
@@ -27,7 +28,17 @@ pub fn write_m4a_with_downmix<P: AsRef<Path>>(
     bitrate_bps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
-    let path = path.as_ref();
+    let mut output = AtomicOutput::new(path)?;
+    write_m4a_to_writer(output.file_mut(), audio, bitrate_bps, downmix)?;
+    output.commit(CommitMode::Replace)
+}
+
+pub(super) fn write_m4a_to_writer<W: Write + Seek>(
+    output: W,
+    audio: &Audio,
+    bitrate_bps: u32,
+    downmix: DownmixMode,
+) -> Result<(), String> {
     if audio.frames() == 0 {
         return Err("M4A output requires at least one frame".into());
     }
@@ -53,8 +64,7 @@ pub fn write_m4a_with_downmix<P: AsRef<Path>>(
     let out_ch = layout.count as usize;
     let hop = FRAME_LEN * out_ch;
 
-    let file = std::fs::File::create(path).map_err(|e| format!("create m4a: {e}"))?;
-    let writer = BufWriter::new(file);
+    let writer = BufWriter::new(output);
 
     let parse_brand = |s: &str| -> Result<FourCC, String> {
         s.parse::<FourCC>()
@@ -107,8 +117,8 @@ pub fn write_m4a_with_downmix<P: AsRef<Path>>(
     mp4_writer
         .write_end()
         .map_err(|e| format!("mp4 finalize: {e}"))?;
-
-    Ok(())
+    let mut output = mp4_writer.into_writer();
+    output.flush().map_err(|e| format!("mp4 flush: {e}"))
 }
 
 fn write_aac_sample<W: std::io::Write + std::io::Seek>(

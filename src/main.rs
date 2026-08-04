@@ -2,14 +2,14 @@
 
 use denoize::audio::{
     ensure_memory_limit, estimate_audio_working_set_bytes, estimate_file_memory_bytes,
-    estimate_stream_memory_bytes, read_audio, read_wav_bytes, write_audio, write_wav_bytes,
-    write_wav_channel_mask, WavStreamReader, WavStreamWriter,
+    estimate_stream_memory_bytes, read_audio, read_wav_bytes, write_wav_bytes,
+    write_wav_channel_mask_to_file, WavStreamReader, WavStreamWriter,
 };
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, Algorithm, Backend, BackendOptions, ChannelMode, DownmixMode, EncodeOptions,
-    OnnxModelConfig, SgmseProfile, StreamingDenoiser, WindowType,
+    AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode,
+    DownmixMode, EncodeOptions, OnnxModelConfig, SgmseProfile, StreamingDenoiser, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -929,6 +929,23 @@ fn run_live(_args: &[String]) -> Result<(), String> {
     Err("live audio is unavailable in this build; rebuild with --features live".into())
 }
 
+fn ensure_output_available(path: &std::path::Path, force: bool) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(format!(
+            "output already exists: {} (use --force to replace it)",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "inspect output destination {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     validate_resource_options(&ov)?;
     if input != "-" {
@@ -977,10 +994,8 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         print_report(input, &audio, &cfg, backend);
         return Ok(());
     }
-    if output != "-" && std::path::Path::new(output).exists() && !ov.force {
-        return Err(format!(
-            "output already exists: {output} (use --force to replace it)"
-        ));
+    if output != "-" {
+        ensure_output_available(std::path::Path::new(output), ov.force)?;
     }
 
     let mut enc = EncodeOptions::default();
@@ -1034,29 +1049,17 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
             .map_err(|error| format!("failed to write stdout: {error}"))?;
     } else {
         let output_path = std::path::Path::new(output);
-        let filename = output_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("invalid output filename")?;
-        let temporary = output_path.with_file_name(format!(".denoize-{filename}.part"));
-        // Preserve the real codec extension on the temporary file.
-        let temporary = temporary.with_extension(
-            output_path
-                .extension()
-                .and_then(|x| x.to_str())
-                .unwrap_or("wav"),
-        );
-        if let Err(error) = write_audio(&temporary, &audio, enc) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
-        }
-        if output_path.exists() {
-            std::fs::remove_file(output_path).map_err(|e| format!("replace output: {e}"))?;
-        }
-        std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
-        if let Some(metadata) = metadata {
-            denoize::metadata::write_extended(metadata, output_path)?;
-        }
+        denoize::write_audio_transactional(
+            output_path,
+            &audio,
+            enc,
+            metadata,
+            if ov.force {
+                CommitMode::Replace
+            } else {
+                CommitMode::NoClobber
+            },
+        )?;
         if ov.json {
             println!(
                 "{}",
@@ -1091,11 +1094,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     if !is_wav(input_path) || !is_wav(output_path) {
         return Err("--stream currently supports WAV-to-WAV paths only".into());
     }
-    if output_path.exists() && !ov.force {
-        return Err(format!(
-            "output already exists: {output} (use --force to replace it)"
-        ));
-    }
+    ensure_output_available(output_path, ov.force)?;
     if ov.auto_backend
         || ov
             .backend
@@ -1144,14 +1143,11 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         return Ok(());
     }
 
-    let filename = output_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("invalid output filename")?;
-    let temporary = output_path.with_file_name(format!(".denoize-{filename}.part"));
-    let result = (|| -> Result<usize, String> {
+    let mut transaction = AtomicOutput::new(output_path)?;
+    let frames = (|| -> Result<usize, String> {
         let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
-        let mut writer = WavStreamWriter::create(&temporary, spec)?;
+        let sink = std::io::BufWriter::new(transaction.file_mut());
+        let mut writer = WavStreamWriter::from_sink(sink, spec)?;
         let mut frames = 0usize;
         while let Some(block) = reader.next_block(block_frames)? {
             let block_frames = block.first().map(Vec::len).unwrap_or(0);
@@ -1162,23 +1158,17 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         let tail = processor.finish()?;
         writer.write_block(&tail)?;
         writer.finalize()?;
-        write_wav_channel_mask(&temporary, spec.channels as usize, channel_mask)?;
         Ok(frames)
-    })();
-    let frames = match result {
-        Ok(frames) => frames,
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
-        }
-    };
-    if output_path.exists() {
-        std::fs::remove_file(output_path).map_err(|e| format!("replace output: {e}"))?;
-    }
-    std::fs::rename(&temporary, output_path).map_err(|e| format!("commit output: {e}"))?;
+    })()?;
+    write_wav_channel_mask_to_file(transaction.file_mut(), spec.channels as usize, channel_mask)?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write_extended(metadata, output_path)?;
+        denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
     }
+    transaction.commit(if ov.force {
+        CommitMode::Replace
+    } else {
+        CommitMode::NoClobber
+    })?;
     if ov.json {
         println!(
             "{}",
