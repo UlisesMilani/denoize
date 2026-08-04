@@ -11,7 +11,7 @@ USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
-    denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
+    denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 

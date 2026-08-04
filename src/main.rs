@@ -171,7 +171,7 @@ USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
-    denoize models <list|info|install|update|verify|remove|path|cache-dir> [MODEL|all]
+    denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
@@ -2035,52 +2035,438 @@ fn run_compare(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_models(args: &[String]) -> Result<(), String> {
-    let command = args.first().map(String::as_str).unwrap_or("list");
-    if command == "list" {
-        println!("NAME\tBACKEND\tRATE\tLICENSE\tSTATUS");
-        for model in denoize::models::MODELS {
-            let status = if denoize::models::verify(model).is_ok() {
-                "installed"
-            } else {
-                "not-installed"
-            };
-            println!(
-                "{}\t{}\t{}\t{}\t{}",
-                model.name, model.backend, model.sample_rate, model.license, status
-            );
+fn models_usage() -> &'static str {
+    "\
+Manage verified external models.
+
+USAGE:
+    denoize models list
+    denoize models info <MODEL|all>
+    denoize models install <MODEL|all> [DOWNLOAD OPTIONS]
+    denoize models install <MODEL> --from <PATH>
+    denoize models update <MODEL|all> [DOWNLOAD OPTIONS]
+    denoize models verify <MODEL|all>
+    denoize models remove <MODEL|all>
+    denoize models path <MODEL|all>
+    denoize models cache-dir
+
+DOWNLOAD OPTIONS:
+        --offline                  never access the network; use only verified cached data
+        --proxy <URL>              use this proxy instead of proxy environment variables
+        --no-proxy                 connect directly and ignore proxy environment variables
+        --url <URL>                download one MODEL from an alternate HTTP(S) URL
+        --bearer-token-env <VAR>   read a bearer token from environment variable VAR
+        --basic-user <USER>        username for HTTP Basic authentication
+        --basic-password-env <VAR> read the Basic password from environment variable VAR
+        --from <PATH>              install one MODEL from a local file (install only)
+
+Bearer tokens and Basic passwords are read from environment variables instead
+of literal secret flags. Basic authentication requires both --basic-user and
+--basic-password-env. Signed --url values and proxy credentials can still be
+visible in process arguments. Alternate sources, origin authentication, and
+--from accept one model, not `all`; --url rejects userinfo credentials.
+
+ENVIRONMENT:
+    DENOIZE_MODEL_OFFLINE, DENOIZE_MODEL_URL, DENOIZE_MODEL_PROXY,
+    DENOIZE_MODEL_BEARER_TOKEN, DENOIZE_MODEL_USERNAME, DENOIZE_MODEL_PASSWORD
+    HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY (and lowercase variants)
+"
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelCommand {
+    Info,
+    Install,
+    Update,
+    Verify,
+    Remove,
+    Path,
+}
+
+#[derive(Debug)]
+enum ParsedModelsCommand {
+    Help,
+    List,
+    CacheDir,
+    Run {
+        command: ModelCommand,
+        target: String,
+        download_options: Option<Box<denoize::models::ModelDownloadOptions>>,
+        source_file: Option<std::path::PathBuf>,
+    },
+}
+
+fn models_option_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
+    *index += 1;
+    let value = args
+        .get(*index)
+        .ok_or_else(|| format!("missing value for {flag}"))?;
+    if value.is_empty() {
+        return Err(format!("empty value for {flag}"));
+    }
+    Ok(value.clone())
+}
+
+fn validate_model_source_url(value: &str) -> Result<(), String> {
+    let source = url::Url::parse(value)
+        .map_err(|_| "invalid value for --url: expected an HTTP(S) URL".to_string())?;
+    if !matches!(source.scheme(), "http" | "https") {
+        return Err("invalid value for --url: expected an HTTP(S) URL".into());
+    }
+    if !source.username().is_empty() || source.password().is_some() {
+        return Err(
+            "--url must not contain credentials; use --bearer-token-env or Basic authentication options"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn read_model_secret<F>(
+    flag: &str,
+    variable: &str,
+    read_environment: &mut F,
+) -> Result<String, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    if variable.trim().is_empty() {
+        return Err(format!("empty environment variable name for {flag}"));
+    }
+    let secret = read_environment(variable).map_err(|error| {
+        format!("failed to read environment variable {variable} for {flag}: {error}")
+    })?;
+    if secret.is_empty() {
+        return Err(format!(
+            "environment variable {variable} referenced by {flag} is empty"
+        ));
+    }
+    Ok(secret)
+}
+
+fn parse_models_command<F>(
+    args: &[String],
+    mut download_options: denoize::models::ModelDownloadOptions,
+    mut read_environment: F,
+) -> Result<ParsedModelsCommand, String>
+where
+    F: FnMut(&str) -> Result<String, String>,
+{
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        || args.first().map(String::as_str) == Some("help")
+    {
+        return Ok(ParsedModelsCommand::Help);
+    }
+
+    let command_name = args.first().map(String::as_str).unwrap_or("list");
+    if matches!(command_name, "list" | "cache-dir") {
+        if args.len() > 1 {
+            return Err(format!("models {command_name} accepts no arguments"));
         }
-        return Ok(());
+        return Ok(if command_name == "list" {
+            ParsedModelsCommand::List
+        } else {
+            ParsedModelsCommand::CacheDir
+        });
     }
-    if command == "cache-dir" {
-        println!("{}", denoize::models::cache_dir()?.display());
-        return Ok(());
-    }
-    let name = args
+
+    let command = match command_name {
+        "info" => ModelCommand::Info,
+        "install" => ModelCommand::Install,
+        "update" => ModelCommand::Update,
+        "verify" => ModelCommand::Verify,
+        "remove" => ModelCommand::Remove,
+        "path" => ModelCommand::Path,
+        _ => return Err(format!("unknown models command: {command_name}")),
+    };
+    let target = args
         .get(1)
-        .ok_or_else(|| format!("models {command} requires MODEL"))?;
-    let models: Vec<_> = if name == "all" {
+        .filter(|target| !target.starts_with('-'))
+        .ok_or_else(|| format!("models {command_name} requires MODEL|all"))?
+        .clone();
+
+    if !matches!(command, ModelCommand::Install | ModelCommand::Update) {
+        if args.len() > 2 {
+            return Err(format!(
+                "models {command_name} does not accept options or extra arguments"
+            ));
+        }
+        return Ok(ParsedModelsCommand::Run {
+            command,
+            target,
+            download_options: None,
+            source_file: None,
+        });
+    }
+
+    let mut offline_seen = false;
+    let mut proxy_flag: Option<&str> = None;
+    let mut source_url_seen = false;
+    let mut bearer_variable: Option<String> = None;
+    let mut basic_user: Option<String> = None;
+    let mut basic_password_variable: Option<String> = None;
+    let mut source_file: Option<std::path::PathBuf> = None;
+    let mut index = 2;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--offline" => {
+                if offline_seen {
+                    return Err("--offline specified more than once".into());
+                }
+                offline_seen = true;
+                download_options.offline = true;
+            }
+            "--proxy" => {
+                if let Some(previous) = proxy_flag {
+                    return Err(format!("--proxy cannot be combined with {previous}"));
+                }
+                let value = models_option_value(args, &mut index, flag)?;
+                proxy_flag = Some("--proxy");
+                download_options.proxy = denoize::models::ModelProxy::Url(value);
+            }
+            "--no-proxy" => {
+                if let Some(previous) = proxy_flag {
+                    return Err(format!("--no-proxy cannot be combined with {previous}"));
+                }
+                proxy_flag = Some("--no-proxy");
+                download_options.proxy = denoize::models::ModelProxy::Disabled;
+            }
+            "--url" => {
+                if source_url_seen {
+                    return Err("--url specified more than once".into());
+                }
+                let value = models_option_value(args, &mut index, flag)?;
+                validate_model_source_url(&value)?;
+                source_url_seen = true;
+                download_options.source_url = Some(value);
+            }
+            "--bearer-token-env" => {
+                if bearer_variable.is_some() {
+                    return Err("--bearer-token-env specified more than once".into());
+                }
+                bearer_variable = Some(models_option_value(args, &mut index, flag)?);
+            }
+            "--basic-user" => {
+                if basic_user.is_some() {
+                    return Err("--basic-user specified more than once".into());
+                }
+                basic_user = Some(models_option_value(args, &mut index, flag)?);
+            }
+            "--basic-password-env" => {
+                if basic_password_variable.is_some() {
+                    return Err("--basic-password-env specified more than once".into());
+                }
+                basic_password_variable = Some(models_option_value(args, &mut index, flag)?);
+            }
+            "--from" => {
+                if source_file.is_some() {
+                    return Err("--from specified more than once".into());
+                }
+                source_file = Some(models_option_value(args, &mut index, flag)?.into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown models {command_name} option: {value}"));
+            }
+            value => {
+                return Err(format!(
+                    "unexpected argument for models {command_name}: {value}"
+                ));
+            }
+        }
+        index += 1;
+    }
+
+    if source_file.is_some() {
+        if command != ModelCommand::Install {
+            return Err("--from is supported only by `models install`".into());
+        }
+        if target == "all" {
+            return Err("--from requires one MODEL and cannot be used with `all`".into());
+        }
+        if source_url_seen
+            || proxy_flag.is_some()
+            || bearer_variable.is_some()
+            || basic_user.is_some()
+            || basic_password_variable.is_some()
+        {
+            return Err("--from cannot be combined with network download options".into());
+        }
+        download_options = denoize::models::ModelDownloadOptions::default();
+        download_options.offline = offline_seen;
+    }
+
+    if bearer_variable.is_some() && (basic_user.is_some() || basic_password_variable.is_some()) {
+        return Err(
+            "--bearer-token-env cannot be combined with Basic authentication options".into(),
+        );
+    }
+    download_options.authentication = if let Some(variable) = bearer_variable {
+        Some(denoize::models::ModelAuthentication::Bearer(
+            read_model_secret("--bearer-token-env", &variable, &mut read_environment)?,
+        ))
+    } else {
+        match (basic_user, basic_password_variable) {
+            (Some(username), Some(variable)) => {
+                let password =
+                    read_model_secret("--basic-password-env", &variable, &mut read_environment)?;
+                Some(denoize::models::ModelAuthentication::Basic { username, password })
+            }
+            (None, None) => download_options.authentication,
+            _ => {
+                return Err(
+                    "--basic-user and --basic-password-env must be specified together".into(),
+                )
+            }
+        }
+    };
+
+    if target == "all" && download_options.source_url.is_some() {
+        return Err(
+            "an alternate model URL requires one MODEL and cannot be used with `all`".into(),
+        );
+    }
+    if target == "all" && download_options.authentication.is_some() {
+        return Err("model authentication requires one MODEL and cannot be used with `all`".into());
+    }
+
+    Ok(ParsedModelsCommand::Run {
+        command,
+        target,
+        download_options: Some(Box::new(download_options)),
+        source_file,
+    })
+}
+
+fn model_download_options_from_environment_with<F>(
+    args: &[String],
+    mut read_environment: F,
+) -> Result<denoize::models::ModelDownloadOptions, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if args.iter().any(|argument| argument == "--from") {
+        return Ok(denoize::models::ModelDownloadOptions::default());
+    }
+    let overrides_offline = args.iter().any(|argument| argument == "--offline");
+    let overrides_source = args.iter().any(|argument| argument == "--url");
+    let overrides_proxy = args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--proxy" | "--no-proxy"));
+    let overrides_authentication = args.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--bearer-token-env" | "--basic-user" | "--basic-password-env"
+        )
+    });
+    denoize::models::ModelDownloadOptions::from_env_with(|name| {
+        let overridden = match name {
+            "DENOIZE_MODEL_OFFLINE" => overrides_offline,
+            "DENOIZE_MODEL_URL" => overrides_source,
+            "DENOIZE_MODEL_PROXY" => overrides_proxy,
+            "DENOIZE_MODEL_BEARER_TOKEN" | "DENOIZE_MODEL_USERNAME" | "DENOIZE_MODEL_PASSWORD" => {
+                overrides_authentication
+            }
+            _ => false,
+        };
+        (!overridden).then(|| read_environment(name)).flatten()
+    })
+}
+
+fn run_models(args: &[String]) -> Result<(), String> {
+    let help_requested = args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        || args.first().map(String::as_str) == Some("help");
+    let download_command = matches!(args.first().map(String::as_str), Some("install" | "update"));
+    let download_options = if download_command && !help_requested {
+        model_download_options_from_environment_with(args, |name| std::env::var(name).ok())?
+    } else {
+        denoize::models::ModelDownloadOptions::default()
+    };
+    let parsed = parse_models_command(args, download_options, |name| {
+        std::env::var(name).map_err(|error| error.to_string())
+    })?;
+
+    let (command, target, download_options, source_file) = match parsed {
+        ParsedModelsCommand::Help => {
+            print!("{}", models_usage());
+            return Ok(());
+        }
+        ParsedModelsCommand::List => {
+            println!("NAME\tBACKEND\tRATE\tLICENSE\tSTATUS");
+            for model in denoize::models::MODELS {
+                let status = if denoize::models::verify(model).is_ok() {
+                    "installed"
+                } else {
+                    "not-installed"
+                };
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    model.name, model.backend, model.sample_rate, model.license, status
+                );
+            }
+            return Ok(());
+        }
+        ParsedModelsCommand::CacheDir => {
+            println!("{}", denoize::models::cache_dir()?.display());
+            return Ok(());
+        }
+        ParsedModelsCommand::Run {
+            command,
+            target,
+            download_options,
+            source_file,
+        } => (command, target, download_options, source_file),
+    };
+
+    let models: Vec<_> = if target == "all" {
         denoize::models::MODELS.iter().collect()
     } else {
-        vec![denoize::models::find(name)
-            .ok_or_else(|| format!("unknown model: {name} (run `denoize models list`)"))?]
+        vec![denoize::models::find(&target)
+            .ok_or_else(|| format!("unknown model: {target} (run `denoize models list`)"))?]
     };
     for model in models {
         match command {
-            "info" => {
+            ModelCommand::Info => {
                 println!("name: {}", model.name);
                 println!("backend: {}", model.backend);
                 println!("sample-rate: {}", model.sample_rate);
                 println!("license: {}", model.license);
                 println!("revision: {}", model.revision);
                 println!("sha256: {}", model.sha256);
-                println!("url: {}", model.url);
+                println!("url: {}", denoize::models::redact_url(model.url));
                 println!("path: {}", denoize::models::path(model)?.display());
             }
-            "install" => println!("{}", denoize::models::install(model)?.display()),
-            "update" => println!("{}", denoize::models::update(model)?.display()),
-            "verify" => println!("verified {}", denoize::models::verify(model)?.display()),
-            "remove" => println!(
+            ModelCommand::Install => {
+                let installed = if let Some(source) = source_file.as_ref() {
+                    denoize::models::install_from_file(model, source)?
+                } else {
+                    denoize::models::install_with_options(
+                        model,
+                        download_options
+                            .as_ref()
+                            .expect("download options exist for install"),
+                    )?
+                };
+                println!("{}", installed.display());
+            }
+            ModelCommand::Update => println!(
+                "{}",
+                denoize::models::update_with_options(
+                    model,
+                    download_options
+                        .as_ref()
+                        .expect("download options exist for update"),
+                )?
+                .display()
+            ),
+            ModelCommand::Verify => {
+                println!("verified {}", denoize::models::verify(model)?.display())
+            }
+            ModelCommand::Remove => println!(
                 "{} {}",
                 if denoize::models::remove(model)? {
                     "removed"
@@ -2089,11 +2475,350 @@ fn run_models(args: &[String]) -> Result<(), String> {
                 },
                 model.name
             ),
-            "path" => println!("{}", denoize::models::path(model)?.display()),
-            _ => return Err(format!("unknown models command: {command}")),
+            ModelCommand::Path => println!("{}", denoize::models::path(model)?.display()),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod model_command_tests {
+    use super::*;
+
+    fn missing_secret(name: &str) -> Result<String, String> {
+        Err(format!("{name} is not set"))
+    }
+
+    #[test]
+    fn explicit_model_flags_override_invalid_environment_defaults() {
+        let args = vec![
+            "install".into(),
+            "gtcrn-dns3".into(),
+            "--offline".into(),
+            "--url".into(),
+            "https://models.example/model.onnx".into(),
+            "--no-proxy".into(),
+            "--bearer-token-env".into(),
+            "MODEL_TOKEN".into(),
+        ];
+        let options = model_download_options_from_environment_with(&args, |name| {
+            Some(
+                match name {
+                    "DENOIZE_MODEL_OFFLINE" => "not-a-boolean",
+                    "DENOIZE_MODEL_URL" => "environment-url",
+                    "DENOIZE_MODEL_PROXY" => "environment-proxy",
+                    "DENOIZE_MODEL_BEARER_TOKEN" => "environment-bearer",
+                    "DENOIZE_MODEL_USERNAME" => "environment-user",
+                    "DENOIZE_MODEL_PASSWORD" => "environment-password",
+                    _ => return None,
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        assert!(!options.offline);
+        assert!(options.source_url.is_none());
+        assert!(matches!(
+            options.proxy,
+            denoize::models::ModelProxy::Environment
+        ));
+        assert!(options.authentication.is_none());
+    }
+
+    #[test]
+    fn local_model_install_does_not_validate_unrelated_environment_defaults() {
+        let args = vec![
+            "install".into(),
+            "gtcrn-dns3".into(),
+            "--from".into(),
+            "model.onnx".into(),
+        ];
+        let options = model_download_options_from_environment_with(&args, |_| {
+            panic!("local installs must not read model download environment variables")
+        })
+        .unwrap();
+        assert!(!options.offline);
+        assert!(options.source_url.is_none());
+        assert!(options.authentication.is_none());
+    }
+
+    #[test]
+    fn parses_model_download_overrides_without_reading_process_environment() {
+        let mut base = denoize::models::ModelDownloadOptions::default();
+        base.source_url = Some("https://environment.invalid/model".into());
+        base.authentication = Some(denoize::models::ModelAuthentication::Basic {
+            username: "environment-user".into(),
+            password: "environment-secret".into(),
+        });
+        let args = vec![
+            "update".into(),
+            "gtcrn-dns3".into(),
+            "--url".into(),
+            "https://models.example/model.onnx".into(),
+            "--no-proxy".into(),
+            "--bearer-token-env".into(),
+            "MODEL_TOKEN".into(),
+        ];
+        let parsed = parse_models_command(&args, base, |name| {
+            assert_eq!(name, "MODEL_TOKEN");
+            Ok("secret-token".into())
+        })
+        .unwrap();
+
+        let ParsedModelsCommand::Run {
+            command,
+            target,
+            download_options: Some(options),
+            source_file,
+        } = parsed
+        else {
+            panic!("expected an executable model command");
+        };
+        assert_eq!(command, ModelCommand::Update);
+        assert_eq!(target, "gtcrn-dns3");
+        assert!(source_file.is_none());
+        assert_eq!(
+            options.source_url.as_deref(),
+            Some("https://models.example/model.onnx")
+        );
+        assert!(matches!(
+            options.proxy,
+            denoize::models::ModelProxy::Disabled
+        ));
+        assert!(matches!(
+            options.authentication,
+            Some(denoize::models::ModelAuthentication::Bearer(ref token)) if token == "secret-token"
+        ));
+    }
+
+    #[test]
+    fn parses_basic_authentication_and_local_install() {
+        let basic = vec![
+            "install".into(),
+            "gtcrn-dns3".into(),
+            "--basic-user".into(),
+            "release-bot".into(),
+            "--basic-password-env".into(),
+            "MODEL_PASSWORD".into(),
+        ];
+        let parsed = parse_models_command(
+            &basic,
+            denoize::models::ModelDownloadOptions::default(),
+            |_| Ok("password-from-environment".into()),
+        )
+        .unwrap();
+        let ParsedModelsCommand::Run {
+            download_options: Some(options),
+            ..
+        } = parsed
+        else {
+            panic!("expected download options");
+        };
+        assert!(matches!(
+            options.authentication,
+            Some(denoize::models::ModelAuthentication::Basic {
+                ref username,
+                ref password,
+            }) if username == "release-bot" && password == "password-from-environment"
+        ));
+
+        let local = vec![
+            "install".into(),
+            "gtcrn-dns3".into(),
+            "--offline".into(),
+            "--from".into(),
+            "model.onnx".into(),
+        ];
+        let parsed = parse_models_command(
+            &local,
+            denoize::models::ModelDownloadOptions::default(),
+            missing_secret,
+        )
+        .unwrap();
+        let ParsedModelsCommand::Run {
+            command,
+            source_file: Some(source),
+            download_options: Some(options),
+            ..
+        } = parsed
+        else {
+            panic!("expected a local install");
+        };
+        assert_eq!(command, ModelCommand::Install);
+        assert_eq!(source, std::path::PathBuf::from("model.onnx"));
+        assert!(options.offline);
+    }
+
+    #[test]
+    fn rejects_conflicting_or_incomplete_model_options() {
+        let cases = [
+            (
+                vec![
+                    "install".into(),
+                    "gtcrn-dns3".into(),
+                    "--proxy".into(),
+                    "http://proxy.example".into(),
+                    "--no-proxy".into(),
+                ],
+                "cannot be combined",
+            ),
+            (
+                vec![
+                    "install".into(),
+                    "gtcrn-dns3".into(),
+                    "--basic-user".into(),
+                    "release-bot".into(),
+                ],
+                "must be specified together",
+            ),
+            (
+                vec![
+                    "install".into(),
+                    "gtcrn-dns3".into(),
+                    "--bearer-token-env".into(),
+                    "TOKEN".into(),
+                    "--basic-user".into(),
+                    "release-bot".into(),
+                    "--basic-password-env".into(),
+                    "PASSWORD".into(),
+                ],
+                "cannot be combined",
+            ),
+            (
+                vec![
+                    "install".into(),
+                    "gtcrn-dns3".into(),
+                    "--from".into(),
+                    "model.onnx".into(),
+                    "--proxy".into(),
+                    "http://proxy.example".into(),
+                ],
+                "network download options",
+            ),
+        ];
+        for (args, expected) in cases {
+            let error = parse_models_command(
+                &args,
+                denoize::models::ModelDownloadOptions::default(),
+                missing_secret,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_options_outside_their_supported_target_or_command() {
+        let cases = [
+            (
+                vec!["info".into(), "gtcrn-dns3".into(), "--offline".into()],
+                "does not accept options",
+            ),
+            (
+                vec![
+                    "update".into(),
+                    "gtcrn-dns3".into(),
+                    "--from".into(),
+                    "model.onnx".into(),
+                ],
+                "install",
+            ),
+            (
+                vec![
+                    "install".into(),
+                    "all".into(),
+                    "--from".into(),
+                    "model.onnx".into(),
+                ],
+                "cannot be used with `all`",
+            ),
+            (
+                vec![
+                    "update".into(),
+                    "all".into(),
+                    "--url".into(),
+                    "https://models.example/model.onnx".into(),
+                ],
+                "cannot be used with `all`",
+            ),
+            (
+                vec![
+                    "install".into(),
+                    "gtcrn-dns3".into(),
+                    "--url".into(),
+                    "https://user:secret@models.example/model.onnx".into(),
+                ],
+                "must not contain credentials",
+            ),
+        ];
+        for (args, expected) in cases {
+            let error = parse_models_command(
+                &args,
+                denoize::models::ModelDownloadOptions::default(),
+                missing_secret,
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_environment_source_or_authentication_for_all_models() {
+        let args = vec!["update".into(), "all".into()];
+        let mut source = denoize::models::ModelDownloadOptions::default();
+        source.source_url = Some("https://mirror.example/model.onnx".into());
+        let source_error = parse_models_command(&args, source, missing_secret).unwrap_err();
+        assert!(source_error.contains("cannot be used with `all`"));
+
+        let mut authenticated = denoize::models::ModelDownloadOptions::default();
+        authenticated.authentication = Some(denoize::models::ModelAuthentication::Bearer(
+            "environment-token".into(),
+        ));
+        let authentication_error =
+            parse_models_command(&args, authenticated, missing_secret).unwrap_err();
+        assert!(authentication_error.contains("requires one MODEL"));
+    }
+
+    #[test]
+    fn reports_missing_secret_environment_variables_without_exposing_values() {
+        let args = vec![
+            "install".into(),
+            "gtcrn-dns3".into(),
+            "--bearer-token-env".into(),
+            "MISSING_TOKEN".into(),
+        ];
+        let error = parse_models_command(
+            &args,
+            denoize::models::ModelDownloadOptions::default(),
+            missing_secret,
+        )
+        .unwrap_err();
+        assert!(error.contains("MISSING_TOKEN"));
+        assert!(error.contains("not set"));
+    }
+
+    #[test]
+    fn exposes_dedicated_models_help() {
+        let parsed = parse_models_command(
+            &["--help".into()],
+            denoize::models::ModelDownloadOptions::default(),
+            missing_secret,
+        )
+        .unwrap();
+        assert!(matches!(parsed, ParsedModelsCommand::Help));
+        for flag in [
+            "--offline",
+            "--proxy",
+            "--no-proxy",
+            "--url",
+            "--bearer-token-env",
+            "--basic-user",
+            "--basic-password-env",
+            "--from",
+        ] {
+            assert!(models_usage().contains(flag));
+        }
+    }
 }
 
 fn main() {

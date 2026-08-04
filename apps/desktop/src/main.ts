@@ -37,6 +37,11 @@ type ModelProgress = {
   jobId: number; name: string; status: "running" | "completed" | "failed" | "cancelled";
   message: string; downloaded: number; total: number | null; fraction: number | null;
 };
+type ModelActionOptions = {
+  offline: boolean; sourceUrl: string | null; proxyUrl: string | null; direct: boolean;
+  bearerToken: string | null; basicUsername: string | null; basicPassword: string | null;
+  sourcePath: string | null;
+};
 type PreviewData = { source: string; playablePath: string; durationSeconds: number; rmsDb: number; waveform: number[] };
 type DropSelection = { audioFiles: string[]; directories: string[]; ignored: string[] };
 type LiveDevices = { inputs: string[]; outputs: string[] };
@@ -53,6 +58,9 @@ let pendingJobKind: "file" | "batch" | null = null;
 let pendingJobEvents: JobProgress[] = [];
 let comparison: Comparison | null = null;
 let activeModelJob: number | null = null;
+let activeModelName: string | null = null;
+let pendingModelName: string | null = null;
+let pendingModelEvents: ModelProgress[] = [];
 const previews: { input?: PreviewData; output?: PreviewData } = {};
 let activePreview: "input" | "output" = "input";
 
@@ -170,7 +178,27 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       </section>
 
       <section class="page" id="page-models">
-        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><button class="secondary" id="refresh-models">更新</button></div><p class="section-copy">外部モデルはチェックサム検証後、ローカルキャッシュに保存されます。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
+        <article class="card model-options-card">
+          <div class="card-heading"><div><span class="step">NET</span><h2>セッション限定の導入設定</h2></div><span class="hint">保存・書き出し対象外</span></div>
+          <p class="section-copy">未指定時は環境のプロキシ設定を使います。認証情報は操作開始後に消去され、この端末の設定には保存されません。</p>
+          <div class="form-grid two model-network-fields">
+            <label>取得元URL<input id="model-source-url" type="url" placeholder="マニフェスト既定URL" autocomplete="off" spellcheck="false"></label>
+            <label id="model-proxy-field">プロキシURL<input id="model-proxy-url" type="url" placeholder="環境設定を使用" autocomplete="off" spellcheck="false"></label>
+          </div>
+          <div class="toggle-grid model-policy-toggles">
+            <label class="toggle"><input id="model-offline" type="checkbox"><span></span><div><b>オフライン</b><small>ネットワーク接続を禁止</small></div></label>
+            <label class="toggle"><input id="model-direct" type="checkbox"><span></span><div><b>直接接続</b><small>プロキシを使用しない</small></div></label>
+          </div>
+          <div class="form-grid three model-auth-fields">
+            <label>Bearer token<input id="model-bearer-token" type="password" autocomplete="new-password" spellcheck="false"></label>
+            <label>Basic username<input id="model-basic-username" type="text" autocomplete="off" spellcheck="false"></label>
+            <label>Basic password<input id="model-basic-password" type="password" autocomplete="new-password" spellcheck="false"></label>
+          </div>
+          <div class="file-row model-local-file"><div><label>ローカルモデル（導入時に使用）</label><div id="model-local-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="clear-model-local" disabled>解除</button><button class="secondary" id="choose-model-local">選択</button></div></div>
+          <input id="model-local-path" type="hidden">
+          <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルもマニフェスト固定のSHA-256で検証されます。</p>
+        </article>
+        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><button class="secondary" id="refresh-models">更新</button></div><p class="section-copy">外部モデルはチェックサム検証後、ローカルキャッシュに保存されます。中断したダウンロードは次回の導入・更新で再開されます。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
       </section>
       <div id="toast" role="status"></div>
       <div id="drop-overlay"><strong>ここにドロップ</strong><span>音声ファイルまたはフォルダ</span></div>
@@ -565,26 +593,123 @@ $("#export-report").addEventListener("click", async () => {
   if (path) { await invoke("save_text_file", { path, contents: comparison.html }); showToast("レポートを保存しました"); }
 });
 
+function modelDownloadOptions(action: string): ModelActionOptions {
+  const selectedSourcePath = $<HTMLInputElement>("#model-local-path").value || null;
+  if (selectedSourcePath && action !== "install") throw new Error("ローカルファイルは導入操作でのみ使用できます");
+  const sourcePath = action === "install" ? selectedSourcePath : null;
+  if (sourcePath) {
+    return {
+      offline: false, sourceUrl: null, proxyUrl: null, direct: false,
+      bearerToken: null, basicUsername: null, basicPassword: null, sourcePath,
+    };
+  }
+  const direct = $<HTMLInputElement>("#model-direct").checked;
+  const value = (selector: string) => $<HTMLInputElement>(selector).value || null;
+  return {
+    offline: $<HTMLInputElement>("#model-offline").checked,
+    sourceUrl: value("#model-source-url"),
+    proxyUrl: direct ? null : value("#model-proxy-url"),
+    direct,
+    bearerToken: value("#model-bearer-token"),
+    basicUsername: value("#model-basic-username"),
+    basicPassword: value("#model-basic-password"),
+    sourcePath: null,
+  };
+}
+
+function clearModelSecrets() {
+  $<HTMLInputElement>("#model-bearer-token").value = "";
+  $<HTMLInputElement>("#model-basic-username").value = "";
+  $<HTMLInputElement>("#model-basic-password").value = "";
+  for (const selector of ["#model-source-url", "#model-proxy-url"] as const) {
+    const input = $<HTMLInputElement>(selector);
+    if (!input.value) continue;
+    try {
+      // Proxy URLs may omit the scheme (for example user:pass@proxy:8080).
+      // Parse those as an authority instead of letting WHATWG treat `user:` as
+      // a scheme, then clear every value that can carry a secret.
+      const candidate = input.value.includes("://") ? input.value : `http://${input.value}`;
+      const url = new URL(candidate);
+      if (url.username || url.password || url.search || url.hash) input.value = "";
+    } catch { input.value = ""; }
+  }
+}
+
+function updateModelProxyField() {
+  const local = Boolean($<HTMLInputElement>("#model-local-path").value);
+  const direct = $<HTMLInputElement>("#model-direct").checked;
+  $<HTMLInputElement>("#model-proxy-url").disabled = direct || local;
+  $("#model-proxy-field").classList.toggle("muted-control", direct || local);
+}
+
+function updateModelLocalPolicy() {
+  const local = Boolean($<HTMLInputElement>("#model-local-path").value);
+  for (const selector of [
+    "#model-source-url", "#model-offline", "#model-direct", "#model-bearer-token",
+    "#model-basic-username", "#model-basic-password",
+  ]) $<HTMLInputElement>(selector).disabled = local;
+  updateModelProxyField();
+}
+
+$("#model-direct").addEventListener("change", updateModelProxyField);
+$("#choose-model-local").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
+  if (typeof path !== "string") return;
+  for (const selector of [
+    "#model-source-url", "#model-proxy-url", "#model-bearer-token",
+    "#model-basic-username", "#model-basic-password",
+  ]) $<HTMLInputElement>(selector).value = "";
+  $<HTMLInputElement>("#model-offline").checked = false;
+  $<HTMLInputElement>("#model-direct").checked = false;
+  setPath("#model-local-path", "#model-local-display", path);
+  $<HTMLButtonElement>("#clear-model-local").disabled = false;
+  updateModelLocalPolicy();
+});
+$("#clear-model-local").addEventListener("click", () => {
+  setPath("#model-local-path", "#model-local-display", null);
+  $<HTMLButtonElement>("#clear-model-local").disabled = true;
+  updateModelLocalPolicy();
+});
+updateModelLocalPolicy();
+
 async function loadModels() {
   try {
     const models = await invoke<ModelRow[]>("list_models");
     $("#model-list").innerHTML = models.map((model) => `<div class="model-row" data-model-row="${model.name}"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${model.installed ? "installed" : ""}">${model.installed ? "インストール済み" : "未導入"}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small><div class="model-progress hidden"><div><i></i></div><span></span></div></div><div class="model-actions">${model.installed ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>` : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`}<button class="remove hidden" data-cancel-model>中断</button></div></div>`).join("");
     document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.addEventListener("click", async () => {
       try {
-        document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((item) => item.disabled = true);
-        activeModelJob = await invoke<number>("model_action", { name: button.dataset.model, action: button.dataset.action });
-        const row = button.closest<HTMLElement>("[data-model-row]")!;
-        row.querySelector(".model-progress")?.classList.remove("hidden"); row.querySelector("[data-cancel-model]")?.classList.remove("hidden");
-      } catch (error) { showToast(errorText(error), true); document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((item) => item.disabled = false); }
+        const action = button.dataset.action!;
+        const usesDownloadOptions = action === "install" || action === "update";
+        await beginModelJob(
+          button.dataset.model!,
+          action,
+          usesDownloadOptions ? modelDownloadOptions(action) : null,
+          usesDownloadOptions,
+        );
+      } catch (error) { showToast(errorText(error), true); }
     }));
     document.querySelectorAll<HTMLButtonElement>("[data-cancel-model]").forEach((button) => button.addEventListener("click", async () => {
       if (activeModelJob !== null) await invoke("cancel_job", { jobId: activeModelJob });
     }));
+    const busy = activeModelJob !== null || pendingModelName !== null;
+    setModelUiBusy(busy);
+    if (activeModelName ?? pendingModelName) showModelJobRow((activeModelName ?? pendingModelName)!);
   } catch (error) { $("#model-list").textContent = errorText(error); }
 }
-$("#refresh-models").addEventListener("click", loadModels);
-listen<ModelProgress>("model-progress", ({ payload }) => {
-  if (payload.jobId !== activeModelJob) return;
+$("#refresh-models").addEventListener("click", () => void loadModels());
+
+function setModelUiBusy(busy: boolean) {
+  document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.disabled = busy);
+  $<HTMLButtonElement>("#refresh-models").disabled = busy;
+}
+
+function showModelJobRow(name: string) {
+  const row = document.querySelector<HTMLElement>(`[data-model-row="${CSS.escape(name)}"]`);
+  row?.querySelector(".model-progress")?.classList.remove("hidden");
+  row?.querySelector("[data-cancel-model]")?.classList.toggle("hidden", activeModelJob === null);
+}
+
+function handleModelProgress(payload: ModelProgress) {
   const row = document.querySelector<HTMLElement>(`[data-model-row="${CSS.escape(payload.name)}"]`);
   if (row) {
     const progress = row.querySelector<HTMLElement>(".model-progress")!; progress.classList.remove("hidden");
@@ -594,9 +719,46 @@ listen<ModelProgress>("model-progress", ({ payload }) => {
     progress.querySelector("span")!.textContent = `${payload.message}${percent == null ? "" : ` · ${percent}%`}`;
   }
   if (payload.status !== "running") {
-    activeModelJob = null; showToast(payload.message, payload.status === "failed"); void loadModels();
+    activeModelJob = null;
+    activeModelName = null;
+    setModelUiBusy(false);
+    showToast(payload.message, payload.status === "failed");
+    void loadModels();
+  }
+}
+
+const modelProgressReady = listen<ModelProgress>("model-progress", ({ payload }) => {
+  if (payload.jobId === activeModelJob) {
+    handleModelProgress(payload);
+  } else if (pendingModelName === payload.name) {
+    pendingModelEvents.push(payload);
   }
 });
+
+async function beginModelJob(name: string, action: string, options: ModelActionOptions | null, clearSecrets: boolean) {
+  await modelProgressReady;
+  if (activeModelJob !== null || pendingModelName !== null) throw new Error("別のモデル操作が実行中です");
+  pendingModelName = name;
+  pendingModelEvents = [];
+  setModelUiBusy(true);
+  let jobId: number;
+  try {
+    jobId = await invoke<number>("model_action", { name, action, options });
+  } catch (error) {
+    pendingModelName = null;
+    pendingModelEvents = [];
+    setModelUiBusy(false);
+    throw error;
+  }
+  activeModelJob = jobId;
+  activeModelName = name;
+  if (clearSecrets) clearModelSecrets();
+  const buffered = pendingModelEvents.filter((event) => event.jobId === jobId);
+  pendingModelName = null;
+  pendingModelEvents = [];
+  showModelJobRow(name);
+  buffered.forEach(handleModelProgress);
+}
 
 let checkingUpdate = false;
 async function checkForUpdate(interactive: boolean) {

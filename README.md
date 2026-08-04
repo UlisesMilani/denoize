@@ -264,6 +264,60 @@ cargo build --release --features full
   -a specsub-nl -s 0.5
 ```
 
+### Managed model downloads
+
+Model installs and updates support explicit network policy, authenticated
+mirrors, resumable transfers, and air-gapped local files. Run
+`denoize models --help` for the dedicated command reference.
+
+```sh
+# Offline mode never opens a network connection.
+denoize models install gtcrn-dns3 --offline
+
+# Override the source and proxy for one model.
+denoize models update gtcrn-dns3 \
+  --url https://models.example.net/gtcrn.onnx \
+  --proxy http://proxy.example.net:8080
+
+# Read origin credentials from the environment, never a CLI secret value.
+export MODEL_ACCESS_TOKEN='...'
+denoize models install gtcrn-dns3 --bearer-token-env MODEL_ACCESS_TOKEN
+
+export MODEL_BASIC_PASSWORD='...'
+denoize models install gtcrn-dns3 \
+  --basic-user buildbot --basic-password-env MODEL_BASIC_PASSWORD
+
+# Ignore all proxy settings, or install an already transferred local file.
+denoize models update gtcrn-dns3 --no-proxy
+denoize models install gtcrn-dns3 --from /media/models/gtcrn_simple.onnx
+```
+
+The corresponding defaults are `DENOIZE_MODEL_OFFLINE`,
+`DENOIZE_MODEL_URL`, `DENOIZE_MODEL_PROXY`,
+`DENOIZE_MODEL_BEARER_TOKEN`, `DENOIZE_MODEL_USERNAME`, and
+`DENOIZE_MODEL_PASSWORD`. Standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+and `NO_PROXY` variables (including lowercase variants) are used when no
+denoize-specific proxy override is active. `--proxy` selects an explicit
+proxy; `--no-proxy` and an empty `DENOIZE_MODEL_PROXY` force a direct
+connection.
+
+Interrupted transfers are retained in a `.part` sidecar and resumed with HTTP
+range requests. Saved `ETag` or `Last-Modified` validators and each
+`Content-Range` are checked before appending; changed objects, malformed range
+responses, or an unverified `416` response cause a clean restart. All downloaded
+or local files must match the manifest's pinned SHA-256 before they are
+atomically published, and an update keeps the current verified model until its
+replacement is ready.
+
+HTTPS model connections, including those tunneled through an HTTP CONNECT
+proxy, use the operating system trust store. CLI Bearer tokens and Basic
+passwords are accepted through environment variables, and diagnostics redact
+credentials, query strings, and fragments. Signed `--url` values and proxy
+credentials can still leak through process listings and shell history, so use
+protected environment injection when that matters. See the
+[managed-model guide](docs/models.md) for option combinations,
+proxy precedence, and resume validation details.
+
 ### Long recordings with bounded memory
 
 For long WAV recordings, use the classical streaming path. It keeps only the
@@ -301,6 +355,11 @@ default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
 when selected; managed GTCRN weights are resolved automatically after install.
+The model manager's offline, alternate-source, proxy/direct, authentication,
+and local-file controls are session-only. Bearer tokens and Basic credentials are
+cleared after an operation starts, and none of these download overrides are
+included in saved settings, named presets, or CLI-compatible imports and
+exports.
 Desktop batches accept files or folders, preserve relative paths, run with a
 configurable worker count, continue after individual failures, and can resume
 from the `.denoize-gui-state` journal in the output directory.
@@ -469,7 +528,7 @@ denoize input.wav output.m4a --aac-encoder fdk --m4a-bitrate 192
 The FDK feature uses the third-party Rust port and is intentionally excluded
 from `full` and official release binaries. Fraunhofer's codec source has its own
 license and MPEG-AAC patent language; downstream distributors are responsible
-for reviewing both. Enabling it raises the minimum Rust version to 1.87.
+for reviewing both. The project requires Rust 1.96 or newer.
 
 ### Raw ADTS AAC
 
