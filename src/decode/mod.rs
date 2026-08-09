@@ -40,6 +40,37 @@ pub enum AudioFormat {
     Unknown,
 }
 
+/// Codec carried by an audio container.
+///
+/// This is deliberately separate from [`AudioFormat`]: containers such as Ogg
+/// and ISO BMFF (`.m4a` / `.mp4`) can carry more than one codec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioCodec {
+    Pcm,
+    Flac,
+    Opus,
+    Vorbis,
+    Mp3,
+    Aac,
+    Alac,
+    Unknown,
+}
+
+/// Result of inspecting an audio file without decoding its sample payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioProbe {
+    /// Detected container / format family.
+    pub format: AudioFormat,
+    /// Codec reported by the container's audio track metadata.
+    pub codec: AudioCodec,
+    /// Number of audio tracks reported by the container.
+    pub audio_tracks: usize,
+    /// Whether the container also reports video, subtitle, or other non-audio tracks.
+    pub has_non_audio_tracks: bool,
+    /// Whether a RIFF/RF64 WAVE carries Broadcast Wave (`bext`) metadata.
+    pub is_broadcast_wave: bool,
+}
+
 impl AudioFormat {
     /// Sniff from file content and extension.
     pub fn detect(path: &Path, header: &[u8]) -> Self {
@@ -116,6 +147,510 @@ impl AudioFormat {
             AudioFormat::AacAdts => &["aac"],
             AudioFormat::Unknown => &[],
         }
+    }
+}
+
+/// Inspect an audio file's container and codec without decoding its samples.
+///
+/// Container detection is content-based. Ogg and ISO BMFF containers are then
+/// demuxed with Symphonia so that `.ogg` is not implicitly treated as Opus and
+/// `.m4a` / `.mp4` is not implicitly treated as AAC.
+pub fn probe_file(path: &Path) -> Result<AudioProbe, String> {
+    let header = read_header(path, 4096)?;
+    // Suppress extension fallback here. A probe must describe the file's
+    // contents, not what its name claims the contents are.
+    let format = AudioFormat::detect(Path::new(""), &header);
+
+    match format {
+        AudioFormat::Wav | AudioFormat::Rf64 => probe_wave_file(path, format),
+        AudioFormat::Aiff | AudioFormat::Caf => Ok(single_audio_track(format, AudioCodec::Pcm)),
+        AudioFormat::Flac => Ok(single_audio_track(format, AudioCodec::Flac)),
+        AudioFormat::Mp3 => Ok(single_audio_track(format, AudioCodec::Mp3)),
+        AudioFormat::AacAdts => Ok(single_audio_track(format, AudioCodec::Aac)),
+        AudioFormat::OggOpus | AudioFormat::OggVorbis => probe_ogg_tracks(path, format),
+        AudioFormat::M4a => probe_mp4_tracks(path),
+        AudioFormat::Unknown => Err(format!(
+            "could not identify the audio container from the file header ({}); verify that the file is a supported, non-truncated audio file",
+            path.display()
+        )),
+    }
+}
+
+fn single_audio_track(format: AudioFormat, codec: AudioCodec) -> AudioProbe {
+    AudioProbe {
+        format,
+        codec,
+        audio_tracks: 1,
+        has_non_audio_tracks: false,
+        is_broadcast_wave: false,
+    }
+}
+
+fn probe_wave_file(path: &Path, format: AudioFormat) -> Result<AudioProbe, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for WAVE codec probe: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat {} for WAVE codec probe: {error}", path.display()))?
+        .len();
+    if file_len < 12 {
+        return Err(format!("truncated WAVE header ({})", path.display()));
+    }
+
+    let mut offset = 12u64;
+    let mut codec = AudioCodec::Unknown;
+    let mut found_fmt = false;
+    let mut found_data = false;
+    let mut is_broadcast_wave = false;
+    let mut rf64_data_size = None;
+    let mut rf64_chunk_sizes = std::collections::HashMap::<[u8; 4], u64>::new();
+    for _ in 0..4096 {
+        let Some(header_end) = offset.checked_add(8) else {
+            break;
+        };
+        if header_end > file_len {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek WAVE chunk {}: {error}", path.display()))?;
+        let mut header = [0u8; 8];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read WAVE chunk {}: {error}", path.display()))?;
+        let chunk_size_32 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let chunk_size = u64::from(chunk_size_32);
+        let data_offset = header_end;
+        let effective_chunk_size = if format == AudioFormat::Rf64 && chunk_size_32 == u32::MAX {
+            rf64_chunk_sizes
+                .get(&header[0..4])
+                .copied()
+                .or_else(|| {
+                    (&header[0..4] == b"data")
+                        .then_some(rf64_data_size)
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "RF64 chunk {:?} has no ds64 size ({})",
+                        String::from_utf8_lossy(&header[0..4]),
+                        path.display()
+                    )
+                })?
+        } else {
+            chunk_size
+        };
+
+        if &header[0..4] == b"ds64" && format == AudioFormat::Rf64 {
+            if !(28..=1 << 20).contains(&chunk_size)
+                || data_offset
+                    .checked_add(chunk_size)
+                    .is_none_or(|end| end > file_len)
+            {
+                return Err(format!("RF64 ds64 chunk is truncated ({})", path.display()));
+            }
+            let mut body = vec![0u8; usize::try_from(chunk_size).unwrap()];
+            file.read_exact(&mut body)
+                .map_err(|error| format!("read RF64 ds64 chunk {}: {error}", path.display()))?;
+            rf64_data_size = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
+            let table_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
+            let required = 28usize.saturating_add(table_len.saturating_mul(12));
+            if required > body.len() {
+                return Err(format!(
+                    "RF64 ds64 chunk ends before its table ({})",
+                    path.display()
+                ));
+            }
+            for entry in body[28..required].chunks_exact(12) {
+                let mut chunk_id = [0u8; 4];
+                chunk_id.copy_from_slice(&entry[..4]);
+                rf64_chunk_sizes.insert(
+                    chunk_id,
+                    u64::from_le_bytes(entry[4..12].try_into().unwrap()),
+                );
+            }
+        } else if &header[0..4] == b"fmt " {
+            if chunk_size < 16 {
+                return Err(format!("WAVE fmt chunk is truncated ({})", path.display()));
+            }
+            let read_len = usize::try_from(chunk_size.min(64)).unwrap();
+            if data_offset
+                .checked_add(read_len as u64)
+                .is_none_or(|end| end > file_len)
+            {
+                return Err(format!(
+                    "WAVE fmt chunk exceeds the file ({})",
+                    path.display()
+                ));
+            }
+            let mut fmt = vec![0u8; read_len];
+            file.read_exact(&mut fmt)
+                .map_err(|error| format!("read WAVE fmt chunk {}: {error}", path.display()))?;
+            codec = wave_codec_from_fmt(&fmt);
+            found_fmt = true;
+        } else if &header[0..4] == b"bext" {
+            is_broadcast_wave = true;
+        } else if &header[0..4] == b"data" {
+            if data_offset
+                .checked_add(effective_chunk_size)
+                .is_none_or(|end| end > file_len)
+            {
+                return Err(format!(
+                    "WAVE data chunk exceeds the file ({})",
+                    path.display()
+                ));
+            }
+            found_data = true;
+        }
+
+        let Some(next) = data_offset
+            .checked_add(effective_chunk_size)
+            .and_then(|end| end.checked_add(effective_chunk_size & 1))
+        else {
+            return Err(format!("WAVE chunk size overflows ({})", path.display()));
+        };
+        if next <= offset || next > file_len {
+            return Err(format!("WAVE chunk exceeds the file ({})", path.display()));
+        }
+        offset = next;
+    }
+
+    if !found_fmt {
+        return Err(format!(
+            "WAVE file has no valid fmt chunk ({})",
+            path.display()
+        ));
+    }
+    if !found_data {
+        return Err(format!("WAVE file has no data chunk ({})", path.display()));
+    }
+    Ok(AudioProbe {
+        format,
+        codec,
+        audio_tracks: 1,
+        has_non_audio_tracks: false,
+        is_broadcast_wave,
+    })
+}
+
+fn wave_codec_from_fmt(fmt: &[u8]) -> AudioCodec {
+    if fmt.len() < 16 {
+        return AudioCodec::Unknown;
+    }
+    match u16::from_le_bytes([fmt[0], fmt[1]]) {
+        1 | 3 => AudioCodec::Pcm,
+        0xfffe if fmt.len() >= 40 => {
+            const PCM_GUID: [u8; 16] = [
+                1, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+            ];
+            const FLOAT_GUID: [u8; 16] = [
+                3, 0, 0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71,
+            ];
+            if fmt[24..40] == PCM_GUID || fmt[24..40] == FLOAT_GUID {
+                AudioCodec::Pcm
+            } else {
+                AudioCodec::Unknown
+            }
+        }
+        _ => AudioCodec::Unknown,
+    }
+}
+
+fn probe_mp4_tracks(path: &Path) -> Result<AudioProbe, String> {
+    use std::io::BufReader;
+
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for MP4 codec probe: {error}", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("stat {} for MP4 codec probe: {error}", path.display()))?
+        .len();
+    let primary = mp4::Mp4Reader::read_header(BufReader::new(file), size)
+        .map(|reader| summarize_mp4_tracks(reader.tracks()))
+        .map_err(|error| format!("parse M4A/MP4 track metadata ({}): {error}", path.display()));
+
+    if let Ok(probe) = primary {
+        if probe.audio_tracks > 0 && probe.codec != AudioCodec::Unknown {
+            return Ok(probe);
+        }
+    }
+
+    match probe_container_tracks(path, AudioFormat::M4a) {
+        Ok(probe) if probe.codec == AudioCodec::Alac => Ok(probe),
+        Ok(mut probe) => {
+            // The generic demuxer does not establish that an `mp4a` sample
+            // entry is the AAC-LC profile supported by this project. Keep the
+            // primary parser's conservative result instead of upgrading an
+            // unsupported AAC/USAC/ALS profile to preservable AAC.
+            if let Ok(primary_probe) = &primary {
+                Ok(*primary_probe)
+            } else {
+                probe.codec = AudioCodec::Unknown;
+                Ok(probe)
+            }
+        }
+        Err(symphonia_error) => match primary {
+            // The primary parser still gives a safe answer for an unknown or
+            // unsupported audio sample entry. Let planning reject it as
+            // ambiguous instead of guessing AAC.
+            Ok(probe) => Ok(probe),
+            Err(mp4_error) => Err(format!(
+                "{mp4_error}; fallback probe failed: {symphonia_error}"
+            )),
+        },
+    }
+}
+
+fn summarize_mp4_tracks(tracks: &std::collections::HashMap<u32, mp4::Mp4Track>) -> AudioProbe {
+    let mut audio_tracks = 0;
+    let mut has_non_audio_tracks = false;
+    let mut codec = None;
+    let mut codecs_disagree = false;
+
+    for track in tracks.values() {
+        match track.track_type() {
+            Ok(mp4::TrackType::Audio) => {
+                audio_tracks += 1;
+                let track_codec = if matches!(track.media_type(), Ok(mp4::MediaType::AAC))
+                    && matches!(
+                        track.audio_profile(),
+                        Ok(mp4::AudioObjectType::AacLowComplexity)
+                    )
+                    && track.sample_freq_index().is_ok()
+                    && track.channel_config().is_ok()
+                {
+                    AudioCodec::Aac
+                } else {
+                    AudioCodec::Unknown
+                };
+                if let Some(previous) = codec {
+                    codecs_disagree |= previous != track_codec;
+                } else {
+                    codec = Some(track_codec);
+                }
+            }
+            _ => has_non_audio_tracks = true,
+        }
+    }
+
+    AudioProbe {
+        format: AudioFormat::M4a,
+        codec: if codecs_disagree {
+            AudioCodec::Unknown
+        } else {
+            codec.unwrap_or(AudioCodec::Unknown)
+        },
+        audio_tracks,
+        has_non_audio_tracks,
+        is_broadcast_wave: false,
+    }
+}
+
+fn probe_ogg_tracks(path: &Path, header_format: AudioFormat) -> Result<AudioProbe, String> {
+    // Ask the demuxer to validate the first physical link, then scan every BOS
+    // page so chained or multiplexed logical streams cannot be silently lost.
+    probe_container_tracks(path, header_format)?;
+    let codecs = scan_ogg_bos_codecs(path)?;
+    let audio_tracks = codecs
+        .iter()
+        .filter(|codec| matches!(codec, AudioCodec::Opus | AudioCodec::Vorbis))
+        .count();
+    let has_non_audio_tracks = codecs.iter().any(|codec| *codec == AudioCodec::Unknown);
+    let mut known = codecs
+        .iter()
+        .copied()
+        .filter(|codec| *codec != AudioCodec::Unknown);
+    let first = known.next().unwrap_or(AudioCodec::Unknown);
+    let codecs_disagree = known.any(|codec| codec != first);
+    let codec = if has_non_audio_tracks || codecs_disagree {
+        AudioCodec::Unknown
+    } else {
+        first
+    };
+    let format = match codec {
+        AudioCodec::Opus => AudioFormat::OggOpus,
+        AudioCodec::Vorbis => AudioFormat::OggVorbis,
+        _ => AudioFormat::Unknown,
+    };
+    Ok(AudioProbe {
+        format,
+        codec,
+        audio_tracks,
+        has_non_audio_tracks,
+        is_broadcast_wave: false,
+    })
+}
+
+fn scan_ogg_bos_codecs(path: &Path) -> Result<Vec<AudioCodec>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for Ogg stream probe: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat {} for Ogg stream probe: {error}", path.display()))?
+        .len();
+    let mut offset = 0u64;
+    let mut codecs = Vec::new();
+    while offset < file_len {
+        if offset
+            .checked_add(27)
+            .is_none_or(|header_end| header_end > file_len)
+        {
+            return Err(format!("truncated Ogg page header ({})", path.display()));
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("seek Ogg page {}: {error}", path.display()))?;
+        let mut header = [0u8; 27];
+        file.read_exact(&mut header)
+            .map_err(|error| format!("read Ogg page {}: {error}", path.display()))?;
+        if &header[0..4] != b"OggS" || header[4] != 0 {
+            return Err(format!("invalid Ogg page header ({})", path.display()));
+        }
+        let mut lacing = vec![0u8; header[26] as usize];
+        file.read_exact(&mut lacing)
+            .map_err(|error| format!("read Ogg lacing table {}: {error}", path.display()))?;
+        let body_size = lacing.iter().map(|value| *value as u64).sum::<u64>();
+        let body_offset = offset + 27 + lacing.len() as u64;
+        let body_end = body_offset
+            .checked_add(body_size)
+            .ok_or_else(|| format!("Ogg page size overflows ({})", path.display()))?;
+        if body_end > file_len || body_end <= offset {
+            return Err(format!("Ogg page exceeds the file ({})", path.display()));
+        }
+
+        if header[5] & 0x02 != 0 {
+            let mut prefix = [0u8; 8];
+            let prefix_len = usize::try_from(body_size.min(prefix.len() as u64)).unwrap();
+            file.read_exact(&mut prefix[..prefix_len])
+                .map_err(|error| format!("read Ogg BOS packet {}: {error}", path.display()))?;
+            codecs.push(if prefix.starts_with(b"OpusHead") {
+                AudioCodec::Opus
+            } else if prefix.starts_with(b"\x01vorbis") {
+                AudioCodec::Vorbis
+            } else {
+                AudioCodec::Unknown
+            });
+        }
+        offset = body_end;
+    }
+    if codecs.is_empty() {
+        return Err(format!(
+            "Ogg container has no BOS stream ({})",
+            path.display()
+        ));
+    }
+    Ok(codecs)
+}
+
+fn probe_container_tracks(path: &Path, header_format: AudioFormat) -> Result<AudioProbe, String> {
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+
+    let source = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for codec probe: {error}", path.display()))?;
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension(if header_format == AudioFormat::M4a {
+        "mp4"
+    } else {
+        "ogg"
+    });
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|error| {
+            format!(
+                "the {} header was recognized, but its track metadata could not be parsed ({}): {error}",
+                if header_format == AudioFormat::M4a {
+                    "M4A/MP4"
+                } else {
+                    "Ogg"
+                },
+                path.display()
+            )
+        })?;
+
+    Ok(summarize_container_tracks(header_format, format.tracks()))
+}
+
+fn summarize_container_tracks(
+    header_format: AudioFormat,
+    tracks: &[symphonia::core::formats::Track],
+) -> AudioProbe {
+    let mut audio_tracks = 0;
+    let mut has_non_audio_tracks = false;
+    let mut codec = None;
+    let mut codecs_disagree = false;
+
+    for track in tracks {
+        match track
+            .codec_params
+            .as_ref()
+            .and_then(|params| params.audio())
+        {
+            Some(params) => {
+                audio_tracks += 1;
+                let track_codec = audio_codec_from_symphonia(params.codec);
+                if let Some(previous) = codec {
+                    codecs_disagree |= previous != track_codec;
+                } else {
+                    codec = Some(track_codec);
+                }
+            }
+            None => {
+                // Preserve mode must not silently discard video, subtitle, or
+                // unclassified tracks. Treat every non-audio track as extra,
+                // including one whose parameters are absent.
+                has_non_audio_tracks = true;
+            }
+        }
+    }
+
+    let codec = if codecs_disagree {
+        AudioCodec::Unknown
+    } else {
+        codec.unwrap_or(AudioCodec::Unknown)
+    };
+    let format = match header_format {
+        AudioFormat::OggOpus | AudioFormat::OggVorbis => match codec {
+            AudioCodec::Opus => AudioFormat::OggOpus,
+            AudioCodec::Vorbis => AudioFormat::OggVorbis,
+            // AudioFormat has no generic Ogg variant. Do not mislabel an
+            // unknown or mixed Ogg stream as one of the supported codecs.
+            _ => AudioFormat::Unknown,
+        },
+        _ => header_format,
+    };
+
+    AudioProbe {
+        format,
+        codec,
+        audio_tracks,
+        has_non_audio_tracks,
+        is_broadcast_wave: false,
+    }
+}
+
+fn audio_codec_from_symphonia(codec: symphonia::core::codecs::audio::AudioCodecId) -> AudioCodec {
+    use symphonia::core::codecs::audio::well_known::{
+        CODEC_ID_AAC, CODEC_ID_ALAC, CODEC_ID_FLAC, CODEC_ID_MP3, CODEC_ID_OPUS, CODEC_ID_VORBIS,
+    };
+
+    match codec {
+        CODEC_ID_FLAC => AudioCodec::Flac,
+        CODEC_ID_OPUS => AudioCodec::Opus,
+        CODEC_ID_VORBIS => AudioCodec::Vorbis,
+        CODEC_ID_MP3 => AudioCodec::Mp3,
+        CODEC_ID_AAC => AudioCodec::Aac,
+        CODEC_ID_ALAC => AudioCodec::Alac,
+        _ => AudioCodec::Unknown,
     }
 }
 
@@ -531,6 +1066,20 @@ fn decode_wav(path: &Path) -> Result<DecodedPcm, String> {
 mod tests {
     use super::*;
 
+    fn symphonia_audio_track(
+        id: u32,
+        codec: symphonia::core::codecs::audio::AudioCodecId,
+    ) -> symphonia::core::formats::Track {
+        use symphonia::core::codecs::audio::AudioCodecParameters;
+        use symphonia::core::codecs::CodecParameters;
+
+        let mut params = AudioCodecParameters::new();
+        params.for_codec(codec);
+        let mut track = symphonia::core::formats::Track::new(id);
+        track.with_codec_params(CodecParameters::Audio(params));
+        track
+    }
+
     #[test]
     fn detect_wav() {
         let h = b"RIFF\x00\x00\x00\x00WAVE";
@@ -562,5 +1111,135 @@ mod tests {
             AudioFormat::detect(Path::new("x.aac"), b""),
             AudioFormat::AacAdts
         );
+    }
+
+    #[test]
+    fn summarize_ogg_uses_track_codec_instead_of_header_guess() {
+        use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
+
+        let tracks = [symphonia_audio_track(0, CODEC_ID_VORBIS)];
+        let probe = summarize_container_tracks(AudioFormat::OggOpus, &tracks);
+
+        assert_eq!(probe.format, AudioFormat::OggVorbis);
+        assert_eq!(probe.codec, AudioCodec::Vorbis);
+        assert_eq!(probe.audio_tracks, 1);
+        assert!(!probe.has_non_audio_tracks);
+    }
+
+    #[test]
+    fn summarize_m4a_reports_all_tracks_and_alac() {
+        use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
+        use symphonia::core::codecs::video::VideoCodecParameters;
+        use symphonia::core::codecs::CodecParameters;
+
+        let audio = symphonia_audio_track(0, CODEC_ID_ALAC);
+        let mut video = symphonia::core::formats::Track::new(1);
+        video.with_codec_params(CodecParameters::Video(VideoCodecParameters::default()));
+
+        let probe = summarize_container_tracks(AudioFormat::M4a, &[audio, video]);
+
+        assert_eq!(probe.format, AudioFormat::M4a);
+        assert_eq!(probe.codec, AudioCodec::Alac);
+        assert_eq!(probe.audio_tracks, 1);
+        assert!(probe.has_non_audio_tracks);
+    }
+
+    #[test]
+    fn summarize_unclassified_track_prevents_implicit_preservation() {
+        use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+
+        let audio = symphonia_audio_track(0, CODEC_ID_AAC);
+        let unclassified = symphonia::core::formats::Track::new(1);
+
+        let probe = summarize_container_tracks(AudioFormat::M4a, &[audio, unclassified]);
+
+        assert_eq!(probe.codec, AudioCodec::Aac);
+        assert_eq!(probe.audio_tracks, 1);
+        assert!(probe.has_non_audio_tracks);
+    }
+
+    #[test]
+    fn summarize_mixed_audio_codecs_is_unknown() {
+        use symphonia::core::codecs::audio::well_known::{CODEC_ID_AAC, CODEC_ID_ALAC};
+
+        let tracks = [
+            symphonia_audio_track(0, CODEC_ID_AAC),
+            symphonia_audio_track(1, CODEC_ID_ALAC),
+        ];
+        let probe = summarize_container_tracks(AudioFormat::M4a, &tracks);
+
+        assert_eq!(probe.codec, AudioCodec::Unknown);
+        assert_eq!(probe.audio_tracks, 2);
+        assert!(!probe.has_non_audio_tracks);
+    }
+
+    #[test]
+    fn probe_mp4_counts_multiple_aac_and_non_audio_tracks() {
+        let config = mp4::Mp4Config {
+            major_brand: "M4A ".parse().unwrap(),
+            minor_version: 0,
+            compatible_brands: vec!["M4A ".parse().unwrap(), "isom".parse().unwrap()],
+            timescale: 48_000,
+        };
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = mp4::Mp4Writer::write_start(cursor, &config).unwrap();
+        let track = mp4::TrackConfig::from(mp4::AacConfig::default());
+        writer.add_track(&track).unwrap();
+        writer.add_track(&track).unwrap();
+        writer
+            .add_track(&mp4::TrackConfig::from(mp4::TtxtConfig::default()))
+            .unwrap();
+        writer.write_end().unwrap();
+        let bytes = writer.into_writer().into_inner();
+        let path = std::env::temp_dir().join(format!(
+            "denoize-probe-{}-multiple-audio.m4a",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+
+        let probe = probe_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(probe.format, AudioFormat::M4a);
+        assert_eq!(probe.codec, AudioCodec::Aac);
+        assert_eq!(probe.audio_tracks, 2);
+        assert!(probe.has_non_audio_tracks);
+    }
+
+    #[test]
+    fn probe_file_uses_content_instead_of_extension() {
+        let path =
+            std::env::temp_dir().join(format!("denoize-probe-{}-content.mp4", std::process::id()));
+        let bytes = crate::audio::write_wav_bytes(&crate::audio::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 16]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        })
+        .expect("encode probe fixture");
+        std::fs::write(&path, bytes).expect("write probe fixture");
+
+        let probe = probe_file(&path).expect("probe WAV header");
+        std::fs::remove_file(&path).expect("remove probe fixture");
+
+        assert_eq!(probe, single_audio_track(AudioFormat::Wav, AudioCodec::Pcm));
+    }
+
+    #[test]
+    fn probe_file_does_not_assume_codec_from_extension() {
+        use std::io::Write;
+
+        let path =
+            std::env::temp_dir().join(format!("denoize-probe-{}-unknown.m4a", std::process::id()));
+        let mut file = std::fs::File::create(&path).expect("create probe fixture");
+        file.write_all(b"not an audio file")
+            .expect("write probe fixture");
+        drop(file);
+
+        let error = probe_file(&path).expect_err("extension alone must not determine a codec");
+        std::fs::remove_file(&path).expect("remove probe fixture");
+
+        assert!(error.contains("could not identify the audio container"));
     }
 }
