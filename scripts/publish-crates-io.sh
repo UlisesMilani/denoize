@@ -19,10 +19,16 @@ cp Cargo.crates-io.toml Cargo.toml
 rm Cargo.lock
 cargo generate-lockfile
 
+if [[ "${1:-}" == "--audit" ]]; then
+  cargo audit --file Cargo.lock
+  exit 0
+fi
+
 if [[ "${1:-}" == "--test" ]]; then
   shift
   cargo test --locked --all-targets --features full "$@"
   exit 0
 fi
 
+cargo audit --file Cargo.lock
 cargo publish --locked --allow-dirty "$@"

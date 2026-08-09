@@ -3,12 +3,12 @@
 One version tag publishes two distributions:
 
 - GitHub Release archives with classical DSP, RNNoise, and DeepFilterNet.
-- The crates.io CLI/library package with classical DSP and RNNoise.
+- The crates.io CLI/library package with every crates.io-compatible backend.
 
-DeepFilterNet 0.5.6 is currently a Git-only dependency. Cargo registries cannot
-publish packages with an unreleased Git dependency, so it is intentionally
-excluded from `Cargo.crates-io.toml`. Do not add it to that manifest until a
-compatible DeepFilterNet release exists on crates.io.
+The DeepFilterNet Rust crate is currently a Git-only dependency. Cargo
+registries cannot publish packages with an unreleased Git dependency, so it is
+intentionally excluded from `Cargo.crates-io.toml`. Do not add it to that
+manifest until a compatible DeepFilterNet release exists on crates.io.
 
 ## One-time repository setup
 
@@ -34,7 +34,13 @@ the repository's built-in `GITHUB_TOKEN`.
 4. Run:
 
    ```sh
+   cargo audit --file Cargo.lock
+   cargo audit --file apps/desktop/src-tauri/Cargo.lock
+   bash scripts/publish-crates-io.sh --audit
+   npm --prefix apps/desktop audit --package-lock-only --audit-level=moderate
    cargo test --locked --all-targets --features full
+   cargo build --locked --features full --bin denoize
+   python3 scripts/validate-deepfilter.py --denoize target/debug/denoize
    bash scripts/publish-crates-io.sh --dry-run
    ```
 

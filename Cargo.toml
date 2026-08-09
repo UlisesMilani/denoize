@@ -24,14 +24,15 @@ path = "src/main.rs"
 [dependencies]
 hound = "3.5"
 nnnoiseless = { version = "0.5.2", optional = true, default-features = false }
-df = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", package = "deep_filter", optional = true, default-features = false, features = ["tract", "default-model", "wav-utils", "transforms"] }
-ndarray = { version = "0.15", optional = true }
+# Upstream PR #695 migrates DeepFilterNet to the patched tract 0.23 line. The
+# reviewed commit is mirrored under the project owner for reproducible builds.
+df = { git = "https://github.com/penguin425/DeepFilterNet", rev = "9b8790dca0fbc6e3625b5d0b9aef7b90740f3563", package = "deep_filter", optional = true, default-features = false, features = ["tract", "default-model", "wav-utils", "transforms"] }
+ndarray = { version = "0.17.2", optional = true }
 tract-onnx = { version = "0.22.3", optional = true }
 rustfft = { version = "6.4", optional = true }
 kaldi-native-fbank = { version = "0.1.0", optional = true }
 audio_samples = { version = "2.0.1", optional = true, default-features = false }
 audio_samples_qoe = { version = "0.1.3", optional = true }
-ndarray-visqol = { package = "ndarray", version = "0.17.2", optional = true }
 nanomp3 = "0.1.1"
 shine-rs = "0.1.3"
 oxideav-aac = "0.1.6"
@@ -84,7 +85,7 @@ bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
-visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray-visqol"]
+visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
 live = ["dep:cpal"]
 fdk-aac-encoder = ["dep:fdk-aac-rust"]

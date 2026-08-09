@@ -303,7 +303,7 @@ fn segment_correlation(
 fn visqol(reference: &Audio, test: &Audio) -> Option<f64> {
     use audio_samples::AudioSamples;
     use audio_samples_qoe::{visqol as calculate_visqol, VisqolOptions};
-    use ndarray_visqol::Array1;
+    use ndarray::Array1;
     use std::num::NonZeroU32;
 
     let rate = NonZeroU32::new(reference.sample_rate)?;
