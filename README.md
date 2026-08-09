@@ -36,10 +36,10 @@ The generic ONNX backend is the deployment foundation for future neural
 models. It intentionally accepts only single-input/single-output waveform
 models; spectral models and diffusion samplers require dedicated adapters.
 
-> The prebuilt GitHub binaries include every backend. Because DeepFilterNet
-> 0.5.6 is not available from crates.io, the crates.io package's `full` feature
-> currently includes RNNoise, generic ONNX, MP-SENet, BSRNN, MossFormer2, and
-> SGMSE+, but not DeepFilterNet.
+> The prebuilt GitHub binaries include every backend. Because the DeepFilterNet
+> Rust crate is not available from crates.io, the crates.io package's `full`
+> feature currently includes RNNoise, generic ONNX, MP-SENet, BSRNN,
+> MossFormer2, SGMSE+, and GTCRN, but not DeepFilterNet.
 
 ## Supported input formats
 
@@ -408,8 +408,8 @@ Every archive has a matching `.sha256` checksum file.
 
 ## Install with Cargo
 
-The crates.io package provides the CLI and library with the classical DSP and
-optional RNNoise backends:
+The crates.io package provides the CLI and library with every
+crates.io-compatible backend:
 
 ```sh
 cargo install denoize --features full

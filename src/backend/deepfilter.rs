@@ -36,10 +36,25 @@ pub fn process(channels: &[Vec<f64>], sample_rate: u32) -> Result<Vec<Vec<f64>>,
     let mut model = DfTract::new(df_params, &r_params)
         .map_err(|e| format!("DeepFilterNet init failed: {e}"))?;
 
-    // Pad both unequal channels and the final partial model hop. The result is
-    // trimmed back to each original channel length below.
+    // Flush and remove the STFT/model lookahead latency. Processing only the
+    // source frames leaves this delay at the beginning and truncates the same
+    // number of samples from the end.
     let source_len_48k = ch_data.iter().map(|c| c.len()).max().unwrap_or(0);
-    let len_48k = padded_hop_len(source_len_48k, model.hop_size);
+    let stft_delay = model
+        .fft_size
+        .checked_sub(model.hop_size)
+        .ok_or_else(|| "DeepFilterNet reported an invalid FFT size".to_string())?;
+    let model_delay = model
+        .lookahead
+        .checked_mul(model.hop_size)
+        .ok_or_else(|| "DeepFilterNet latency overflow".to_string())?;
+    let delay_48k = stft_delay
+        .checked_add(model_delay)
+        .ok_or_else(|| "DeepFilterNet latency overflow".to_string())?;
+    let flush_len_48k = source_len_48k
+        .checked_add(delay_48k)
+        .ok_or_else(|| "DeepFilterNet input is too long".to_string())?;
+    let len_48k = padded_hop_len(flush_len_48k, model.hop_size);
     for c in &mut ch_data {
         c.resize(len_48k, 0.0);
     }
@@ -61,7 +76,13 @@ pub fn process(channels: &[Vec<f64>], sample_rate: u32) -> Result<Vec<Vec<f64>>,
     // Extract per-channel output and resample back.
     let mut result = Vec::with_capacity(n_ch);
     for ch in 0..n_ch {
-        let row: Vec<f32> = enh.row(ch).iter().copied().collect();
+        let row: Vec<f32> = enh
+            .row(ch)
+            .iter()
+            .skip(delay_48k)
+            .take(source_len_48k)
+            .copied()
+            .collect();
         let f64_out: Vec<f64> = if sample_rate as usize == DF_SR {
             row.iter().map(|&x| x as f64).collect()
         } else {
@@ -109,10 +130,87 @@ fn resample_from_48k(input: &[f32], to_sr: usize) -> Result<Vec<f32>, String> {
 mod tests {
     use super::*;
 
+    fn correlation(left: &[f64], right: &[f64]) -> f64 {
+        let dot: f64 = left.iter().zip(right).map(|(a, b)| a * b).sum();
+        let left_energy: f64 = left.iter().map(|sample| sample * sample).sum();
+        let right_energy: f64 = right.iter().map(|sample| sample * sample).sum();
+        dot / (left_energy * right_energy).sqrt()
+    }
+
     #[test]
     fn final_partial_hop_is_padded() {
         assert_eq!(padded_hop_len(1, 480), 480);
         assert_eq!(padded_hop_len(480, 480), 480);
         assert_eq!(padded_hop_len(481, 480), 960);
+    }
+
+    #[test]
+    fn embedded_model_runs_end_to_end() {
+        let sample_count = DF_SR / 4;
+        let noisy: Vec<f64> = (0..sample_count)
+            .map(|index| {
+                let time = index as f64 / DF_SR as f64;
+                let voiced = 0.18 * (std::f64::consts::TAU * 180.0 * time).sin()
+                    + 0.08 * (std::f64::consts::TAU * 360.0 * time).sin();
+                let noise = (((index * 37) % 101) as f64 / 50.0 - 1.0) * 0.03;
+                voiced + noise
+            })
+            .collect();
+        let input_energy: f64 = noisy.iter().map(|sample| sample * sample).sum();
+
+        let enhanced = process(&[noisy], DF_SR as u32).expect("embedded model inference failed");
+
+        assert_eq!(enhanced.len(), 1);
+        assert_eq!(enhanced[0].len(), sample_count);
+        assert!(enhanced[0].iter().all(|sample| sample.is_finite()));
+        let output_energy: f64 = enhanced[0].iter().map(|sample| sample * sample).sum();
+        assert!(output_energy > 1e-6, "embedded model produced silence");
+        assert!(
+            output_energy < input_energy * 4.0,
+            "embedded model produced unbounded output"
+        );
+    }
+
+    #[test]
+    fn embedded_model_handles_resampled_stereo() {
+        const INPUT_RATE: u32 = 16_000;
+        let sample_count = INPUT_RATE as usize / 4;
+        let channel = |frequency: f64, phase: f64| {
+            (0..sample_count)
+                .map(|index| {
+                    let time = index as f64 / INPUT_RATE as f64;
+                    0.2 * (std::f64::consts::TAU * frequency * time + phase).sin()
+                })
+                .collect::<Vec<_>>()
+        };
+        let input = [channel(180.0, 0.0), channel(240.0, 0.4)];
+
+        let enhanced = process(&input, INPUT_RATE).expect("resampled stereo inference failed");
+
+        assert_eq!(enhanced.len(), input.len());
+        for (output, source) in enhanced.iter().zip(input.iter()) {
+            assert_eq!(output.len(), source.len());
+            assert!(output.iter().all(|sample| sample.is_finite()));
+            let output_energy: f64 = output.iter().map(|sample| sample * sample).sum();
+            let input_energy: f64 = source.iter().map(|sample| sample * sample).sum();
+            assert!(output_energy > 1e-6, "resampled output was silent");
+            assert!(
+                output_energy < input_energy * 4.0,
+                "resampled output was unbounded"
+            );
+            let tail_energy: f64 = output
+                .iter()
+                .rev()
+                .take(INPUT_RATE as usize / 100)
+                .map(|sample| sample * sample)
+                .sum();
+            assert!(tail_energy > 1e-6, "resampled output tail was truncated");
+        }
+        let left_own = correlation(&enhanced[0], &input[0]).abs();
+        let left_other = correlation(&enhanced[0], &input[1]).abs();
+        let right_own = correlation(&enhanced[1], &input[1]).abs();
+        let right_other = correlation(&enhanced[1], &input[0]).abs();
+        assert!(left_own > left_other + 0.2, "left channel was mixed up");
+        assert!(right_own > right_other + 0.2, "right channel was mixed up");
     }
 }
