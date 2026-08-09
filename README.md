@@ -467,9 +467,25 @@ Process a directory tree concurrently while preserving its relative layout:
 denoize recordings cleaned --batch --recursive --jobs 4 --output-format flac
 ```
 
-Batch mode continues after per-file failures and reports a final success/failure
-summary. Existing outputs remain protected unless `--force` is supplied. Omit
-`--output-format` to retain each input file's format.
+Batch mode validates the complete input/output plan before creating the output
+directory, then continues after per-file processing failures and reports a
+final summary. Existing outputs remain protected unless `--force` is supplied,
+and input/output directories must not overlap. Recursive discovery does not
+follow directory symlinks, and planned destinations that resolve back into the
+input tree are rejected.
+
+Omit `--output-format` only when denoize can re-encode the same container and
+codec (WAV, FLAC, Ogg Opus, MP3, AAC-in-MP4, or ADTS AAC). Decode-only
+containers such as AIFF/AIFC, CAF, RF64/BWF, plus Ogg Vorbis and ALAC-in-MP4,
+require an explicit output format. This prevents implicit Vorbis-to-Opus or
+ALAC-to-AAC conversion; for example, use `--output-format flac` when that
+conversion is intentional. AAC-in-MP4 and ADTS AAC also require a build with
+the corresponding AAC encoder; unavailable outputs are rejected during
+preflight.
+
+With `--resume`, each state entry is bound to both the input path and the
+planned destination/codec. Changing `--output-format` therefore reprocesses the
+input instead of accepting an unrelated stale output.
 
 ### Automatic backend selection
 

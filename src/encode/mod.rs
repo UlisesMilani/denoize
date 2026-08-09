@@ -96,16 +96,63 @@ impl OutputFormat {
         {
             Some("wav") => Ok(OutputFormat::Wav),
             Some("flac") => Ok(OutputFormat::Flac),
-            Some("opus" | "ogg") => Ok(OutputFormat::OggOpus),
+            Some("opus" | "ogg" | "oga") => Ok(OutputFormat::OggOpus),
             Some("mp3") => Ok(OutputFormat::Mp3),
             Some("m4a" | "m4b" | "mp4") => Ok(OutputFormat::M4a),
             Some("aac") => Ok(OutputFormat::AacAdts),
             Some(ext) => Err(format!(
-                "unsupported output format '.{ext}'; use .wav, .flac, .opus, .mp3, .m4a, or .aac"
+                "unsupported output format '.{ext}'; use .wav, .flac, .opus/.ogg/.oga, .mp3, .m4a, or .aac"
             )),
             None => Err(
-                "output path has no extension; use .wav, .flac, .opus, .mp3, .m4a, or .aac".into(),
+                "output path has no extension; use .wav, .flac, .opus/.ogg/.oga, .mp3, .m4a, or .aac".into(),
             ),
+        }
+    }
+
+    /// Validate that this output format and encoder selection are available
+    /// in the current build before any audio processing or output staging.
+    pub fn validate_encoder(self, aac_encoder: AacEncoder) -> Result<(), String> {
+        match self {
+            OutputFormat::M4a => {
+                #[cfg(not(feature = "m4a-encode"))]
+                {
+                    let _ = aac_encoder;
+                    Err("M4A output is unavailable in this build; rebuild with --features m4a-encode or use WAV/MP3".into())
+                }
+                #[cfg(feature = "m4a-encode")]
+                {
+                    if aac_encoder == AacEncoder::Fdk {
+                        #[cfg(not(feature = "fdk-aac-encoder"))]
+                        {
+                            return Err("FDK-AAC is unavailable in this build; rebuild with --features fdk-aac-encoder".into());
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            OutputFormat::AacAdts => {
+                #[cfg(not(feature = "m4a-encode"))]
+                {
+                    let _ = aac_encoder;
+                    Err(
+                        "AAC output is unavailable in this build; rebuild with --features m4a-encode"
+                            .into(),
+                    )
+                }
+                #[cfg(feature = "m4a-encode")]
+                {
+                    if aac_encoder == AacEncoder::Fdk {
+                        return Err(
+                            "FDK-AAC ADTS output is not available; use M4A or --aac-encoder oxide"
+                                .into(),
+                        );
+                    }
+                    Ok(())
+                }
+            }
+            OutputFormat::Wav | OutputFormat::Flac | OutputFormat::OggOpus | OutputFormat::Mp3 => {
+                Ok(())
+            }
         }
     }
 }
@@ -157,6 +204,7 @@ pub fn write_audio_to_file(
     audio: &Audio,
     options: EncodeOptions,
 ) -> Result<(), String> {
+    format.validate_encoder(options.aac_encoder)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("seek output: {error}"))?;
     file.set_len(0)
@@ -301,6 +349,50 @@ mod tests {
             OutputFormat::from_path(Path::new("out.opus")).unwrap(),
             OutputFormat::OggOpus
         );
+        assert_eq!(
+            OutputFormat::from_path(Path::new("out.oga")).unwrap(),
+            OutputFormat::OggOpus
+        );
+    }
+
+    #[test]
+    fn validates_encoder_availability_before_writing() {
+        for format in [
+            OutputFormat::Wav,
+            OutputFormat::Flac,
+            OutputFormat::OggOpus,
+            OutputFormat::Mp3,
+        ] {
+            assert!(format.validate_encoder(AacEncoder::Oxide).is_ok());
+            assert!(format.validate_encoder(AacEncoder::Fdk).is_ok());
+        }
+
+        #[cfg(feature = "m4a-encode")]
+        {
+            assert!(OutputFormat::M4a
+                .validate_encoder(AacEncoder::Oxide)
+                .is_ok());
+            assert!(OutputFormat::AacAdts
+                .validate_encoder(AacEncoder::Oxide)
+                .is_ok());
+        }
+        #[cfg(not(feature = "m4a-encode"))]
+        {
+            assert!(OutputFormat::M4a
+                .validate_encoder(AacEncoder::Oxide)
+                .is_err());
+            assert!(OutputFormat::AacAdts
+                .validate_encoder(AacEncoder::Oxide)
+                .is_err());
+        }
+
+        #[cfg(all(feature = "m4a-encode", feature = "fdk-aac-encoder"))]
+        assert!(OutputFormat::M4a.validate_encoder(AacEncoder::Fdk).is_ok());
+        #[cfg(not(all(feature = "m4a-encode", feature = "fdk-aac-encoder")))]
+        assert!(OutputFormat::M4a.validate_encoder(AacEncoder::Fdk).is_err());
+        assert!(OutputFormat::AacAdts
+            .validate_encoder(AacEncoder::Fdk)
+            .is_err());
     }
 
     #[test]

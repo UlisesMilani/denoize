@@ -63,7 +63,7 @@ OPTIONS:
         --max-memory <MB>     refuse inputs whose estimated working set exceeds MB
         --recursive           include subdirectories in batch mode
         --jobs <N>            concurrent batch workers (default: CPU count)
-        --output-format <EXT> convert every batch output to this format
+        --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
         --resume              skip completed files recorded by batch state
         --no-progress         suppress batch progress and ETA output

@@ -5,11 +5,13 @@ use denoize::audio::{
     estimate_stream_memory_bytes, read_audio, read_wav_bytes, write_wav_bytes,
     write_wav_channel_mask_to_file, WavStreamReader, WavStreamWriter,
 };
+use denoize::decode::{probe_file as probe_audio_file, AudioCodec, AudioFormat, AudioProbe};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
     AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode,
-    DownmixMode, EncodeOptions, OnnxModelConfig, SgmseProfile, StreamingDenoiser, WindowType,
+    DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile, StreamingDenoiser,
+    WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -223,7 +225,7 @@ OPTIONS:
         --max-memory <MB>     refuse inputs whose estimated working set exceeds MB
         --recursive           include subdirectories in batch mode
         --jobs <N>            concurrent batch workers (default: CPU count)
-        --output-format <EXT> convert every batch output to this format
+        --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
         --resume              skip completed files recorded by batch state
         --no-progress         suppress batch progress and ETA output
@@ -780,11 +782,16 @@ fn build_config(ov: &Overrides, sample_rate: u32) -> DenoiserConfig {
     cfg
 }
 
-fn print_report(input: &str, audio: &denoize::Audio, cfg: &DenoiserConfig, backend: Backend) {
+fn print_report(
+    input: &std::path::Path,
+    audio: &denoize::Audio,
+    cfg: &DenoiserConfig,
+    backend: Backend,
+) {
     let hop = (cfg.frame_size as f64 * (1.0 - cfg.overlap)).round() as usize;
     let g_min_db = -20.0 - 25.0 * cfg.strength;
     let dur = audio.frames() as f64 / audio.sample_rate as f64;
-    println!("input      : {input}");
+    println!("input      : {}", input.display());
     println!(
         "format     : {}ch, {:.2}s ({} frames), {} Hz, {}-bit {:?}",
         audio.channels(),
@@ -930,10 +937,14 @@ fn run_live(_args: &[String]) -> Result<(), String> {
 }
 
 fn ensure_output_available(path: &std::path::Path, force: bool) -> Result<(), String> {
-    if force {
-        return Ok(());
-    }
     match std::fs::symlink_metadata(path) {
+        Ok(metadata) if force && (metadata.is_file() || metadata.file_type().is_symlink()) => {
+            Ok(())
+        }
+        Ok(_) if force => Err(format!(
+            "output exists but is not a replaceable file or symlink: {}",
+            path.display()
+        )),
         Ok(_) => Err(format!(
             "output already exists: {} (use --force to replace it)",
             path.display()
@@ -947,17 +958,44 @@ fn ensure_output_available(path: &std::path::Path, force: bool) -> Result<(), St
 }
 
 fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
+    run_one_with_output_format(
+        std::path::Path::new(input),
+        std::path::Path::new(output),
+        ov,
+        None,
+    )
+}
+
+fn run_one_with_output_format(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    ov: Overrides,
+    planned_output_format: Option<OutputFormat>,
+) -> Result<(), String> {
     validate_resource_options(&ov)?;
-    if input != "-" {
-        let estimate = estimate_file_memory_bytes(std::path::Path::new(input))?;
-        ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
-    }
-    let metadata = if input != "-" && !ov.no_metadata {
-        denoize::metadata::read_extended(std::path::Path::new(input))?
+    let standard_input = input == std::path::Path::new("-");
+    let standard_output = output == std::path::Path::new("-");
+    let output_format = if !ov.report && !standard_output {
+        let format = match planned_output_format {
+            Some(format) => format,
+            None => OutputFormat::from_path(output)?,
+        };
+        format.validate_encoder(ov.aac_encoder.unwrap_or_default())?;
+        ensure_output_available(output, ov.force)?;
+        Some(format)
     } else {
         None
     };
-    let mut audio = if input == "-" {
+    if !standard_input {
+        let estimate = estimate_file_memory_bytes(input)?;
+        ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
+    }
+    let metadata = if !standard_input && !ov.no_metadata {
+        denoize::metadata::read_extended(input)?
+    } else {
+        None
+    };
+    let mut audio = if standard_input {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
             .map_err(|error| format!("failed to read stdin: {error}"))?;
@@ -993,9 +1031,6 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     if ov.report {
         print_report(input, &audio, &cfg, backend);
         return Ok(());
-    }
-    if output != "-" {
-        ensure_output_available(std::path::Path::new(output), ov.force)?;
     }
 
     let mut enc = EncodeOptions::default();
@@ -1043,14 +1078,15 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     } else if ov.true_peak_dbtp.is_some() {
         return Err("--true-peak requires --loudness".into());
     }
-    if output == "-" {
+    if standard_output {
         let bytes = write_wav_bytes(&audio)?;
         std::io::Write::write_all(&mut std::io::stdout(), &bytes)
             .map_err(|error| format!("failed to write stdout: {error}"))?;
     } else {
-        let output_path = std::path::Path::new(output);
-        denoize::write_audio_transactional(
-            output_path,
+        let output_format = output_format.expect("filesystem output was preflighted");
+        denoize::write_audio_transactional_as(
+            output,
+            output_format,
             &audio,
             enc,
             metadata,
@@ -1061,11 +1097,13 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
             },
         )?;
         if ov.json {
+            let input = input.to_string_lossy();
+            let output = output.to_string_lossy();
             println!(
                 "{}",
                 process_result_json_line(
-                    input,
-                    output,
+                    input.as_ref(),
+                    output.as_ref(),
                     service::backend_name(result.backend),
                     audio.channels(),
                     audio.frames(),
@@ -1207,6 +1245,345 @@ fn count_batch_results<E>(results: &[Result<BatchFileOutcome, E>]) -> BatchCount
     counts
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BatchItem {
+    input: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    state_key: String,
+    output_format: OutputFormat,
+}
+
+fn hash_batch_path(hasher: &mut sha2::Sha256, path: &std::path::Path) {
+    use sha2::Digest as _;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(path.to_string_lossy().as_bytes());
+}
+
+fn batch_state_key(
+    input_identity: &std::path::Path,
+    input_relative: &std::path::Path,
+    output_relative: &std::path::Path,
+    output_format: OutputFormat,
+) -> String {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"denoize-batch-state-v2\0");
+    hash_batch_path(&mut hasher, input_identity);
+    hasher.update(b"\0");
+    hash_batch_path(&mut hasher, input_relative);
+    hasher.update(b"\0");
+    hash_batch_path(&mut hasher, output_relative);
+    hasher.update(b"\0");
+    hasher.update(match output_format {
+        OutputFormat::Wav => b"wav".as_slice(),
+        OutputFormat::Flac => b"flac".as_slice(),
+        OutputFormat::OggOpus => b"ogg-opus".as_slice(),
+        OutputFormat::Mp3 => b"mp3".as_slice(),
+        OutputFormat::M4a => b"m4a-aac".as_slice(),
+        OutputFormat::AacAdts => b"adts-aac".as_slice(),
+    });
+    let mut key = String::from("v2:");
+    for byte in hasher.finalize() {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    key
+}
+
+fn batch_probe_description(probe: &AudioProbe) -> &'static str {
+    if probe.is_broadcast_wave {
+        return "Broadcast Wave (BWF) PCM";
+    }
+    match (probe.format, probe.codec) {
+        (AudioFormat::Wav, AudioCodec::Pcm) => "WAV PCM",
+        (AudioFormat::Rf64, AudioCodec::Pcm) => "RF64 PCM",
+        (AudioFormat::Aiff, AudioCodec::Pcm) => "AIFF/AIFC",
+        (AudioFormat::Caf, AudioCodec::Pcm) => "CAF",
+        (AudioFormat::Flac, AudioCodec::Flac) => "FLAC",
+        (AudioFormat::OggOpus, AudioCodec::Opus) => "Ogg Opus",
+        (AudioFormat::OggVorbis, AudioCodec::Vorbis) => "Ogg Vorbis",
+        (AudioFormat::Mp3, AudioCodec::Mp3) => "MP3",
+        (AudioFormat::M4a, AudioCodec::Aac) => "AAC-in-MP4",
+        (AudioFormat::M4a, AudioCodec::Alac) => "ALAC-in-MP4",
+        (AudioFormat::AacAdts, AudioCodec::Aac) => "ADTS AAC",
+        _ => "unknown or ambiguous audio encoding",
+    }
+}
+
+fn batch_can_preserve(probe: &AudioProbe, output_format: OutputFormat) -> bool {
+    probe.audio_tracks == 1
+        && !probe.has_non_audio_tracks
+        && !probe.is_broadcast_wave
+        && matches!(
+            (probe.format, probe.codec, output_format),
+            (AudioFormat::Wav, AudioCodec::Pcm, OutputFormat::Wav)
+                | (AudioFormat::Flac, AudioCodec::Flac, OutputFormat::Flac)
+                | (
+                    AudioFormat::OggOpus,
+                    AudioCodec::Opus,
+                    OutputFormat::OggOpus
+                )
+                | (AudioFormat::Mp3, AudioCodec::Mp3, OutputFormat::Mp3)
+                | (AudioFormat::M4a, AudioCodec::Aac, OutputFormat::M4a)
+                | (AudioFormat::AacAdts, AudioCodec::Aac, OutputFormat::AacAdts)
+        )
+}
+
+fn plan_batch_files(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+    files: Vec<std::path::PathBuf>,
+    output_extension: Option<&str>,
+    aac_encoder: AacEncoder,
+) -> Result<Vec<BatchItem>, String> {
+    let mut items = Vec::with_capacity(files.len());
+    for input in files {
+        let relative = input.strip_prefix(input_dir).map_err(|error| {
+            format!(
+                "batch input {} is outside {}: {error}",
+                input.display(),
+                input_dir.display()
+            )
+        })?;
+        let mut destination = output_dir.join(relative);
+        if let Some(extension) = output_extension {
+            destination.set_extension(extension);
+        }
+
+        let probe = probe_audio_file(&input)
+            .map_err(|error| format!("probe batch input {}: {error}", input.display()))?;
+        if probe.audio_tracks != 1 {
+            return Err(format!(
+                "batch input {} must contain exactly one supported audio track; found {}",
+                input.display(),
+                probe.audio_tracks
+            ));
+        }
+        if probe.codec == AudioCodec::Unknown {
+            return Err(format!(
+                "batch input {} has no supported, unambiguous audio track",
+                input.display()
+            ));
+        }
+        let output_format = OutputFormat::from_path(&destination).map_err(|error| {
+            if output_extension.is_none() {
+                format!(
+                    "batch cannot preserve {} ({}): {error}; specify --output-format wav, flac, opus, ogg, oga, mp3, m4a, or aac",
+                    input.display(),
+                    batch_probe_description(&probe)
+                )
+            } else {
+                error
+            }
+        })?;
+        if output_extension.is_none() && !batch_can_preserve(&probe, output_format) {
+            let track_detail = if probe.audio_tracks != 1 || probe.has_non_audio_tracks {
+                format!(
+                    "; source contains {} audio track(s){}",
+                    probe.audio_tracks,
+                    if probe.has_non_audio_tracks {
+                        " and non-audio tracks"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "batch cannot preserve {} ({}) without an explicit conversion{track_detail}; specify --output-format wav, flac, opus, ogg, oga, mp3, m4a, or aac",
+                input.display(),
+                batch_probe_description(&probe)
+            ));
+        }
+        output_format.validate_encoder(aac_encoder)?;
+        let destination_relative = destination.strip_prefix(output_dir).map_err(|error| {
+            format!(
+                "batch output {} is outside {}: {error}",
+                destination.display(),
+                output_dir.display()
+            )
+        })?;
+        let input_identity = normalize_batch_path(&input)?;
+        let state_key = batch_state_key(
+            &input_identity,
+            relative,
+            destination_relative,
+            output_format,
+        );
+
+        items.push(BatchItem {
+            input,
+            destination,
+            state_key,
+            output_format,
+        });
+    }
+    validate_batch_destinations(input_dir, &items)?;
+    Ok(items)
+}
+
+fn batch_collision_key(path: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        std::path::PathBuf::from(path.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        path.to_path_buf()
+    }
+}
+
+fn validate_batch_destinations(
+    input_dir: &std::path::Path,
+    items: &[BatchItem],
+) -> Result<(), String> {
+    let input_root = normalize_batch_path(input_dir)?;
+    let mut destinations = Vec::with_capacity(items.len());
+    for item in items {
+        let resolved = normalize_batch_path(&item.destination)?;
+        if resolved.starts_with(&input_root) {
+            return Err(format!(
+                "batch output {} resolves inside the input directory; remove output symlinks or choose a separate output directory",
+                item.destination.display()
+            ));
+        }
+        destinations.push((batch_collision_key(&resolved), item));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for pair in destinations.windows(2) {
+        let (left_path, left) = &pair[0];
+        let (right_path, right) = &pair[1];
+        if right_path == left_path {
+            return Err(format!(
+                "multiple inputs map to the same batch output: {} and {} -> {}",
+                left.input.display(),
+                right.input.display(),
+                right.destination.display()
+            ));
+        }
+        if right_path.starts_with(left_path) {
+            return Err(format!(
+                "batch outputs conflict as a file and directory: {} -> {} and {} -> {}",
+                left.input.display(),
+                left.destination.display(),
+                right.input.display(),
+                right.destination.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_reserved_path(
+    items: &[BatchItem],
+    reserved: &std::path::Path,
+) -> Result<(), String> {
+    let reserved = batch_collision_key(&normalize_batch_path(reserved)?);
+    for item in items {
+        let destination = batch_collision_key(&normalize_batch_path(&item.destination)?);
+        if destination == reserved
+            || destination.starts_with(&reserved)
+            || reserved.starts_with(&destination)
+        {
+            return Err(format!(
+                "batch output {} conflicts with reserved resume state path .denoize-state",
+                item.destination.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_batch_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve current directory: {error}"))?
+            .join(path)
+    };
+    #[derive(Debug)]
+    enum MissingComponent {
+        Normal(std::ffi::OsString),
+        Parent,
+    }
+
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect batch path {}: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+        let component = ancestor
+            .components()
+            .next_back()
+            .ok_or_else(|| format!("cannot resolve batch path {}", absolute.display()))?;
+        match component {
+            std::path::Component::Normal(name) => {
+                missing.push(MissingComponent::Normal(name.to_os_string()))
+            }
+            std::path::Component::ParentDir => missing.push(MissingComponent::Parent),
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!("cannot resolve batch path {}", absolute.display()));
+            }
+        }
+        if !ancestor.pop() {
+            return Err(format!("cannot resolve batch path {}", absolute.display()));
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&ancestor)
+        .map_err(|error| format!("resolve {}: {error}", ancestor.display()))?;
+    for component in missing.into_iter().rev() {
+        match component {
+            MissingComponent::Normal(name) => resolved.push(name),
+            MissingComponent::Parent => {
+                resolved.pop();
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_batch_directories(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<(), String> {
+    let input = normalize_batch_path(input_dir)?;
+    let output = normalize_batch_path(output_dir)?;
+    if input.starts_with(&output) || output.starts_with(&input) {
+        return Err(format!(
+            "batch input and output directories must not overlap: {} and {}",
+            input_dir.display(),
+            output_dir.display()
+        ));
+    }
+    Ok(())
+}
+
 fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     use rayon::prelude::*;
 
@@ -1220,99 +1597,103 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             return Err("--jobs must be at least 1".into());
         }
     }
+    validate_batch_directories(input_dir, output_dir)?;
     let output_extension = ov
         .output_format
         .as_deref()
         .map(normalize_output_extension)
         .transpose()?;
-    std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
-    install_cancel_handler()?;
-    CANCELLED.store(false, Ordering::SeqCst);
     let files = collect_batch_files(input_dir, ov.recursive)?;
     if files.is_empty() {
         return Err("batch input contains no supported audio files".into());
     }
-    if let Some(extension) = output_extension {
-        let mut destinations = std::collections::HashSet::new();
-        for path in &files {
-            let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
-            let mut destination = output_dir.join(relative);
-            destination.set_extension(extension);
-            if !destinations.insert(destination.clone()) {
-                return Err(format!(
-                    "multiple inputs map to the same batch output: {}",
-                    destination.display()
-                ));
-            }
-        }
-    }
+    let items = plan_batch_files(
+        input_dir,
+        output_dir,
+        files,
+        output_extension,
+        ov.aac_encoder.unwrap_or_default(),
+    )?;
 
     let state_path = output_dir.join(".denoize-state");
+    if ov.resume {
+        validate_batch_reserved_path(&items, &state_path)?;
+        validate_existing_batch_state_path(&state_path)?;
+    }
     let completed_paths = if ov.resume {
         read_batch_state(&state_path)?
     } else {
         std::collections::HashSet::new()
     };
+    for item in &items {
+        let resumable =
+            ov.resume && completed_paths.contains(&item.state_key) && item.destination.is_file();
+        if !resumable {
+            ensure_output_available(&item.destination, ov.force)?;
+        }
+    }
+
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
+    install_cancel_handler()?;
+    CANCELLED.store(false, Ordering::SeqCst);
     let state_file = if ov.resume {
-        Some(Arc::new(Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&state_path)
-                .map_err(|error| format!("open resume state {}: {error}", state_path.display()))?,
-        )))
+        Some(Arc::new(Mutex::new(open_batch_state_for_append(
+            &state_path,
+        )?)))
     } else {
         None
     };
     let finished = AtomicUsize::new(0);
     let started = Instant::now();
-    let process_file = |path: &std::path::PathBuf| -> Result<BatchFileOutcome, String> {
+    let process_item = |item: &BatchItem| -> Result<BatchFileOutcome, String> {
         if CANCELLED.load(Ordering::SeqCst) {
             return Err("cancelled".into());
         }
-        let relative = path.strip_prefix(input_dir).map_err(|e| e.to_string())?;
-        let mut destination = output_dir.join(relative);
-        if let Some(extension) = output_extension {
-            destination.set_extension(extension);
-        }
-        let state_key = relative.to_string_lossy().replace('\\', "/");
-        if ov.resume && completed_paths.contains(&state_key) && destination.is_file() {
-            report_batch_progress(&finished, files.len(), started, path, "skipped", ov);
+        if ov.resume && completed_paths.contains(&item.state_key) && item.destination.is_file() {
+            report_batch_progress(&finished, items.len(), started, &item.input, "skipped", ov);
             return Ok(BatchFileOutcome::Skipped);
         }
-        if let Some(parent) = destination.parent() {
+        if let Some(parent) = item.destination.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
         let mut options = ov.clone();
         options.batch = false;
         options.json = false;
-        run_one(
-            &path.to_string_lossy(),
-            &destination.to_string_lossy(),
+        run_one_with_output_format(
+            &item.input,
+            &item.destination,
             options,
+            Some(item.output_format),
         )?;
         if let Some(file) = &state_file {
             use std::io::Write;
             let mut file = file.lock().map_err(|_| "resume state lock poisoned")?;
-            writeln!(file, "{state_key}")
+            writeln!(file, "{}", item.state_key)
                 .map_err(|error| format!("write resume state: {error}"))?;
             file.flush()
                 .map_err(|error| format!("flush resume state: {error}"))?;
         }
-        report_batch_progress(&finished, files.len(), started, path, "completed", ov);
+        report_batch_progress(
+            &finished,
+            items.len(),
+            started,
+            &item.input,
+            "completed",
+            ov,
+        );
         Ok(BatchFileOutcome::Completed)
     };
     let results = if ov.deterministic {
-        files.iter().map(process_file).collect::<Vec<_>>()
+        items.iter().map(process_item).collect::<Vec<_>>()
     } else if let Some(jobs) = ov.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
             .map_err(|e| format!("create batch worker pool: {e}"))?
-            .install(|| files.par_iter().map(process_file).collect::<Vec<_>>())
+            .install(|| items.par_iter().map(process_item).collect::<Vec<_>>())
     } else {
-        files.par_iter().map(process_file).collect::<Vec<_>>()
+        items.par_iter().map(process_item).collect::<Vec<_>>()
     };
     let counts = count_batch_results(&results);
     let failures: Vec<_> = results
@@ -1324,7 +1705,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         println!(
             "{}",
             batch_summary_json_line(
-                files.len(),
+                items.len(),
                 counts.succeeded,
                 counts.skipped,
                 counts.failed,
@@ -1348,16 +1729,116 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     }
 }
 
-fn read_batch_state(path: &std::path::Path) -> Result<std::collections::HashSet<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(source) => Ok(source
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
-        Err(error) => Err(format!("read resume state {}: {error}", path.display())),
+fn configure_batch_state_open(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn validate_batch_state_metadata(
+    metadata: &std::fs::Metadata,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    if !metadata.is_file() {
+        return Err(format!(
+            "resume state must be a regular file, not a symlink, directory, or special file: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "resume state must not have multiple hard links: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_state_file(file: &std::fs::File, path: &std::path::Path) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect resume state {}: {error}", path.display()))?;
+    validate_batch_state_metadata(&metadata, path)?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `information` is valid writable storage.
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+        if succeeded == 0 {
+            return Err(format!(
+                "inspect resume state links {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        if information.nNumberOfLinks != 1 {
+            return Err(format!(
+                "resume state must not have multiple hard links: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_existing_batch_state_path(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_batch_state_metadata(&metadata, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect resume state {}: {error}", path.display())),
+    }
+}
+
+fn open_batch_state_for_append(path: &std::path::Path) -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    configure_batch_state_open(&mut options);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open resume state {}: {error}", path.display()))?;
+    validate_batch_state_file(&file, path)?;
+    Ok(file)
+}
+
+fn read_batch_state(path: &std::path::Path) -> Result<std::collections::HashSet<String>, String> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    configure_batch_state_open(&mut options);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(format!("open resume state {}: {error}", path.display())),
+    };
+    validate_batch_state_file(&file, path)?;
+    let mut source = String::new();
+    file.read_to_string(&mut source)
+        .map_err(|error| format!("read resume state {}: {error}", path.display()))?;
+    Ok(source
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn report_batch_progress(
@@ -1399,10 +1880,14 @@ fn collect_batch_files(
         for entry in std::fs::read_dir(&directory)
             .map_err(|e| format!("read batch input {}: {e}", directory.display()))?
         {
-            let path = entry.map_err(|e| format!("read batch entry: {e}"))?.path();
-            if path.is_dir() && recursive {
+            let entry = entry.map_err(|e| format!("read batch entry: {e}"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("read batch entry type: {e}"))?;
+            let path = entry.path();
+            if file_type.is_dir() && recursive {
                 pending.push(path);
-            } else if path.is_file() && is_supported_audio_path(&path) {
+            } else if file_type.is_file() && is_supported_audio_path(&path) {
                 files.push(path);
             }
         }
@@ -1442,7 +1927,7 @@ fn normalize_output_extension(value: &str) -> Result<&str, String> {
     let extension = value.trim_start_matches('.');
     if matches!(
         extension.to_ascii_lowercase().as_str(),
-        "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg"
+        "wav" | "mp3" | "m4a" | "aac" | "flac" | "opus" | "ogg" | "oga"
     ) {
         Ok(extension)
     } else {
@@ -1584,7 +2069,301 @@ mod batch_tests {
     fn validates_batch_output_format() {
         assert_eq!(normalize_output_extension(".flac").unwrap(), "flac");
         assert_eq!(normalize_output_extension("aac").unwrap(), "aac");
+        assert_eq!(normalize_output_extension("oga").unwrap(), "oga");
         assert!(normalize_output_extension("wma").is_err());
+    }
+
+    fn probe(format: AudioFormat, codec: AudioCodec) -> AudioProbe {
+        AudioProbe {
+            format,
+            codec,
+            audio_tracks: 1,
+            has_non_audio_tracks: false,
+            is_broadcast_wave: false,
+        }
+    }
+
+    #[test]
+    fn batch_preserve_policy_is_codec_and_container_exact() {
+        for (source, output) in [
+            (probe(AudioFormat::Wav, AudioCodec::Pcm), OutputFormat::Wav),
+            (
+                probe(AudioFormat::Flac, AudioCodec::Flac),
+                OutputFormat::Flac,
+            ),
+            (
+                probe(AudioFormat::OggOpus, AudioCodec::Opus),
+                OutputFormat::OggOpus,
+            ),
+            (probe(AudioFormat::Mp3, AudioCodec::Mp3), OutputFormat::Mp3),
+            (probe(AudioFormat::M4a, AudioCodec::Aac), OutputFormat::M4a),
+            (
+                probe(AudioFormat::AacAdts, AudioCodec::Aac),
+                OutputFormat::AacAdts,
+            ),
+        ] {
+            assert!(batch_can_preserve(&source, output));
+        }
+
+        for (source, output) in [
+            (probe(AudioFormat::Rf64, AudioCodec::Pcm), OutputFormat::Wav),
+            (probe(AudioFormat::Aiff, AudioCodec::Pcm), OutputFormat::Wav),
+            (probe(AudioFormat::Caf, AudioCodec::Pcm), OutputFormat::Wav),
+            (
+                probe(AudioFormat::OggVorbis, AudioCodec::Vorbis),
+                OutputFormat::OggOpus,
+            ),
+            (probe(AudioFormat::M4a, AudioCodec::Alac), OutputFormat::M4a),
+        ] {
+            assert!(!batch_can_preserve(&source, output));
+        }
+
+        let mut multi_track = probe(AudioFormat::M4a, AudioCodec::Aac);
+        multi_track.audio_tracks = 2;
+        assert!(!batch_can_preserve(&multi_track, OutputFormat::M4a));
+        multi_track.audio_tracks = 1;
+        multi_track.has_non_audio_tracks = true;
+        assert!(!batch_can_preserve(&multi_track, OutputFormat::M4a));
+
+        let mut broadcast_wave = probe(AudioFormat::Wav, AudioCodec::Pcm);
+        broadcast_wave.is_broadcast_wave = true;
+        assert!(!batch_can_preserve(&broadcast_wave, OutputFormat::Wav));
+    }
+
+    #[test]
+    fn batch_resume_identity_includes_destination_and_codec() {
+        let identity = std::path::Path::new("/input-a/voice.aiff");
+        let input = std::path::Path::new("voice.aiff");
+        let wav = batch_state_key(
+            identity,
+            input,
+            std::path::Path::new("voice.wav"),
+            OutputFormat::Wav,
+        );
+        let flac = batch_state_key(
+            identity,
+            input,
+            std::path::Path::new("voice.flac"),
+            OutputFormat::Flac,
+        );
+        let renamed = batch_state_key(
+            identity,
+            input,
+            std::path::Path::new("nested/voice.wav"),
+            OutputFormat::Wav,
+        );
+
+        assert_ne!(wav, flac);
+        assert_ne!(wav, renamed);
+        assert_ne!(
+            wav,
+            batch_state_key(
+                std::path::Path::new("/input-b/voice.aiff"),
+                input,
+                std::path::Path::new("voice.wav"),
+                OutputFormat::Wav,
+            )
+        );
+        assert!(wav.starts_with("v2:"));
+    }
+
+    #[test]
+    fn batch_plan_rejects_collisions_before_processing() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let aiff = input.join("clip.aiff");
+        let caf = input.join("clip.caf");
+        std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
+        std::fs::write(&caf, b"caff\0\x01\0\0\0\0\0\0").unwrap();
+
+        let error = plan_batch_files(
+            &input,
+            &output,
+            vec![aiff, caf],
+            Some("flac"),
+            AacEncoder::Oxide,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("multiple inputs map to the same batch output"));
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_plan_rejects_file_directory_prefix_collisions() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        let nested = input.join("clip.wav");
+        std::fs::create_dir_all(&nested).unwrap();
+        let aiff = input.join("clip.aiff");
+        let caf = nested.join("child.caf");
+        std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
+        std::fs::write(&caf, b"caff\0\x01\0\0\0\0\0\0").unwrap();
+
+        let error = plan_batch_files(
+            &input,
+            &output,
+            vec![aiff, caf],
+            Some("wav"),
+            AacEncoder::Oxide,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("conflict as a file and directory"));
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_collection_does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_directory();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("voice.wav"), []).unwrap();
+        symlink(&root, root.join("loop")).unwrap();
+
+        assert_eq!(
+            collect_batch_files(&root, true).unwrap(),
+            vec![root.join("voice.wav")]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_plan_rejects_output_symlinks_into_the_input_tree() {
+        use std::os::unix::fs::symlink;
+
+        let root = temporary_directory();
+        let input = root.join("input");
+        let input_nested = input.join("nested");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input_nested).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        symlink(&input_nested, output.join("nested")).unwrap();
+        let aiff = input_nested.join("voice.aiff");
+        std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
+
+        let error = plan_batch_files(&input, &output, vec![aiff], Some("wav"), AacEncoder::Oxide)
+            .unwrap_err();
+
+        assert!(error.contains("resolves inside the input directory"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_plan_accepts_explicit_conversion_for_decode_only_input() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let aiff = input.join("voice.aiff");
+        std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
+
+        let items = plan_batch_files(
+            &input,
+            &output,
+            vec![aiff.clone()],
+            Some("wav"),
+            AacEncoder::Oxide,
+        )
+        .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].input, aiff);
+        assert_eq!(items[0].destination, output.join("voice.wav"));
+        assert_eq!(
+            items[0].state_key,
+            batch_state_key(
+                &std::fs::canonicalize(&aiff).unwrap(),
+                std::path::Path::new("voice.aiff"),
+                std::path::Path::new("voice.wav"),
+                OutputFormat::Wav,
+            )
+        );
+        assert_eq!(items[0].output_format, OutputFormat::Wav);
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_preflight_has_no_output_side_effects() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        let audio = denoize::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1_600]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+        denoize::write_audio(input.join("a-valid.wav"), &audio, EncodeOptions::default()).unwrap();
+        std::fs::write(input.join("b-decode-only.aiff"), b"FORM\0\0\0\0AIFF").unwrap();
+        let options = Overrides {
+            batch: true,
+            no_progress: true,
+            ..Overrides::default()
+        };
+
+        let error =
+            run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap_err();
+
+        assert!(error.contains("AIFF/AIFC"));
+        assert!(error.contains("--output-format"));
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_rejects_overlapping_input_and_output_directories() {
+        let root = temporary_directory();
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(validate_batch_directories(&root, &root).is_err());
+        assert!(validate_batch_directories(&root, &nested).is_err());
+        assert!(validate_batch_directories(&nested, &root).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resume_state_path_is_reserved_before_processing() {
+        let root = temporary_directory();
+        let input = root.join("input");
+        let output = root.join("output");
+        let reserved = input.join(".denoize-state");
+        std::fs::create_dir_all(&reserved).unwrap();
+        let audio = denoize::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1_600]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+        denoize::write_audio(reserved.join("voice.wav"), &audio, EncodeOptions::default()).unwrap();
+        let options = Overrides {
+            batch: true,
+            recursive: true,
+            resume: true,
+            no_progress: true,
+            ..Overrides::default()
+        };
+
+        let error =
+            run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap_err();
+
+        assert!(error.contains("reserved resume state path"));
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1710,9 +2489,9 @@ mod batch_tests {
             .modified()
             .unwrap();
         assert_eq!(first_modified, second_modified);
-        assert!(read_batch_state(&output.join(".denoize-state"))
-            .unwrap()
-            .contains("sample.wav"));
+        let state = read_batch_state(&output.join(".denoize-state")).unwrap();
+        assert_eq!(state.len(), 1);
+        assert!(state.iter().all(|key| key.starts_with("v2:")));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

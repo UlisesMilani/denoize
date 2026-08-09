@@ -72,7 +72,7 @@ pub use backend::{
 };
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
-pub use decode::{decode_file, AudioFormat, DecodedPcm};
+pub use decode::{decode_file, probe_file, AudioCodec, AudioFormat, AudioProbe, DecodedPcm};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
@@ -90,6 +90,28 @@ pub fn write_audio_transactional(
 ) -> Result<(), String> {
     let output = output.as_ref();
     let format = OutputFormat::from_path(output)?;
+    write_audio_transactional_as(
+        output,
+        format,
+        audio,
+        encode_options,
+        metadata_snapshot,
+        commit_mode,
+    )
+}
+
+/// Encode audio using a format selected during preflight, then publish it in
+/// one filesystem commit without re-inferring the codec from the path.
+pub fn write_audio_transactional_as(
+    output: impl AsRef<std::path::Path>,
+    format: OutputFormat,
+    audio: &Audio,
+    encode_options: EncodeOptions,
+    metadata_snapshot: Option<metadata::Metadata>,
+    commit_mode: CommitMode,
+) -> Result<(), String> {
+    let output = output.as_ref();
+    format.validate_encoder(encode_options.aac_encoder)?;
     let mut transaction = AtomicOutput::new(output)?;
     encode::write_audio_to_file(transaction.file_mut(), format, audio, encode_options)?;
     if let Some(metadata_snapshot) = metadata_snapshot {
