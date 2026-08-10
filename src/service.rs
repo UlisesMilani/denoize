@@ -24,6 +24,50 @@ pub struct ProcessingOptions {
     pub true_peak_dbtp: f64,
 }
 
+/// Fully selected and validated processing options.
+///
+/// This is the single effective configuration consumed by both execution and
+/// batch recipe fingerprinting. In particular, the denoiser sample rate has
+/// already been replaced with the decoded rate, compatibility sanitization
+/// has already been applied, and managed backend resources have been resolved.
+#[derive(Clone, Debug)]
+pub struct ResolvedProcessingOptions {
+    pub backend: Backend,
+    pub denoiser: DenoiserConfig,
+    pub backend_options: BackendOptions,
+    pub loudness_lufs: Option<f64>,
+    pub true_peak_dbtp: f64,
+}
+
+impl ResolvedProcessingOptions {
+    /// Validate an already-resolved plan without opening or modifying audio.
+    pub fn validate_config(&self) -> Result<(), String> {
+        self.denoiser
+            .validate_config()
+            .map_err(|error| error.to_string())?;
+        self.backend_options
+            .validate_resolved_resources(self.backend)?;
+        if let Some(target) = self.loudness_lufs {
+            validate_finite_range(
+                "loudness_lufs",
+                target,
+                -70.0,
+                0.0,
+                "a finite value in -70..=0 LUFS",
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        validate_finite_range(
+            "true_peak_dbtp",
+            self.true_peak_dbtp,
+            -20.0,
+            0.0,
+            "a finite value in -20..=0 dBTP",
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl ProcessingOptions {
     /// Validate effective processing options without opening a model or
     /// modifying decoded audio. The selected backend is returned so callers
@@ -63,6 +107,11 @@ impl ProcessingOptions {
             "a finite value in -20..=0 dBTP",
         )?;
         Ok(backend)
+    }
+
+    /// Resolve every effective option without modifying decoded audio.
+    pub fn resolve(self, audio: &Audio) -> Result<ResolvedProcessingOptions, String> {
+        resolve_processing_options(audio, self)
     }
 }
 
@@ -189,21 +238,51 @@ pub fn resolve_backend_options(
     Ok(options)
 }
 
-/// Process already-decoded audio with common backend and delivery behavior.
-pub fn process_audio(
-    audio: &mut Audio,
+/// Select, validate, sanitize, and resolve the exact processing configuration
+/// that execution will consume.
+pub fn resolve_processing_options(
+    audio: &Audio,
     options: ProcessingOptions,
-) -> Result<ProcessingResult, String> {
+) -> Result<ResolvedProcessingOptions, String> {
     let backend = options
         .validate_config(audio)
         .map_err(|error| error.to_string())?;
+    let mut denoiser = options.denoiser;
+    denoiser.sample_rate = audio.sample_rate;
+    // `Denoiser::try_new`, used by the classical backend, validates first and
+    // then applies this compatibility sanitization. Resolve it here so recipe
+    // hashing and execution cannot observe two different configurations.
+    denoiser
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+    let denoiser = denoiser.sanitized();
     let backend_options = resolve_backend_options(backend, options.backend_options)?;
-    backend_options.validate_resolved_resources(backend)?;
+    Ok(ResolvedProcessingOptions {
+        backend,
+        denoiser,
+        backend_options,
+        loudness_lufs: options.loudness_lufs,
+        true_peak_dbtp: options.true_peak_dbtp,
+    })
+}
+
+/// Process decoded audio using an already-resolved effective configuration.
+pub fn process_audio_resolved(
+    audio: &mut Audio,
+    options: &ResolvedProcessingOptions,
+) -> Result<ProcessingResult, String> {
+    if audio.sample_rate != options.denoiser.sample_rate {
+        return Err(format!(
+            "resolved processing sample rate {} Hz does not match decoded audio rate {} Hz",
+            options.denoiser.sample_rate, audio.sample_rate
+        ));
+    }
+    options.validate_config()?;
     let (mut working, elapsed) = crate::process_audio_copy_with_backend_config(
         audio,
-        options.denoiser,
-        backend,
-        &backend_options,
+        options.denoiser.clone(),
+        options.backend,
+        &options.backend_options,
     )?;
     let loudness = options
         .loudness_lufs
@@ -211,10 +290,19 @@ pub fn process_audio(
         .transpose()?;
     *audio = working;
     Ok(ProcessingResult {
-        backend,
+        backend: options.backend,
         elapsed,
         loudness,
     })
+}
+
+/// Process already-decoded audio with common backend and delivery behavior.
+pub fn process_audio(
+    audio: &mut Audio,
+    options: ProcessingOptions,
+) -> Result<ProcessingResult, String> {
+    let resolved = resolve_processing_options(audio, options)?;
+    process_audio_resolved(audio, &resolved)
 }
 
 #[cfg(test)]
@@ -291,6 +379,35 @@ mod tests {
         assert!(options
             .validate_config(&audio(crate::config::MAX_SAMPLE_RATE + 1))
             .is_err());
+    }
+
+    #[test]
+    fn resolution_records_the_exact_sanitized_execution_config() {
+        let mut options = options();
+        options.denoiser.sample_rate = 1;
+        options.denoiser.smoothing = 1.0;
+
+        let resolved = resolve_processing_options(&audio(44_100), options).unwrap();
+
+        assert_eq!(resolved.backend, Backend::Classical);
+        assert_eq!(resolved.denoiser.sample_rate, 44_100);
+        assert_eq!(resolved.denoiser.smoothing, 0.95);
+        resolved.validate_config().unwrap();
+    }
+
+    #[test]
+    fn resolved_sample_rate_mismatch_is_transactional() {
+        let mut decoded = audio(48_000);
+        decoded.channels[0][0] = 2.0;
+        let before = decoded.clone();
+        let resolved = resolve_processing_options(&decoded, options()).unwrap();
+        decoded.sample_rate = 44_100;
+
+        let error = process_audio_resolved(&mut decoded, &resolved).unwrap_err();
+
+        assert!(error.contains("does not match decoded audio rate"));
+        assert_eq!(decoded.channels, before.channels);
+        assert_eq!(decoded.sample_rate, 44_100);
     }
 
     #[test]

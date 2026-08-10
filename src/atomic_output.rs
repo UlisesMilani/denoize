@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use tempfile::{Builder, NamedTempFile};
 
 #[cfg(unix)]
-fn validate_unix_acl(path: &Path, destination: &Path) -> Result<(), String> {
+pub(crate) fn validate_unix_acl(path: &Path, destination: &Path) -> Result<(), String> {
     let unsafe_acl = unix_acl_is_unsafe(path).map_err(|error| {
         format!(
             "failed to inspect output directory ACL security for {} at {}: {error}",
@@ -255,7 +255,7 @@ fn unix_path_has_extended_acl(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn validate_unix_staging_path(parent: &Path, destination: &Path) -> Result<(), String> {
+pub(crate) fn validate_unix_staging_path(parent: &Path, destination: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let effective_uid = unsafe { libc::geteuid() };
@@ -486,7 +486,6 @@ mod windows_security {
             }
         }
 
-        #[cfg(test)]
         pub(super) fn identity(&self) -> io::Result<(bool, Vec<u8>)> {
             let descriptor = self.descriptor.as_ptr().cast_mut().cast();
             let mut present = 0;
@@ -519,7 +518,11 @@ mod windows_security {
         }
     }
 
-    pub(super) fn create_private(path: &Path) -> io::Result<File> {
+    fn create_private_with_access(
+        path: &Path,
+        desired_access: u32,
+        share_mode: u32,
+    ) -> io::Result<File> {
         // Owner, LocalSystem, and built-in administrators receive full access;
         // inheritance is disabled so a shared parent cannot expose the stage.
         let sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)\0"
@@ -547,8 +550,8 @@ mod windows_security {
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE | WRITE_DAC | DELETE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                desired_access,
+                share_mode,
                 &attributes,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
@@ -560,6 +563,22 @@ mod windows_security {
         } else {
             Ok(unsafe { File::from_raw_handle(handle) })
         }
+    }
+
+    pub(super) fn create_private(path: &Path) -> io::Result<File> {
+        create_private_with_access(
+            path,
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+    }
+
+    pub(super) fn create_private_control(path: &Path) -> io::Result<File> {
+        create_private_with_access(
+            path,
+            GENERIC_READ | GENERIC_WRITE | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )
     }
 
     /// Open a destination entry without requesting access to its contents.
@@ -647,6 +666,26 @@ mod windows_security {
             Ok(())
         }
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn create_private_windows_control_file(path: &Path) -> io::Result<File> {
+    windows_security::create_private_control(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn require_windows_acl_capability(file: &File) -> io::Result<()> {
+    windows_security::DaclSnapshot::capture(file)?
+        .identity()
+        .map(|_| ())
+}
+
+#[cfg(windows)]
+fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 /// How an [`AtomicOutput`] is committed to its destination.
@@ -850,7 +889,15 @@ impl AtomicOutput {
                             Some((metadata.uid(), metadata.gid())),
                         )
                     }
-                    Ok(_) => (self.new_destination_permissions.clone(), None),
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        (self.new_destination_permissions.clone(), None)
+                    }
+                    Ok(_) => {
+                        return Err(format!(
+                            "refusing to replace output {} because the destination is a directory or special file",
+                            self.display_destination.display()
+                        ));
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         (self.new_destination_permissions.clone(), None)
                     }
@@ -967,6 +1014,7 @@ impl AtomicOutput {
     fn commit_windows(mut self, mode: CommitMode) -> Result<(), String> {
         if mode == CommitMode::Replace {
             let existing_dacl = match std::fs::symlink_metadata(&self.destination) {
+                Ok(metadata) if windows_metadata_is_reparse_point(&metadata) => None,
                 Ok(metadata) if metadata.file_type().is_file() => {
                     let destination = windows_security::open_for_security(&self.destination)
                         .map_err(|error| {
@@ -984,7 +1032,12 @@ impl AtomicOutput {
                         })?,
                     )
                 }
-                Ok(_) => None,
+                Ok(_) => {
+                    return Err(format!(
+                        "refusing to replace output {} because the destination is a directory or special file",
+                        self.display_destination.display()
+                    ));
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => None,
                 Err(error) => {
                     return Err(format!(
@@ -1266,18 +1319,45 @@ mod tests {
     }
 
     #[test]
-    fn failed_commit_cleans_up_temporary_file() {
+    fn replace_rejects_directory_created_before_commit_and_cleans_up_temporary_file() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("existing-directory");
-        fs::create_dir(&destination).unwrap();
-
         let mut output = AtomicOutput::new(&destination).unwrap();
         let temporary = output.temporary_path().to_path_buf();
         output.file_mut().write_all(b"candidate").unwrap();
+        fs::create_dir(&destination).unwrap();
 
         let error = output.commit(CommitMode::Replace).unwrap_err();
         assert!(error.contains(&destination.display().to_string()));
+        assert!(error.contains("directory or special file"));
         assert!(destination.is_dir());
+        assert!(!temporary.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_rejects_socket_created_before_commit_and_preserves_it() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::net::UnixListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("output.wav");
+        let mut output = AtomicOutput::new(&destination).unwrap();
+        let temporary = output.temporary_path().to_path_buf();
+        output.file_mut().write_all(b"candidate").unwrap();
+        let listener = UnixListener::bind(&destination).unwrap();
+
+        let error = output.commit(CommitMode::Replace).unwrap_err();
+
+        assert!(error.contains("directory or special file"));
+        assert!(fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        assert_eq!(
+            listener.local_addr().unwrap().as_pathname(),
+            Some(destination.as_path())
+        );
         assert!(!temporary.exists());
     }
 
@@ -1316,10 +1396,9 @@ mod tests {
         let victim = directory.path().join("victim.wav");
         let destination = directory.path().join("output.wav");
         fs::write(&victim, b"victim").unwrap();
-        symlink(&victim, &destination).unwrap();
-
         let mut output = AtomicOutput::new(&destination).unwrap();
         output.file_mut().write_all(b"replacement").unwrap();
+        symlink(&victim, &destination).unwrap();
         output.commit(CommitMode::Replace).unwrap();
 
         assert_eq!(fs::read(&victim).unwrap(), b"victim");

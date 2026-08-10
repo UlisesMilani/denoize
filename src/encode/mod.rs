@@ -22,6 +22,7 @@ pub use aac::{write_adts_aac, write_adts_aac_with_downmix};
 pub use m4a::{write_m4a, write_m4a_with_downmix};
 #[cfg(feature = "fdk-aac-encoder")]
 pub use m4a_fdk::{write_m4a_fdk, write_m4a_fdk_with_downmix};
+pub(crate) use mp3::effective_mp3_bitrate_kbps;
 pub use mp3::{write_mp3, write_mp3_with_downmix, DEFAULT_MP3_BITRATE};
 
 /// Default AAC bitrate (bps, not kbps).

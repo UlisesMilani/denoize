@@ -19,7 +19,8 @@ type GuiConfig = {
 type JobProgress = {
   jobId: number; kind: string; status: string; message: string; current: number; total: number;
   fraction: number; elapsedSeconds: number; output?: string; error?: string; etaSeconds?: number;
-  item?: string; itemStatus?: "completed" | "failed" | "skipped";
+  item?: string; itemStatus?: "completed" | "failed" | "skipped" | "cancelled";
+  itemId?: string; resumeReason?: string;
 };
 type Comparison = {
   markdown: string; json: string; html: string; noisySnrDb: number; enhancedSnrDb: number; improvementDb: number;
@@ -153,7 +154,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <section class="page" id="page-batch">
         <div class="grid two-col">
           <article class="card tall" data-drop-zone="batch-input"><div class="card-heading"><div><span class="step">01</span><h2>入力</h2></div><div class="button-row"><button class="secondary" id="choose-batch-folder">フォルダ</button><button class="secondary" id="choose-batch">ファイル追加</button></div></div><div id="batch-files" class="empty-panel">フォルダまたは複数ファイルを選択／ドロップしてください</div><div id="batch-results" class="batch-results hidden"></div></article>
-          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row" data-drop-zone="batch-output"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択／ドロップ</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>完了済みをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>出力先を置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
+          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row" data-drop-zone="batch-output"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択／ドロップ</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>同じ入力・設定・モデル・出力だけをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>変更済み・旧形式の出力も置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
         </div>
       </section>
 
@@ -574,7 +575,7 @@ $("#cancel-process").addEventListener("click", () => cancelActive());
 let batchInputs: string[] = [];
 let batchInputDir = "";
 let batchOutput = "";
-const batchStatuses = new Map<string, { status: string; error?: string }>();
+const batchStatuses = new Map<string, { path: string; status: string; error?: string }>();
 $("#choose-batch").addEventListener("click", async () => {
   const paths = await open({ multiple: true, filters: audioFilters }); if (!Array.isArray(paths)) return;
   batchInputs = paths; renderBatch();
@@ -944,9 +945,26 @@ function updateProgress(progress: JobProgress) {
   if (progress.kind === "batch") $("#batch-summary").textContent = `${progress.message}  ${progress.current}/${progress.total}`;
 }
 function renderBatchResult(progress: JobProgress) {
-  batchStatuses.set(progress.item!, { status: progress.itemStatus!, error: progress.error });
-  const rows = [...batchStatuses.entries()].map(([path, result]) => `<div class="batch-result ${result.status}"><b>${result.status === "completed" ? "完了" : result.status === "skipped" ? "スキップ" : "失敗"}</b><span title="${escapeHtml(path)}">${escapeHtml(path)}${result.error ? ` — ${escapeHtml(result.error)}` : ""}</span></div>`).join("");
+  const key = progress.itemId ?? progress.item!;
+  const resumeReason = progress.resumeReason ? resumeReasonText(progress.resumeReason) : "";
+  batchStatuses.set(key, { path: progress.item!, status: progress.itemStatus!, error: progress.error ?? resumeReason });
+  const rows = [...batchStatuses.values()].map((result) => `<div class="batch-result ${result.status}"><b>${result.status === "completed" ? "完了" : result.status === "skipped" ? "スキップ" : result.status === "cancelled" ? "取消" : "失敗"}</b><span title="${escapeHtml(result.path)}">${escapeHtml(result.path)}${result.error ? ` — ${escapeHtml(result.error)}` : ""}</span></div>`).join("");
   $("#batch-results").innerHTML = rows;
+}
+function resumeReasonText(reason: string) {
+  const labels: Record<string, string> = {
+    exact: "入力・設定・モデル・出力が一致",
+    missing: "出力なし",
+    inputChanged: "入力が変更されています",
+    recipeChanged: "処理設定が変更されています",
+    modelChanged: "モデルが変更されています",
+    outputChanged: "出力が変更されています",
+    legacy: "旧形式の再開状態です。上書きを有効にして再処理してください",
+    stale: "再開状態が古いため、上書きを有効にして再処理してください",
+    untracked: "既存出力が再開状態に記録されていません",
+    unsafe: "リンクまたは安全でない出力は再開できません",
+  };
+  return labels[reason] ?? reason;
 }
 function setJobUi(running: boolean, kind: string) {
   if (kind === "file" || kind === "process") {
