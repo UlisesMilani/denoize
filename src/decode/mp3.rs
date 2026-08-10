@@ -378,31 +378,7 @@ fn seek_past_id3v2(input: &mut File) -> Result<(), String> {
         read += count;
     }
 
-    let payload_offset = if read == header.len() && &header[..3] == b"ID3" {
-        if header[6..10].iter().any(|byte| byte & 0x80 != 0) {
-            return Err("invalid ID3v2 synchsafe size".into());
-        }
-        let tag_size = header[6..10]
-            .iter()
-            .fold(0u64, |size, byte| (size << 7) | u64::from(*byte));
-        // Bit 4 denotes a footer only in ID3v2.4; it is reserved in earlier
-        // versions and must not move the MPEG payload offset.
-        let footer_size = if header[3] == 4 && header[5] & 0x10 != 0 {
-            10
-        } else {
-            0
-        };
-        10u64
-            .checked_add(tag_size)
-            .and_then(|offset| offset.checked_add(footer_size))
-            .ok_or_else(|| "ID3v2 size overflows".to_string())?
-    } else {
-        0
-    };
-
-    if payload_offset > file_len {
-        return Err("ID3v2 tag extends beyond the MP3 file".into());
-    }
+    let payload_offset = super::id3v2_payload_offset(&header[..read], file_len)?.unwrap_or(0);
     input
         .seek(SeekFrom::Start(payload_offset))
         .map_err(|error| format!("seek past MP3 ID3v2 tag: {error}"))?;

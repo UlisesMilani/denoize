@@ -4,7 +4,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
-use support::extended_audio::{aiff_pcm, caf_pcm, pcm_samples, rf64_pcm};
+use support::extended_audio::{aiff_pcm, alac_m4a, caf_pcm, pcm_samples, rf64_pcm, vorbis_ogg};
 
 struct TestWorkspace {
     path: PathBuf,
@@ -112,6 +112,11 @@ fn rf64_unknown_chunk_without_required_padding() -> Vec<u8> {
     output
 }
 
+fn fill_only_adts() -> [u8; 10] {
+    // AAC-LC, 44.1 kHz, mono ADTS header followed by a fill element and END.
+    [0xff, 0xf1, 0x50, 0x40, 0x01, 0x5f, 0xfc, 0xc2, 0x01, 0xc0]
+}
+
 #[test]
 fn decodes_aiff_caf_and_rf64_pcm() {
     let workspace = TestWorkspace::new();
@@ -125,6 +130,23 @@ fn decodes_aiff_caf_and_rf64_pcm() {
     assert_pcm(&aiff, 44_100);
     assert_pcm(&caf, 44_100);
     assert_pcm(&rf64, 44_100);
+}
+
+#[test]
+fn decodes_independently_generated_vorbis_and_alac_fixtures() {
+    let workspace = TestWorkspace::new();
+    for (name, bytes) in [("fixture.oga", vorbis_ogg()), ("fixture.m4a", alac_m4a())] {
+        let path = workspace.file(name);
+        std::fs::write(&path, bytes).expect("write compressed fixture");
+        let decoded = decode_file(&path).expect("decode compressed fixture");
+        assert_eq!(decoded.sample_rate, 8_000, "{name}");
+        assert_eq!(decoded.n_channels(), 1, "{name}");
+        assert_eq!(decoded.frames(), 160, "{name}");
+        assert!(
+            decoded.channels[0].iter().all(|sample| sample.is_finite()),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -142,7 +164,7 @@ fn detects_extended_format_signatures() {
         AudioFormat::Rf64
     );
     assert_eq!(
-        AudioFormat::detect(Path::new("fixture.oga"), b"OggS\0\0\0\0\0\x01vorbis\0\0"),
+        AudioFormat::detect(Path::new("fixture.oga"), &vorbis_ogg()),
         AudioFormat::OggVorbis
     );
 }
@@ -255,4 +277,43 @@ fn cli_rf64_bounds_failure_leaves_no_output_or_stage() {
         .filter(|name| name.contains(".part"))
         .collect();
     assert!(staged.is_empty(), "RF64 failure left stages: {staged:?}");
+}
+
+#[test]
+fn cli_fill_only_aac_failure_preserves_existing_output_and_leaves_no_stage() {
+    let workspace = TestWorkspace::new();
+    let input = workspace.file("fill-only.aac");
+    let output = workspace.file("output.wav");
+    let sentinel = b"existing output must survive";
+    std::fs::write(&input, fill_only_adts()).expect("write fill-only AAC fixture");
+    std::fs::write(&output, sentinel).expect("write output sentinel");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_denoize"))
+        .arg(&input)
+        .arg(&output)
+        .args(["--force", "--no-metadata", "--json"])
+        .output()
+        .expect("run denoize CLI");
+
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty(), "failure emitted partial JSON");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("decode produced no samples"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&output).expect("read preserved output"),
+        sentinel
+    );
+    let control_or_stage: Vec<_> = std::fs::read_dir(&workspace.path)
+        .expect("read test directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".denoize-") || name.contains(".part"))
+        .collect();
+    assert!(
+        control_or_stage.is_empty(),
+        "AAC failure left control/stage files: {control_or_stage:?}"
+    );
 }
