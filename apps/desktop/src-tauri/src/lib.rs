@@ -2270,8 +2270,14 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    // Item identities preserve each platform's raw OS path representation:
+    // UTF-8 bytes on Unix-like targets and UTF-16LE code units on Windows.
+    #[cfg(not(windows))]
     const FRONTEND_PARITY_ITEM_ID_HEX: &str =
         "795ada4ccf8186cdaa1d64cec4f53165bc5ca003d68e0964aee9a33a5f8105e8";
+    #[cfg(windows)]
+    const FRONTEND_PARITY_ITEM_ID_HEX: &str =
+        "28a3a5bc0a5112777268b438a5357badea3c055ea91a1472a9cdba3c1a8522f0";
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
