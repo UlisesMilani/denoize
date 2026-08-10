@@ -44,8 +44,21 @@ pub(super) fn write_mp3_to_writer<W: Write>(
     downmix: DownmixMode,
 ) -> Result<(), String> {
     let (layout, config) = effective_mp3_config(audio, bitrate_kbps, downmix)?;
-    let pcm = planar_f64_to_interleaved_i16(audio, layout)?;
+    let mut pcm = planar_f64_to_interleaved_i16(audio, layout)?;
     let mut encoder = Mp3Encoder::new(config).map_err(|e| format!("mp3 encoder: {e}"))?;
+
+    // A single MPEG frame is too short for common demuxers to establish frame
+    // continuity (FFmpeg and Symphonia both reject it). MP3 has no raw-stream
+    // field for an exact sub-frame duration, so emit at least two complete
+    // frames and let standards-aware Xing/LAME files carry exact timing when
+    // that metadata is available.
+    let minimum_samples = encoder
+        .samples_per_frame()
+        .checked_mul(2)
+        .ok_or_else(|| "MP3 minimum frame count overflows".to_string())?;
+    if pcm.len() < minimum_samples {
+        pcm.resize(minimum_samples, 0);
+    }
 
     let mut mp3 = Vec::new();
     for frame in encoder
@@ -55,6 +68,21 @@ pub(super) fn write_mp3_to_writer<W: Write>(
         mp3.extend(frame);
     }
     mp3.extend(encoder.finish().map_err(|e| format!("mp3 finish: {e}"))?);
+
+    // `shine-rs` 0.1.3 mirrors the C `shine_flush()` helper, which only
+    // returns whole bytes already written to the output buffer. The Rust
+    // bitstream writer can still hold the final few bytes in its bit cache,
+    // leaving the last MPEG frame shorter than the length declared in its
+    // header. Flush that cache before collecting the remaining bytes so short
+    // clips and the final partial frame remain valid MP3 bitstreams.
+    encoder
+        .shine_config()
+        .bs
+        .flush()
+        .map_err(|e| format!("mp3 bitstream flush: {e}"))?;
+    let config = encoder.shine_config();
+    let (flush_data, flush_written) = shine_rs::shine_flush(config);
+    mp3.extend_from_slice(&flush_data[..flush_written]);
 
     output
         .write_all(&mp3)
@@ -157,6 +185,10 @@ mod tests {
         let decoded = crate::decode::decode_file(&path).unwrap();
         assert_eq!(decoded.sample_rate, 44100);
         assert_eq!(decoded.n_channels(), 2);
+        assert_eq!(
+            decoded.channel_mask,
+            crate::channel_layout::ChannelLayout::Stereo.mask()
+        );
         assert!(decoded.frames() > 10000);
 
         // Lossy but should retain energy

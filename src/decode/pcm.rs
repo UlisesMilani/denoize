@@ -73,6 +73,7 @@ impl DecodedPcm {
 }
 
 /// Convert `f32` decoder samples to `f64` without clamping (preserves headroom).
+#[cfg(test)]
 #[inline]
 pub fn f32_to_f64(v: f32) -> f64 {
     v as f64
