@@ -25,6 +25,7 @@ pub struct ModelInfo {
     pub url: &'static str,
     pub revision: &'static str,
     pub sha256: &'static str,
+    pub size_bytes: u64,
     pub license: &'static str,
     pub sample_rate: u32,
 }
@@ -77,7 +78,7 @@ pub struct ModelDownloadOptions {
     /// verified `.part` file can still be used.
     pub offline: bool,
     /// Override the pinned manifest URL, for example with an authenticated
-    /// mirror. Integrity remains pinned by the manifest SHA-256.
+    /// mirror. Integrity remains pinned by the manifest size and SHA-256.
     pub source_url: Option<String>,
     pub proxy: ModelProxy,
     pub authentication: Option<ModelAuthentication>,
@@ -183,6 +184,7 @@ pub const MODELS: &[ModelInfo] = &[ModelInfo {
     url: "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/stream/onnx_models/gtcrn_simple.onnx",
     revision: "3862c44808dca492ea5a8a145d2dc2a1028d08c8",
     sha256: "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+    size_bytes: 535_190,
     license: "MIT",
     sample_rate: 16_000,
 }];
@@ -218,10 +220,10 @@ pub fn verify(model: &ModelInfo) -> Result<PathBuf, String> {
 }
 
 fn verify_at(model: &ModelInfo, destination: &Path) -> Result<PathBuf, String> {
-    if !destination.is_file() {
+    let Some(mut input) = open_existing_regular_file(destination, "installed model")? else {
         return Err(format!("model is not installed: {}", destination.display()));
-    }
-    let actual = sha256(destination)?;
+    };
+    let actual = sha256_open_file_exact(&mut input, destination, model.size_bytes)?;
     if actual != model.sha256 {
         return Err(format!(
             "checksum mismatch for {}: expected {}, got {}",
@@ -275,8 +277,8 @@ where
     install_internal(model, options, false, &mut cancelled, &mut progress)
 }
 
-/// Install a model from a local file after checking the pinned SHA-256. This
-/// is the air-gapped counterpart to a network install.
+/// Install a model from a local file after checking the pinned byte length and
+/// SHA-256. This is the air-gapped counterpart to a network install.
 pub fn install_from_file(model: &ModelInfo, source: impl AsRef<Path>) -> Result<PathBuf, String> {
     install_from_file_with_progress(model, source, || false, |_, _| {})
 }
@@ -301,11 +303,7 @@ where
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
         let mut source_file = open_local_model(source)?;
-        let total = source_file
-            .metadata()
-            .map_err(|error| format!("failed to inspect {}: {error}", source.display()))?
-            .len();
-        let actual = sha256_open_file(&mut source_file, source)?;
+        let actual = sha256_open_file_exact(&mut source_file, source, model.size_bytes)?;
         if actual != model.sha256 {
             return Err(format!(
                 "local model checksum mismatch: expected {}, got {}",
@@ -319,10 +317,10 @@ where
             source_file,
             source,
             &destination,
+            model.size_bytes,
             model.sha256,
             &mut cancelled,
             &mut progress,
-            Some(total),
         )?;
         Ok(destination.clone())
     })();
@@ -424,20 +422,40 @@ where
         reject_symlink(&partial)?;
         reject_symlink(&metadata_path)?;
 
-        if partial.is_file() && sha256(&partial).ok().as_deref() == Some(model.sha256) {
-            let total = partial.metadata().ok().map(|metadata| metadata.len());
-            let mut ignored_progress = |_, _| {};
-            publish_file(
-                &partial,
-                &destination,
-                model.sha256,
-                cancelled,
-                &mut ignored_progress,
-                total,
-            )?;
-            remove_file_if_present(&partial)?;
-            remove_file_if_present(&metadata_path)?;
-            return Ok(destination.clone());
+        if let Some(mut partial_file) =
+            open_existing_regular_file(&partial, "partial model download")?
+        {
+            let partial_size = open_file_length(&partial_file, &partial)?;
+            if partial_size == model.size_bytes {
+                let valid =
+                    match sha256_open_file_exact(&mut partial_file, &partial, model.size_bytes) {
+                        Ok(actual) => actual == model.sha256,
+                        Err(error) => {
+                            drop(partial_file);
+                            reset_partial(&partial, &metadata_path)?;
+                            return Err(error);
+                        }
+                    };
+                drop(partial_file);
+                if valid {
+                    let mut ignored_progress = |_, _| {};
+                    publish_file(
+                        &partial,
+                        &destination,
+                        model.size_bytes,
+                        model.sha256,
+                        cancelled,
+                        &mut ignored_progress,
+                    )?;
+                    remove_file_if_present(&partial)?;
+                    remove_file_if_present(&metadata_path)?;
+                    return Ok(destination.clone());
+                }
+                reset_partial(&partial, &metadata_path)?;
+            } else if partial_size > model.size_bytes {
+                drop(partial_file);
+                reset_partial(&partial, &metadata_path)?;
+            }
         }
         if options.offline {
             if let Ok(path) = verify_at(model, &destination) {
@@ -472,10 +490,10 @@ where
         publish_file(
             &partial,
             &destination,
+            model.size_bytes,
             model.sha256,
             cancelled,
             &mut ignored_progress,
-            None,
         )?;
         remove_file_if_present(&partial)?;
         remove_file_if_present(&metadata_path)?;
@@ -505,35 +523,53 @@ where
         if cancelled() {
             return Err("cancelled".into());
         }
-        let mut metadata = load_matching_metadata(metadata_path, source_id, model.sha256)?;
-        let mut downloaded = partial.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let mut metadata =
+            load_matching_metadata(metadata_path, source_id, model.sha256, model.size_bytes)?;
+        let mut partial_file = open_existing_regular_file(partial, "partial model download")?;
+        let mut downloaded = partial_file
+            .as_ref()
+            .map(|file| open_file_length(file, partial))
+            .transpose()?
+            .unwrap_or(0);
         if downloaded == 0 {
+            drop(partial_file.take());
             remove_file_if_present(metadata_path)?;
             metadata = None;
         } else if metadata.is_none() {
+            drop(partial_file.take());
             reset_partial(partial, metadata_path)?;
             downloaded = 0;
         }
 
-        if let Some(expected_total) = metadata.as_ref().and_then(|meta| meta.total) {
-            if downloaded > expected_total {
-                reset_partial(partial, metadata_path)?;
-                downloaded = 0;
-                metadata = None;
-            } else if downloaded == expected_total {
-                if sha256(partial)? == model.sha256 {
-                    return Ok(());
-                }
-                reset_partial(partial, metadata_path)?;
-                downloaded = 0;
-                metadata = None;
+        if downloaded > model.size_bytes {
+            drop(partial_file.take());
+            reset_partial(partial, metadata_path)?;
+            downloaded = 0;
+            metadata = None;
+        } else if downloaded == model.size_bytes {
+            let mut input = partial_file
+                .take()
+                .expect("a non-empty partial has an open file");
+            if sha256_open_file_exact(&mut input, partial, model.size_bytes)? == model.sha256 {
+                return Ok(());
             }
+            drop(input);
+            reset_partial(partial, metadata_path)?;
+            downloaded = 0;
+            metadata = None;
         }
+        drop(partial_file);
 
         let response = request_with_redirects(options, source, downloaded, metadata.as_ref())?;
         let status = response.status();
         if status == 416 && downloaded > 0 {
-            if handle_range_not_satisfiable(&response, partial, downloaded, model.sha256)? {
+            if handle_range_not_satisfiable(
+                &response,
+                partial,
+                downloaded,
+                model.size_bytes,
+                model.sha256,
+            )? {
                 return Ok(());
             }
             if !clean_retry_available {
@@ -549,13 +585,25 @@ where
                 redact_url(source.as_str())
             ));
         }
-        let content_length = response
-            .header("Content-Length")
-            .and_then(|value| value.parse::<u64>().ok());
-        let (resumed, response_total, expected_body_length) = match status {
-            200 => (false, content_length, content_length),
-            206 => match validate_partial_response(&response, downloaded, metadata.as_ref()) {
-                Ok((total, length)) => (downloaded > 0, total, Some(length)),
+        let (resumed, expected_body_length) = match status {
+            200 => {
+                let content_length = parse_content_length(&response)?;
+                if content_length.is_some_and(|length| length != model.size_bytes) {
+                    return Err(format!(
+                        "model response size mismatch: expected {} bytes, got {}",
+                        model.size_bytes,
+                        content_length.expect("checked as present")
+                    ));
+                }
+                (false, content_length)
+            }
+            206 => match validate_partial_response(
+                &response,
+                downloaded,
+                metadata.as_ref(),
+                model.size_bytes,
+            ) {
+                Ok(length) => (downloaded > 0, Some(length)),
                 Err(error) => {
                     if !clean_retry_available {
                         return Err(error);
@@ -572,11 +620,7 @@ where
                 ))
             }
         };
-        let total = response_total.or_else(|| {
-            resumed
-                .then(|| metadata.as_ref().and_then(|metadata| metadata.total))
-                .flatten()
-        });
+        let total = Some(model.size_bytes);
 
         let received_before = if resumed { downloaded } else { 0 };
         let next_metadata = PartialMetadata {
@@ -605,6 +649,14 @@ where
         write_metadata(metadata_path, &next_metadata)?;
 
         let mut output = open_partial(partial, resumed)?;
+        let opened_length = open_file_length(&output, partial)?;
+        if opened_length != received_before {
+            drop(output);
+            reset_partial(partial, metadata_path)?;
+            return Err(format!(
+                "partial model size changed before writing: expected {received_before} bytes, got {opened_length}"
+            ));
+        }
         let mut reader = response.into_reader();
         let mut received = received_before;
         let mut body_received = 0_u64;
@@ -626,16 +678,24 @@ where
             if count == 0 {
                 break;
             }
+            let next_received = received
+                .checked_add(count as u64)
+                .ok_or_else(|| "model response size overflow".to_string())?;
+            let next_body_received = body_received
+                .checked_add(count as u64)
+                .ok_or_else(|| "model response size overflow".to_string())?;
+            if next_received > model.size_bytes
+                || expected_body_length.is_some_and(|expected| next_body_received > expected)
+            {
+                drop(output);
+                reset_partial(partial, metadata_path)?;
+                return Err("model server sent more bytes than allowed by the manifest".into());
+            }
             output
                 .write_all(&buffer[..count])
                 .map_err(|error| format!("failed to save {}: {error}", partial.display()))?;
-            received += count as u64;
-            body_received += count as u64;
-            if total.is_some_and(|total| received > total) {
-                drop(output);
-                reset_partial(partial, metadata_path)?;
-                return Err("model server sent more bytes than declared".into());
-            }
+            received = next_received;
+            body_received = next_body_received;
             progress(received, total);
         }
         output
@@ -643,21 +703,29 @@ where
             .map_err(|error| format!("failed to sync {}: {error}", partial.display()))?;
         if let Some(expected) = expected_body_length {
             if body_received != expected {
+                drop(output);
                 reset_partial(partial, metadata_path)?;
                 return Err(format!(
                     "model response body length mismatch: received {body_received}, expected {expected}"
                 ));
             }
         }
-        if let Some(total) = total {
-            if received != total {
-                return Err(format!(
-                    "model download is incomplete: received {received} of {total} bytes"
-                ));
-            }
+        if received != model.size_bytes {
+            return Err(format!(
+                "model download is incomplete: received {received} of {} bytes",
+                model.size_bytes
+            ));
         }
-        let actual = sha256(partial)?;
+        let actual = match sha256_open_file_exact(&mut output, partial, model.size_bytes) {
+            Ok(actual) => actual,
+            Err(error) => {
+                drop(output);
+                reset_partial(partial, metadata_path)?;
+                return Err(error);
+            }
+        };
         if actual != model.sha256 {
+            drop(output);
             reset_partial(partial, metadata_path)?;
             return Err(format!(
                 "downloaded model checksum mismatch: expected {}, got {}; discarded corrupt partial download",
@@ -1092,6 +1160,7 @@ fn load_matching_metadata(
     path: &Path,
     source_id: &str,
     expected_sha256: &str,
+    expected_size: u64,
 ) -> Result<Option<PartialMetadata>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1132,7 +1201,8 @@ fn load_matching_metadata(
     Ok((metadata.version == PARTIAL_METADATA_VERSION
         && metadata.source_id == source_id
         && metadata.expected_sha256 == expected_sha256)
-        .then_some(metadata))
+        .then_some(metadata)
+        .filter(|metadata| metadata.total.is_none_or(|total| total == expected_size)))
 }
 
 fn write_metadata(path: &Path, metadata: &PartialMetadata) -> Result<(), String> {
@@ -1146,11 +1216,23 @@ fn write_metadata(path: &Path, metadata: &PartialMetadata) -> Result<(), String>
     output.commit(CommitMode::Replace)
 }
 
+fn parse_content_length(response: &ureq::Response) -> Result<Option<u64>, String> {
+    response
+        .header("Content-Length")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "model response has invalid Content-Length".to_string())
+        })
+        .transpose()
+}
+
 fn validate_partial_response(
     response: &ureq::Response,
     requested_start: u64,
     metadata: Option<&PartialMetadata>,
-) -> Result<(Option<u64>, u64), String> {
+    expected_size: u64,
+) -> Result<u64, String> {
     let value = response
         .header("Content-Range")
         .ok_or_else(|| "partial model response omitted Content-Range".to_string())?;
@@ -1161,22 +1243,29 @@ fn validate_partial_response(
             "partial model response starts at {start}, expected {requested_start}"
         ));
     }
+    if start >= expected_size || end >= expected_size {
+        return Err("partial model response exceeds the manifest size".into());
+    }
+    if total.is_some_and(|total| total != expected_size) {
+        return Err(format!(
+            "partial model response size mismatch: expected {expected_size} bytes, got {}",
+            total.expect("checked as present")
+        ));
+    }
     let range_length = end
         .checked_sub(start)
         .and_then(|length| length.checked_add(1))
         .ok_or_else(|| "partial model response has invalid Content-Range".to_string())?;
-    if let Some(length) = response
-        .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-    {
+    if let Some(length) = parse_content_length(response)? {
         if length != range_length {
             return Err("partial model response length disagrees with Content-Range".into());
         }
     }
-    if let (Some(old_total), Some(new_total)) = (metadata.and_then(|meta| meta.total), total) {
-        if old_total != new_total {
-            return Err("model source size changed during resume".into());
-        }
+    if metadata
+        .and_then(|metadata| metadata.total)
+        .is_some_and(|total| total != expected_size)
+    {
+        return Err("partial metadata conflicts with the manifest size".into());
     }
     if let (Some(old), Some(new)) = (
         metadata.and_then(|meta| meta.etag.as_deref()),
@@ -1194,7 +1283,7 @@ fn validate_partial_response(
             return Err("model source Last-Modified changed during resume".into());
         }
     }
-    Ok((total, range_length))
+    Ok(range_length)
 }
 
 fn parse_satisfied_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
@@ -1227,49 +1316,40 @@ fn handle_range_not_satisfiable(
     response: &ureq::Response,
     partial: &Path,
     downloaded: u64,
+    expected_size: u64,
     expected_sha256: &str,
 ) -> Result<bool, String> {
     let total = response
         .header("Content-Range")
         .and_then(parse_unsatisfied_content_range);
-    if total == Some(downloaded) && sha256(partial)? == expected_sha256 {
-        return Ok(true);
+    if downloaded != expected_size || total != Some(expected_size) {
+        return Ok(false);
     }
-    Ok(false)
+    Ok(file_matches(partial, expected_size, expected_sha256))
 }
 
 fn publish_file<C, P>(
     source: &Path,
     destination: &Path,
+    expected_size: u64,
     expected_sha256: &str,
     cancelled: &mut C,
     progress: &mut P,
-    total: Option<u64>,
 ) -> Result<(), String>
 where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
-    let input = File::open(source)
-        .map_err(|error| format!("failed to open {}: {error}", source.display()))?;
-    if !input
-        .metadata()
-        .map_err(|error| format!("failed to inspect {}: {error}", source.display()))?
-        .is_file()
-    {
-        return Err(format!(
-            "model source is not a regular file: {}",
-            source.display()
-        ));
-    }
+    let input = open_existing_regular_file(source, "model source")?
+        .ok_or_else(|| format!("failed to open {}: file not found", source.display()))?;
     publish_open_file(
         input,
         source,
         destination,
+        expected_size,
         expected_sha256,
         cancelled,
         progress,
-        total,
     )
 }
 
@@ -1278,19 +1358,22 @@ fn publish_open_file<C, P>(
     mut input: File,
     source: &Path,
     destination: &Path,
+    expected_size: u64,
     expected_sha256: &str,
     cancelled: &mut C,
     progress: &mut P,
-    total: Option<u64>,
 ) -> Result<(), String>
 where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
-    let copy_total = total.or_else(|| input.metadata().ok().map(|metadata| metadata.len()));
+    require_open_file_size(&input, source, expected_size)?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind {}: {error}", source.display()))?;
     let mut output = AtomicOutput::new(destination)?;
-    let mut digest = Sha256::new();
     let mut copied = 0_u64;
+    progress(0, Some(expected_size));
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         if cancelled() {
@@ -1302,15 +1385,35 @@ where
         if count == 0 {
             break;
         }
+        let next_copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| "model size overflow while staging".to_string())?;
+        if next_copied > expected_size {
+            return Err(format!(
+                "model size exceeds the manifest while staging: expected {expected_size} bytes"
+            ));
+        }
         output
             .file_mut()
             .write_all(&buffer[..count])
             .map_err(|error| format!("failed to stage {}: {error}", destination.display()))?;
-        digest.update(&buffer[..count]);
-        copied += count as u64;
-        progress(copied, copy_total);
+        copied = next_copied;
+        progress(copied, Some(expected_size));
     }
-    let actual = format!("{:x}", digest.finalize());
+    if copied != expected_size {
+        return Err(format!(
+            "model size mismatch while staging: expected {expected_size} bytes, got {copied}"
+        ));
+    }
+    require_open_file_size(&input, source, expected_size)?;
+    output.file_mut().flush().map_err(|error| {
+        format!(
+            "failed to flush staged model for {}: {error}",
+            destination.display()
+        )
+    })?;
+    require_open_file_size(output.file_mut(), destination, expected_size)?;
+    let actual = sha256_open_file_exact(output.file_mut(), destination, expected_size)?;
     if actual != expected_sha256 {
         return Err(format!(
             "model checksum mismatch while staging: expected {expected_sha256}, got {actual}"
@@ -1320,31 +1423,61 @@ where
 }
 
 fn open_local_model(path: &Path) -> Result<File, String> {
+    open_existing_regular_file(path, "local model source")?
+        .ok_or_else(|| format!("failed to open {}: file not found", path.display()))
+}
+
+fn open_existing_regular_file(path: &Path, description: &str) -> Result<Option<File>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-    if !file
-        .metadata()
-        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
-        .is_file()
+    #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to open {}: {error}", path.display())),
+    };
+    require_regular_file(&file, path, description)?;
+    Ok(Some(file))
+}
+
+fn open_file_length(file: &File, path: &Path) -> Result<u64, String> {
+    file.metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
+}
+
+fn require_open_file_size(file: &File, path: &Path, expected_size: u64) -> Result<(), String> {
+    require_regular_file(file, path, "model source")?;
+    let actual_size = open_file_length(file, path)?;
+    if actual_size != expected_size {
         return Err(format!(
-            "local model source is not a regular file: {}",
+            "model size mismatch for {}: expected {expected_size} bytes, got {actual_size}",
             path.display()
         ));
     }
-    Ok(file)
+    Ok(())
 }
 
-fn sha256_open_file(input: &mut File, path: &Path) -> Result<String, String> {
+fn sha256_open_file_exact(
+    input: &mut File,
+    path: &Path,
+    expected_size: u64,
+) -> Result<String, String> {
+    require_open_file_size(input, path, expected_size)?;
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind {}: {error}", path.display()))?;
     let mut digest = Sha256::new();
+    let mut read = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let count = input
@@ -1353,49 +1486,35 @@ fn sha256_open_file(input: &mut File, path: &Path) -> Result<String, String> {
         if count == 0 {
             break;
         }
+        read = read
+            .checked_add(count as u64)
+            .ok_or_else(|| "model size overflow while hashing".to_string())?;
+        if read > expected_size {
+            return Err(format!(
+                "model size exceeds the manifest while hashing: expected {expected_size} bytes"
+            ));
+        }
         digest.update(&buffer[..count]);
     }
+    if read != expected_size {
+        return Err(format!(
+            "model size changed while hashing {}: expected {expected_size} bytes, read {read}",
+            path.display()
+        ));
+    }
+    require_open_file_size(input, path, expected_size)?;
     input
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind {}: {error}", path.display()))?;
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn sha256_with_progress<C, P>(
-    path: &Path,
-    cancelled: &mut C,
-    progress: &mut P,
-    total: Option<u64>,
-) -> Result<String, String>
-where
-    C: FnMut() -> bool,
-    P: FnMut(u64, Option<u64>),
-{
-    let mut input =
-        File::open(path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
-    let mut digest = Sha256::new();
-    let mut read = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    progress(0, total);
-    loop {
-        if cancelled() {
-            return Err("cancelled".into());
-        }
-        let count = input
-            .read(&mut buffer)
-            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&buffer[..count]);
-        read += count as u64;
-        progress(read, total);
-    }
-    Ok(format!("{:x}", digest.finalize()))
-}
-
-fn sha256(path: &Path) -> Result<String, String> {
-    sha256_with_progress(path, &mut || false, &mut |_, _| {}, None)
+fn file_matches(path: &Path, expected_size: u64, expected_sha256: &str) -> bool {
+    let Ok(Some(mut input)) = open_existing_regular_file(path, "model source") else {
+        return false;
+    };
+    sha256_open_file_exact(&mut input, path, expected_size)
+        .is_ok_and(|actual| actual == expected_sha256)
 }
 
 fn acquire_lock<C>(destination: &Path, cancelled: &mut C) -> Result<File, String>
@@ -1462,6 +1581,7 @@ fn open_partial(path: &Path, resumed: bool) -> Result<File, String> {
     let mut options = OpenOptions::new();
     options
         .create(true)
+        .read(true)
         .write(true)
         .append(resumed)
         .truncate(!resumed);
