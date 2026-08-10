@@ -1,4 +1,7 @@
 use denoize::audio::{read_audio, write_audio};
+use denoize::batch_resume::{
+    self, BatchSession, Digest, MetadataPolicy, ResumeDecision, ResumeExpectation,
+};
 use denoize::benchmark::{BenchmarkReport, ComparisonReport};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::encode::write_audio_to_file;
@@ -12,7 +15,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,21 +49,27 @@ impl JobControl {
     }
 
     fn cancel(&self) -> Result<(), String> {
+        // Signal first so no waiter can enter a later commit fence while this
+        // call waits for the publication that already owns the gate.
+        self.cancelled.store(true, Ordering::SeqCst);
         let _commit_guard = self
             .commit_gate
             .lock()
             .map_err(|_| "出力確定状態を取得できません")?;
-        self.cancelled.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn commit(&self, transaction: AtomicOutput, mode: CommitMode) -> Result<(), String> {
+        self.commit_fence(|| transaction.commit(mode))
+    }
+
+    fn commit_fence<T>(&self, publish: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let _commit_guard = self
             .commit_gate
             .lock()
             .map_err(|_| "出力確定状態を取得できません")?;
         check_cancelled(self)?;
-        transaction.commit(mode)
+        publish()
     }
 }
 
@@ -269,62 +277,29 @@ struct BatchRequest {
 struct BatchItem {
     input: PathBuf,
     output: PathBuf,
-    state_key: String,
-}
-
-fn hash_batch_path(hasher: &mut sha2::Sha256, path: &Path) {
-    use sha2::Digest as _;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt as _;
-        hasher.update(path.as_os_str().as_bytes());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt as _;
-        for unit in path.as_os_str().encode_wide() {
-            hasher.update(unit.to_le_bytes());
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    hasher.update(path.to_string_lossy().as_bytes());
-}
-
-fn batch_state_key(
-    input_identity: &Path,
-    input_relative: &Path,
-    output_relative: &Path,
     output_format: OutputFormat,
-) -> String {
-    use sha2::Digest as _;
-    use std::fmt::Write as _;
+    item_id: Digest,
+}
 
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"denoize-batch-state-v2\0");
-    hash_batch_path(&mut hasher, input_identity);
-    hasher.update(b"\0");
-    hash_batch_path(&mut hasher, input_relative);
-    hasher.update(b"\0");
-    hash_batch_path(&mut hasher, output_relative);
-    hasher.update(b"\0");
-    hasher.update(match output_format {
-        OutputFormat::Wav => b"wav".as_slice(),
-        OutputFormat::Flac => b"flac".as_slice(),
-        OutputFormat::OggOpus => b"ogg-opus".as_slice(),
-        OutputFormat::Mp3 => b"mp3".as_slice(),
-        OutputFormat::M4a => b"m4a-aac".as_slice(),
-        OutputFormat::AacAdts => b"adts-aac".as_slice(),
-    });
-    let mut key = String::from("v2:");
-    for byte in hasher.finalize() {
-        write!(&mut key, "{byte:02x}").unwrap();
-    }
-    key
+#[derive(Clone, Debug)]
+struct PreparedBatchItem {
+    item: BatchItem,
+    input_channels: usize,
+    encode: EncodeOptions,
+    metadata_policy: MetadataPolicy,
+    processing: service::ResolvedProcessingOptions,
+    expectation: ResumeExpectation,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedBatchItem {
+    prepared: PreparedBatchItem,
+    decision: ResumeDecision,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(not(feature = "live"), allow(dead_code))]
 struct LiveRequest {
     input_device: Option<String>,
     output_device: Option<String>,
@@ -342,6 +317,7 @@ struct LiveDevices {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "live")]
 struct LiveEvent {
     status: &'static str,
     message: String,
@@ -371,6 +347,8 @@ struct JobProgress {
     eta_seconds: Option<f64>,
     item: Option<String>,
     item_status: Option<&'static str>,
+    item_id: Option<String>,
+    resume_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -753,192 +731,138 @@ fn start_batch(
     state: State<'_, AppState>,
     request: BatchRequest,
 ) -> Result<u64, String> {
-    let items = prepare_batch_request(&request)?;
-    let state_path = Path::new(&request.output_dir).join(".denoize-gui-state");
-    if request.resume {
-        validate_batch_reserved_path(&items, &state_path)?;
-    }
-    let completed = if request.resume {
-        read_batch_state(&state_path)?
-    } else {
-        HashSet::new()
-    };
-    preflight_batch_outputs(&request, &items, &completed)?;
-    let state_file = if request.resume {
-        Some(Arc::new(Mutex::new(open_batch_state_for_append(
-            &state_path,
-        )?)))
-    } else {
-        None
-    };
-    let (job_id, control) = register_job(&state)?;
+    let RegisteredBatch {
+        job_id,
+        control,
+        pool,
+        session,
+        items,
+    } = prepare_registered_batch(&state, &request)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
         let total = items.len();
         let finished = AtomicUsize::new(0);
-        let succeeded = AtomicUsize::new(0);
-        let skipped = AtomicUsize::new(0);
-        let failures = Mutex::new(Vec::<String>::new());
-        let process_item = |batch_item: &BatchItem| {
-            if control.is_cancelled() {
-                return;
-            }
-            let report_failure = |error: String| {
-                if let Ok(mut list) = failures.lock() {
-                    list.push(format!("{}: {error}", batch_item.input.display()));
-                }
-                let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                emit_batch_item(
-                    &app,
-                    job_id,
-                    "failed",
-                    batch_item,
-                    current,
-                    total,
-                    started,
-                    Some(error),
-                );
-            };
-            if request.resume && completed.contains(&batch_item.state_key) {
-                match batch_output_is_regular_file(&batch_item.output) {
-                    Ok(true) => {
-                        skipped.fetch_add(1, Ordering::Relaxed);
-                        let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                        emit_batch_item(
-                            &app, job_id, "skipped", batch_item, current, total, started, None,
-                        );
-                        return;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        report_failure(error);
-                        return;
-                    }
-                }
-            }
-            let result = (|| {
-                let input = batch_item.input.to_str().ok_or_else(|| {
-                    format!(
-                        "GUIバッチではUTF-8で表現できない入力パスを処理できません: {}",
-                        batch_item.input.display()
-                    )
-                })?;
-                let output = batch_item.output.to_str().ok_or_else(|| {
-                    format!(
-                        "GUIバッチではUTF-8で表現できない出力パスを処理できません: {}",
-                        batch_item.output.display()
-                    )
-                })?;
-                let process_request = ProcessRequest {
-                    input: input.into(),
-                    output: output.into(),
-                    options: request.options.clone(),
+        let run_item = |batch_item: &PlannedBatchItem| -> BatchItemOutcome {
+            let commit_mode =
+                match batch_item_commit_mode(batch_item.decision, control.is_cancelled()) {
+                    Ok(commit_mode) => commit_mode,
+                    Err(outcome) => return outcome,
                 };
-                validate_request(
-                    &process_request.input,
-                    &process_request.output,
-                    &process_request.options,
-                )?;
-                process_file(&process_request, &control, |_, _| {})
-            })()
-            .and_then(|output| {
-                if let Some(file) = &state_file {
-                    let mut file = file
-                        .lock()
-                        .map_err(|_| "再開状態のロックを取得できません".to_string())?;
-                    append_batch_state_entry(&mut *file, &batch_item.state_key)?;
-                }
-                Ok(output)
+            let prepared = &batch_item.prepared;
+            let result = stage_batch_output(
+                &prepared.item.input,
+                &prepared.item.output,
+                prepared.item.output_format,
+                prepared.encode,
+                prepared.metadata_policy,
+                &prepared.processing,
+                &control,
+            )
+            .and_then(|transaction| {
+                verify_prepared_batch_recipe(prepared)?;
+                control.commit_fence(|| {
+                    session
+                        .publish(&prepared.expectation, transaction, commit_mode)
+                        .map(|_| ())
+                })
             });
             match result {
-                Ok(_) => {
-                    succeeded.fetch_add(1, Ordering::Relaxed);
-                    let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                    emit_batch_item(
-                        &app,
-                        job_id,
-                        "completed",
-                        batch_item,
-                        current,
-                        total,
-                        started,
-                        None,
-                    );
-                }
-                Err(error) if error == "cancelled" => {}
-                Err(error) => report_failure(error),
+                Ok(_) => BatchItemOutcome::Completed,
+                Err(error) if error == "cancelled" => BatchItemOutcome::Cancelled,
+                Err(error) => BatchItemOutcome::Failed(error),
             }
         };
-        let pool_error = if request.options.deterministic {
-            items.iter().for_each(process_item);
-            None
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(request.jobs)
-                .build();
-            match pool {
-                Ok(pool) => {
-                    pool.install(|| items.par_iter().for_each(process_item));
-                    None
-                }
-                Err(error) => Some(error.to_string()),
-            }
+        let process_item = |batch_item: &PlannedBatchItem| {
+            let outcome = run_item(batch_item);
+            let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+            emit_batch_item(
+                &app,
+                job_id,
+                outcome.status(),
+                &batch_item.prepared.item,
+                Some(batch_item.decision.reason()),
+                current,
+                total,
+                started,
+                outcome.error(),
+            );
+            outcome
         };
-        let current = finished.load(Ordering::SeqCst);
-        if control.is_cancelled() {
-            emit_progress(
-                &app,
-                job_id,
-                "batch",
-                "cancelled",
-                "バッチをキャンセルしました",
-                current,
-                total,
-                started,
-                None,
-                None,
-            );
-        } else if let Some(error) = pool_error {
-            emit_progress(
-                &app,
-                job_id,
-                "batch",
-                "failed",
-                "バッチを開始できませんでした",
-                current,
-                total,
-                started,
-                Some(request.output_dir.clone()),
-                Some(format!("並列処理を開始できませんでした: {error}")),
-            );
+        let outcomes = if let Some(pool) = pool {
+            pool.install(|| items.par_iter().map(process_item).collect::<Vec<_>>())
         } else {
-            let failure_count = failures.lock().map(|list| list.len()).unwrap_or(0);
-            let success_count = succeeded.load(Ordering::Relaxed);
-            let skipped_count = skipped.load(Ordering::Relaxed);
-            let BatchTerminalOutcome {
-                status,
-                message,
-                error,
-            } = batch_terminal_outcome(success_count, skipped_count, failure_count);
-            emit_progress(
-                &app,
-                job_id,
-                "batch",
-                status,
-                &message,
-                current,
-                total,
-                started,
-                Some(request.output_dir),
-                error,
-            );
-        }
+            items.iter().map(process_item).collect::<Vec<_>>()
+        };
+        let counts = count_batch_outcomes(&outcomes);
+        debug_assert_eq!(counts.total(), total);
+        debug_assert_eq!(finished.load(Ordering::SeqCst), total);
+        let BatchTerminalOutcome {
+            status,
+            message,
+            error,
+        } = batch_terminal_outcome(counts);
+        emit_progress(
+            &app,
+            job_id,
+            "batch",
+            status,
+            &message,
+            total,
+            total,
+            started,
+            Some(request.output_dir),
+            error,
+        );
         if let Ok(mut jobs) = jobs.lock() {
             jobs.remove(&job_id);
         }
     });
     Ok(job_id)
+}
+
+struct RegisteredBatch {
+    job_id: u64,
+    control: Arc<JobControl>,
+    pool: Option<rayon::ThreadPool>,
+    session: BatchSession,
+    items: Vec<PlannedBatchItem>,
+}
+
+fn prepare_registered_batch(
+    state: &AppState,
+    request: &BatchRequest,
+) -> Result<RegisteredBatch, String> {
+    let (job_id, control) = register_job(state)?;
+    let prepared = (|| {
+        let prepared = prepare_batch_request(request)?;
+        let pool = if request.options.deterministic {
+            None
+        } else {
+            Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(request.jobs)
+                    .build()
+                    .map_err(|error| format!("並列処理を準備できませんでした: {error}"))?,
+            )
+        };
+        let session = BatchSession::acquire(Path::new(&request.output_dir), request.resume)?;
+        let items = plan_batch_items(&session, prepared, request.options.force)?;
+        session.activate()?;
+        Ok(RegisteredBatch {
+            job_id,
+            control: Arc::clone(&control),
+            pool,
+            session,
+            items,
+        })
+    })();
+    if prepared.is_err() {
+        if let Ok(mut jobs) = state.jobs.lock() {
+            jobs.remove(&job_id);
+        }
+    }
+    prepared
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -948,13 +872,82 @@ struct BatchTerminalOutcome {
     error: Option<String>,
 }
 
-fn batch_terminal_outcome(
-    success_count: usize,
-    skipped_count: usize,
-    failure_count: usize,
-) -> BatchTerminalOutcome {
-    let message = format!("完了 {success_count} · スキップ {skipped_count} · 失敗 {failure_count}");
-    if failure_count == 0 {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BatchOutcomeCounts {
+    completed: usize,
+    skipped: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+impl BatchOutcomeCounts {
+    fn total(self) -> usize {
+        self.completed + self.skipped + self.failed + self.cancelled
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BatchItemOutcome {
+    Completed,
+    Skipped,
+    Failed(String),
+    Cancelled,
+}
+
+fn batch_item_commit_mode(
+    decision: ResumeDecision,
+    cancelled: bool,
+) -> Result<CommitMode, BatchItemOutcome> {
+    match decision {
+        ResumeDecision::Skip { .. } => Err(BatchItemOutcome::Skipped),
+        ResumeDecision::Process { .. } if cancelled => Err(BatchItemOutcome::Cancelled),
+        ResumeDecision::Process { commit_mode, .. } => Ok(commit_mode),
+    }
+}
+
+impl BatchItemOutcome {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Skipped => "skipped",
+            Self::Failed(_) => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn error(&self) -> Option<String> {
+        match self {
+            Self::Failed(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+}
+
+fn count_batch_outcomes(outcomes: &[BatchItemOutcome]) -> BatchOutcomeCounts {
+    let mut counts = BatchOutcomeCounts::default();
+    for outcome in outcomes {
+        match outcome {
+            BatchItemOutcome::Completed => counts.completed += 1,
+            BatchItemOutcome::Skipped => counts.skipped += 1,
+            BatchItemOutcome::Failed(_) => counts.failed += 1,
+            BatchItemOutcome::Cancelled => counts.cancelled += 1,
+        }
+    }
+    counts
+}
+
+fn batch_terminal_outcome(counts: BatchOutcomeCounts) -> BatchTerminalOutcome {
+    let message = format!(
+        "完了 {} · スキップ {} · 失敗 {} · キャンセル {}",
+        counts.completed, counts.skipped, counts.failed, counts.cancelled
+    );
+    if counts.cancelled > 0 {
+        BatchTerminalOutcome {
+            status: "cancelled",
+            message,
+            error: None,
+        }
+    } else if counts.failed == 0 {
         BatchTerminalOutcome {
             status: "completed",
             message,
@@ -964,8 +957,39 @@ fn batch_terminal_outcome(
         BatchTerminalOutcome {
             status: "failed",
             message,
-            error: Some(format!("{failure_count}件のファイルを処理できませんでした")),
+            error: Some(format!(
+                "{}件のファイルを処理できませんでした",
+                counts.failed
+            )),
         }
+    }
+}
+
+fn plan_batch_items(
+    session: &BatchSession,
+    prepared: Vec<PreparedBatchItem>,
+    force: bool,
+) -> Result<Vec<PlannedBatchItem>, String> {
+    let mut planned = Vec::with_capacity(prepared.len());
+    for prepared in prepared {
+        let decision = session
+            .plan(&prepared.expectation, force)
+            .map_err(actionable_batch_resume_error)?;
+        planned.push(PlannedBatchItem { prepared, decision });
+    }
+    for item in &planned {
+        item.prepared.expectation.verify_sources()?;
+    }
+    Ok(planned)
+}
+
+fn actionable_batch_resume_error(error: String) -> String {
+    if error.contains("without --force") {
+        format!(
+            "{error}\n既存出力が古い・未追跡・旧形式・安全でない状態です。「既存を上書き」を有効にして再処理してください"
+        )
+    } else {
+        error
     }
 }
 
@@ -1020,12 +1044,17 @@ fn collect_batch_items(request: &BatchRequest, extension: &str) -> Result<Vec<Ba
             let input_identity = std::fs::canonicalize(&input).map_err(|error| {
                 format!("バッチ入力 {} を解決できません: {error}", input.display())
             })?;
-            let state_key =
-                batch_state_key(&input_identity, &relative, output_relative, output_format);
+            let item_id = batch_resume::item_identity(
+                &input_identity,
+                &relative,
+                output_relative,
+                output_format,
+            );
             Ok(BatchItem {
                 input,
                 output,
-                state_key,
+                output_format,
+                item_id,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1208,166 +1237,28 @@ fn validate_batch_directories(input_dir: &Path, output_dir: &Path) -> Result<(),
     Ok(())
 }
 
-fn validate_batch_reserved_path(items: &[BatchItem], state_path: &Path) -> Result<(), String> {
-    let state_path = batch_collision_key(&normalize_batch_path(state_path)?);
-    for item in items {
-        let output = batch_collision_key(&normalize_batch_path(&item.output)?);
-        if output == state_path
-            || output.starts_with(&state_path)
-            || state_path.starts_with(&output)
-        {
-            return Err(format!(
-                "バッチ出力 {} は再開状態 .denoize-gui-state と競合します",
-                item.output.display()
-            ));
+fn validate_batch_control_paths(items: &[BatchItem], output_root: &Path) -> Result<(), String> {
+    for name in [
+        batch_resume::STATE_FILE_NAME,
+        batch_resume::LEGACY_DESKTOP_STATE_FILE_NAME,
+        batch_resume::LOCK_FILE_NAME,
+    ] {
+        let reserved = output_root.join(name);
+        let reserved_key = batch_collision_key(&normalize_batch_path(&reserved)?);
+        for item in items {
+            let output = batch_collision_key(&normalize_batch_path(&item.output)?);
+            if output == reserved_key
+                || output.starts_with(&reserved_key)
+                || reserved_key.starts_with(&output)
+            {
+                return Err(format!(
+                    "バッチ出力 {} は予約済みの管理パス {name} と競合します",
+                    item.output.display()
+                ));
+            }
         }
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn batch_state_nofollow_flag() -> i32 {
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "solaris",
-        target_os = "illumos"
-    ))]
-    {
-        // O_NOFOLLOW on Linux-family and System V-family targets.
-        0x0002_0000
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "solaris",
-        target_os = "illumos"
-    )))]
-    {
-        // O_NOFOLLOW on Darwin and the BSD desktop targets.
-        0x0000_0100
-    }
-}
-
-fn configure_batch_state_open(options: &mut std::fs::OpenOptions) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(batch_state_nofollow_flag());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-}
-
-fn validate_batch_state_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<(), String> {
-    if !metadata.is_file() {
-        return Err(format!(
-            "再開状態はシンボリックリンク、ディレクトリ、特殊ファイルではなく通常ファイルである必要があります: {}",
-            path.display()
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.nlink() != 1 {
-            return Err(format!(
-                "再開状態に複数のハードリンクは使用できません: {}",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_batch_state_file(file: &std::fs::File, path: &Path) -> Result<(), String> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("再開状態 {} を確認できません: {error}", path.display()))?;
-    validate_batch_state_metadata(&metadata, path)?;
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle as _;
-        use windows_sys::Win32::Storage::FileSystem::{
-            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        };
-
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `file` owns a live handle and `information` is valid writable storage.
-        let succeeded =
-            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
-        if succeeded == 0 {
-            return Err(format!(
-                "再開状態 {} のハードリンク数を確認できません: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-        if information.nNumberOfLinks != 1 {
-            return Err(format!(
-                "再開状態に複数のハードリンクは使用できません: {}",
-                path.display()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_existing_batch_state_path(path: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => validate_batch_state_metadata(&metadata, path),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "再開状態 {} を確認できません: {error}",
-            path.display()
-        )),
-    }
-}
-
-fn open_batch_state_for_append(path: &Path) -> Result<std::fs::File, String> {
-    validate_existing_batch_state_path(path)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    configure_batch_state_open(&mut options);
-    let file = options
-        .open(path)
-        .map_err(|error| format!("再開状態 {} を開けません: {error}", path.display()))?;
-    validate_batch_state_file(&file, path)?;
-    Ok(file)
-}
-
-fn read_batch_state(path: &Path) -> Result<HashSet<String>, String> {
-    use std::io::Read as _;
-
-    validate_existing_batch_state_path(path)?;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    configure_batch_state_open(&mut options);
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(error) => return Err(format!("再開状態 {} を開けません: {error}", path.display())),
-    };
-    validate_batch_state_file(&file, path)?;
-    let mut source = String::new();
-    file.read_to_string(&mut source)
-        .map_err(|error| format!("再開状態 {} を読めません: {error}", path.display()))?;
-    Ok(source
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect())
-}
-
-fn append_batch_state_entry(file: &mut impl Write, state_key: &str) -> Result<(), String> {
-    writeln!(file, "{state_key}").map_err(|error| format!("再開状態を書き込めません: {error}"))?;
-    file.flush()
-        .map_err(|error| format!("再開状態を確定できません: {error}"))
 }
 
 #[tauri::command]
@@ -1381,6 +1272,7 @@ fn cancel_job(state: State<'_, AppState>, job_id: u64) -> Result<(), String> {
 }
 
 #[tauri::command]
+#[cfg(feature = "live")]
 async fn live_devices() -> Result<LiveDevices, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let (inputs, outputs) = denoize::live::device_names()?;
@@ -1391,6 +1283,13 @@ async fn live_devices() -> Result<LiveDevices, String> {
 }
 
 #[tauri::command]
+#[cfg(not(feature = "live"))]
+async fn live_devices() -> Result<LiveDevices, String> {
+    Err("このビルドではライブ処理を利用できません".into())
+}
+
+#[tauri::command]
+#[cfg(feature = "live")]
 fn start_live(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1472,6 +1371,17 @@ fn start_live(
 }
 
 #[tauri::command]
+#[cfg(not(feature = "live"))]
+fn start_live(
+    _app: AppHandle,
+    _state: State<'_, AppState>,
+    _request: LiveRequest,
+) -> Result<(), String> {
+    Err("このビルドではライブ処理を利用できません".into())
+}
+
+#[tauri::command]
+#[cfg(feature = "live")]
 fn stop_live(state: State<'_, AppState>) -> Result<(), String> {
     let live = state
         .live
@@ -1480,6 +1390,12 @@ fn stop_live(state: State<'_, AppState>) -> Result<(), String> {
     let running = live.as_ref().ok_or("ライブ処理は実行されていません")?;
     running.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+#[tauri::command]
+#[cfg(not(feature = "live"))]
+fn stop_live(_state: State<'_, AppState>) -> Result<(), String> {
+    Err("このビルドではライブ処理を利用できません".into())
 }
 
 #[tauri::command]
@@ -1747,7 +1663,7 @@ fn save_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|error| format!("{path} を保存できません: {error}"))
 }
 
-fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<JobControl>), String> {
+fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
     if state
         .live
         .lock()
@@ -1830,7 +1746,7 @@ fn validate_batch_request(request: &BatchRequest) -> Result<String, String> {
     Ok(extension)
 }
 
-fn prepare_batch_request(request: &BatchRequest) -> Result<Vec<BatchItem>, String> {
+fn prepare_batch_request(request: &BatchRequest) -> Result<Vec<PreparedBatchItem>, String> {
     let extension = validate_batch_request(request)?;
     preflight_explicit_backend_resources(&request.options)?;
     if !Path::new(&request.output_dir).is_dir() {
@@ -1840,63 +1756,108 @@ fn prepare_batch_request(request: &BatchRequest) -> Result<Vec<BatchItem>, Strin
     if items.is_empty() {
         return Err("対応する音声ファイルがありません".into());
     }
-    preflight_batch_codecs(&request.options, &items)?;
-    Ok(items)
+    validate_batch_control_paths(&items, Path::new(&request.output_dir))?;
+    preflight_batch_items(&request.options, request.resume, items)
 }
 
-fn preflight_batch_codecs(options: &ProcessOptions, items: &[BatchItem]) -> Result<(), String> {
+fn preflight_batch_items(
+    options: &ProcessOptions,
+    resume_enabled: bool,
+    items: Vec<BatchItem>,
+) -> Result<Vec<PreparedBatchItem>, String> {
     let encode = parsed_encode_options(options)?;
+    let metadata_policy = if options.preserve_metadata {
+        MetadataPolicy::Preserve
+    } else {
+        MetadataPolicy::Drop
+    };
+    let mut model_fingerprints = HashMap::<(PathBuf, u32), batch_resume::ConsumedModel>::new();
+    let mut prepared = Vec::with_capacity(items.len());
     for item in items {
-        let format = OutputFormat::from_path(&item.output)?;
+        let input_fingerprint = batch_resume::fingerprint_file(&item.input).map_err(|error| {
+            format!(
+                "バッチ入力 {} の内容を確認できません: {error}",
+                item.input.display()
+            )
+        })?;
         let audio = read_audio(&item.input).map_err(|error| {
             format!(
                 "バッチ入力 {} を事前検査できません: {error}",
                 item.input.display()
             )
         })?;
-        format.validate_config(&audio, &encode).map_err(|error| {
-            format!(
-                "バッチ出力 {} のcodec設定が不正です: {error}",
-                item.output.display()
-            )
-        })?;
-        validated_processing_options(options, &audio).map_err(|error| {
+        item.output_format
+            .validate_config(&audio, &encode)
+            .map_err(|error| {
+                format!(
+                    "バッチ出力 {} のcodec設定が不正です: {error}",
+                    item.output.display()
+                )
+            })?;
+        let processing = resolved_processing_options(options, &audio).map_err(|error| {
             format!(
                 "バッチ入力 {} の処理設定が不正です: {error}",
                 item.input.display()
             )
         })?;
+        let model = match batch_resume::consumed_model_config(&processing)
+            .map_err(|error| format!("使用するモデル設定を確認できません: {error}"))?
+        {
+            Some(config) => {
+                let key = (config.path.clone(), config.sample_rate);
+                let model = match model_fingerprints.get(&key) {
+                    Some(model) => model.clone(),
+                    None => {
+                        let model = if resume_enabled {
+                            batch_resume::fingerprint_resumable_model(config)
+                        } else {
+                            batch_resume::fingerprint_consumed_model(config)
+                        }
+                        .map_err(|error| {
+                            format!("使用するモデルの内容を確認できません: {error}")
+                        })?;
+                        model_fingerprints.insert(key, model.clone());
+                        model
+                    }
+                };
+                Some(model)
+            }
+            None => None,
+        };
+        let recipe = batch_resume::recipe_digest(
+            &processing,
+            audio.channels(),
+            item.output_format,
+            encode,
+            metadata_policy,
+            model
+                .as_ref()
+                .map(|model| (&model.fingerprint, model.sample_rate)),
+        )?;
+        let expectation = ResumeExpectation::new(
+            item.item_id,
+            item.output.clone(),
+            item.input.clone(),
+            input_fingerprint,
+            model,
+            recipe,
+        );
+        prepared.push(PreparedBatchItem {
+            item,
+            input_channels: audio.channels(),
+            encode,
+            metadata_policy,
+            processing,
+            expectation,
+        });
     }
-    Ok(())
+    for item in &prepared {
+        item.expectation.verify_sources()?;
+    }
+    Ok(prepared)
 }
 
-fn preflight_batch_outputs(
-    request: &BatchRequest,
-    items: &[BatchItem],
-    completed: &HashSet<String>,
-) -> Result<(), String> {
-    for item in items {
-        let resumable = request.resume
-            && completed.contains(&item.state_key)
-            && batch_output_is_regular_file(&item.output)?;
-        if !resumable {
-            ensure_output_available(&item.output, request.options.force)?;
-        }
-    }
-    Ok(())
-}
-
-fn batch_output_is_regular_file(path: &Path) -> Result<bool, String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(format!(
-            "バッチ出力 {} を確認できません: {error}",
-            path.display()
-        )),
-    }
-}
-
+#[cfg(feature = "live")]
 fn validate_live_request(request: &LiveRequest) -> Result<Backend, String> {
     if !(10..=2_000).contains(&request.chunk_ms) {
         return Err("チャンク長は10〜2000msにしてください".into());
@@ -1918,6 +1879,12 @@ fn validate_live_request(request: &LiveRequest) -> Result<Backend, String> {
         .validate_config(backend)
         .map_err(|error| error.to_string())?;
     Ok(backend)
+}
+
+#[cfg(not(feature = "live"))]
+#[allow(dead_code)]
+fn validate_live_request(_request: &LiveRequest) -> Result<Backend, String> {
+    Err("このビルドではライブ処理を利用できません".into())
 }
 
 fn parse_aac_encoder(value: &str) -> Result<AacEncoder, String> {
@@ -2049,6 +2016,13 @@ fn validated_processing_options(
     Ok(processing)
 }
 
+fn resolved_processing_options(
+    options: &ProcessOptions,
+    audio: &denoize::Audio,
+) -> Result<service::ResolvedProcessingOptions, String> {
+    service::resolve_processing_options(audio, validated_processing_options(options, audio)?)
+}
+
 fn process_file(
     request: &ProcessRequest,
     control: &JobControl,
@@ -2093,6 +2067,61 @@ fn process_file(
     };
     control.commit(transaction, commit_mode)?;
     Ok(output.to_string_lossy().into_owned())
+}
+
+fn stage_batch_output(
+    input: &Path,
+    output: &Path,
+    format: OutputFormat,
+    encode: EncodeOptions,
+    metadata_policy: MetadataPolicy,
+    processing: &service::ResolvedProcessingOptions,
+    control: &JobControl,
+) -> Result<AtomicOutput, String> {
+    check_cancelled(control)?;
+    let metadata = if metadata_policy == MetadataPolicy::Preserve {
+        denoize::metadata::read_extended(input)?
+    } else {
+        None
+    };
+    let mut audio = read_audio(input)?;
+    format.validate_config(&audio, &encode)?;
+    check_cancelled(control)?;
+    service::process_audio_resolved(&mut audio, processing)?;
+    check_cancelled(control)?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("出力フォルダを作成できません: {error}"))?;
+    }
+    let mut transaction = AtomicOutput::new(output)?;
+    write_audio_to_file(transaction.file_mut(), format, &audio, encode)?;
+    if let Some(metadata) = metadata {
+        denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
+    }
+    Ok(transaction)
+}
+
+fn verify_prepared_batch_recipe(item: &PreparedBatchItem) -> Result<(), String> {
+    let recipe = batch_resume::recipe_digest(
+        &item.processing,
+        item.input_channels,
+        item.item.output_format,
+        item.encode,
+        item.metadata_policy,
+        item.expectation
+            .model()
+            .map(|model| (&model.fingerprint, model.sample_rate)),
+    )?;
+    if recipe != item.expectation.recipe() {
+        return Err(format!(
+            "バッチ出力 {} の有効な処理設定が事前検査後に変化しました",
+            item.item.output.display()
+        ));
+    }
+    Ok(())
 }
 
 fn processing_config(options: &ProcessOptions, sample_rate: u32) -> Result<DenoiserConfig, String> {
@@ -2153,6 +2182,8 @@ fn emit_progress(
             eta_seconds: None,
             item: None,
             item_status: None,
+            item_id: None,
+            resume_reason: None,
         },
     );
 }
@@ -2163,6 +2194,7 @@ fn emit_batch_item(
     job_id: u64,
     item_status: &'static str,
     item: &BatchItem,
+    resume_reason: Option<batch_resume::ResumeReason>,
     current: usize,
     total: usize,
     started: Instant,
@@ -2192,6 +2224,8 @@ fn emit_batch_item(
             eta_seconds: eta,
             item: Some(item.input.to_string_lossy().into_owned()),
             item_status: Some(item_status),
+            item_id: Some(item.item_id.as_hex()),
+            resume_reason: resume_reason.map(batch_resume::ResumeReason::as_str),
         },
     );
 }
@@ -2235,6 +2269,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Item identities preserve each platform's raw OS path representation:
+    // UTF-8 bytes on Unix-like targets and UTF-16LE code units on Windows.
+    #[cfg(not(windows))]
+    const FRONTEND_PARITY_ITEM_ID_HEX: &str =
+        "795ada4ccf8186cdaa1d64cec4f53165bc5ca003d68e0964aee9a33a5f8105e8";
+    #[cfg(windows)]
+    const FRONTEND_PARITY_ITEM_ID_HEX: &str =
+        "28a3a5bc0a5112777268b438a5357badea3c055ea91a1472a9cdba3c1a8522f0";
+    // The package version is intentionally part of the v3 recipe ABI. Update
+    // this value in both frontend tests when an intentional release bump lands.
+    const FRONTEND_PARITY_RECIPE_HEX: &str =
+        "cd288e5590c5f440714b2bf4d760fa5d56a2aad93de311ca95db7ab63fb97649";
 
     struct TestDirectory {
         path: PathBuf,
@@ -2292,6 +2339,26 @@ mod tests {
         wav.extend(16_000_u32.to_le_bytes());
         wav.extend(32_000_u32.to_le_bytes());
         wav.extend(2_u16.to_le_bytes());
+        wav.extend(16_u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((samples.len() as u32).to_le_bytes());
+        wav.extend(samples);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn write_test_stereo_wav(path: &Path) {
+        let frames = 960_u32;
+        let samples = vec![0_u8; frames as usize * 2 * 2];
+        let mut wav = Vec::with_capacity(44 + samples.len());
+        wav.extend(b"RIFF");
+        wav.extend((36_u32 + samples.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16_u32.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(2_u16.to_le_bytes());
+        wav.extend(48_000_u32.to_le_bytes());
+        wav.extend(192_000_u32.to_le_bytes());
+        wav.extend(4_u16.to_le_bytes());
         wav.extend(16_u16.to_le_bytes());
         wav.extend(b"data");
         wav.extend((samples.len() as u32).to_le_bytes());
@@ -2370,6 +2437,145 @@ mod tests {
             jobs: 1,
             resume: false,
             options: options(),
+        }
+    }
+
+    fn test_batch_item(input: PathBuf, output: PathBuf, id: u8) -> BatchItem {
+        BatchItem {
+            input,
+            output_format: OutputFormat::from_path(&output).unwrap_or(OutputFormat::Wav),
+            output,
+            item_id: Digest::from_bytes([id; 32]),
+        }
+    }
+
+    fn desktop_batch_fixture(directory: &TestDirectory, resume: bool, force: bool) -> BatchRequest {
+        let input = directory.join("input");
+        let output = directory.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        let source = input.join("sample.wav");
+        if !source.exists() {
+            write_test_wav(&source);
+        }
+        BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_string_lossy().into_owned()),
+            output_dir: output.to_string_lossy().into_owned(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 1,
+            resume,
+            options: classical_options(force),
+        }
+    }
+
+    #[test]
+    fn desktop_batch_recipe_matches_the_frontend_parity_golden_vector() {
+        let directory = TestDirectory::create("frontend-parity-golden");
+        let input = directory.join("input");
+        let output = directory.join("output");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        let source = input.join("stereo.wav");
+        write_test_stereo_wav(&source);
+        let config = parse_gui_config(
+            r#"
+backend = "classical"
+preset = "hifi"
+mode = "speech"
+strength = 0.37
+adaptive_noise = false
+vad = false
+channels = "linked"
+downmix = "preserve"
+loudness_lufs = -16.0
+true_peak_dbtp = -1.0
+preserve_metadata = false
+force = false
+mp3_bitrate_kbps = 256
+m4a_bitrate_kbps = 224
+aac_encoder = "oxide"
+sgmse_profile = "balanced"
+deterministic = false
+"#,
+            gui_config(),
+        )
+        .unwrap();
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_string_lossy().into_owned()),
+            output_dir: output.to_string_lossy().into_owned(),
+            output_format: "mp3".into(),
+            recursive: false,
+            jobs: 1,
+            resume: true,
+            options: config.process_options(),
+        };
+        let prepared = prepare_batch_request(&request).unwrap();
+        let prepared = &prepared[0];
+
+        assert_eq!(prepared.processing.backend, Backend::Classical);
+        assert!(!prepared.processing.denoiser.adaptive_noise);
+        assert!(!prepared.processing.denoiser.vad);
+        assert_eq!(
+            prepared.processing.backend_options.channel_mode,
+            ChannelMode::StereoLinked
+        );
+        assert_eq!(prepared.processing.loudness_lufs, Some(-16.0));
+        assert_eq!(prepared.processing.true_peak_dbtp, -1.0);
+        assert_eq!(prepared.input_channels, 2);
+        assert_eq!(prepared.item.output_format, OutputFormat::Mp3);
+        assert_eq!(prepared.encode.mp3_bitrate_kbps, 256);
+        assert_eq!(prepared.metadata_policy, MetadataPolicy::Drop);
+        assert!(prepared.expectation.model().is_none());
+        assert_eq!(
+            prepared.expectation.recipe().as_hex(),
+            FRONTEND_PARITY_RECIPE_HEX
+        );
+        assert_eq!(prepared.expectation.item_id(), prepared.item.item_id);
+
+        let fixed_item_id = batch_resume::item_identity(
+            Path::new("/denoize/frontend-parity/input/stereo.wav"),
+            Path::new("stereo.wav"),
+            Path::new("stereo.mp3"),
+            OutputFormat::Mp3,
+        );
+        assert_eq!(fixed_item_id.as_hex(), FRONTEND_PARITY_ITEM_ID_HEX);
+    }
+
+    fn publish_planned_item(session: &BatchSession, item: &PlannedBatchItem) -> Result<(), String> {
+        let ResumeDecision::Process { commit_mode, .. } = item.decision else {
+            return Err("test item unexpectedly planned as a skip".into());
+        };
+        let control = JobControl::default();
+        let transaction = stage_batch_output(
+            &item.prepared.item.input,
+            &item.prepared.item.output,
+            item.prepared.item.output_format,
+            item.prepared.encode,
+            item.prepared.metadata_policy,
+            &item.prepared.processing,
+            &control,
+        )?;
+        verify_prepared_batch_recipe(&item.prepared)?;
+        control.commit_fence(|| {
+            session
+                .publish(&item.prepared.expectation, transaction, commit_mode)
+                .map(|_| ())
+        })
+    }
+
+    fn complete_desktop_batch(request: &BatchRequest) {
+        let prepared = prepare_batch_request(request).unwrap();
+        let session =
+            BatchSession::acquire(Path::new(&request.output_dir), request.resume).unwrap();
+        let planned = plan_batch_items(&session, prepared, request.options.force).unwrap();
+        session.activate().unwrap();
+        for item in &planned {
+            if matches!(item.decision, ResumeDecision::Process { .. }) {
+                publish_planned_item(&session, item).unwrap();
+            }
         }
     }
 
@@ -2622,20 +2828,24 @@ mod tests {
                 .contains("並列数"));
         }
 
-        for chunk_ms in [10, 2_000] {
-            let mut live = live_request();
-            live.chunk_ms = chunk_ms;
-            validate_live_request(&live).unwrap();
-        }
-        for chunk_ms in [9, 2_001] {
-            let mut live = live_request();
-            live.chunk_ms = chunk_ms;
-            assert!(validate_live_request(&live)
-                .unwrap_err()
-                .contains("チャンク長"));
+        #[cfg(feature = "live")]
+        {
+            for chunk_ms in [10, 2_000] {
+                let mut live = live_request();
+                live.chunk_ms = chunk_ms;
+                validate_live_request(&live).unwrap();
+            }
+            for chunk_ms in [9, 2_001] {
+                let mut live = live_request();
+                live.chunk_ms = chunk_ms;
+                assert!(validate_live_request(&live)
+                    .unwrap_err()
+                    .contains("チャンク長"));
+            }
         }
     }
 
+    #[cfg(feature = "live")]
     #[test]
     fn non_live_backends_are_rejected_before_starting_a_session() {
         let Some(name) = Backend::available_names()
@@ -2685,6 +2895,30 @@ mod tests {
             .contains("並列数"));
         assert!(!Path::new(&batch.output_dir).exists());
         assert!(state.jobs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_job_rejection_precedes_resume_journal_mutation() {
+        let directory = TestDirectory::create("active-job-resume-order");
+        let state_path = directory.join(batch_resume::STATE_FILE_NAME);
+        std::fs::write(&state_path, b"legacy/item.wav\n{\"version\":3").unwrap();
+        let before = std::fs::read(&state_path).unwrap();
+        let state = AppState::default();
+        state
+            .jobs
+            .lock()
+            .unwrap()
+            .insert(999, Arc::new(JobControl::default()));
+        let mut request = batch_request();
+        request.output_dir = directory.path.to_string_lossy().into_owned();
+
+        let error = prepare_registered_batch(&state, &request)
+            .err()
+            .expect("an active job must reject the batch");
+
+        assert!(error.contains("別の処理が実行中"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), before);
+        assert_eq!(state.jobs.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2871,6 +3105,60 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_waits_for_an_active_commit_fence() {
+        let control = Arc::new(JobControl::default());
+        let worker_control = Arc::clone(&control);
+        let (inside_tx, inside_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let published = Arc::new(AtomicBool::new(false));
+        let worker_published = Arc::clone(&published);
+        let worker = std::thread::spawn(move || {
+            worker_control.commit_fence(|| {
+                inside_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                worker_published.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        inside_rx.recv().unwrap();
+        let cancel_control = Arc::clone(&control);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let canceller = std::thread::spawn(move || {
+            cancel_control.cancel().unwrap();
+            cancelled_tx.send(()).unwrap();
+        });
+        assert!(cancelled_rx.try_recv().is_err());
+        let wait_started = Instant::now();
+        while !control.is_cancelled() && wait_started.elapsed() < std::time::Duration::from_secs(1)
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            control.is_cancelled(),
+            "cancellation must be visible while the active publication finishes"
+        );
+
+        release_tx.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        cancelled_rx.recv().unwrap();
+        canceller.join().unwrap();
+
+        assert!(published.load(Ordering::SeqCst));
+        assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn commit_fence_propagates_shared_publisher_failures() {
+        let control = JobControl::default();
+        let error = control
+            .commit_fence::<()>(|| Err("injected journal failure".into()))
+            .unwrap_err();
+        assert_eq!(error, "injected journal failure");
+        assert!(!control.is_cancelled());
+    }
+
+    #[test]
     fn invalid_codec_config_precedes_processing_and_output_staging() {
         let directory = TestDirectory::create("codec-preflight");
         let input = directory.join("input.wav");
@@ -2996,7 +3284,8 @@ mod tests {
         assert!(error.contains("unsupported sample rate"), "{error}");
         assert!(!output.join("a-valid.mp3").exists());
         assert!(!output.join("b-invalid-rate.mp3").exists());
-        assert!(!output.join(".denoize-gui-state").exists());
+        assert!(!output.join(".denoize-state").exists());
+        assert!(!output.join(".denoize-batch.lock").exists());
     }
 
     #[test]
@@ -3030,7 +3319,8 @@ mod tests {
         assert!(error.contains("sample_rate"), "{error}");
         assert!(!output.join("a-valid.wav").exists());
         assert!(!output.join("b-invalid-processing-rate.wav").exists());
-        assert!(!output.join(".denoize-gui-state").exists());
+        assert!(!output.join(".denoize-state").exists());
+        assert!(!output.join(".denoize-batch.lock").exists());
     }
 
     #[test]
@@ -3042,7 +3332,7 @@ mod tests {
         std::fs::create_dir(&output).unwrap();
         write_test_wav(&input.join("a.wav"));
         write_test_wav(&input.join("b.wav"));
-        let mut request = BatchRequest {
+        let request = BatchRequest {
             inputs: Vec::new(),
             input_dir: Some(input.to_string_lossy().into_owned()),
             output_dir: output.to_string_lossy().into_owned(),
@@ -3055,49 +3345,114 @@ mod tests {
         let items = prepare_batch_request(&request).unwrap();
         std::fs::write(output.join("b.wav"), b"existing").unwrap();
 
-        let error = preflight_batch_outputs(&request, &items, &HashSet::new()).unwrap_err();
-        assert!(error.contains("既に存在"), "{error}");
+        let session = BatchSession::acquire(&output, false).unwrap();
+        let error = plan_batch_items(&session, items, false).unwrap_err();
+        assert!(error.contains("--force"), "{error}");
         assert!(!output.join("a.wav").exists());
         assert_eq!(std::fs::read(output.join("b.wav")).unwrap(), b"existing");
+        assert!(!output.join(batch_resume::STATE_FILE_NAME).exists());
+        drop(session);
 
-        request.options.force = true;
         std::fs::remove_file(output.join("b.wav")).unwrap();
         std::fs::create_dir(output.join("b.wav")).unwrap();
-        let error = preflight_batch_outputs(&request, &items, &HashSet::new()).unwrap_err();
-        assert!(error.contains("置換可能"), "{error}");
+        let items = prepare_batch_request(&request).unwrap();
+        let session = BatchSession::acquire(&output, false).unwrap();
+        let error = plan_batch_items(&session, items, true).unwrap_err();
+        assert!(error.contains("cannot be replaced"), "{error}");
         assert!(!output.join("a.wav").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn completed_batch_symlinks_are_never_treated_as_resumable_files() {
+    fn linked_batch_outputs_are_never_treated_as_resumable_files() {
         use std::os::unix::fs::symlink;
 
         let directory = TestDirectory::create("batch-resume-output-symlink");
+        let input_dir = directory.join("input");
+        let output_dir = directory.join("output");
+        std::fs::create_dir(&input_dir).unwrap();
+        std::fs::create_dir(&output_dir).unwrap();
+        write_test_wav(&input_dir.join("sample.wav"));
         let victim = directory.join("victim.wav");
-        let output = directory.join("output.wav");
+        let output = output_dir.join("sample.wav");
         write_test_wav(&victim);
         symlink(&victim, &output).unwrap();
-        let item = BatchItem {
-            input: directory.join("input.wav"),
-            output: output.clone(),
-            state_key: "v2:completed".into(),
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input_dir.to_string_lossy().into_owned()),
+            output_dir: output_dir.to_string_lossy().into_owned(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 1,
+            resume: true,
+            options: classical_options(false),
         };
-        let mut request = batch_request();
-        request.resume = true;
-        request.options.force = true;
-        let completed = HashSet::from([item.state_key.clone()]);
+        let prepared = prepare_batch_request(&request).unwrap();
+        let session = BatchSession::acquire(&output_dir, true).unwrap();
 
         assert!(
             output.is_file(),
             "the follow-link check would incorrectly skip"
         );
-        assert!(!batch_output_is_regular_file(&output).unwrap());
-        preflight_batch_outputs(&request, &[item], &completed).unwrap();
+        let error = plan_batch_items(&session, prepared.clone(), false).unwrap_err();
+        assert!(error.contains("unsafe"), "{error}");
+        let planned = plan_batch_items(&session, prepared, true).unwrap();
+        assert!(matches!(
+            planned[0].decision,
+            ResumeDecision::Process {
+                reason: batch_resume::ResumeReason::Unsafe,
+                ..
+            }
+        ));
         assert!(std::fs::symlink_metadata(&output)
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_batch_outputs_are_never_treated_as_resumable_files() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = TestDirectory::create("batch-resume-output-hardlink");
+        let input_dir = directory.join("input");
+        let output_dir = directory.join("output");
+        std::fs::create_dir(&input_dir).unwrap();
+        std::fs::create_dir(&output_dir).unwrap();
+        write_test_wav(&input_dir.join("sample.wav"));
+        let victim = directory.join("victim.wav");
+        let output = output_dir.join("sample.wav");
+        write_test_wav(&victim);
+        std::fs::hard_link(&victim, &output).unwrap();
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input_dir.to_string_lossy().into_owned()),
+            output_dir: output_dir.to_string_lossy().into_owned(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 1,
+            resume: true,
+            options: classical_options(false),
+        };
+        let prepared = prepare_batch_request(&request).unwrap();
+        let session = BatchSession::acquire(&output_dir, true).unwrap();
+
+        let error = plan_batch_items(&session, prepared.clone(), false).unwrap_err();
+        assert!(error.contains("unsafe"), "{error}");
+        let planned = plan_batch_items(&session, prepared, true).unwrap();
+        assert!(matches!(
+            planned[0].decision,
+            ResumeDecision::Process {
+                reason: batch_resume::ResumeReason::Unsafe,
+                ..
+            }
+        ));
+        let output_metadata = std::fs::metadata(&output).unwrap();
+        let victim_metadata = std::fs::metadata(&victim).unwrap();
+        assert_eq!(output_metadata.dev(), victim_metadata.dev());
+        assert_eq!(output_metadata.ino(), victim_metadata.ino());
+        assert!(output_metadata.nlink() > 1);
     }
 
     #[test]
@@ -3111,32 +3466,16 @@ mod tests {
         std::fs::create_dir(&output).unwrap();
 
         let exact = vec![
-            BatchItem {
-                input: input_a.clone(),
-                output: output.join("same.wav"),
-                state_key: "a".into(),
-            },
-            BatchItem {
-                input: input_b.clone(),
-                output: output.join("same.wav"),
-                state_key: "b".into(),
-            },
+            test_batch_item(input_a.clone(), output.join("same.wav"), 1),
+            test_batch_item(input_b.clone(), output.join("same.wav"), 2),
         ];
         assert!(validate_batch_destinations(None, &exact)
             .unwrap_err()
             .contains("同じバッチ出力"));
 
         let file_and_directory = vec![
-            BatchItem {
-                input: input_a,
-                output: output.join("foo.flac"),
-                state_key: "a".into(),
-            },
-            BatchItem {
-                input: input_b,
-                output: output.join("foo.flac/bar.flac"),
-                state_key: "b".into(),
-            },
+            test_batch_item(input_a, output.join("foo.flac"), 1),
+            test_batch_item(input_b, output.join("foo.flac/bar.flac"), 2),
         ];
         assert!(validate_batch_destinations(None, &file_and_directory)
             .unwrap_err()
@@ -3222,20 +3561,18 @@ mod tests {
     }
 
     #[test]
-    fn batch_state_keys_include_input_identity_destination_and_format() {
+    fn batch_item_ids_include_input_identity_destination_and_format() {
         let relative = Path::new("voice.wav");
         let output = Path::new("nested/voice.output");
-        let wav = batch_state_key(
+        let wav = batch_resume::item_identity(
             Path::new("/input-a/voice.wav"),
             relative,
             output,
             OutputFormat::Wav,
         );
-
-        assert!(wav.starts_with("v2:"));
         assert_ne!(
             wav,
-            batch_state_key(
+            batch_resume::item_identity(
                 Path::new("/input-b/voice.wav"),
                 relative,
                 output,
@@ -3244,7 +3581,7 @@ mod tests {
         );
         assert_ne!(
             wav,
-            batch_state_key(
+            batch_resume::item_identity(
                 Path::new("/input-a/voice.wav"),
                 relative,
                 output,
@@ -3253,7 +3590,7 @@ mod tests {
         );
         assert_ne!(
             wav,
-            batch_state_key(
+            batch_resume::item_identity(
                 Path::new("/input-a/voice.wav"),
                 relative,
                 Path::new("other/voice.output"),
@@ -3275,13 +3612,13 @@ mod tests {
             second_relative.to_string_lossy()
         );
         assert_ne!(
-            batch_state_key(
+            batch_resume::item_identity(
                 Path::new("/input/voice.wav"),
                 &first_relative,
                 &first_relative,
                 OutputFormat::Wav,
             ),
-            batch_state_key(
+            batch_resume::item_identity(
                 Path::new("/input/voice.wav"),
                 &second_relative,
                 &second_relative,
@@ -3309,103 +3646,376 @@ mod tests {
         let error = collect_batch_items(&request, "wav").unwrap_err();
         assert!(error.contains("UTF-8"), "{error}");
         assert!(std::fs::read_dir(&output).unwrap().next().is_none());
-        assert!(!output.join(".denoize-gui-state").exists());
+        assert!(!output.join(".denoize-state").exists());
+        assert!(!output.join(".denoize-batch.lock").exists());
     }
 
     #[test]
-    fn batch_state_missing_file_is_empty() {
-        let path = std::env::temp_dir().join(format!(
-            "denoize-missing-state-{}-{}",
-            std::process::id(),
-            NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
+    fn desktop_resume_uses_canonical_state_and_exact_force_still_skips() {
+        let directory = TestDirectory::create("batch-v3-exact");
+        let request = desktop_batch_fixture(&directory, true, false);
+        complete_desktop_batch(&request);
+        let output = Path::new(&request.output_dir);
+        assert!(output.join(batch_resume::STATE_FILE_NAME).is_file());
+        assert!(output.join(batch_resume::LOCK_FILE_NAME).is_file());
+        assert!(!output
+            .join(batch_resume::LEGACY_DESKTOP_STATE_FILE_NAME)
+            .exists());
+
+        let prepared = prepare_batch_request(&request).unwrap();
+        let session = BatchSession::acquire(output, true).unwrap();
+        let planned = plan_batch_items(&session, prepared, true).unwrap();
+        assert!(matches!(
+            planned[0].decision,
+            ResumeDecision::Skip {
+                reason: batch_resume::ResumeReason::Exact
+            }
         ));
-        assert!(read_batch_state(&path).unwrap().is_empty());
     }
 
     #[test]
-    fn batch_state_read_and_write_errors_are_not_ignored() {
-        let directory = TestDirectory::create("batch-state-errors");
-        let state = directory.join(".denoize-gui-state");
-        std::fs::write(&state, [0xff]).unwrap();
-        assert!(read_batch_state(&state).unwrap_err().contains("読めません"));
-
-        struct FailingWriter;
-        impl Write for FailingWriter {
-            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("injected write failure"))
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
+    fn desktop_resume_detects_input_recipe_and_output_changes() {
+        for change in ["input", "recipe", "output"] {
+            let directory = TestDirectory::create(&format!("batch-v3-{change}"));
+            let mut request = desktop_batch_fixture(&directory, true, false);
+            complete_desktop_batch(&request);
+            let output = PathBuf::from(&request.output_dir);
+            let expected_reason = match change {
+                "input" => {
+                    let input = Path::new(request.input_dir.as_deref().unwrap()).join("sample.wav");
+                    let mut bytes = std::fs::read(&input).unwrap();
+                    *bytes.last_mut().unwrap() ^= 0x7f;
+                    std::fs::write(input, bytes).unwrap();
+                    batch_resume::ResumeReason::InputChanged
+                }
+                "recipe" => {
+                    request.options.strength = 0.8;
+                    batch_resume::ResumeReason::RecipeChanged
+                }
+                "output" => {
+                    std::fs::write(output.join("sample.wav"), b"changed output").unwrap();
+                    batch_resume::ResumeReason::OutputChanged
+                }
+                _ => unreachable!(),
+            };
+            let prepared = prepare_batch_request(&request).unwrap();
+            let session = BatchSession::acquire(&output, true).unwrap();
+            let error = plan_batch_items(&session, prepared.clone(), false).unwrap_err();
+            assert!(error.contains("上書き"), "{change}: {error}");
+            let planned = plan_batch_items(&session, prepared, true).unwrap();
+            assert!(matches!(
+                planned[0].decision,
+                ResumeDecision::Process { reason, .. } if reason == expected_reason
+            ));
         }
-
-        let error = append_batch_state_entry(&mut FailingWriter, "input.wav").unwrap_err();
-        assert!(error.contains("書き込めません"), "{error}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn batch_state_rejects_symlinks_and_hard_links_without_touching_targets() {
-        use std::os::unix::fs::symlink;
-
-        let directory = TestDirectory::create("batch-state-links");
-        let victim = directory.join("victim.txt");
-        let symlink_state = directory.join("symlink-state");
-        let hardlink_state = directory.join("hardlink-state");
-        std::fs::write(&victim, b"victim\n").unwrap();
-        symlink(&victim, &symlink_state).unwrap();
-
-        assert!(read_batch_state(&symlink_state).is_err());
-        assert!(open_batch_state_for_append(&symlink_state).is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim\n");
-
-        std::fs::hard_link(&victim, &hardlink_state).unwrap();
-        assert!(read_batch_state(&hardlink_state).is_err());
-        assert!(open_batch_state_for_append(&hardlink_state).is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim\n");
     }
 
     #[test]
-    fn batch_outputs_cannot_claim_the_resume_state_path() {
+    fn desktop_resume_tracks_the_consumed_model_fingerprint() {
+        use std::io::Write as _;
+
+        let directory = TestDirectory::create("batch-v3-model");
+        let input = directory.join("input.wav");
+        let model = directory.join("model.onnx");
+        let output_root = directory.join("output");
+        let output = output_root.join("output.wav");
+        std::fs::create_dir(&output_root).unwrap();
+        write_test_wav(&input);
+        std::fs::write(&model, b"model one").unwrap();
+        let input_fingerprint = batch_resume::fingerprint_file(&input).unwrap();
+        let recipe = Digest::from_bytes([9; 32]);
+        let expectation = ResumeExpectation::new(
+            Digest::from_bytes([7; 32]),
+            output.clone(),
+            input.clone(),
+            input_fingerprint,
+            Some(batch_resume::ConsumedModel {
+                path: model.clone(),
+                fingerprint: batch_resume::fingerprint_file(&model).unwrap(),
+                sample_rate: 16_000,
+            }),
+            recipe,
+        );
+        let session = BatchSession::acquire(&output_root, true).unwrap();
+        let ResumeDecision::Process { commit_mode, .. } =
+            session.plan(&expectation, false).unwrap()
+        else {
+            panic!("missing output must be processed");
+        };
+        session.activate().unwrap();
+        let mut transaction = AtomicOutput::new(&output).unwrap();
+        transaction.file_mut().write_all(b"encoded output").unwrap();
+        session
+            .publish(&expectation, transaction, commit_mode)
+            .unwrap();
+        drop(session);
+
+        std::fs::write(&model, b"model two").unwrap();
+        let changed = ResumeExpectation::new(
+            expectation.item_id(),
+            output,
+            input,
+            input_fingerprint,
+            Some(batch_resume::ConsumedModel {
+                path: model.clone(),
+                fingerprint: batch_resume::fingerprint_file(&model).unwrap(),
+                sample_rate: 16_000,
+            }),
+            recipe,
+        );
+        let session = BatchSession::acquire(&output_root, true).unwrap();
+        let decision = session.plan(&changed, true).unwrap();
+        assert!(matches!(
+            decision,
+            ResumeDecision::Process {
+                reason: batch_resume::ResumeReason::ModelChanged,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_desktop_state_is_untrusted_migrated_and_never_modified() {
+        let directory = TestDirectory::create("batch-v3-legacy");
+        let request = desktop_batch_fixture(&directory, true, false);
+        let output = PathBuf::from(&request.output_dir);
+        let destination = output.join("sample.wav");
+        std::fs::write(&destination, b"legacy output").unwrap();
+        let legacy_path = output.join(batch_resume::LEGACY_DESKTOP_STATE_FILE_NAME);
+        let legacy = format!("v2:{}\n", "11".repeat(32));
+        std::fs::write(&legacy_path, &legacy).unwrap();
+
+        let prepared = prepare_batch_request(&request).unwrap();
+        let session = BatchSession::acquire(&output, true).unwrap();
+        let error = plan_batch_items(&session, prepared.clone(), false).unwrap_err();
+        assert!(error.contains("上書き"), "{error}");
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy);
+        let planned = plan_batch_items(&session, prepared, true).unwrap();
+        assert!(matches!(
+            planned[0].decision,
+            ResumeDecision::Process {
+                reason: batch_resume::ResumeReason::Legacy,
+                ..
+            }
+        ));
+        session.activate().unwrap();
+        publish_planned_item(&session, &planned[0]).unwrap();
+        drop(session);
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy);
+
+        let prepared = prepare_batch_request(&request).unwrap();
+        let session = BatchSession::acquire(&output, true).unwrap();
+        let planned = plan_batch_items(&session, prepared, false).unwrap();
+        assert!(matches!(planned[0].decision, ResumeDecision::Skip { .. }));
+        assert_eq!(std::fs::read_to_string(legacy_path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn desktop_migrates_canonical_v1_and_v2_without_touching_legacy_gui_state() {
+        for (index, canonical_legacy) in [
+            b"sample.wav\n".to_vec(),
+            format!("v2:{}\n", "52".repeat(32)).into_bytes(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = TestDirectory::create(&format!("canonical-legacy-{index}"));
+            let mut request = desktop_batch_fixture(&directory, true, false);
+            let output = PathBuf::from(&request.output_dir);
+            let destination = output.join("sample.wav");
+            let original_output = b"canonical legacy output";
+            std::fs::write(&destination, original_output).unwrap();
+            let canonical_path = output.join(batch_resume::STATE_FILE_NAME);
+            std::fs::write(&canonical_path, &canonical_legacy).unwrap();
+
+            let prepared = prepare_batch_request(&request).unwrap();
+            let session = BatchSession::acquire(&output, true).unwrap();
+            let error = plan_batch_items(&session, prepared, false).unwrap_err();
+            assert!(error.contains("legacy"), "{error}");
+            assert_eq!(std::fs::read(&destination).unwrap(), original_output);
+            assert_eq!(std::fs::read(&canonical_path).unwrap(), canonical_legacy);
+            drop(session);
+
+            let legacy_gui_path = output.join(batch_resume::LEGACY_DESKTOP_STATE_FILE_NAME);
+            let legacy_gui = format!("v2:{}\n", "63".repeat(32)).into_bytes();
+            std::fs::write(&legacy_gui_path, &legacy_gui).unwrap();
+            request.options.force = true;
+            let prepared = prepare_batch_request(&request).unwrap();
+            let session = BatchSession::acquire(&output, true).unwrap();
+            let planned = plan_batch_items(&session, prepared, true).unwrap();
+            assert!(matches!(
+                planned[0].decision,
+                ResumeDecision::Process {
+                    reason: batch_resume::ResumeReason::Legacy,
+                    ..
+                }
+            ));
+            session.activate().unwrap();
+            publish_planned_item(&session, &planned[0]).unwrap();
+            drop(session);
+            let migrated_state = std::fs::read(&canonical_path).unwrap();
+            assert!(migrated_state.starts_with(&canonical_legacy));
+            assert!(String::from_utf8_lossy(&migrated_state).contains("\"version\":3"));
+            assert_eq!(std::fs::read(&legacy_gui_path).unwrap(), legacy_gui);
+
+            request.options.force = false;
+            let prepared = prepare_batch_request(&request).unwrap();
+            let session = BatchSession::acquire(&output, true).unwrap();
+            let planned = plan_batch_items(&session, prepared, false).unwrap();
+            assert!(matches!(
+                planned[0].decision,
+                ResumeDecision::Skip {
+                    reason: batch_resume::ResumeReason::Exact
+                }
+            ));
+            session.activate().unwrap();
+            assert_eq!(std::fs::read(&canonical_path).unwrap(), migrated_state);
+            assert_eq!(std::fs::read(&legacy_gui_path).unwrap(), legacy_gui);
+        }
+    }
+
+    #[test]
+    fn desktop_batch_session_guard_lives_in_the_worker() {
+        let directory = TestDirectory::create("batch-v3-lock-lifetime");
+        let output = directory.join("output");
+        std::fs::create_dir(&output).unwrap();
+        let session = BatchSession::acquire(&output, false).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(session);
+        });
+        ready_rx.recv().unwrap();
+        assert!(BatchSession::acquire(&output, false).is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(BatchSession::acquire(&output, false).is_ok());
+    }
+
+    #[test]
+    fn batch_outputs_cannot_claim_control_paths() {
         let directory = TestDirectory::create("batch-state-reserved");
-        let state = directory.join(".denoize-gui-state");
-        let items = vec![BatchItem {
-            input: directory.join("input.wav"),
-            output: state.join("nested.wav"),
-            state_key: "input.wav".into(),
-        }];
-        assert!(validate_batch_reserved_path(&items, &state).is_err());
+        for name in [
+            batch_resume::STATE_FILE_NAME,
+            batch_resume::LEGACY_DESKTOP_STATE_FILE_NAME,
+            batch_resume::LOCK_FILE_NAME,
+        ] {
+            let items = vec![test_batch_item(
+                directory.join("input.wav"),
+                directory.join(name).join("nested.wav"),
+                1,
+            )];
+            let error = validate_batch_control_paths(&items, &directory.path).unwrap_err();
+            assert!(error.contains(name), "{error}");
+        }
     }
 
     #[test]
     fn successful_batch_has_completed_terminal_outcome() {
-        let outcome = batch_terminal_outcome(3, 1, 0);
+        let counts = BatchOutcomeCounts {
+            completed: 3,
+            skipped: 1,
+            ..Default::default()
+        };
+        let outcome = batch_terminal_outcome(counts);
         assert_eq!(outcome.status, "completed");
-        assert_eq!(outcome.message, "完了 3 · スキップ 1 · 失敗 0");
+        assert_eq!(
+            outcome.message,
+            "完了 3 · スキップ 1 · 失敗 0 · キャンセル 0"
+        );
         assert_eq!(outcome.error, None);
+        assert_eq!(counts.total(), 4);
     }
 
     #[test]
     fn mixed_batch_has_failed_terminal_outcome() {
-        let outcome = batch_terminal_outcome(2, 1, 1);
+        let counts = BatchOutcomeCounts {
+            completed: 2,
+            skipped: 1,
+            failed: 1,
+            cancelled: 0,
+        };
+        let outcome = batch_terminal_outcome(counts);
         assert_eq!(outcome.status, "failed");
-        assert_eq!(outcome.message, "完了 2 · スキップ 1 · 失敗 1");
+        assert_eq!(
+            outcome.message,
+            "完了 2 · スキップ 1 · 失敗 1 · キャンセル 0"
+        );
         assert_eq!(
             outcome.error.as_deref(),
             Some("1件のファイルを処理できませんでした")
         );
+        assert_eq!(counts.total(), 4);
     }
 
     #[test]
     fn all_failed_batch_has_failed_terminal_outcome() {
-        let outcome = batch_terminal_outcome(0, 0, 3);
+        let counts = BatchOutcomeCounts {
+            failed: 3,
+            ..Default::default()
+        };
+        let outcome = batch_terminal_outcome(counts);
         assert_eq!(outcome.status, "failed");
-        assert_eq!(outcome.message, "完了 0 · スキップ 0 · 失敗 3");
+        assert_eq!(
+            outcome.message,
+            "完了 0 · スキップ 0 · 失敗 3 · キャンセル 0"
+        );
         assert_eq!(
             outcome.error.as_deref(),
             Some("3件のファイルを処理できませんでした")
         );
+        assert_eq!(counts.total(), 3);
+    }
+
+    #[test]
+    fn cancelled_batch_has_one_total_partition() {
+        assert_eq!(
+            batch_item_commit_mode(
+                ResumeDecision::Skip {
+                    reason: batch_resume::ResumeReason::Exact,
+                },
+                true,
+            ),
+            Err(BatchItemOutcome::Skipped),
+            "an exact resume skip remains skipped after cancellation"
+        );
+        assert_eq!(
+            batch_item_commit_mode(
+                ResumeDecision::Process {
+                    commit_mode: CommitMode::NoClobber,
+                    reason: batch_resume::ResumeReason::Missing,
+                },
+                true,
+            ),
+            Err(BatchItemOutcome::Cancelled),
+            "only work that still needs processing is cancelled"
+        );
+        let outcomes = vec![
+            BatchItemOutcome::Completed,
+            BatchItemOutcome::Skipped,
+            BatchItemOutcome::Failed("injected".into()),
+            BatchItemOutcome::Cancelled,
+            BatchItemOutcome::Cancelled,
+        ];
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(BatchItemOutcome::status)
+                .collect::<Vec<_>>(),
+            vec!["completed", "skipped", "failed", "cancelled", "cancelled"]
+        );
+        assert_eq!(outcomes[2].error().as_deref(), Some("injected"));
+        let counts = count_batch_outcomes(&outcomes);
+        let outcome = batch_terminal_outcome(counts);
+        assert_eq!(outcome.status, "cancelled");
+        assert_eq!(
+            outcome.message,
+            "完了 1 · スキップ 1 · 失敗 1 · キャンセル 2"
+        );
+        assert_eq!(outcome.error, None);
+        assert_eq!(counts.total(), 5);
     }
 
     #[test]

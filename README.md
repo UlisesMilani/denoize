@@ -394,7 +394,7 @@ included in saved settings, named presets, or CLI-compatible imports and
 exports.
 Desktop batches accept files or folders, preserve relative paths, run with a
 configurable worker count, continue after individual failures, and can resume
-from the `.denoize-gui-state` journal in the output directory.
+from the same `.denoize-state` journal used by the CLI in the output directory.
 Single-file processing also provides local waveform previews, RMS-matched
 before/after switching, click-to-seek, and configurable section looping.
 Desktop settings are restored automatically, can be stored as named presets,
@@ -520,9 +520,12 @@ conversion is intentional. AAC-in-MP4 and ADTS AAC also require a build with
 the corresponding AAC encoder; unavailable outputs are rejected during
 preflight.
 
-With `--resume`, each state entry is bound to both the input path and the
-planned destination/codec. Changing `--output-format` therefore reprocesses the
-input instead of accepting an unrelated stale output.
+With `--resume`, the v3 state journal binds each completion to the input bytes,
+the actual selected backend and effective processing/codec/metadata settings,
+any consumed model bytes, the destination identity, and the published output
+bytes. A file is skipped only when all of those still match and the output is a
+safe regular file with a single link. This also means `--backend auto` records
+the backend it actually selected, not merely the word `auto`.
 
 ### Automatic backend selection
 
@@ -686,22 +689,73 @@ part of the reproducibility guarantee.
 
 ### Batch progress and recovery
 
-Batch runs show completed files, elapsed time, and ETA. `--resume` records
-successful outputs in `.denoize-state` under the output directory and skips
-them on the next run. Ctrl+C stops scheduling new files; each output is first
-written to a randomly named private file in the destination directory. Audio and
-metadata are completed there before one atomic commit, so an interrupted or
-failed encode leaves an existing destination unchanged. Without `--force`,
-the destination is checked again at commit time to prevent concurrent
-overwrites. On Unix, output paths through non-sticky shared-writable or
-untrusted-owner directories are rejected before staging. Extended ACLs that
-grant additional access are also rejected, as are network or userspace
-filesystems whose ACLs cannot be verified safely. On Windows, atomic private
-staging requires an ACL-capable filesystem such as NTFS; FAT and exFAT output
-paths are rejected before encoding. Use `--no-progress` for quiet operation or
-`--json` for NDJSON progress and summary records. On Unix, `--force` also
-refuses to replace an existing file with an extended ACL or a different owner,
-avoiding a silent loss or weakening of its access policy.
+Batch runs show completed files, elapsed time, and ETA. `--resume` records v3
+completion entries in `.denoize-state` under the output directory. The CLI and
+desktop app use this same canonical state filename. State written by older v1
+or v2 releases is read only as legacy evidence: it is never trusted for a skip.
+Run once with `--force` to regenerate a replaceable legacy output and migrate it
+to v3; the following identical run can then skip it.
+
+The resume/force decision is deliberately conservative:
+
+| Planned destination | Without `--force` | With `--force` |
+|---|---|---|
+| Exact safe v3 output | Skip | Skip |
+| Output is missing | Process | Process |
+| Legacy, untracked, changed, or unsafe existing output | Error and preserve it | Replace it when the path is safely replaceable |
+
+“Changed” includes input content, the effective backend or recipe, model
+content, and output content. Symlinks, multiply linked files, directories, and
+special files are never accepted as completed outputs; directories and special
+files remain non-replaceable even with `--force`.
+
+Resumable ONNX-backed batches require a self-contained `.onnx` model. ONNX
+models that declare external tensor sidecars remain usable in ordinary
+non-resume batches, but `--resume` rejects them because a one-file model digest
+cannot safely represent all consumed weights.
+
+Every batch run creates the output directory only after complete input, codec,
+and configuration preflight, then takes the shared `.denoize-batch.lock` before
+reading resume state or deciding what to do with destinations. Another denoize
+batch using that directory fails immediately while the lock is held. The lock,
+canonical `.denoize-state`, and legacy desktop `.denoize-gui-state` migration
+names are reserved from the planned output topology.
+
+Ctrl+C stops work before publication where possible. Each output is encoded to
+a randomly named private file in the destination directory. Publication then
+serializes and synchronizes a journal prepare, the atomic output commit, and a
+completion record, while rechecking the input and model. Cancellation before this gate
+leaves the destination and state untouched; once an item enters the gate, its
+publication is finished atomically. If a process exits between prepare and
+completion, the next locked batch reconciles the prepared record against the
+published output before making new decisions. A journal failure closes the gate
+so later workers cannot publish unrecorded outputs.
+
+Without `--force`, the destination is checked again at commit time to prevent
+ordinary concurrent overwrites. On Unix, the batch output root must be owned by
+the current user and must not be group/world writable; output paths through
+non-sticky shared-writable or untrusted-owner ancestors are also rejected.
+Extended ACLs that grant additional access are also rejected, as are network or
+userspace filesystems whose ACLs cannot be verified safely. On Windows, atomic
+private staging requires an ACL-capable filesystem such as NTFS; FAT and exFAT
+output paths are rejected before encoding, newly created batch control files
+receive a protected DACL, and the output root must not be writable by untrusted
+accounts. Windows interprocess locking assumes that principals with write or
+delete access to the output root or any pre-existing control/output entry
+cooperate; denoize does not audit those DACLs for hostile-principal access. Use
+`--no-progress` for quiet
+operation or `--json` for NDJSON progress and summary records. On Unix,
+`--force` also refuses to replace an existing file with an extended ACL or a
+different owner, avoiding a silent loss or weakening of its access policy.
+JSON summaries retain the `cancelled` boolean and also report
+`cancelled_count`; together with succeeded, skipped, and failed, that count
+partitions the batch total.
+
+These checks define a non-adversarial local-filesystem, process-crash recovery
+contract. They do not claim protection from a hostile process performing
+precisely timed ABA path swaps, or from power loss and storage-level durability
+failures; file synchronization and atomic rename reduce those risks but do not
+extend this contract. Keep independent backups for those failure classes.
 
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter

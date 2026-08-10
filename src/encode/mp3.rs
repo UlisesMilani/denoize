@@ -98,14 +98,6 @@ pub(super) fn effective_mp3_config(
     if audio.frames() == 0 {
         return Err("MP3 output requires at least one frame".into());
     }
-    if !shine_rs::SUPPORTED_SAMPLE_RATES.contains(&audio.sample_rate) {
-        return Err(format!(
-            "MP3 encode: unsupported sample rate {} Hz (supported: {:?})",
-            audio.sample_rate,
-            shine_rs::SUPPORTED_SAMPLE_RATES,
-        ));
-    }
-
     let layout = lossy_channel_layout(audio, downmix)?;
     let stereo_mode = if layout.is_stereo {
         StereoMode::JointStereo
@@ -120,7 +112,33 @@ pub(super) fn effective_mp3_config(
         copyright: false,
         original: true,
     };
-    let bitrate = SUPPORTED_BITRATES
+    let bitrate = effective_mp3_bitrate_kbps(audio.sample_rate, requested_bitrate_kbps)?;
+    let config = build_config(bitrate);
+    config
+        .validate()
+        .map_err(|error| format!("MP3 encoder config: {error}"))?;
+    Ok((layout, config))
+}
+
+pub(crate) fn effective_mp3_bitrate_kbps(
+    sample_rate: u32,
+    requested_bitrate_kbps: u32,
+) -> Result<u32, String> {
+    if !shine_rs::SUPPORTED_SAMPLE_RATES.contains(&sample_rate) {
+        return Err(format!(
+            "MP3 encode: unsupported sample rate {sample_rate} Hz (supported: {:?})",
+            shine_rs::SUPPORTED_SAMPLE_RATES,
+        ));
+    }
+    let build_config = |bitrate| Mp3EncoderConfig {
+        sample_rate,
+        bitrate,
+        channels: 1,
+        stereo_mode: StereoMode::Mono,
+        copyright: false,
+        original: true,
+    };
+    SUPPORTED_BITRATES
         .iter()
         .copied()
         .filter(|bitrate| *bitrate <= requested_bitrate_kbps)
@@ -132,17 +150,7 @@ pub(super) fn effective_mp3_config(
                 .copied()
                 .find(|bitrate| build_config(*bitrate).validate().is_ok())
         })
-        .ok_or_else(|| {
-            format!(
-                "MP3 encode: no compatible bitrate for {} Hz and {} channel(s)",
-                audio.sample_rate, layout.count
-            )
-        })?;
-    let config = build_config(bitrate);
-    config
-        .validate()
-        .map_err(|error| format!("MP3 encoder config: {error}"))?;
-    Ok((layout, config))
+        .ok_or_else(|| format!("MP3 encode: no compatible bitrate for {sample_rate} Hz"))
 }
 
 #[cfg(test)]

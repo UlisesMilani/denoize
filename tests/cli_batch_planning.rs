@@ -208,6 +208,91 @@ fn explicit_conversion_collision_has_no_side_effects() {
 }
 
 #[test]
+fn state_and_lock_names_are_reserved_for_every_batch() {
+    for (index, reserved) in [
+        ".denoize-state",
+        ".denoize-gui-state",
+        ".denoize-batch.lock",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let root = TestDirectory::create();
+        let input = root.path.join(format!("input-{index}"));
+        let output = root.path.join(format!("output-{index}"));
+        let reserved_directory = input.join(reserved);
+        std::fs::create_dir_all(&reserved_directory).expect("create reserved input directory");
+        std::fs::write(
+            reserved_directory.join("voice.wav"),
+            denoize::write_wav_bytes(&denoize::Audio {
+                sample_rate: 16_000,
+                channels: vec![vec![0.0; 1_600]],
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+                channel_mask: None,
+            })
+            .expect("encode WAV fixture"),
+        )
+        .expect("write reserved-path fixture");
+
+        let result = run_batch(&input, &output, &["--recursive"]);
+
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(reserved),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+fn held_shared_batch_lock_fails_before_state_or_output_changes() {
+    let root = TestDirectory::create();
+    let input = root.path.join("input");
+    let output = root.path.join("output");
+    std::fs::create_dir(&input).expect("create input directory");
+    std::fs::create_dir(&output).expect("create output directory");
+    std::fs::write(
+        input.join("voice.wav"),
+        denoize::write_wav_bytes(&denoize::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.0; 1_600]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        })
+        .expect("encode WAV fixture"),
+    )
+    .expect("write WAV fixture");
+    let held = denoize::batch_resume::BatchSession::acquire(&output, true)
+        .expect("hold shared batch lock");
+
+    let blocked = run_batch(&input, &output, &["--resume"]);
+
+    assert!(!blocked.status.success());
+    assert!(blocked.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("already holds the output lock"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(!output.join("voice.wav").exists());
+    assert!(!output.join(denoize::batch_resume::STATE_FILE_NAME).exists());
+
+    drop(held);
+    let retry = run_batch(&input, &output, &["--resume"]);
+    assert!(
+        retry.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(summary(&retry)["succeeded"], 1);
+}
+
+#[test]
 fn existing_destination_preflight_preserves_all_outputs_and_resume_state() {
     let root = TestDirectory::create();
     let input = root.path.join("input");
@@ -261,7 +346,7 @@ fn force_rejects_existing_output_directories_before_processing() {
 
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("not a replaceable file"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("cannot be replaced"));
     assert!(output.join("a.wav").is_dir());
     assert!(!output.join("b.wav").exists());
 }
@@ -297,7 +382,11 @@ fn resume_state_symlink_is_rejected_without_touching_its_target() {
 
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&result.stderr).contains("resume state must be a regular file"));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("open batch state") && stderr.contains(".denoize-state"),
+        "unexpected stderr: {stderr}"
+    );
     assert_eq!(std::fs::read(target).unwrap(), original);
     assert!(!output.join("voice.wav").exists());
 }

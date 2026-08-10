@@ -35,6 +35,8 @@
 pub mod atomic_output;
 pub mod audio;
 pub mod backend;
+#[doc(hidden)]
+pub mod batch_resume;
 pub mod benchmark;
 pub mod bessel;
 pub mod channel_layout;

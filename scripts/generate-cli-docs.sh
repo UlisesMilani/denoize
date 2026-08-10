@@ -33,6 +33,53 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```text'
   "$binary" --help
   echo '```'
+  cat <<'EOF'
+
+## Batch resume state
+
+CLI and desktop batches share the `.denoize-state` v3 journal in the output
+directory. A v3 entry is trusted only when the input bytes, actual resolved
+backend and effective recipe, consumed model bytes, destination, and safe
+single-link regular output all still match. An exact match skips even when
+`--force` is present. A missing output is processed. Any legacy v1/v2,
+untracked, changed, or unsafe existing output is preserved with an error unless
+`--force` can safely replace it; run that forced regeneration once to migrate a
+legacy entry, after which an identical run can skip.
+
+Resumable ONNX-backed batches require a self-contained `.onnx` file. Models
+that declare external tensor sidecars can still be used without `--resume`, but
+are rejected for resume because the v3 model digest cannot represent every
+consumed sidecar byte.
+
+Every batch completes input/codec/configuration preflight before creating the
+output directory. It then acquires `.denoize-batch.lock` before resume or output
+decisions; a second denoize batch for that directory fails immediately. Both
+state names (`.denoize-state` and the legacy `.denoize-gui-state`) and the lock
+name are rejected as planned outputs.
+
+On Unix, the batch output root must be owned by the current user and must not be
+group/world writable. On Windows, use an ACL-capable local filesystem and an
+output root that is not writable by untrusted accounts; newly created state and
+lock files receive protected DACLs. Windows locking is process-cooperative for
+principals that already have write or delete access to the output root or any
+pre-existing control/output entry; the CLI does not audit those DACLs as an
+adversarial security boundary.
+
+Publication is a serialized prepare → atomic output commit → complete sequence.
+Input and model bytes are rechecked at publication, later commits stop after a
+journal failure, and the next locked run reconciles a prepare left by process
+exit. Cancellation before publication leaves output and state untouched; an
+item already publishing is completed atomically.
+
+NDJSON summaries include both the existing `cancelled` boolean and an additive
+`cancelled_count`; succeeded, skipped, failed, and cancelled counts partition
+the reported total.
+
+This is a non-adversarial local-filesystem, process-crash recovery contract. It
+does not cover hostile, precisely timed ABA path replacement or power/storage
+durability failures. File synchronization and atomic rename reduce those risks
+but do not extend this contract.
+EOF
 } > "$temporary_output"
 
 if [[ "$check" == true ]]; then
