@@ -8,8 +8,11 @@
 //! makes the OLA exact for *any* window and any overlap ratio, including the
 //! 75%-overlap Hann configuration used by default (where the sum is not 1.0).
 
+use crate::config::{ConfigError, MAX_DENOISER_FRAME_SIZE, MAX_KAISER_BETA};
 use crate::fft::{Complex, Fft};
-use crate::window::{make_with_params, WindowParams, WindowType};
+use crate::window::{
+    make_with_params, make_with_params_checked, validate_dpss_bandwidth, WindowParams, WindowType,
+};
 
 /// Configuration for the STFT engine.
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +21,40 @@ pub struct StftConfig {
     pub hop: usize,
     pub window: WindowType,
     pub window_params: WindowParams,
+}
+
+impl StftConfig {
+    /// Validate an STFT configuration supplied by an external caller.
+    pub fn validate_config(&self) -> Result<(), ConfigError> {
+        if !self.frame_size.is_power_of_two()
+            || self.frame_size < 2
+            || self.frame_size > MAX_DENOISER_FRAME_SIZE
+        {
+            return Err(ConfigError::invalid(
+                "frame_size",
+                "a power of two in 2..=65536",
+            ));
+        }
+        if self.hop == 0 || self.hop > self.frame_size {
+            return Err(ConfigError::invalid("hop", "an integer in 1..=frame_size"));
+        }
+        match self.window {
+            WindowType::Kaiser => {
+                let beta = self.window_params.kaiser_beta;
+                if !beta.is_finite() || !(0.0..=MAX_KAISER_BETA).contains(&beta) {
+                    return Err(ConfigError::invalid(
+                        "window_params.kaiser_beta",
+                        "a finite value in 0..=50",
+                    ));
+                }
+            }
+            WindowType::Dpss => {
+                validate_dpss_bandwidth(self.frame_size, self.window_params.dpss_bandwidth)?
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 pub struct Stft {
@@ -34,10 +71,21 @@ impl Stft {
         // Identical analysis and synthesis windows: the normalization buffer
         // then holds sum_k w[n-kH]^2 which is smooth and strictly positive.
         let w = make_with_params(cfg.window, cfg.frame_size, &cfg.window_params);
+        Self::from_window(cfg, w)
+    }
+
+    /// Construct an STFT without panicking on invalid external parameters.
+    pub fn try_new(cfg: StftConfig) -> Result<Self, ConfigError> {
+        cfg.validate_config()?;
+        let window = make_with_params_checked(cfg.window, cfg.frame_size, &cfg.window_params)?;
+        Ok(Self::from_window(cfg, window))
+    }
+
+    fn from_window(cfg: StftConfig, window: Vec<f64>) -> Self {
         Stft {
             cfg,
-            analysis: w.clone(),
-            synthesis: w,
+            analysis: window.clone(),
+            synthesis: window,
             fft: Fft::new(cfg.frame_size),
         }
     }
@@ -100,6 +148,61 @@ impl Stft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_constructor_reports_invalid_dimensions_and_windows() {
+        let base = StftConfig {
+            frame_size: 256,
+            hop: 64,
+            window: WindowType::Hann,
+            window_params: WindowParams::default(),
+        };
+        assert!(Stft::try_new(base).is_ok());
+
+        let mut invalid = base;
+        invalid.frame_size = usize::MAX;
+        assert!(matches!(
+            Stft::try_new(invalid).err().unwrap(),
+            ConfigError::InvalidValue {
+                field: "frame_size",
+                ..
+            }
+        ));
+
+        let mut invalid = base;
+        invalid.hop = 0;
+        assert!(matches!(
+            Stft::try_new(invalid).err().unwrap(),
+            ConfigError::InvalidValue { field: "hop", .. }
+        ));
+
+        let mut invalid = base;
+        invalid.window = WindowType::Kaiser;
+        invalid.window_params.kaiser_beta = f64::INFINITY;
+        assert!(matches!(
+            Stft::try_new(invalid).err().unwrap(),
+            ConfigError::InvalidValue {
+                field: "window_params.kaiser_beta",
+                ..
+            }
+        ));
+
+        let mut invalid = base;
+        invalid.window = WindowType::Dpss;
+        invalid.window_params.dpss_bandwidth = f64::NAN;
+        assert!(matches!(
+            Stft::try_new(invalid).err().unwrap(),
+            ConfigError::Window(_)
+        ));
+
+        // The established low-level constructor keeps accepting small FFTs.
+        let low_level = Stft::new(StftConfig {
+            frame_size: 128,
+            hop: 32,
+            ..base
+        });
+        assert_eq!(low_level.frame_size(), 128);
+    }
 
     fn assert_dpss_roundtrip(nw: f64, hop: usize, min_norm_floor: f64, max_norm_ceiling: f64) {
         let n = 256;

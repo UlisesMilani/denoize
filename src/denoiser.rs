@@ -57,6 +57,11 @@
 use std::collections::VecDeque;
 
 use crate::audio::sanitize_sample;
+use crate::config::{
+    checked_stream_memory_bytes, ConfigError, ResourcePlan, MAX_DENOISER_FRAME_SIZE,
+    MAX_KAISER_BETA, MAX_MAKEUP_GAIN_DB, MAX_PROFILE_MS, MAX_SAMPLE_RATE, MIN_DENOISER_FRAME_SIZE,
+    MIN_MAKEUP_GAIN_DB,
+};
 use crate::fft::Complex;
 use crate::gain::{compute_gain, multiband_specsub_gains, Algorithm, GainParams, SpecSubLaw};
 use crate::noise::{NoiseConfig, NoiseEstimator};
@@ -105,7 +110,7 @@ pub struct DenoiserConfig {
     pub smoothing: f64,
     /// Apply a DC-blocking high-pass filter before processing.
     pub dc_block: bool,
-    /// Makeup gain in dB applied to the output.
+    /// Makeup gain in dB applied to the output (`-120..=120`).
     pub makeup_gain_db: f64,
     /// Sample rate of the signal to be processed.
     pub sample_rate: u32,
@@ -308,61 +313,184 @@ impl DenoiserConfig {
         }
     }
 
-    /// Validate configuration that cannot be safely repaired without hiding
-    /// an explicit user choice.
+    /// Strictly validate configuration received from an external caller.
     ///
-    /// DPSS validation applies only when DPSS is the effective window. Other
-    /// windows intentionally ignore the dormant DPSS parameter.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.window != WindowType::Dpss {
-            return Ok(());
-        }
-
-        let bandwidth = self.window_params.dpss_bandwidth;
-        if !bandwidth.is_finite() {
-            return Err("DPSS bandwidth (NW) must be finite".into());
-        }
-        if bandwidth <= 0.0 {
-            return Err("DPSS bandwidth (NW) must be greater than zero".into());
-        }
-        if bandwidth > MAX_DENOISER_DPSS_NW {
-            return Err(format!(
-                "DPSS bandwidth (NW) must be at most {MAX_DENOISER_DPSS_NW} for denoising"
+    /// Window-specific parameters are checked only when their window is
+    /// selected, so dormant values retain the behavior of the established
+    /// infallible API.
+    pub fn validate_config(&self) -> Result<(), ConfigError> {
+        validate_finite_range(
+            "strength",
+            self.strength,
+            0.0,
+            1.0,
+            "a finite value in 0..=1",
+        )?;
+        validate_finite_range(
+            "overlap",
+            self.overlap,
+            0.5,
+            0.95,
+            "a finite value in 0.5..=0.95",
+        )?;
+        validate_finite_range(
+            "vad_silence_gain",
+            self.vad_silence_gain,
+            0.0,
+            1.0,
+            "a finite value in 0..=1",
+        )?;
+        validate_finite_range(
+            "vad_speech_mix",
+            self.vad_speech_mix,
+            0.0,
+            1.0,
+            "a finite value in 0..=1",
+        )?;
+        validate_finite_range(
+            "smoothing",
+            self.smoothing,
+            0.0,
+            1.0,
+            "a finite value in 0..=1",
+        )?;
+        if !self.profile_ms.is_finite() || self.profile_ms > MAX_PROFILE_MS {
+            return Err(ConfigError::invalid(
+                "profile_ms",
+                "a finite non-positive mode or at most 60000 ms",
             ));
         }
+        validate_finite_range(
+            "makeup_gain_db",
+            self.makeup_gain_db,
+            MIN_MAKEUP_GAIN_DB,
+            MAX_MAKEUP_GAIN_DB,
+            "a finite value in -120..=120 dB",
+        )?;
+        if !self.frame_size.is_power_of_two()
+            || !(MIN_DENOISER_FRAME_SIZE..=MAX_DENOISER_FRAME_SIZE).contains(&self.frame_size)
+        {
+            return Err(ConfigError::invalid(
+                "frame_size",
+                "a power of two in 256..=65536",
+            ));
+        }
+        if self.sample_rate == 0 || self.sample_rate > MAX_SAMPLE_RATE {
+            return Err(ConfigError::invalid(
+                "sample_rate",
+                "an integer in 1..=768000 Hz",
+            ));
+        }
+        validate_finite_range(
+            "pre_emphasis_alpha",
+            self.pre_emphasis_alpha,
+            0.0,
+            0.99,
+            "a finite value in 0..=0.99",
+        )?;
 
-        // Denoiser::new repairs unsupported frame sizes before constructing
-        // the window. Validate against that effective size so this fallible
-        // API and the infallible constructor use the same solver domain.
-        let frame_size = if self.frame_size.is_power_of_two() && self.frame_size >= 256 {
-            self.frame_size
-        } else {
-            2048
-        };
-        validate_dpss_bandwidth(frame_size, bandwidth)
-            .map_err(|error| format!("invalid DPSS bandwidth (NW): {error}"))
+        match self.window {
+            WindowType::Kaiser => validate_finite_range(
+                "window_params.kaiser_beta",
+                self.window_params.kaiser_beta,
+                0.0,
+                MAX_KAISER_BETA,
+                "a finite value in 0..=50",
+            )?,
+            WindowType::Dpss => {
+                let bandwidth = self.window_params.dpss_bandwidth;
+                if !bandwidth.is_finite() || bandwidth <= 0.0 || bandwidth > MAX_DENOISER_DPSS_NW {
+                    return Err(ConfigError::invalid(
+                        "window_params.dpss_bandwidth",
+                        "DPSS bandwidth (NW), finite and greater than 0 and at most 8",
+                    ));
+                }
+                validate_dpss_bandwidth(self.frame_size, bandwidth)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Compatibility wrapper returning the established string error type.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_config().map_err(|error| error.to_string())
     }
 
     /// Clamp user-supplied values into safe ranges.
     pub fn sanitized(mut self) -> Self {
-        self.strength = self.strength.clamp(0.0, 1.0);
-        self.smoothing = self.smoothing.clamp(0.0, 0.95);
-        self.overlap = self.overlap.clamp(0.5, 0.95);
-        self.vad_silence_gain = self.vad_silence_gain.clamp(0.0, 1.0);
-        self.vad_speech_mix = self.vad_speech_mix.clamp(0.0, 1.0);
-        if !self.frame_size.is_power_of_two() || self.frame_size < 256 {
+        let defaults = DenoiserConfig::default(48_000);
+        self.strength = finite_clamp(self.strength, defaults.strength, 0.0, 1.0);
+        // Preserve the established effective ceiling of the infallible API.
+        self.smoothing = finite_clamp(self.smoothing, defaults.smoothing, 0.0, 0.95);
+        self.overlap = finite_clamp(self.overlap, defaults.overlap, 0.5, 0.95);
+        self.vad_silence_gain =
+            finite_clamp(self.vad_silence_gain, defaults.vad_silence_gain, 0.0, 1.0);
+        self.vad_speech_mix = finite_clamp(self.vad_speech_mix, defaults.vad_speech_mix, 0.0, 1.0);
+        if !self.profile_ms.is_finite() {
+            self.profile_ms = defaults.profile_ms;
+        } else if self.profile_ms > MAX_PROFILE_MS {
+            self.profile_ms = MAX_PROFILE_MS;
+        }
+        self.makeup_gain_db = finite_clamp(
+            self.makeup_gain_db,
+            defaults.makeup_gain_db,
+            MIN_MAKEUP_GAIN_DB,
+            MAX_MAKEUP_GAIN_DB,
+        );
+        if !self.frame_size.is_power_of_two()
+            || !(MIN_DENOISER_FRAME_SIZE..=MAX_DENOISER_FRAME_SIZE).contains(&self.frame_size)
+        {
             self.frame_size = 2048;
         }
+        if self.sample_rate == 0 || self.sample_rate > MAX_SAMPLE_RATE {
+            self.sample_rate = 48_000;
+        }
+        if self.window == WindowType::Kaiser
+            && (!self.window_params.kaiser_beta.is_finite()
+                || !(0.0..=MAX_KAISER_BETA).contains(&self.window_params.kaiser_beta))
+        {
+            self.window_params.kaiser_beta = WindowParams::default().kaiser_beta;
+        }
         if self.window == WindowType::Dpss
-            && (self.window_params.dpss_bandwidth > MAX_DENOISER_DPSS_NW
+            && (!self.window_params.dpss_bandwidth.is_finite()
+                || self.window_params.dpss_bandwidth > MAX_DENOISER_DPSS_NW
                 || validate_dpss_bandwidth(self.frame_size, self.window_params.dpss_bandwidth)
                     .is_err())
         {
             self.window_params.dpss_bandwidth = WindowParams::default().dpss_bandwidth;
         }
-        self.pre_emphasis_alpha = self.pre_emphasis_alpha.clamp(0.0, 0.99);
+        self.pre_emphasis_alpha = finite_clamp(
+            self.pre_emphasis_alpha,
+            defaults.pre_emphasis_alpha,
+            0.0,
+            0.99,
+        );
         // Always enable quality features by default for best results unless explicitly off
         self
+    }
+}
+
+fn validate_finite_range(
+    field: &'static str,
+    value: f64,
+    minimum: f64,
+    maximum: f64,
+    expected: &'static str,
+) -> Result<(), ConfigError> {
+    if value.is_finite() && (minimum..=maximum).contains(&value) {
+        Ok(())
+    } else {
+        Err(ConfigError::invalid(field, expected))
+    }
+}
+
+fn finite_clamp(value: f64, fallback: f64, minimum: f64, maximum: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        fallback
     }
 }
 
@@ -412,21 +540,34 @@ pub struct Denoiser {
 }
 
 impl Denoiser {
-    /// Construct a de-noizer from a (sanitized) configuration.
+    /// Construct a denoiser after repairing invalid values for compatibility.
+    ///
+    /// External callers that need invalid input reported rather than repaired
+    /// should use [`Denoiser::try_new`].
     pub fn new(config: DenoiserConfig) -> Self {
         let config = config.sanitized();
+        Self::build(config).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Strictly validate and construct a denoiser from an external config.
+    pub fn try_new(config: DenoiserConfig) -> Result<Self, ConfigError> {
+        config.validate_config()?;
+        Self::build(config.sanitized())
+    }
+
+    fn build(config: DenoiserConfig) -> Result<Self, ConfigError> {
         let strength = config.strength;
         let musical_pf = config.musical_noise_postfilter;
         let sample_rate = config.sample_rate;
         let frame_size = config.frame_size;
         let hop = (frame_size as f64 * (1.0 - config.overlap)).round() as usize;
         let hop = hop.max(1);
-        let stft = Stft::new(StftConfig {
+        let stft = Stft::try_new(StftConfig {
             frame_size,
             hop,
             window: config.window,
             window_params: config.window_params,
-        });
+        })?;
         let m = stft.nbins();
 
         // Strength -> estimator floors / oversubtraction.
@@ -452,7 +593,7 @@ impl Denoiser {
         let cepstral_fft_size = (2 * m).next_power_of_two().max(32);
         let cepstral_fft = crate::fft::Fft::new(cepstral_fft_size);
 
-        Denoiser {
+        Ok(Denoiser {
             config,
             stft,
             noise,
@@ -494,7 +635,7 @@ impl Denoiser {
                     ..PostFilterConfig::default()
                 },
             ),
-        }
+        })
     }
 
     pub fn config(&self) -> &DenoiserConfig {
@@ -678,7 +819,12 @@ impl Denoiser {
 
         self.cepstral_fft.forward(&mut self.cepstral_spec);
 
-        for slot in self.cepstral_spec.iter_mut().take(fft_size - keep).skip(keep) {
+        for slot in self
+            .cepstral_spec
+            .iter_mut()
+            .take(fft_size - keep)
+            .skip(keep)
+        {
             *slot = Complex::default();
         }
 
@@ -708,37 +854,18 @@ impl Denoiser {
         let frames_15s = (1.5 * self.sample_rate as f64 / hop as f64) as usize;
         let max_check = frames_15s.max(8);
 
-        let mut spec = vec![crate::fft::Complex::default(); n];
-        let mut frame = vec![0.0; n];
-        let mut flatness = Vec::with_capacity(max_check);
-
+        let mut observed = 0usize;
+        let mut fmax = 0.0f64;
+        let mut fmin = 1.0f64;
         let mut start = 0;
-        while start + n <= input.len() && flatness.len() < max_check {
-            frame[..n].copy_from_slice(&input[start..start + n]);
-            self.stft.analyze(&frame, &mut spec);
-            // Spectral flatness = geom_mean(power) / arith_mean(power).
-            let mut sum_p = 0.0;
-            let mut sum_logp = 0.0;
-            let mut nz = 0usize;
-            for &c in spec.iter().take(m) {
-                let p = c.re * c.re + c.im * c.im;
-                if p > 1e-20 {
-                    sum_p += p;
-                    sum_logp += p.ln();
-                    nz += 1;
-                }
-            }
-            let f = if nz > 0 {
-                let gm = (sum_logp / nz as f64).exp();
-                let am = sum_p / nz as f64;
-                (gm / am.max(1e-300)).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            flatness.push(f);
+        while start + n <= input.len() && observed < max_check {
+            let flatness = self.profile_frame_flatness(input, start, n, m);
+            fmax = fmax.max(flatness);
+            fmin = fmin.min(flatness);
+            observed += 1;
             start += hop;
         }
-        if flatness.is_empty() {
+        if observed == 0 {
             return 0;
         }
 
@@ -747,8 +874,6 @@ impl Denoiser {
         // threshold near 1 does not work. Instead, threshold adaptively relative
         // to the observed flatness range: the leading noise-only frames have the
         // highest flatness, and the signal onset shows up as a drop.
-        let fmax = flatness.iter().cloned().fold(0.0f64, f64::max);
-        let fmin = flatness.iter().cloned().fold(1.0f64, f64::min);
         // Need a meaningful flatness contrast to trust a profile.
         if fmax - fmin < 0.08 {
             return 0;
@@ -756,43 +881,90 @@ impl Denoiser {
         // 60% of the way from the minimum to the maximum flatness.
         let flat_thr = fmin + 0.6 * (fmax - fmin);
         let mut run = 0;
-        for &f in &flatness {
-            if f >= flat_thr {
+        start = 0;
+        while run < observed {
+            if self.profile_frame_flatness(input, start, n, m) >= flat_thr {
                 run += 1;
             } else {
                 break;
             }
+            start += hop;
         }
         let min_frames = ((0.08 * self.sample_rate as f64 / hop as f64).round() as usize).max(1);
         // Trust the profile only if there is a signal onset after it.
-        if run >= min_frames && run < flatness.len() {
+        if run >= min_frames && run < observed {
             run
         } else {
             0
         }
     }
 
+    fn profile_frame_flatness(&mut self, input: &[f64], start: usize, n: usize, m: usize) -> f64 {
+        self.frame[..n].copy_from_slice(&input[start..start + n]);
+        self.stft.analyze(&self.frame, &mut self.spec);
+        let mut sum_p = 0.0;
+        let mut sum_logp = 0.0;
+        let mut nonzero = 0usize;
+        for &bin in self.spec.iter().take(m) {
+            let power = bin.re * bin.re + bin.im * bin.im;
+            if power > 1e-20 {
+                sum_p += power;
+                sum_logp += power.ln();
+                nonzero += 1;
+            }
+        }
+        if nonzero == 0 {
+            return 0.0;
+        }
+        let geometric_mean = (sum_logp / nonzero as f64).exp();
+        let arithmetic_mean = sum_p / nonzero as f64;
+        (geometric_mean / arithmetic_mean.max(1e-300)).clamp(0.0, 1.0)
+    }
+
     /// Analyze the first `n_frames` frames and return their per-bin power.
     fn collect_profile_y2(&mut self, input: &[f64], n_frames: usize) -> Vec<Vec<f64>> {
         let n = self.frame_size;
         let m = self.m;
-        let mut out = Vec::with_capacity(n_frames);
+        let available_frames = if input.len() < n {
+            0
+        } else {
+            1 + (input.len() - n) / self.hop
+        };
+        let frame_count = n_frames.min(available_frames);
+        if frame_count == 0 {
+            return Vec::new();
+        }
+
+        // Accumulate one mean spectrum instead of retaining every requested
+        // frame. This bounds profile memory by O(nbins), and the chronological
+        // sum for each bin is identical to NoiseEstimator's frame averaging.
+        let mut mean = vec![0.0; m];
         let mut start = 0;
-        let mut idx = 0;
-        while idx < n_frames && start + n <= input.len() {
+        for _ in 0..frame_count {
             self.frame[..n].copy_from_slice(&input[start..start + n]);
             self.stft.analyze(&self.frame, &mut self.spec);
-            let y2: Vec<f64> = (0..m)
-                .map(|k| {
-                    let c = self.spec[k];
-                    c.re * c.re + c.im * c.im
-                })
-                .collect();
-            out.push(y2);
+            for (k, total) in mean.iter_mut().enumerate() {
+                let c = self.spec[k];
+                *total += c.re * c.re + c.im * c.im;
+            }
             start += self.hop;
-            idx += 1;
         }
-        out
+        for value in &mut mean {
+            *value /= frame_count as f64;
+        }
+        vec![mean]
+    }
+
+    fn explicit_profile_frames(&self) -> usize {
+        if self.config.profile_ms <= 0.0 {
+            return 0;
+        }
+        // Keep the established single-rounding formula for batch/profile DSP.
+        // `checked_profile_target_samples` is intentionally used only for the
+        // retained streaming prefix, whose unit is whole samples.
+        ((self.config.profile_ms / 1000.0 * self.sample_rate as f64 / self.hop as f64).round()
+            as usize)
+            .max(1)
     }
 
     /// Apply a real per-bin gain `g` (length `m`) to the full spectrum,
@@ -948,7 +1120,8 @@ impl Denoiser {
 
         // Musical-noise post-filter.
         if self.config.musical_noise_postfilter {
-            self.postfilter.apply(&self.y2, &self.lambda_d_buf, &mut self.g);
+            self.postfilter
+                .apply(&self.y2, &self.lambda_d_buf, &mut self.g);
         }
 
         // Stash for decision-directed recursion.
@@ -992,9 +1165,7 @@ impl Denoiser {
 
         // Noise profiling.
         let profile_frames = if self.config.profile_ms > 0.0 {
-            ((self.config.profile_ms / 1000.0 * self.sample_rate as f64 / self.hop as f64).round()
-                as usize)
-                .max(1)
+            self.explicit_profile_frames()
         } else if self.config.profile_ms == 0.0 {
             self.detect_profile_frames(&x)
         } else {
@@ -1092,43 +1263,119 @@ struct ChannelStream {
 }
 
 impl ChannelStream {
-    fn new(config: DenoiserConfig) -> Self {
-        let denoiser = Denoiser::new(config);
+    fn try_new(config: DenoiserConfig, profile_target: usize) -> Result<Self, ConfigError> {
+        let denoiser = Denoiser::try_new(config)?;
         let n = denoiser.frame_size;
-        let profile_target = if denoiser.config.profile_ms < 0.0 {
-            0
-        } else if denoiser.config.profile_ms > 0.0 {
-            ((denoiser.config.profile_ms / 1000.0 * denoiser.sample_rate as f64).round() as usize)
-                .saturating_add(n)
-                .max(n)
-        } else {
-            ((1.5 * denoiser.sample_rate as f64).round() as usize)
-                .saturating_add(n)
-                .max(n)
-        };
-        let mut input = VecDeque::with_capacity(n * 2);
+        let doubled_frame = n.checked_mul(2).ok_or(ConfigError::ResourceOverflow {
+            resource: "stream input",
+        })?;
+        let profiled_input =
+            profile_target
+                .checked_add(n)
+                .ok_or(ConfigError::ResourceOverflow {
+                    resource: "stream input",
+                })?;
+        let input_capacity = doubled_frame.max(profiled_input);
+        let mut input = VecDeque::new();
+        input
+            .try_reserve_exact(input_capacity)
+            .map_err(|_| ConfigError::allocation_failed("stream input"))?;
         if profile_target == 0 {
             input.extend(std::iter::repeat(0.0).take(n));
         }
-        Self {
+        let mut profile = Vec::new();
+        profile
+            .try_reserve_exact(profile_target)
+            .map_err(|_| ConfigError::allocation_failed("stream profile"))?;
+        let mut pending = VecDeque::new();
+        pending
+            .try_reserve_exact(n)
+            .map_err(|_| ConfigError::allocation_failed("stream output"))?;
+        Ok(Self {
             denoiser,
             input,
-            profile: Vec::with_capacity(profile_target),
+            profile,
             profile_ready: profile_target == 0,
             profile_target,
-            frame: vec![0.0; n],
-            frame_out: vec![0.0; n],
-            frame_norm: vec![0.0; n],
-            ola_out: vec![0.0; n],
-            ola_norm: vec![0.0; n],
-            pending: VecDeque::with_capacity(n),
+            frame: try_zeroed_f64(n, "stream frame")?,
+            frame_out: try_zeroed_f64(n, "stream frame output")?,
+            frame_norm: try_zeroed_f64(n, "stream frame normalization")?,
+            ola_out: try_zeroed_f64(n, "stream overlap output")?,
+            ola_norm: try_zeroed_f64(n, "stream overlap normalization")?,
+            pending,
             frame_idx: 0,
             input_frames: 0,
             emitted_padded: 0,
             discarded_left: 0,
             returned_frames: 0,
             finished: false,
-        }
+        })
+    }
+
+    fn try_reserve_block(&mut self, frames: usize) -> Result<Vec<f64>, ConfigError> {
+        let next_input_frames =
+            self.input_frames
+                .checked_add(frames)
+                .ok_or(ConfigError::ResourceOverflow {
+                    resource: "stream frame count",
+                })?;
+        let returned_capacity = next_input_frames.checked_sub(self.returned_frames).ok_or(
+            ConfigError::ResourceOverflow {
+                resource: "stream returned block",
+            },
+        )?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(returned_capacity)
+            .map_err(|_| ConfigError::allocation_failed("stream returned block"))?;
+
+        let n = self.denoiser.frame_size;
+        let profile_remaining = if self.profile_ready {
+            0
+        } else {
+            self.profile_target.saturating_sub(self.profile.len())
+        };
+        let profile_samples = frames.min(profile_remaining);
+        self.profile
+            .try_reserve_exact(profile_samples)
+            .map_err(|_| ConfigError::allocation_failed("stream profile block"))?;
+
+        let crosses_profile = !self.profile_ready && frames >= profile_remaining;
+        let pending_samples = if crosses_profile {
+            // initialize_profile() transfers the entire retained prefix after
+            // adding a left-padding frame, then this block contributes every
+            // sample (including any remainder after the boundary).
+            let transition_samples = n
+                .checked_add(self.profile.len())
+                .and_then(|samples| samples.checked_add(frames))
+                .ok_or(ConfigError::ResourceOverflow {
+                    resource: "stream profile transition",
+                })?;
+            self.input
+                .try_reserve_exact(transition_samples)
+                .map_err(|_| ConfigError::allocation_failed("stream input block"))?;
+            transition_samples
+        } else {
+            if self.profile_ready {
+                self.input
+                    .try_reserve_exact(frames)
+                    .map_err(|_| ConfigError::allocation_failed("stream input block"))?;
+            }
+            // A pre-existing partial frame can make processing emit up to one
+            // frame more than the new block length.
+            frames.checked_add(n).ok_or(ConfigError::ResourceOverflow {
+                resource: "stream output block",
+            })?
+        };
+        self.pending
+            .try_reserve_exact(pending_samples)
+            .map_err(|_| ConfigError::allocation_failed("stream output block"))?;
+        self.emitted_padded
+            .checked_add(pending_samples)
+            .ok_or(ConfigError::ResourceOverflow {
+                resource: "stream frame count",
+            })?;
+        Ok(output)
     }
 
     #[inline]
@@ -1149,19 +1396,14 @@ impl ChannelStream {
         }
         let profile = std::mem::take(&mut self.profile);
         let profile_frames = if self.denoiser.config.profile_ms > 0.0 {
-            ((self.denoiser.config.profile_ms / 1000.0 * self.denoiser.sample_rate as f64
-                / self.denoiser.hop as f64)
-                .round() as usize)
-                .max(1)
+            self.denoiser.explicit_profile_frames()
         } else if self.denoiser.config.profile_ms == 0.0 {
             self.denoiser.detect_profile_frames(&profile)
         } else {
             0
         };
         if profile_frames > 0 {
-            let frames = self
-                .denoiser
-                .collect_profile_y2(&profile, profile_frames);
+            let frames = self.denoiser.collect_profile_y2(&profile, profile_frames);
             if !frames.is_empty() {
                 self.denoiser.noise.seed_from_profile(&frames);
             }
@@ -1232,7 +1474,7 @@ impl ChannelStream {
         }
     }
 
-    fn drain_ready(&mut self) -> Vec<f64> {
+    fn drain_ready_into(&mut self, output: &mut Vec<f64>) {
         let n = self.denoiser.frame_size;
         while self.discarded_left < n {
             if self.pending.pop_front().is_none() {
@@ -1240,7 +1482,6 @@ impl ChannelStream {
             }
             self.discarded_left += 1;
         }
-        let mut output = Vec::new();
         while self.returned_frames < self.input_frames {
             let Some(value) = self.pending.pop_front() else {
                 break;
@@ -1253,20 +1494,73 @@ impl ChannelStream {
             output.push(value);
             self.returned_frames += 1;
         }
-        output
     }
 
-    fn finish(&mut self) -> Vec<f64> {
+    fn try_reserve_finish(&mut self) -> Result<Vec<f64>, ConfigError> {
         if self.finished {
-            return Vec::new();
+            return Ok(Vec::new());
         }
+        let n = self.denoiser.frame_size;
+        let unreturned = self.input_frames.checked_sub(self.returned_frames).ok_or(
+            ConfigError::ResourceOverflow {
+                resource: "stream finish buffer",
+            },
+        )?;
+        self.input_frames
+            .checked_add(n)
+            .ok_or(ConfigError::ResourceOverflow {
+                resource: "stream finish frame count",
+            })?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(unreturned)
+            .map_err(|_| ConfigError::allocation_failed("stream returned finish"))?;
+
+        let input_samples = if self.profile_ready {
+            n
+        } else {
+            n.checked_mul(2)
+                .and_then(|samples| samples.checked_add(self.profile.len()))
+                .ok_or(ConfigError::ResourceOverflow {
+                    resource: "stream finish input",
+                })?
+        };
+        self.input
+            .try_reserve_exact(input_samples)
+            .map_err(|_| ConfigError::allocation_failed("stream finish input"))?;
+
+        // Completing the final full frames can overshoot the exact padded
+        // target by one hop, so keep two frames beyond all unreturned input.
+        let finish_samples = n
+            .checked_mul(2)
+            .and_then(|samples| samples.checked_add(unreturned))
+            .ok_or(ConfigError::ResourceOverflow {
+                resource: "stream finish buffer",
+            })?;
+        self.pending
+            .try_reserve_exact(finish_samples)
+            .map_err(|_| ConfigError::allocation_failed("stream finish output"))?;
+
+        self.emitted_padded
+            .checked_add(finish_samples)
+            .ok_or(ConfigError::ResourceOverflow {
+                resource: "stream finish frame count",
+            })?;
+        Ok(output)
+    }
+
+    fn finish_into(&mut self, output: &mut Vec<f64>) {
+        if self.finished {
+            return;
+        }
+        let n = self.denoiser.frame_size;
         if !self.profile_ready {
             self.initialize_profile();
         }
-        let n = self.denoiser.frame_size;
         self.input.extend(std::iter::repeat(0.0).take(n));
         self.process_available();
-        let target = n.saturating_add(self.input_frames);
+        // Checked by try_reserve_finish before any channel is advanced.
+        let target = n + self.input_frames;
         if self.emitted_padded < target {
             let remaining = (target - self.emitted_padded).min(n);
             let makeup = self.denoiser.makeup;
@@ -1281,23 +1575,45 @@ impl ChannelStream {
             }
             self.emitted_padded += remaining;
         }
-        let output = self.drain_ready();
+        self.drain_ready_into(output);
         self.finished = true;
-        output
     }
+}
+
+fn try_zeroed_f64(length: usize, resource: &'static str) -> Result<Vec<f64>, ConfigError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(length)
+        .map_err(|_| ConfigError::allocation_failed(resource))?;
+    values.resize(length, 0.0);
+    Ok(values)
 }
 
 impl StreamingDenoiser {
     /// Create a stateful denoiser with one independent processor per channel.
     pub fn new(config: DenoiserConfig, channels: usize) -> Result<Self, String> {
-        if channels == 0 {
-            return Err("streaming denoiser requires at least one channel".into());
+        config
+            .validate_config()
+            .map_err(|error| error.to_string())?;
+        let plan = ResourcePlan::for_stream(
+            channels,
+            config.frame_size,
+            config.sample_rate,
+            config.profile_ms,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut channel_streams = Vec::new();
+        channel_streams
+            .try_reserve_exact(channels)
+            .map_err(|_| ConfigError::allocation_failed("stream channels").to_string())?;
+        for _ in 0..channels {
+            channel_streams.push(
+                ChannelStream::try_new(config.clone(), plan.profile_target_samples())
+                    .map_err(|error| error.to_string())?,
+            );
         }
-        config.validate()?;
         Ok(Self {
-            channels: (0..channels)
-                .map(|_| ChannelStream::new(config.clone()))
-                .collect(),
+            channels: channel_streams,
             finished: false,
         })
     }
@@ -1319,14 +1635,42 @@ impl StreamingDenoiser {
         if channels.iter().any(|channel| channel.len() != frames) {
             return Err("streaming blocks must have equal channel lengths".into());
         }
-        for (stream, channel) in self.channels.iter_mut().zip(channels) {
-            stream.push_samples(channel);
+        if frames > 0 {
+            let config = &self.channels[0].denoiser.config;
+            checked_stream_memory_bytes(
+                self.channels.len(),
+                frames,
+                config.frame_size,
+                config.sample_rate,
+                config.profile_ms,
+            )
+            .map_err(|error| error.to_string())?;
         }
-        Ok(self
-            .channels
-            .iter_mut()
-            .map(ChannelStream::drain_ready)
-            .collect())
+
+        // Phase one reserves every internal queue and every returned vector
+        // for every channel.  Capacity changes are harmless if a later
+        // reservation fails; no samples or DSP state have been consumed yet.
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(self.channels.len())
+            .map_err(|_| ConfigError::allocation_failed("stream returned channels").to_string())?;
+        for stream in &mut self.channels {
+            output.push(
+                stream
+                    .try_reserve_block(frames)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+
+        // Phase two is allocation-free for the stream queues and return
+        // buffers, so all channels advance together.
+        for ((stream, channel), channel_output) in
+            self.channels.iter_mut().zip(channels).zip(&mut output)
+        {
+            stream.push_samples(channel);
+            stream.drain_ready_into(channel_output);
+        }
+        Ok(output)
     }
 
     /// Flush the overlap-add tail and return the final output block.
@@ -1334,11 +1678,20 @@ impl StreamingDenoiser {
         if self.finished {
             return Err("streaming denoiser has already been finished".into());
         }
-        let output = self
-            .channels
-            .iter_mut()
-            .map(ChannelStream::finish)
-            .collect();
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(self.channels.len())
+            .map_err(|_| ConfigError::allocation_failed("stream returned channels").to_string())?;
+        for stream in &mut self.channels {
+            output.push(
+                stream
+                    .try_reserve_finish()
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        for (stream, channel_output) in self.channels.iter_mut().zip(&mut output) {
+            stream.finish_into(channel_output);
+        }
         self.finished = true;
         Ok(output)
     }
@@ -1363,6 +1716,426 @@ mod tests {
             let u = (self.0 >> 32) as f64 / (u32::MAX as f64 + 1.0);
             u * 2.0 - 1.0 // [-1, 1)
         }
+    }
+
+    fn invalid_field(error: ConfigError) -> &'static str {
+        match error {
+            ConfigError::InvalidValue { field, .. } => field,
+            other => panic!("expected invalid field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_validation_rejects_nonfinite_major_float_fields() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut config = DenoiserConfig::default(48_000);
+            config.strength = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "strength"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.overlap = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "overlap"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.vad_silence_gain = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "vad_silence_gain"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.vad_speech_mix = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "vad_speech_mix"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.smoothing = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "smoothing"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.profile_ms = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "profile_ms"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.makeup_gain_db = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "makeup_gain_db"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.pre_emphasis_alpha = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "pre_emphasis_alpha"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.window = WindowType::Kaiser;
+            config.window_params.kaiser_beta = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "window_params.kaiser_beta"
+            );
+
+            let mut config = DenoiserConfig::default(48_000);
+            config.window = WindowType::Dpss;
+            config.window_params.dpss_bandwidth = value;
+            assert_eq!(
+                invalid_field(config.validate_config().unwrap_err()),
+                "window_params.dpss_bandwidth"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_validation_accepts_boundaries_and_rejects_hostile_sizes() {
+        let mut config = DenoiserConfig::default(1);
+        config.strength = 0.0;
+        config.overlap = 0.5;
+        config.vad_silence_gain = 1.0;
+        config.vad_speech_mix = 0.0;
+        config.smoothing = 1.0;
+        config.profile_ms = -f64::MAX;
+        config.frame_size = MIN_DENOISER_FRAME_SIZE;
+        config.pre_emphasis_alpha = 0.99;
+        config.makeup_gain_db = MIN_MAKEUP_GAIN_DB;
+        config.validate_config().unwrap();
+
+        config.sample_rate = MAX_SAMPLE_RATE;
+        config.frame_size = MAX_DENOISER_FRAME_SIZE;
+        config.profile_ms = MAX_PROFILE_MS;
+        config.strength = 1.0;
+        config.overlap = 0.95;
+        config.makeup_gain_db = MAX_MAKEUP_GAIN_DB;
+        config.validate_config().unwrap();
+
+        config.window = WindowType::Kaiser;
+        config.window_params.kaiser_beta = MAX_KAISER_BETA;
+        config.validate_config().unwrap();
+        config.window_params.kaiser_beta = MAX_KAISER_BETA + 1.0;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "window_params.kaiser_beta"
+        );
+        config.window = WindowType::Hann;
+        config.validate_config().unwrap();
+
+        config.makeup_gain_db = MAX_MAKEUP_GAIN_DB + 1.0;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "makeup_gain_db"
+        );
+        config.makeup_gain_db = 0.0;
+
+        config.frame_size = 131_072;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "frame_size"
+        );
+        config.frame_size = 300;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "frame_size"
+        );
+        config.frame_size = 2_048;
+        config.sample_rate = 0;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "sample_rate"
+        );
+        config.sample_rate = MAX_SAMPLE_RATE + 1;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "sample_rate"
+        );
+        config.sample_rate = 48_000;
+        config.profile_ms = MAX_PROFILE_MS + 1.0;
+        assert_eq!(
+            invalid_field(config.validate_config().unwrap_err()),
+            "profile_ms"
+        );
+    }
+
+    #[test]
+    fn legacy_new_repairs_nonfinite_values_and_huge_frames_without_panicking() {
+        let mut config = DenoiserConfig::default(0);
+        config.strength = f64::NAN;
+        config.overlap = f64::INFINITY;
+        config.vad_silence_gain = f64::NEG_INFINITY;
+        config.vad_speech_mix = f64::NAN;
+        config.smoothing = f64::INFINITY;
+        config.profile_ms = f64::NAN;
+        config.makeup_gain_db = f64::INFINITY;
+        config.pre_emphasis_alpha = f64::NAN;
+        config.frame_size = 1 << 20;
+
+        let denoiser = std::panic::catch_unwind(|| Denoiser::new(config))
+            .expect("legacy constructor must repair hostile configuration");
+        assert_eq!(denoiser.config().frame_size, 2_048);
+        assert_eq!(denoiser.config().sample_rate, 48_000);
+        assert!(denoiser.config().validate_config().is_ok());
+
+        let mut strict = DenoiserConfig::default(48_000);
+        strict.frame_size = 1 << 20;
+        assert_eq!(
+            invalid_field(Denoiser::try_new(strict).err().unwrap()),
+            "frame_size"
+        );
+
+        let mut invalid_kaiser = DenoiserConfig::default(48_000);
+        invalid_kaiser.window = WindowType::Kaiser;
+        invalid_kaiser.window_params.kaiser_beta = f64::INFINITY;
+        let repaired = Denoiser::new(invalid_kaiser.clone());
+        assert_eq!(
+            repaired.config().window_params.kaiser_beta,
+            WindowParams::default().kaiser_beta
+        );
+        assert_eq!(
+            invalid_field(Denoiser::try_new(invalid_kaiser).err().unwrap()),
+            "window_params.kaiser_beta"
+        );
+
+        let mut excessive_makeup = DenoiserConfig::default(48_000);
+        excessive_makeup.makeup_gain_db = f64::MAX;
+        let repaired = Denoiser::new(excessive_makeup.clone());
+        assert_eq!(repaired.config().makeup_gain_db, MAX_MAKEUP_GAIN_DB);
+        assert_eq!(
+            invalid_field(Denoiser::try_new(excessive_makeup).err().unwrap()),
+            "makeup_gain_db"
+        );
+    }
+
+    #[test]
+    fn checked_and_legacy_constructors_share_effective_valid_config() {
+        let mut config = DenoiserConfig::default(48_000);
+        config.smoothing = 1.0;
+        config.makeup_gain_db = MAX_MAKEUP_GAIN_DB;
+
+        let legacy = Denoiser::new(config.clone());
+        let checked = Denoiser::try_new(config).unwrap();
+        assert_eq!(legacy.config().smoothing, 0.95);
+        assert_eq!(checked.config().smoothing, legacy.config().smoothing);
+        assert_eq!(
+            checked.config().makeup_gain_db,
+            legacy.config().makeup_gain_db
+        );
+        assert!(checked.makeup.is_finite());
+    }
+
+    #[test]
+    fn streaming_rejects_channels_profiles_and_aggregate_resource_exhaustion() {
+        let config = DenoiserConfig::default(48_000);
+        assert!(StreamingDenoiser::new(config.clone(), 0)
+            .err()
+            .unwrap()
+            .contains("channels"));
+        assert!(
+            StreamingDenoiser::new(config.clone(), crate::config::MAX_STREAM_CHANNELS + 1)
+                .err()
+                .unwrap()
+                .contains("channels")
+        );
+
+        let mut invalid_profile = config.clone();
+        invalid_profile.profile_ms = f64::INFINITY;
+        assert!(StreamingDenoiser::new(invalid_profile, 1)
+            .err()
+            .unwrap()
+            .contains("profile_ms"));
+
+        let mut oversized = config;
+        oversized.frame_size = MAX_DENOISER_FRAME_SIZE;
+        oversized.sample_rate = MAX_SAMPLE_RATE;
+        oversized.profile_ms = MAX_PROFILE_MS;
+        assert!(StreamingDenoiser::new(oversized, 1)
+            .err()
+            .unwrap()
+            .contains("streaming state"));
+    }
+
+    #[test]
+    fn streaming_rejects_oversized_blocks_before_mutating_state() {
+        let mut config = DenoiserConfig::default(48_000);
+        config.profile_ms = -1.0;
+        let mut stream = StreamingDenoiser::new(config, 1).unwrap();
+        let oversized = vec![vec![0.0; crate::config::MAX_STREAM_BLOCK_FRAMES + 1]];
+        let error = stream.process_block(&oversized).unwrap_err();
+        assert!(error.contains("block_frames"), "unexpected error: {error}");
+
+        let empty = stream.process_block(&[Vec::new()]).unwrap();
+        assert_eq!(empty, vec![Vec::<f64>::new()]);
+        assert!(stream.process_block(&[vec![0.0; 32]]).is_ok());
+    }
+
+    #[test]
+    fn profile_crossing_preflight_covers_every_queue_push() {
+        let mut config = DenoiserConfig::default(8_000);
+        config.frame_size = MIN_DENOISER_FRAME_SIZE;
+        config.overlap = 0.5;
+        config.profile_ms = 1.0;
+        config.dc_block = false;
+        let profile_target =
+            ResourcePlan::for_stream(1, config.frame_size, config.sample_rate, config.profile_ms)
+                .unwrap()
+                .profile_target_samples();
+        let mut stream = ChannelStream::try_new(config, profile_target).unwrap();
+
+        let prefix = vec![0.0; profile_target - 1];
+        let mut prefix_output = stream.try_reserve_block(prefix.len()).unwrap();
+        stream.push_samples(&prefix);
+        stream.drain_ready_into(&mut prefix_output);
+        assert!(!stream.profile_ready);
+        assert_eq!(stream.profile.len(), profile_target - 1);
+
+        let crossing = [0.0, 0.0];
+        let transition_samples = stream.denoiser.frame_size + stream.profile.len() + crossing.len();
+        let mut output = stream.try_reserve_block(crossing.len()).unwrap();
+        assert!(stream.input.capacity() - stream.input.len() >= transition_samples);
+        assert!(stream.pending.capacity() - stream.pending.len() >= transition_samples);
+        assert!(output.capacity() - output.len() >= profile_target + 1);
+
+        let input_capacity = stream.input.capacity();
+        let pending_capacity = stream.pending.capacity();
+        stream.push_samples(&crossing);
+        stream.drain_ready_into(&mut output);
+        assert!(stream.profile_ready);
+        assert_eq!(stream.input.capacity(), input_capacity);
+        assert_eq!(stream.pending.capacity(), pending_capacity);
+    }
+
+    #[test]
+    fn incomplete_profile_finish_is_fully_preflighted() {
+        let mut config = DenoiserConfig::default(8_000);
+        config.frame_size = MIN_DENOISER_FRAME_SIZE;
+        config.overlap = 0.5;
+        config.profile_ms = 100.0;
+        config.dc_block = false;
+        let profile_target =
+            ResourcePlan::for_stream(1, config.frame_size, config.sample_rate, config.profile_ms)
+                .unwrap()
+                .profile_target_samples();
+        let mut stream = ChannelStream::try_new(config, profile_target).unwrap();
+        // Stop one sample before the profile boundary.  At this point finish
+        // must hold the retained prefix plus both padding frames at once.
+        let prefix = vec![0.0; profile_target - 1];
+        let mut prefix_output = stream.try_reserve_block(prefix.len()).unwrap();
+        stream.push_samples(&prefix);
+        stream.drain_ready_into(&mut prefix_output);
+
+        let mut output = stream.try_reserve_finish().unwrap();
+        let input_capacity = stream.input.capacity();
+        let pending_capacity = stream.pending.capacity();
+        stream.finish_into(&mut output);
+
+        assert_eq!(output.len(), prefix.len());
+        assert_eq!(stream.input.capacity(), input_capacity);
+        assert_eq!(stream.pending.capacity(), pending_capacity);
+    }
+
+    #[test]
+    fn multichannel_preflight_error_does_not_advance_an_earlier_channel() {
+        let mut config = DenoiserConfig::default(8_000);
+        config.frame_size = MIN_DENOISER_FRAME_SIZE;
+        config.overlap = 0.5;
+        config.profile_ms = -1.0;
+        config.dc_block = false;
+        let mut stream = StreamingDenoiser::new(config, 2).unwrap();
+
+        // Make only the second channel's return reservation impossible.  This
+        // models a late-channel allocation failure without asking the test
+        // process to commit an enormous allocation.
+        stream.channels[1].input_frames = usize::MAX / 2;
+        let first_before = (
+            stream.channels[0].input_frames,
+            stream.channels[0].frame_idx,
+            stream.channels[0].input.len(),
+            stream.channels[0].pending.len(),
+        );
+        let error = stream
+            .process_block(&[vec![0.25; 1], vec![0.25; 1]])
+            .unwrap_err();
+        assert!(
+            error.contains("stream returned block"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            (
+                stream.channels[0].input_frames,
+                stream.channels[0].frame_idx,
+                stream.channels[0].input.len(),
+                stream.channels[0].pending.len(),
+            ),
+            first_before
+        );
+
+        // Restore the synthetic counter and prove both DSP states still
+        // produce identical output for identical subsequent input.
+        stream.channels[1].input_frames = 0;
+        let samples = vec![0.25; 3 * MIN_DENOISER_FRAME_SIZE];
+        let mut output = stream.process_block(&[samples.clone(), samples]).unwrap();
+        let mut tail = stream.finish().unwrap();
+        output[0].append(&mut tail[0]);
+        output[1].append(&mut tail[1]);
+        assert_eq!(output[0], output[1]);
+    }
+
+    #[test]
+    fn multichannel_finish_error_does_not_finish_an_earlier_channel() {
+        let mut config = DenoiserConfig::default(8_000);
+        config.frame_size = MIN_DENOISER_FRAME_SIZE;
+        config.overlap = 0.5;
+        config.profile_ms = -1.0;
+        config.dc_block = false;
+        let mut stream = StreamingDenoiser::new(config, 2).unwrap();
+        let samples = vec![0.125; MIN_DENOISER_FRAME_SIZE + 17];
+        stream.process_block(&[samples.clone(), samples]).unwrap();
+
+        let second_input_frames = stream.channels[1].input_frames;
+        stream.channels[1].input_frames = usize::MAX / 2;
+        let first_before = (
+            stream.channels[0].frame_idx,
+            stream.channels[0].input.len(),
+            stream.channels[0].pending.len(),
+            stream.channels[0].emitted_padded,
+            stream.channels[0].returned_frames,
+            stream.channels[0].finished,
+        );
+        let error = stream.finish().unwrap_err();
+        assert!(
+            error.contains("stream returned finish"),
+            "unexpected error: {error}"
+        );
+        assert!(!stream.finished);
+        assert_eq!(
+            (
+                stream.channels[0].frame_idx,
+                stream.channels[0].input.len(),
+                stream.channels[0].pending.len(),
+                stream.channels[0].emitted_padded,
+                stream.channels[0].returned_frames,
+                stream.channels[0].finished,
+            ),
+            first_before
+        );
+
+        stream.channels[1].input_frames = second_input_frames;
+        let output = stream.finish().unwrap();
+        assert_eq!(output[0], output[1]);
     }
 
     #[test]
@@ -1627,7 +2400,10 @@ mod tests {
             .zip(&expected)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
-        assert!(max_error < 1e-9, "streaming drifted from batch by {max_error}");
+        assert!(
+            max_error < 1e-9,
+            "streaming drifted from batch by {max_error}"
+        );
     }
 
     #[test]

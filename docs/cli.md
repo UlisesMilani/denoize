@@ -15,6 +15,10 @@ USAGE:
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
+LIVE:
+    Low-latency live processing supports only classical and rnnoise; other
+    backends are rejected before capture or playback starts.
+
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
     -b, --backend <NAME>     auto|classical  (default: classical)
@@ -22,21 +26,21 @@ OPTIONS:
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
         --mode <NAME>        speech|music|ambient processing intent
     -s, --strength <0..1>    denoising strength (default: 0.6)
-        --profile <MS>       learn noise from first MS ms (default: auto-detect)
+        --profile <MS>       finite duration: <0 off, 0 auto, >0 up to 60000
         --no-profile         no profiling; rely on blind IMCRA bootstrap
         --no-adapt           freeze the noise estimate
         --adaptive-noise     learn noise from noise-only regions throughout the file
         --vad                speech-aware segmentation and silence suppression
-        --frame <N>          FFT size: 512|1024|2048|4096|8192 (default: 2048)
+        --frame <N>          FFT size: power of two in 256..65536 (default: 2048)
         --overlap <F>        overlap ratio 0.5..0.95 (default: 0.75)
         --window <NAME>      hann|hamming|sine|blackman|kaiser|flattop|dpss
-        --kaiser-beta <B>    Kaiser window beta (default: 8.0)
+        --kaiser-beta <B>    finite Kaiser beta in 0..50 (default: 8.0)
         --dpss-nw <NW>       classical DPSS time-bandwidth product in (0, 8] (default: 3.0)
         --multiband          enable multiband spectral subtraction
         --perceptual         enable Bark-scale perceptual gain weighting
         --postfilter         enable musical-noise suppression post-filter
         --smoothing <0..1>   gain release smoothing (default: 0.6)
-        --makeup <DB>        makeup gain in dB (default: 0.0)
+        --makeup <DB>        makeup gain in -120..120 dB (default: 0.0)
         --no-dc-block        disable DC-blocking pre-filter
         --quality <LEVEL>    high|ultra
         --no-transient       disable transient/onset protection
@@ -46,23 +50,23 @@ OPTIONS:
         --no-pre-emphasis    disable pre-emphasis
         --report             print settings report and exit
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
-        --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
+        --m4a-bitrate <KBPS> positive M4A/AAC CBR bitrate (default: 192)
         --aac-encoder <NAME> oxide|fdk (default: oxide)
         --downmix <MODE>     preserve|stereo (default: preserve; lossy outputs reject surround unless explicit)
-        --loudness <LUFS>     normalize integrated loudness after denoising
-        --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
+        --loudness <LUFS>     finite normalization target in -70..0 LUFS
+        --true-peak <DBTP>    finite ceiling in -20..0 dBTP with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
-        --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
+        --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
-        --stream-frames <N>   streaming block size in frames (default: 8192)
-        --max-memory <MB>     refuse inputs whose estimated working set exceeds MB
+        --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
+        --max-memory <MB>     checked working-set limit in MiB (minimum: 1)
         --recursive           include subdirectories in batch mode
-        --jobs <N>            concurrent batch workers (default: CPU count)
+        --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
         --resume              skip completed files recorded by batch state
@@ -71,7 +75,7 @@ OPTIONS:
         --no-metadata         do not copy input tags/artwork/chapters to the output
         --input-device <NAME> live capture device (default: system default)
         --output-device <NAME> live playback device (default: system default)
-        --chunk-ms <MS>       live processing chunk duration (default: 100)
+        --chunk-ms <MS>       live chunk duration in 10..2000 ms (default: 100)
     -h, --help               show this help
     -V, --version            show version
 
@@ -84,10 +88,15 @@ BACKENDS (build with --features full for all):
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
     mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
-    gtcrn       Official low-complexity streaming GTCRN (requires --features gtcrn)
+    gtcrn       Official causal GTCRN for files/library streams (not the live command)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP
     speech      Voice-optimised balance
     music       Instruments; enables perceptual + postfilter
+
+CONFIGURATION:
+    TOML syntax and enum names are checked when loaded. CLI values then override
+    TOML numeric defaults, and the final effective configuration is validated
+    before audio decoding, output staging, or batch worker creation.
 ```

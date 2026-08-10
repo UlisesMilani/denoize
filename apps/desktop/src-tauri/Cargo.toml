@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 rayon = "1.11"
+sha2 = "0.10.9"
 tauri = { version = "2.11.5", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.7.2"
 
@@ -31,3 +32,6 @@ fdk-aac-encoder = ["denoize/fdk-aac-encoder"]
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-process = "2.3.1"
 tauri-plugin-updater = "2.9.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

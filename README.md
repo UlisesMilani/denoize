@@ -28,7 +28,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `bsrnn` | `--features bsrnn` | ESPnet BSRNN spectral enhancement adapter (external converted model) |
 | `mossformer2` | `--features mossformer2` | ClearerVoice MossFormer2 48 kHz mask adapter (external converted model) |
 | `sgmse` | `--features sgmse` | SGMSE+ iterative diffusion adapter (external converted model) |
-| `gtcrn` | `--features gtcrn` | Official 48K-parameter causal GTCRN; offline and stateful streaming |
+| `gtcrn` | `--features gtcrn` | Official 48K-parameter causal GTCRN; offline plus the stateful library stream API (not the `live` command) |
 
 Build everything: `cargo build --release --features full`
 
@@ -60,7 +60,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 |--------|---------|-------|
 | WAV | `hound` | Lossless; preserves bit depth |
 | MP3 | `shine-rs` (Pure Rust) | `--mp3-bitrate` (default 192 kbps) |
-| M4A | `oxideav-aac` + MP4 mux | GitHub/source builds; `--m4a-bitrate` (default 192 kbps) |
+| M4A | `oxideav-aac` + MP4 mux | GitHub/source builds; positive `--m4a-bitrate` (default 192 kbps) |
 | FLAC | `flacenc` | Lossless, pure Rust |
 | Ogg Opus | `opus` + `ogg` | 128 kbps, mono/stereo |
 
@@ -351,8 +351,10 @@ whole file:
 classical backend and independent channels. VAD, loudness normalization,
 mid/side or linked stereo processing, and AI/encoded output require the normal
 (non-streaming) path. The default block size is 8192 frames; use
-`--stream-frames N` to trade latency and working memory for throughput. Noise
-profiling retains only a bounded leading segment before output begins.
+`--stream-frames N` (1–1,048,576) to trade latency and working memory for
+throughput. Noise profiling retains only a bounded leading segment before
+output begins. Stream resource arithmetic is checked from the input header,
+and the processor is constructed before an output or temporary file is staged.
 
 For the normal (decoded, non-streaming) path, `--max-memory MB` performs a
 conservative preflight and decoded-working-set check before processing. The
@@ -393,7 +395,9 @@ zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
 The realtime page routes a selected capture device through a low-latency
 backend to a playback device, with input/output meters, dropped-chunk counters,
-and explicit start/stop controls. Headphones help prevent acoustic feedback.
+and explicit start/stop controls. Live sessions support only the live-capable
+Classical and RNNoise backends; other backends are rejected before capture or
+playback starts. Headphones help prevent acoustic feedback.
 
 ```sh
 cd apps/desktop
@@ -476,7 +480,9 @@ denoize live --backend rnnoise --input-device "Microphone" --output-device "Virt
 Realtime processing runs outside the device callbacks and uses bounded queues,
 so an overloaded backend drops stale capture chunks instead of blocking the
 audio thread. `--chunk-ms` controls the latency/throughput trade-off and defaults
-to 100 ms. Input and output devices must currently share a default sample rate.
+to 100 ms. Only the low-latency Classical and RNNoise backends are live-capable;
+other backend selections are rejected before capture or playback starts. Input
+and output devices must currently share a default sample rate.
 
 ### Batch processing
 
@@ -486,12 +492,13 @@ Process a directory tree concurrently while preserving its relative layout:
 denoize recordings cleaned --batch --recursive --jobs 4 --output-format flac
 ```
 
-Batch mode validates the complete input/output plan before creating the output
-directory, then continues after per-file processing failures and reports a
-final summary. Existing outputs remain protected unless `--force` is supplied,
-and input/output directories must not overlap. Recursive discovery does not
-follow directory symlinks, and planned destinations that resolve back into the
-input tree are rejected.
+Batch mode validates the complete input/output plan and each input's decoded
+audio properties before creating the output directory or starting workers,
+then continues after later per-file processing failures and reports a final
+summary. Existing outputs remain protected unless `--force` is supplied, and
+input/output directories must not overlap. Recursive discovery does not follow
+directory symlinks, and planned destinations that resolve back into the input
+tree are rejected.
 
 Omit `--output-format` only when denoize can re-encode the same container and
 codec (WAV, FLAC, Ogg Opus, MP3, AAC-in-MP4, or ADTS AAC). Decode-only
@@ -569,7 +576,8 @@ for reviewing both. The project requires Rust 1.96 or newer.
 
 `.aac` files are decoded and encoded directly as ADTS streams without an MP4
 container or an ffmpeg conversion step. M4A and raw AAC share
-`--m4a-bitrate`; raw ADTS output currently uses the default oxideav encoder.
+`--m4a-bitrate`, which must be a positive kbps value that fits the encoder's
+32-bit bps field; raw ADTS output currently uses the default oxideav encoder.
 
 ### Metadata preservation
 
@@ -630,8 +638,15 @@ are represented as `null` rather than preventing the rest of the report.
 
 ### Configuration file
 
-Reusable defaults can be stored in TOML and loaded with `--config`. Explicit
-command-line options override the file.
+Reusable defaults can be stored in TOML and loaded with `--config`. TOML syntax
+and enum names are checked while loading; explicit command-line numeric values
+then override file defaults, and the final effective configuration is validated
+before input decoding, output staging, or batch worker creation. For example,
+FFT frames must be powers of two from 256 through 65,536, streaming blocks must
+be from 1 through 1,048,576 frames, batch jobs from 1 through 32, and live
+chunks from 10 through 2,000 ms. Non-finite effective floating-point settings
+are rejected; loudness targets are limited to -70..0 LUFS and true-peak
+ceilings to -20..0 dBTP.
 
 ```toml
 backend = "auto"
@@ -681,7 +696,7 @@ avoiding a silent loss or weakening of its access policy.
 -b, --backend <NAME>     classical|rnnoise|deepfilter
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
 --window <NAME>          hann|hamming|sine|blackman|kaiser|flattop|dpss
---kaiser-beta <B>        Kaiser β (default 8.0)
+--kaiser-beta <B>        Finite Kaiser β in 0..50 (default: 8.0)
 --dpss-nw <NW>           Classical DPSS time-bandwidth product in (0, 8] (default: 3.0)
 --multiband              Multiband spectral subtraction
 --perceptual             Bark perceptual gain weighting
@@ -689,7 +704,7 @@ avoiding a silent loss or weakening of its access policy.
 -p hifi                   Flagship preset (Kaiser + perceptual + postfilter)
 --quality ultra           Maximum fidelity settings
 --onnx-model <PATH>       Waveform ONNX model used by the onnx backend
---onnx-rate <HZ>          Model sample rate (default: 16000)
+--onnx-rate <HZ>          Model sample rate in 1..768000 Hz (default: 16000)
 ```
 
 ## Library API

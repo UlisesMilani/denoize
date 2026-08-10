@@ -5,12 +5,24 @@
 
 use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::channel_layout::{ChannelLayout, ChannelMask, PanInfo};
+use crate::config::{
+    checked_stream_memory_bytes, ConfigError, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_STATE_BYTES,
+};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const MIN_MEMORY_ESTIMATE_BYTES: u64 = BYTES_PER_MIB;
+// RIFF stores the file size minus the leading eight bytes in a u32. Hound's
+// classic PCM header contributes 36 bytes to that field, while its extensible
+// header contributes 60 bytes.
+const PCM_WAV_RIFF_OVERHEAD: u64 = 36;
+const EXTENSIBLE_WAV_RIFF_OVERHEAD: u64 = 60;
+// Hound's supported integer/float sample encodings occupy at most four bytes.
+// `WavWriter` does not expose the container width chosen by `new_with_spec_ex`,
+// so wrapping an arbitrary writer must account for this conservative maximum.
+const MAX_WAV_CONTAINER_BYTES_PER_SAMPLE: u64 = 4;
 
 /// Keep a decoded sample in the range accepted by the DSP and codecs.
 ///
@@ -44,6 +56,30 @@ impl Audio {
 
     pub fn frames(&self) -> usize {
         self.channels.first().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Fallibly clone the planar samples so callers can preserve transactional
+    /// semantics when later processing can still fail.
+    pub(crate) fn try_clone_fallible(&self, context: &str) -> Result<Self, String> {
+        let mut channels = Vec::new();
+        channels
+            .try_reserve_exact(self.channels.len())
+            .map_err(|_| format!("unable to reserve {context} channels"))?;
+        for source in &self.channels {
+            let mut channel = Vec::new();
+            channel
+                .try_reserve_exact(source.len())
+                .map_err(|_| format!("unable to reserve {context} samples"))?;
+            channel.extend_from_slice(source);
+            channels.push(channel);
+        }
+        Ok(Self {
+            sample_rate: self.sample_rate,
+            channels,
+            bits_per_sample: self.bits_per_sample,
+            sample_format: self.sample_format,
+            channel_mask: self.channel_mask,
+        })
     }
 
     /// Sanitize all in-memory samples in place.
@@ -142,21 +178,23 @@ pub fn estimate_stream_memory_bytes(
     frame_size: usize,
     sample_rate: u32,
 ) -> u64 {
-    let profile_frames = (sample_rate as u64)
-        .saturating_mul(3)
-        .saturating_div(2)
-        .saturating_add(frame_size as u64);
-    let per_channel_samples = (frame_size as u64)
-        .saturating_mul(96)
-        .saturating_add(profile_frames.saturating_mul(2));
-    let block_samples = (block_frames as u64)
-        .saturating_mul(channels as u64)
-        .saturating_mul(4);
-    per_channel_samples
-        .saturating_mul(channels as u64)
-        .saturating_add(block_samples)
-        .saturating_mul(std::mem::size_of::<f64>() as u64)
-        .max(MIN_MEMORY_ESTIMATE_BYTES)
+    checked_stream_memory_bytes(channels, block_frames, frame_size, sample_rate, 0.0)
+        .unwrap_or(u64::MAX)
+}
+
+/// Checked, profile-aware estimate of a streaming working set.
+///
+/// Unlike [`estimate_stream_memory_bytes`], this entry point rejects invalid
+/// dimensions, arithmetic overflow, and aggregate state-plus-block plans over
+/// the streaming hard limit instead of saturating to `u64::MAX`.
+pub fn estimate_stream_memory_bytes_checked(
+    channels: usize,
+    block_frames: usize,
+    frame_size: usize,
+    sample_rate: u32,
+    profile_ms: f64,
+) -> Result<u64, ConfigError> {
+    checked_stream_memory_bytes(channels, block_frames, frame_size, sample_rate, profile_ms)
 }
 
 /// Conservative preflight estimate for a filesystem input.
@@ -184,7 +222,11 @@ pub fn ensure_memory_limit(
     if max_memory_mb == 0 {
         return Err("--max-memory must be at least 1 MiB".into());
     }
-    let limit = (max_memory_mb as u64).saturating_mul(BYTES_PER_MIB);
+    let max_memory_mb = u64::try_from(max_memory_mb)
+        .map_err(|_| "--max-memory is too large for this platform".to_string())?;
+    let limit = max_memory_mb
+        .checked_mul(BYTES_PER_MIB)
+        .ok_or_else(|| "--max-memory byte limit overflows u64".to_string())?;
     if estimated_bytes > limit {
         let estimated_mib = estimated_bytes
             .saturating_add(BYTES_PER_MIB - 1)
@@ -237,13 +279,8 @@ fn read_wav_reader<R: std::io::Read>(
     channel_mask: Option<ChannelMask>,
 ) -> Result<Audio, String> {
     let spec = reader.spec();
+    validate_readable_wav_spec(spec)?;
     let nchan = spec.channels as usize;
-    if nchan == 0 {
-        return Err("0 channels".into());
-    }
-
-    let max = (1u64 << (spec.bits_per_sample - 1)) as f64; // 2^(bits-1)
-    let inv = 1.0 / max;
 
     let mut channels: Vec<Vec<f64>> = (0..nchan).map(|_| Vec::new()).collect();
 
@@ -258,6 +295,8 @@ fn read_wav_reader<R: std::io::Read>(
             }
         }
         SampleFormat::Int => {
+            let max = (1u64 << (spec.bits_per_sample - 1)) as f64; // 2^(bits-1)
+            let inv = 1.0 / max;
             if spec.bits_per_sample <= 16 {
                 let samples: Result<Vec<i16>, String> = reader
                     .samples::<i16>()
@@ -285,6 +324,21 @@ fn read_wav_reader<R: std::io::Read>(
         sample_format: spec.sample_format,
         channel_mask,
     })
+}
+
+fn validate_readable_wav_spec(spec: WavSpec) -> Result<(), String> {
+    if spec.channels == 0 {
+        return Err("0 channels".into());
+    }
+    match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Int, 8 | 16 | 24 | 32) | (SampleFormat::Float, 32) => Ok(()),
+        (SampleFormat::Int, bits) => Err(format!(
+            "unsupported integer WAV bit depth: {bits} (supported: 8, 16, 24, 32)"
+        )),
+        (SampleFormat::Float, bits) => Err(format!(
+            "unsupported float WAV bit depth: {bits} (supported: 32)"
+        )),
+    }
 }
 
 /// Read the optional WAVE_FORMAT_EXTENSIBLE speaker mask without relying on
@@ -380,6 +434,8 @@ pub fn write_audio<P: AsRef<std::path::Path>>(
 /// Write an [`Audio`] to a WAV file, preserving its bit depth / format.
 pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<(), String> {
     let path = path.as_ref();
+    crate::encode::OutputFormat::Wav
+        .validate_config(audio, &crate::encode::EncodeOptions::default())?;
     let mut output = AtomicOutput::new(path)?;
     write_wav_to_file(output.file_mut(), audio)?;
     output.commit(CommitMode::Replace)
@@ -390,9 +446,8 @@ pub fn write_wav<P: AsRef<std::path::Path>>(path: P, audio: &Audio) -> Result<()
 /// The file is rewound and truncated before encoding. It must be open for
 /// reading as well as writing when a multichannel speaker mask is required.
 pub fn write_wav_to_file(file: &mut File, audio: &Audio) -> Result<(), String> {
-    if audio.channels() == 0 {
-        return Err("WAV output requires at least one channel".into());
-    }
+    crate::encode::OutputFormat::Wav
+        .validate_config(audio, &crate::encode::EncodeOptions::default())?;
     file.seek(SeekFrom::Start(0))
         .map_err(|e| format!("seek WAV output: {e}"))?;
     file.set_len(0)
@@ -408,9 +463,8 @@ pub fn write_wav_to_file(file: &mut File, audio: &Audio) -> Result<(), String> {
 
 /// Encode a complete WAV into memory for stdout and network transports.
 pub fn write_wav_bytes(audio: &Audio) -> Result<Vec<u8>, String> {
-    if audio.channels() == 0 {
-        return Err("WAV output requires at least one channel".into());
-    }
+    crate::encode::OutputFormat::Wav
+        .validate_config(audio, &crate::encode::EncodeOptions::default())?;
     let mut bytes = Vec::new();
     {
         let cursor = std::io::Cursor::new(&mut bytes);
@@ -555,6 +609,51 @@ pub struct WavStreamReader<R: Read + Seek> {
     channel_mask: Option<ChannelMask>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WavStreamBlockPlan {
+    max_samples: usize,
+    peak_bytes: u64,
+}
+
+fn plan_wav_stream_block(channels: usize, max_frames: usize) -> Result<WavStreamBlockPlan, String> {
+    if channels == 0 {
+        return Err("stream WAV requires at least one channel".into());
+    }
+    if !(1..=MAX_STREAM_BLOCK_FRAMES).contains(&max_frames) {
+        return Err(format!(
+            "stream block size must be between 1 and {MAX_STREAM_BLOCK_FRAMES} frames"
+        ));
+    }
+    let max_samples = max_frames
+        .checked_mul(channels)
+        .ok_or_else(|| "stream block sample count overflow".to_string())?;
+    let max_samples_u64 = u64::try_from(max_samples)
+        .map_err(|_| "stream block sample count is too large".to_string())?;
+    let sample_bytes = max_samples_u64
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .ok_or_else(|| "stream block byte count overflow".to_string())?;
+    let channel_headers = u64::try_from(channels)
+        .map_err(|_| "stream channel count is too large".to_string())?
+        .checked_mul(std::mem::size_of::<Vec<f64>>() as u64)
+        .ok_or_else(|| "stream channel header byte count overflow".to_string())?;
+    let vector_headers =
+        (std::mem::size_of::<Vec<f64>>() + std::mem::size_of::<Vec<Vec<f64>>>()) as u64;
+    let peak_bytes = sample_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(channel_headers))
+        .and_then(|bytes| bytes.checked_add(vector_headers))
+        .ok_or_else(|| "stream block peak byte count overflow".to_string())?;
+    if peak_bytes > MAX_STREAM_STATE_BYTES {
+        return Err(format!(
+            "stream block requires {peak_bytes} bytes while deinterleaving, limit is {MAX_STREAM_STATE_BYTES} bytes"
+        ));
+    }
+    Ok(WavStreamBlockPlan {
+        max_samples,
+        peak_bytes,
+    })
+}
+
 impl WavStreamReader<BufReader<std::fs::File>> {
     /// Open a filesystem WAV for bounded-memory reading.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, String> {
@@ -576,15 +675,7 @@ impl<R: Read + Seek> WavStreamReader<R> {
         channel_mask: Option<ChannelMask>,
     ) -> Result<Self, String> {
         let spec = reader.spec();
-        if spec.channels == 0 {
-            return Err("0 channels".into());
-        }
-        if spec.sample_format == SampleFormat::Int && !(1..=32).contains(&spec.bits_per_sample) {
-            return Err(format!(
-                "unsupported integer WAV bit depth: {}",
-                spec.bits_per_sample
-            ));
-        }
+        validate_readable_wav_spec(spec)?;
         Ok(Self {
             reader,
             spec,
@@ -602,15 +693,32 @@ impl<R: Read + Seek> WavStreamReader<R> {
 
     /// Read up to `max_frames`, returning `None` only at clean end-of-file.
     pub fn next_block(&mut self, max_frames: usize) -> Result<Option<Vec<Vec<f64>>>, String> {
-        if max_frames == 0 {
-            return Err("stream block size must be at least one frame".into());
-        }
         let nchan = self.spec.channels as usize;
-        let max_samples = max_frames.saturating_mul(nchan);
-        let mut interleaved = Vec::with_capacity(max_samples);
+        let plan = plan_wav_stream_block(nchan, max_frames)?;
+        debug_assert!(plan.peak_bytes <= MAX_STREAM_STATE_BYTES);
+
+        // Reserve every allocation before advancing the streaming reader. If
+        // memory pressure prevents the second representation from being
+        // reserved, the caller can retry without losing an input block.
+        let mut interleaved = Vec::new();
+        interleaved
+            .try_reserve_exact(plan.max_samples)
+            .map_err(|_| "unable to reserve stream input block".to_string())?;
+        let mut channels = Vec::new();
+        channels
+            .try_reserve_exact(nchan)
+            .map_err(|_| "unable to reserve stream channel list".to_string())?;
+        for _ in 0..nchan {
+            let mut channel = Vec::new();
+            channel
+                .try_reserve_exact(max_frames)
+                .map_err(|_| "unable to reserve stream channel block".to_string())?;
+            channels.push(channel);
+        }
+
         match self.spec.sample_format {
             SampleFormat::Float => {
-                for sample in self.reader.samples::<f32>().take(max_samples) {
+                for sample in self.reader.samples::<f32>().take(plan.max_samples) {
                     interleaved.push(sanitize_sample(
                         sample.map_err(|e| format!("read: {e}"))? as f64
                     ));
@@ -619,7 +727,7 @@ impl<R: Read + Seek> WavStreamReader<R> {
             SampleFormat::Int if self.spec.bits_per_sample <= 16 => {
                 let max = (1u64 << (self.spec.bits_per_sample - 1)) as f64;
                 let inv = 1.0 / max;
-                for sample in self.reader.samples::<i16>().take(max_samples) {
+                for sample in self.reader.samples::<i16>().take(plan.max_samples) {
                     interleaved.push(sanitize_sample(
                         sample.map_err(|e| format!("read: {e}"))? as f64 * inv,
                     ));
@@ -628,7 +736,7 @@ impl<R: Read + Seek> WavStreamReader<R> {
             SampleFormat::Int => {
                 let max = (1u64 << (self.spec.bits_per_sample - 1)) as f64;
                 let inv = 1.0 / max;
-                for sample in self.reader.samples::<i32>().take(max_samples) {
+                for sample in self.reader.samples::<i32>().take(plan.max_samples) {
                     interleaved.push(sanitize_sample(
                         sample.map_err(|e| format!("read: {e}"))? as f64 * inv,
                     ));
@@ -641,8 +749,6 @@ impl<R: Read + Seek> WavStreamReader<R> {
         if interleaved.len() % nchan != 0 {
             return Err("truncated WAV frame at end of input".into());
         }
-        let frames = interleaved.len() / nchan;
-        let mut channels: Vec<Vec<f64>> = (0..nchan).map(|_| Vec::with_capacity(frames)).collect();
         for (index, sample) in interleaved.into_iter().enumerate() {
             channels[index % nchan].push(sample);
         }
@@ -655,11 +761,15 @@ impl<R: Read + Seek> WavStreamReader<R> {
 pub struct WavStreamWriter<W: Write + Seek> {
     writer: WavWriter<W>,
     spec: WavSpec,
+    bytes_per_sample: u64,
+    data_bytes_written: u64,
+    data_byte_limit: u64,
 }
 
 impl WavStreamWriter<BufWriter<std::fs::File>> {
     /// Create a filesystem WAV for bounded-memory writing.
     pub fn create<P: AsRef<std::path::Path>>(path: P, spec: WavSpec) -> Result<Self, String> {
+        validate_wav_stream_spec(spec)?;
         let file = std::fs::File::create(path).map_err(|e| format!("create: {e}"))?;
         Self::from_sink(BufWriter::new(file), spec)
     }
@@ -668,22 +778,55 @@ impl WavStreamWriter<BufWriter<std::fs::File>> {
 impl<W: Write + Seek> WavStreamWriter<W> {
     /// Create a streaming WAV writer over an existing seekable sink.
     pub fn from_sink(sink: W, spec: WavSpec) -> Result<Self, String> {
+        validate_wav_stream_spec(spec)?;
         let writer = WavWriter::new(sink, spec).map_err(|e| format!("create: {e}"))?;
-        Self::from_writer(writer, spec)
+        let bytes_per_sample = u64::from(spec.bits_per_sample / 8);
+        Self::from_writer_with_accounting(
+            writer,
+            spec,
+            bytes_per_sample,
+            wav_stream_data_byte_limit(spec),
+        )
     }
 
     /// Wrap an existing WAV sink.
+    ///
+    /// Hound does not expose an existing writer's container width. This
+    /// constructor therefore charges every sample at the maximum supported
+    /// four-byte width and assumes the larger extensible header. Writers made
+    /// by [`Self::from_sink`] use their exact known layout instead.
     pub fn from_writer(writer: WavWriter<W>, spec: WavSpec) -> Result<Self, String> {
-        if spec.channels == 0 {
-            return Err("0 channels".into());
+        validate_wav_stream_spec(spec)?;
+        Self::from_writer_with_accounting(
+            writer,
+            spec,
+            MAX_WAV_CONTAINER_BYTES_PER_SAMPLE,
+            u64::from(u32::MAX) - EXTENSIBLE_WAV_RIFF_OVERHEAD,
+        )
+    }
+
+    fn from_writer_with_accounting(
+        writer: WavWriter<W>,
+        spec: WavSpec,
+        bytes_per_sample: u64,
+        data_byte_limit: u64,
+    ) -> Result<Self, String> {
+        if writer.spec() != spec {
+            return Err("WAV stream writer spec does not match the supplied spec".into());
         }
-        if spec.sample_format == SampleFormat::Int && !(1..=32).contains(&spec.bits_per_sample) {
-            return Err(format!(
-                "unsupported integer WAV bit depth: {}",
-                spec.bits_per_sample
-            ));
+        let data_bytes_written = u64::from(writer.len())
+            .checked_mul(bytes_per_sample)
+            .ok_or_else(|| "existing WAV stream data length overflow".to_string())?;
+        if data_bytes_written > data_byte_limit {
+            return Err("existing WAV stream data exceeds the RIFF container limit".into());
         }
-        Ok(Self { writer, spec })
+        Ok(Self {
+            writer,
+            spec,
+            bytes_per_sample,
+            data_bytes_written,
+            data_byte_limit,
+        })
     }
 
     /// Write a planar block, interleaving it in the WAV container.
@@ -696,13 +839,28 @@ impl<W: Write + Seek> WavStreamWriter<W> {
         if channels.iter().any(|channel| channel.len() != frames) {
             return Err("stream blocks must have equal channel lengths".into());
         }
+        let block_samples = frames
+            .checked_mul(nchan)
+            .ok_or_else(|| "WAV stream block sample count overflow".to_string())?;
+        let block_bytes = u64::try_from(block_samples)
+            .map_err(|_| "WAV stream block sample count is too large".to_string())?
+            .checked_mul(self.bytes_per_sample)
+            .ok_or_else(|| "WAV stream block byte count overflow".to_string())?;
+        let next_data_bytes = self
+            .data_bytes_written
+            .checked_add(block_bytes)
+            .ok_or_else(|| "WAV stream data length overflow".to_string())?;
+        if next_data_bytes > self.data_byte_limit {
+            return Err(format!(
+                "WAV stream data would exceed the RIFF container limit of {} bytes",
+                self.data_byte_limit
+            ));
+        }
         match self.spec.sample_format {
             SampleFormat::Float => {
                 for frame in 0..frames {
                     for channel in channels {
-                        self.writer
-                            .write_sample(sanitize_sample(channel[frame]) as f32)
-                            .map_err(|e| format!("write: {e}"))?;
+                        self.write_sample(sanitize_sample(channel[frame]) as f32)?;
                     }
                 }
             }
@@ -714,9 +872,7 @@ impl<W: Write + Seek> WavStreamWriter<W> {
                     for channel in channels {
                         let value = sanitize_sample(channel[frame]);
                         let quantized = ((value * max).round() as i64).min(hi).max(lo);
-                        self.writer
-                            .write_sample(quantized as i16)
-                            .map_err(|e| format!("write: {e}"))?;
+                        self.write_sample(quantized as i16)?;
                     }
                 }
             }
@@ -728,9 +884,7 @@ impl<W: Write + Seek> WavStreamWriter<W> {
                     for channel in channels {
                         let value = sanitize_sample(channel[frame]);
                         let quantized = ((value * max).round() as i64).min(hi).max(lo);
-                        self.writer
-                            .write_sample(quantized as i32)
-                            .map_err(|e| format!("write: {e}"))?;
+                        self.write_sample(quantized as i32)?;
                     }
                 }
             }
@@ -742,6 +896,63 @@ impl<W: Write + Seek> WavStreamWriter<W> {
     pub fn finalize(self) -> Result<(), String> {
         self.writer.finalize().map_err(|e| format!("finalize: {e}"))
     }
+
+    fn write_sample<S: hound::Sample>(&mut self, sample: S) -> Result<(), String> {
+        self.writer
+            .write_sample(sample)
+            .map_err(|e| format!("write: {e}"))?;
+        // The complete block was checked against `data_byte_limit` before its
+        // first sample was written, so this increment cannot overflow.
+        self.data_bytes_written += self.bytes_per_sample;
+        Ok(())
+    }
+}
+
+fn wav_stream_data_byte_limit(spec: WavSpec) -> u64 {
+    let riff_overhead = if spec.channels > 2 || spec.bits_per_sample > 16 {
+        EXTENSIBLE_WAV_RIFF_OVERHEAD
+    } else {
+        PCM_WAV_RIFF_OVERHEAD
+    };
+    u64::from(u32::MAX) - riff_overhead
+}
+
+fn validate_wav_stream_spec(spec: WavSpec) -> Result<(), String> {
+    if spec.channels == 0 {
+        return Err("WAV stream requires at least one channel".into());
+    }
+    if spec.sample_rate == 0 {
+        return Err("WAV stream sample rate must be greater than zero".into());
+    }
+    let bytes_per_sample = match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Int, 8) => 1u64,
+        (SampleFormat::Int, 16) => 2,
+        (SampleFormat::Int, 24) => 3,
+        (SampleFormat::Int, 32) | (SampleFormat::Float, 32) => 4,
+        (SampleFormat::Int, bits) => {
+            return Err(format!(
+                "unsupported integer WAV bit depth: {bits} (supported: 8, 16, 24, 32)"
+            ));
+        }
+        (SampleFormat::Float, bits) => {
+            return Err(format!(
+                "unsupported float WAV bit depth: {bits} (supported: 32)"
+            ));
+        }
+    };
+    let block_align = u64::from(spec.channels)
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| "WAV stream block alignment overflow".to_string())?;
+    if block_align > u16::MAX as u64 {
+        return Err("WAV stream block alignment exceeds the WAV header limit".into());
+    }
+    let byte_rate = u64::from(spec.sample_rate)
+        .checked_mul(block_align)
+        .ok_or_else(|| "WAV stream byte-rate overflow".to_string())?;
+    if byte_rate > u32::MAX as u64 {
+        return Err("WAV stream byte rate exceeds the WAV header limit".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -752,6 +963,25 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("denoize_audio_{}_{}", std::process::id(), name));
         p
+    }
+
+    fn extensible_float_wav_with_valid_bits(valid_bits: u16) -> Vec<u8> {
+        let audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.25]],
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+            channel_mask: None,
+        };
+        let mut bytes = write_wav_bytes(&audio).unwrap();
+        let fmt = bytes
+            .windows(4)
+            .position(|window| window == b"fmt ")
+            .expect("fmt chunk");
+        let body = fmt + 8;
+        assert_eq!(&bytes[body..body + 2], &0xfffeu16.to_le_bytes());
+        bytes[body + 18..body + 20].copy_from_slice(&valid_bits.to_le_bytes());
+        bytes
     }
 
     #[test]
@@ -916,6 +1146,11 @@ mod tests {
 
         let mut reader = WavStreamReader::open(&input).unwrap();
         assert_eq!(reader.spec(), spec);
+        assert!(reader.next_block(0).unwrap_err().contains("between 1"));
+        assert!(reader
+            .next_block(MAX_STREAM_BLOCK_FRAMES + 1)
+            .unwrap_err()
+            .contains("stream block size"));
         let first = reader.next_block(100).unwrap().unwrap();
         assert_eq!(
             first.iter().map(Vec::len).collect::<Vec<_>>(),
@@ -946,6 +1181,122 @@ mod tests {
     }
 
     #[test]
+    fn extensible_valid_bits_are_rejected_before_sample_conversion() {
+        let bytes = extensible_float_wav_with_valid_bits(65);
+        let error = read_wav_bytes(bytes.clone()).unwrap_err();
+        assert!(error.contains("unsupported float WAV bit depth: 65"));
+
+        let reader = WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let error = WavStreamReader::from_reader(reader).err().unwrap();
+        assert!(error.contains("unsupported float WAV bit depth: 65"));
+
+        let int_twelve = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 12,
+            sample_format: SampleFormat::Int,
+        };
+        assert!(validate_readable_wav_spec(int_twelve).is_err());
+    }
+
+    #[test]
+    fn stream_block_plan_counts_planar_vector_headers() {
+        let normal = plan_wav_stream_block(2, 8_192).unwrap();
+        assert!(normal.peak_bytes <= MAX_STREAM_STATE_BYTES);
+
+        // The two f64 payloads alone are 8 KiB below the hard limit. The
+        // per-channel Vec headers must still make this plan fail closed.
+        let error = plan_wav_stream_block(u16::MAX as usize, 512).unwrap_err();
+        assert!(error.contains("while deinterleaving"));
+    }
+
+    #[test]
+    fn stream_writer_preflights_riff_limit_and_existing_writer_state() {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer =
+            WavStreamWriter::from_sink(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        assert_eq!(writer.bytes_per_sample, 2);
+        assert_eq!(
+            writer.data_byte_limit,
+            u64::from(u32::MAX) - PCM_WAV_RIFF_OVERHEAD
+        );
+        writer.data_bytes_written = writer.data_byte_limit - 1;
+        let underlying_samples = writer.writer.len();
+        let error = writer.write_block(&[vec![0.0]]).unwrap_err();
+        assert!(error.contains("RIFF container limit"));
+        assert_eq!(writer.writer.len(), underlying_samples);
+
+        let mut existing = WavWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        existing.write_sample(1i16).unwrap();
+        let wrapped = WavStreamWriter::from_writer(existing, spec).unwrap();
+        assert_eq!(wrapped.bytes_per_sample, MAX_WAV_CONTAINER_BYTES_PER_SAMPLE);
+        assert_eq!(wrapped.data_bytes_written, 4);
+        assert_eq!(
+            wrapped.data_byte_limit,
+            u64::from(u32::MAX) - EXTENSIBLE_WAV_RIFF_OVERHEAD
+        );
+        wrapped.finalize().unwrap();
+
+        let padded_spec = WavSpec {
+            bits_per_sample: 24,
+            ..spec
+        };
+        let mut padded = WavWriter::new_with_spec_ex(
+            std::io::Cursor::new(Vec::new()),
+            hound::WavSpecEx {
+                spec: padded_spec,
+                bytes_per_sample: 4,
+            },
+        )
+        .unwrap();
+        padded.write_sample(1i32).unwrap();
+        let padded = WavStreamWriter::from_writer(padded, padded_spec).unwrap();
+        assert_eq!(padded.data_bytes_written, 4);
+        padded.finalize().unwrap();
+
+        let actual = WavWriter::new(std::io::Cursor::new(Vec::new()), spec).unwrap();
+        let mismatched = WavSpec {
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+            ..spec
+        };
+        let error = WavStreamWriter::from_writer(actual, mismatched)
+            .err()
+            .unwrap();
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn invalid_wav_configuration_is_rejected_before_replacing_or_truncating_output() {
+        let path = tmp("invalid_preflight.wav");
+        std::fs::write(&path, b"existing output").unwrap();
+        let invalid_spec = WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Float,
+        };
+        assert!(WavStreamWriter::create(&path, invalid_spec).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing output");
+
+        let invalid_audio = Audio {
+            sample_rate: 0,
+            channels: vec![vec![0.0]],
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+            channel_mask: None,
+        };
+        assert!(write_wav(&path, &invalid_audio).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing output");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn memory_estimates_scale_with_audio_and_stream_blocks() {
         let small = Audio {
             sample_rate: 16_000,
@@ -965,6 +1316,28 @@ mod tests {
             estimate_stream_memory_bytes(2, 4_096, 2_048, 48_000)
                 > estimate_stream_memory_bytes(2, 1_024, 2_048, 48_000)
         );
+
+        let without_profile =
+            estimate_stream_memory_bytes_checked(2, 4_096, 2_048, 48_000, -1.0).unwrap();
+        let with_profile =
+            estimate_stream_memory_bytes_checked(2, 4_096, 2_048, 48_000, 10_000.0).unwrap();
+        assert!(with_profile > without_profile);
+    }
+
+    #[test]
+    fn checked_stream_estimate_rejects_overflow_and_oversized_working_sets() {
+        assert!(matches!(
+            estimate_stream_memory_bytes_checked(1, usize::MAX, 2_048, 48_000, -1.0),
+            Err(ConfigError::InvalidValue {
+                field: "block_frames",
+                ..
+            })
+        ));
+        assert!(estimate_stream_memory_bytes_checked(1, 0, 2_048, 48_000, -1.0).is_err());
+        assert!(matches!(
+            estimate_stream_memory_bytes_checked(64, 1_048_576, 2_048, 48_000, -1.0),
+            Err(ConfigError::ResourceLimitExceeded { .. })
+        ));
     }
 
     #[test]
@@ -1021,5 +1394,12 @@ mod tests {
         assert!(error.contains("--max-memory allows 1 MiB"));
         ensure_memory_limit(1024, Some(1), "decoded audio").unwrap();
         ensure_memory_limit(2 * 1024 * 1024, None, "decoded audio").unwrap();
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn memory_limit_rejects_byte_conversion_overflow() {
+        let error = ensure_memory_limit(0, Some(usize::MAX), "decoded audio").unwrap_err();
+        assert!(error.contains("overflows u64"), "unexpected error: {error}");
     }
 }
