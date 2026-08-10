@@ -258,7 +258,7 @@ jobs:
 
   publish:
     name: Publish release
-    needs: verify-assets
+    needs: publish-crate
     runs-on: ubuntu-latest
     steps:
       - name: Publish draft release
@@ -268,7 +268,7 @@ jobs:
 
   verify-assets:
     name: Verify release assets
-    needs: [build, desktop-build, publish-crate]
+    needs: [build, desktop-build]
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source
@@ -281,7 +281,7 @@ jobs:
 
   publish-crate:
     name: Publish crates.io package
-    needs: [build, desktop-build]
+    needs: verify-assets
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
