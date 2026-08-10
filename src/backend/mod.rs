@@ -5,6 +5,7 @@ mod classical;
 use std::path::PathBuf;
 
 use crate::audio::sanitize_sample;
+use crate::config::{ConfigError, MAX_SAMPLE_RATE};
 
 #[inline]
 fn finite_sample(sample: f64) -> f64 {
@@ -57,6 +58,19 @@ pub struct OnnxModelConfig {
     pub path: PathBuf,
     /// Sample rate expected and produced by the model.
     pub sample_rate: u32,
+}
+
+impl OnnxModelConfig {
+    /// Validate model metadata without opening or parsing the model file.
+    pub fn validate_config(&self) -> Result<(), ConfigError> {
+        if self.sample_rate == 0 || self.sample_rate > MAX_SAMPLE_RATE {
+            return Err(ConfigError::invalid(
+                "backend_options.onnx.sample_rate",
+                "an integer in 1..=768000 Hz",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// How a stereo pair is presented to a denoising backend.
@@ -169,6 +183,114 @@ pub struct BackendOptions {
     pub seed: Option<u64>,
 }
 
+impl BackendOptions {
+    /// Validate backend options before any model path is inspected.
+    ///
+    /// A missing GTCRN model remains valid at this stage because application
+    /// services may resolve it from the managed model library. Backends whose
+    /// models must be supplied by the caller reject a missing configuration.
+    pub fn validate_config(&self, backend: Backend) -> Result<(), ConfigError> {
+        if let Some(model) = &self.onnx {
+            model.validate_config()?;
+            validate_named_model_rate(backend, model.sample_rate)?;
+        } else if requires_caller_model(backend) {
+            return Err(missing_model_error());
+        }
+        Ok(())
+    }
+
+    /// Validate options after managed model resolution has completed.
+    pub(crate) fn validate_resolved_config(&self, backend: Backend) -> Result<(), ConfigError> {
+        self.validate_config(backend)?;
+        if requires_any_model(backend) && self.onnx.is_none() {
+            return Err(missing_model_error());
+        }
+        Ok(())
+    }
+
+    /// Validate the selected model resource after managed resolution.
+    ///
+    /// Adapters still validate the file they open. This early check provides
+    /// deterministic error ordering, but is not a substitute for consuming a
+    /// retained file handle when stronger path-race protection is required.
+    pub fn validate_resolved_resources(&self, backend: Backend) -> Result<(), String> {
+        self.validate_resolved_config(backend)
+            .map_err(|error| error.to_string())?;
+        if requires_any_model(backend) {
+            let model = self
+                .onnx
+                .as_ref()
+                .expect("resolved model presence was validated");
+            if !model.path.is_file() {
+                return Err(format!(
+                    "selected backend model does not exist or is not a file: {}",
+                    model.path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn missing_model_error() -> ConfigError {
+    ConfigError::invalid(
+        "backend_options.onnx",
+        "a model configuration for the selected backend",
+    )
+}
+
+fn requires_caller_model(backend: Backend) -> bool {
+    match backend {
+        #[cfg(feature = "onnx")]
+        Backend::Onnx => true,
+        #[cfg(feature = "mpsenet")]
+        Backend::MpSenet => true,
+        #[cfg(feature = "bsrnn")]
+        Backend::Bsrnn => true,
+        #[cfg(feature = "mossformer2")]
+        Backend::Mossformer2 => true,
+        #[cfg(feature = "sgmse")]
+        Backend::Sgmse => true,
+        _ => false,
+    }
+}
+
+fn requires_any_model(backend: Backend) -> bool {
+    if requires_caller_model(backend) {
+        return true;
+    }
+    match backend {
+        #[cfg(feature = "gtcrn")]
+        Backend::Gtcrn => true,
+        _ => false,
+    }
+}
+
+fn validate_named_model_rate(backend: Backend, sample_rate: u32) -> Result<(), ConfigError> {
+    let expected: Option<(u32, &'static str)> = match backend {
+        #[cfg(feature = "mpsenet")]
+        Backend::MpSenet => Some((16_000, "exactly 16000 Hz for MP-SENet")),
+        #[cfg(feature = "bsrnn")]
+        Backend::Bsrnn => Some((48_000, "exactly 48000 Hz for BSRNN")),
+        #[cfg(feature = "mossformer2")]
+        Backend::Mossformer2 => Some((48_000, "exactly 48000 Hz for MossFormer2")),
+        #[cfg(feature = "sgmse")]
+        Backend::Sgmse => Some((16_000, "exactly 16000 Hz for SGMSE+")),
+        #[cfg(feature = "gtcrn")]
+        Backend::Gtcrn => Some((16_000, "exactly 16000 Hz for GTCRN")),
+        _ => None,
+    };
+    if let Some((required, description)) = expected {
+        if sample_rate != required {
+            return Err(ConfigError::invalid(
+                "backend_options.onnx.sample_rate",
+                description,
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Backend {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s.to_ascii_lowercase().as_str() {
@@ -240,9 +362,12 @@ pub fn process_channels(
     classical_cfg: &crate::denoiser::DenoiserConfig,
     backend_options: &BackendOptions,
 ) -> Result<Vec<Vec<f64>>, String> {
-    if backend == Backend::Classical {
-        classical_cfg.validate()?;
-    }
+    let mut effective_config = classical_cfg.clone();
+    effective_config.sample_rate = sample_rate;
+    effective_config
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+    backend_options.validate_resolved_resources(backend)?;
     let needs_sanitization = channels
         .iter()
         .flatten()
@@ -263,7 +388,7 @@ pub fn process_channels(
             backend,
             channels,
             sample_rate,
-            classical_cfg,
+            &effective_config,
             backend_options,
         )
     } else {
@@ -271,7 +396,7 @@ pub fn process_channels(
             backend,
             channels,
             sample_rate,
-            classical_cfg,
+            &effective_config,
             backend_options,
         )
     }?;
@@ -435,6 +560,16 @@ pub mod gtcrn;
 mod channel_tests {
     use super::*;
 
+    fn model_options(sample_rate: u32) -> BackendOptions {
+        BackendOptions {
+            onnx: Some(OnnxModelConfig {
+                path: PathBuf::from("model-that-must-not-be-opened.onnx"),
+                sample_rate,
+            }),
+            ..BackendOptions::default()
+        }
+    }
+
     #[test]
     fn parses_channel_modes() {
         assert_eq!(
@@ -495,6 +630,127 @@ mod channel_tests {
             let after = output[0][index] - output[1][index];
             assert!((before - after).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn model_rate_is_bounded_even_when_the_option_is_dormant() {
+        assert!(model_options(1).validate_config(Backend::Classical).is_ok());
+        assert!(model_options(MAX_SAMPLE_RATE)
+            .validate_config(Backend::Classical)
+            .is_ok());
+        for invalid in [0, MAX_SAMPLE_RATE + 1] {
+            assert!(matches!(
+                model_options(invalid).validate_config(Backend::Classical),
+                Err(ConfigError::InvalidValue {
+                    field: "backend_options.onnx.sample_rate",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn processing_validates_effective_core_config_before_samples() {
+        let samples = vec![vec![f64::INFINITY]];
+        let mut config = crate::denoiser::DenoiserConfig::default(48_000);
+        config.strength = f64::NAN;
+        let error = process_channels(
+            Backend::Classical,
+            &samples,
+            48_000,
+            &config,
+            &BackendOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("`strength`"));
+
+        let mut stale_rate = crate::denoiser::DenoiserConfig::default(0);
+        stale_rate.strength = 0.0;
+        assert!(process_channels(
+            Backend::Classical,
+            &[vec![0.0]],
+            48_000,
+            &stale_rate,
+            &BackendOptions::default(),
+        )
+        .is_ok());
+        assert!(process_channels(
+            Backend::Classical,
+            &[vec![0.0]],
+            0,
+            &stale_rate,
+            &BackendOptions::default(),
+        )
+        .unwrap_err()
+        .contains("`sample_rate`"));
+    }
+
+    #[test]
+    fn named_model_rates_are_checked_before_model_paths() {
+        #[allow(unused_mut)]
+        let mut cases: Vec<(Backend, u32)> = Vec::new();
+        #[cfg(feature = "mpsenet")]
+        cases.push((Backend::MpSenet, 16_000));
+        #[cfg(feature = "bsrnn")]
+        cases.push((Backend::Bsrnn, 48_000));
+        #[cfg(feature = "mossformer2")]
+        cases.push((Backend::Mossformer2, 48_000));
+        #[cfg(feature = "sgmse")]
+        cases.push((Backend::Sgmse, 16_000));
+        #[cfg(feature = "gtcrn")]
+        cases.push((Backend::Gtcrn, 16_000));
+
+        for (backend, required) in cases {
+            assert!(model_options(required).validate_config(backend).is_ok());
+            let wrong = if required == 16_000 { 48_000 } else { 16_000 };
+            assert!(matches!(
+                model_options(wrong).validate_config(backend),
+                Err(ConfigError::InvalidValue {
+                    field: "backend_options.onnx.sample_rate",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn caller_supplied_model_backends_reject_missing_configuration() {
+        let options = BackendOptions::default();
+        #[allow(unused_mut)]
+        let mut backends: Vec<Backend> = Vec::new();
+        #[cfg(feature = "onnx")]
+        backends.push(Backend::Onnx);
+        #[cfg(feature = "mpsenet")]
+        backends.push(Backend::MpSenet);
+        #[cfg(feature = "bsrnn")]
+        backends.push(Backend::Bsrnn);
+        #[cfg(feature = "mossformer2")]
+        backends.push(Backend::Mossformer2);
+        #[cfg(feature = "sgmse")]
+        backends.push(Backend::Sgmse);
+        for backend in backends {
+            assert!(matches!(
+                options.validate_config(backend),
+                Err(ConfigError::InvalidValue {
+                    field: "backend_options.onnx",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(feature = "gtcrn")]
+    #[test]
+    fn managed_gtcrn_may_be_missing_only_before_resolution() {
+        let options = BackendOptions::default();
+        assert!(options.validate_config(Backend::Gtcrn).is_ok());
+        assert!(matches!(
+            options.validate_resolved_config(Backend::Gtcrn),
+            Err(ConfigError::InvalidValue {
+                field: "backend_options.onnx",
+                ..
+            })
+        ));
     }
 }
 

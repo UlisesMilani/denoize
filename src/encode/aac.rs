@@ -1,7 +1,7 @@
 //! Raw AAC-LC in ADTS encoding.
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
-use super::DownmixMode;
+use super::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 use crate::Audio;
 use oxideav_aac_encoder::encoder::{EncoderConfig, StreamEncoder, FRAME_LEN};
 use std::io::Write;
@@ -23,6 +23,13 @@ pub fn write_adts_aac_with_downmix<P: AsRef<Path>>(
     bitrate_bps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
+    EncodeOptions {
+        m4a_bitrate_bps: bitrate_bps,
+        aac_encoder: AacEncoder::Oxide,
+        downmix,
+        ..EncodeOptions::default()
+    }
+    .validate_config(OutputFormat::AacAdts, audio)?;
     let mut output = AtomicOutput::new(path)?;
     write_adts_aac_to_writer(output.file_mut(), audio, bitrate_bps, downmix)?;
     output.commit(CommitMode::Replace)

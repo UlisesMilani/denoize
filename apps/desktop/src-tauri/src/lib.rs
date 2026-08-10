@@ -8,6 +8,7 @@ use denoize::{
     AacEncoder, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode, DownmixMode,
     EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -17,9 +18,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
-use rayon::prelude::*;
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+const VALIDATION_SAMPLE_RATE_HZ: u32 = 48_000;
+const MAX_MODEL_SAMPLE_RATE_HZ: u32 = 768_000;
+const MIN_LOUDNESS_LUFS: f64 = -70.0;
+const MAX_LOUDNESS_LUFS: f64 = 0.0;
+const MIN_TRUE_PEAK_DBTP: f64 = -20.0;
+const MAX_TRUE_PEAK_DBTP: f64 = 0.0;
+const DEFAULT_MODEL_SAMPLE_RATE_HZ: u32 = 16_000;
 
 #[derive(Default)]
 struct AppState {
@@ -84,6 +92,158 @@ struct ProcessOptions {
     seed: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GuiConfig {
+    backend: String,
+    preset: String,
+    mode: String,
+    strength: f64,
+    adaptive_noise: bool,
+    vad: bool,
+    channels: String,
+    downmix: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loudness_lufs: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    true_peak_dbtp: Option<f64>,
+    preserve_metadata: bool,
+    force: bool,
+    mp3_bitrate_kbps: u32,
+    m4a_bitrate_kbps: u32,
+    aac_encoder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    onnx_model: Option<String>,
+    onnx_rate: u32,
+    sgmse_profile: String,
+    deterministic: bool,
+}
+
+/// A typed, partial desktop/CLI configuration import.
+///
+/// Every field is optional so existing reusable TOML snippets continue to
+/// overlay the settings currently shown in the UI. Serde still rejects unknown
+/// fields and wrong value types before anything is applied.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct GuiConfigPatch {
+    backend: Option<String>,
+    preset: Option<String>,
+    mode: Option<String>,
+    strength: Option<f64>,
+    adaptive_noise: Option<bool>,
+    vad: Option<bool>,
+    channels: Option<String>,
+    downmix: Option<String>,
+    loudness_lufs: Option<f64>,
+    true_peak_dbtp: Option<f64>,
+    preserve_metadata: Option<bool>,
+    force: Option<bool>,
+    mp3_bitrate_kbps: Option<u32>,
+    m4a_bitrate_kbps: Option<u32>,
+    aac_encoder: Option<String>,
+    onnx_model: Option<String>,
+    onnx_rate: Option<u32>,
+    sgmse_profile: Option<String>,
+    deterministic: Option<bool>,
+}
+
+impl GuiConfig {
+    fn process_options(&self) -> ProcessOptions {
+        ProcessOptions {
+            backend: self.backend.clone(),
+            preset: Some(self.preset.clone()),
+            mode: Some(self.mode.clone()),
+            strength: self.strength,
+            adaptive_noise: self.adaptive_noise,
+            vad: self.vad,
+            channel_mode: self.channels.clone(),
+            downmix: self.downmix.clone(),
+            loudness_lufs: self.loudness_lufs,
+            true_peak_dbtp: self.true_peak_dbtp.unwrap_or(-1.0),
+            preserve_metadata: self.preserve_metadata,
+            force: self.force,
+            mp3_bitrate_kbps: self.mp3_bitrate_kbps,
+            aac_bitrate_kbps: self.m4a_bitrate_kbps,
+            aac_encoder: self.aac_encoder.clone(),
+            onnx_model: self.onnx_model.clone(),
+            onnx_sample_rate: self.onnx_rate,
+            sgmse_profile: self.sgmse_profile.clone(),
+            deterministic: self.deterministic,
+            seed: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.loudness_lufs.is_none()
+            && self
+                .true_peak_dbtp
+                .is_some_and(|true_peak| true_peak != -1.0)
+        {
+            return Err("true_peak_dbtp は loudness_lufs と一緒に指定してください".into());
+        }
+        validate_process_options(&self.process_options())
+    }
+
+    fn normalized(mut self) -> Result<Self, String> {
+        let backend = configured_backend(&self.backend)?;
+        if !backend.is_some_and(service::requires_external_model) {
+            self.onnx_model = None;
+            self.onnx_rate = DEFAULT_MODEL_SAMPLE_RATE_HZ;
+        }
+        self.validate()?;
+        Ok(self)
+    }
+}
+
+impl GuiConfigPatch {
+    fn merge(self, mut current: GuiConfig) -> Result<GuiConfig, String> {
+        macro_rules! replace_present {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    current.$field = value;
+                }
+            };
+        }
+
+        replace_present!(backend);
+        replace_present!(preset);
+        replace_present!(mode);
+        replace_present!(strength);
+        replace_present!(adaptive_noise);
+        replace_present!(vad);
+        replace_present!(channels);
+        replace_present!(downmix);
+        let explicit_loudness_clear = self.loudness_lufs.is_none()
+            && self
+                .true_peak_dbtp
+                .is_some_and(|true_peak| true_peak == -1.0);
+        if explicit_loudness_clear {
+            current.loudness_lufs = None;
+            current.true_peak_dbtp = None;
+        } else if let Some(value) = self.loudness_lufs {
+            current.loudness_lufs = Some(value);
+            if let Some(true_peak) = self.true_peak_dbtp {
+                current.true_peak_dbtp = Some(true_peak);
+            }
+        } else if let Some(value) = self.true_peak_dbtp {
+            current.true_peak_dbtp = Some(value);
+        }
+        replace_present!(preserve_metadata);
+        replace_present!(force);
+        replace_present!(mp3_bitrate_kbps);
+        replace_present!(m4a_bitrate_kbps);
+        replace_present!(aac_encoder);
+        if let Some(value) = self.onnx_model {
+            current.onnx_model = Some(value);
+        }
+        replace_present!(onnx_rate);
+        replace_present!(sgmse_profile);
+        replace_present!(deterministic);
+        current.normalized()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProcessRequest {
@@ -112,6 +272,57 @@ struct BatchItem {
     state_key: String,
 }
 
+fn hash_batch_path(hasher: &mut sha2::Sha256, path: &Path) {
+    use sha2::Digest as _;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(path.to_string_lossy().as_bytes());
+}
+
+fn batch_state_key(
+    input_identity: &Path,
+    input_relative: &Path,
+    output_relative: &Path,
+    output_format: OutputFormat,
+) -> String {
+    use sha2::Digest as _;
+    use std::fmt::Write as _;
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"denoize-batch-state-v2\0");
+    hash_batch_path(&mut hasher, input_identity);
+    hasher.update(b"\0");
+    hash_batch_path(&mut hasher, input_relative);
+    hasher.update(b"\0");
+    hash_batch_path(&mut hasher, output_relative);
+    hasher.update(b"\0");
+    hasher.update(match output_format {
+        OutputFormat::Wav => b"wav".as_slice(),
+        OutputFormat::Flac => b"flac".as_slice(),
+        OutputFormat::OggOpus => b"ogg-opus".as_slice(),
+        OutputFormat::Mp3 => b"mp3".as_slice(),
+        OutputFormat::M4a => b"m4a-aac".as_slice(),
+        OutputFormat::AacAdts => b"adts-aac".as_slice(),
+    });
+    let mut key = String::from("v2:");
+    for byte in hasher.finalize() {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    key
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LiveRequest {
@@ -124,7 +335,10 @@ struct LiveRequest {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LiveDevices { inputs: Vec<String>, outputs: Vec<String> }
+struct LiveDevices {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -449,8 +663,8 @@ fn app_info() -> AppInfo {
                 external_model: service::requires_external_model(backend),
                 managed_model: (service::backend_name(backend) == "gtcrn").then_some("gtcrn"),
                 sample_rate: match service::backend_name(backend) {
-                    "bsrnn" | "mossformer2" | "gtcrn" => Some(48_000),
-                    "onnx" | "mpsenet" | "sgmse" => Some(16_000),
+                    "bsrnn" | "mossformer2" => Some(48_000),
+                    "onnx" | "mpsenet" | "sgmse" | "gtcrn" => Some(16_000),
                     _ => None,
                 },
             })
@@ -539,89 +753,130 @@ fn start_batch(
     state: State<'_, AppState>,
     request: BatchRequest,
 ) -> Result<u64, String> {
-    if !Path::new(&request.output_dir).is_dir() {
-        return Err("出力フォルダが存在しません".into());
+    let items = prepare_batch_request(&request)?;
+    let state_path = Path::new(&request.output_dir).join(".denoize-gui-state");
+    if request.resume {
+        validate_batch_reserved_path(&items, &state_path)?;
     }
-    if !(1..=32).contains(&request.jobs) {
-        return Err("並列数は1〜32にしてください".into());
-    }
-    let extension = request
-        .output_format
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-    let probe = PathBuf::from(format!("output.{extension}"));
-    OutputFormat::from_path(&probe)?;
-    let items = collect_batch_items(&request, &extension)?;
-    if items.is_empty() {
-        return Err("対応する音声ファイルがありません".into());
-    }
+    let completed = if request.resume {
+        read_batch_state(&state_path)?
+    } else {
+        HashSet::new()
+    };
+    preflight_batch_outputs(&request, &items, &completed)?;
+    let state_file = if request.resume {
+        Some(Arc::new(Mutex::new(open_batch_state_for_append(
+            &state_path,
+        )?)))
+    } else {
+        None
+    };
     let (job_id, control) = register_job(&state)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
         let total = items.len();
-        let state_path = Path::new(&request.output_dir).join(".denoize-gui-state");
-        let completed = if request.resume {
-            read_batch_state(&state_path).unwrap_or_default()
-        } else {
-            HashSet::new()
-        };
-        let state_file = request.resume.then(|| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&state_path)
-                .map(Mutex::new)
-        });
-        let state_file = match state_file.transpose() {
-            Ok(file) => file.map(Arc::new),
-            Err(error) => {
-                emit_progress(&app, job_id, "batch", "failed", "再開状態を開けません", 0, total, started, None, Some(error.to_string()));
-                if let Ok(mut jobs) = jobs.lock() { jobs.remove(&job_id); }
-                return;
-            }
-        };
         let finished = AtomicUsize::new(0);
         let succeeded = AtomicUsize::new(0);
         let skipped = AtomicUsize::new(0);
         let failures = Mutex::new(Vec::<String>::new());
         let process_item = |batch_item: &BatchItem| {
-            if control.is_cancelled() { return; }
-            if request.resume && completed.contains(&batch_item.state_key) && batch_item.output.is_file() {
-                skipped.fetch_add(1, Ordering::Relaxed);
-                let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                emit_batch_item(&app, job_id, "skipped", batch_item, current, total, started, None);
+            if control.is_cancelled() {
                 return;
             }
-            let process_request = ProcessRequest {
-                input: batch_item.input.to_string_lossy().into_owned(),
-                output: batch_item.output.to_string_lossy().into_owned(),
-                options: request.options.clone(),
+            let report_failure = |error: String| {
+                if let Ok(mut list) = failures.lock() {
+                    list.push(format!("{}: {error}", batch_item.input.display()));
+                }
+                let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+                emit_batch_item(
+                    &app,
+                    job_id,
+                    "failed",
+                    batch_item,
+                    current,
+                    total,
+                    started,
+                    Some(error),
+                );
             };
-            let result = validate_request(&process_request.input, &process_request.output, &process_request.options)
-                .and_then(|_| process_file(&process_request, &control, |_, _| {}));
+            if request.resume && completed.contains(&batch_item.state_key) {
+                match batch_output_is_regular_file(&batch_item.output) {
+                    Ok(true) => {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                        let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+                        emit_batch_item(
+                            &app, job_id, "skipped", batch_item, current, total, started, None,
+                        );
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        report_failure(error);
+                        return;
+                    }
+                }
+            }
+            let result = (|| {
+                let input = batch_item.input.to_str().ok_or_else(|| {
+                    format!(
+                        "GUIバッチではUTF-8で表現できない入力パスを処理できません: {}",
+                        batch_item.input.display()
+                    )
+                })?;
+                let output = batch_item.output.to_str().ok_or_else(|| {
+                    format!(
+                        "GUIバッチではUTF-8で表現できない出力パスを処理できません: {}",
+                        batch_item.output.display()
+                    )
+                })?;
+                let process_request = ProcessRequest {
+                    input: input.into(),
+                    output: output.into(),
+                    options: request.options.clone(),
+                };
+                validate_request(
+                    &process_request.input,
+                    &process_request.output,
+                    &process_request.options,
+                )?;
+                process_file(&process_request, &control, |_, _| {})
+            })()
+            .and_then(|output| {
+                if let Some(file) = &state_file {
+                    let mut file = file
+                        .lock()
+                        .map_err(|_| "再開状態のロックを取得できません".to_string())?;
+                    append_batch_state_entry(&mut *file, &batch_item.state_key)?;
+                }
+                Ok(output)
+            });
             match result {
                 Ok(_) => {
                     succeeded.fetch_add(1, Ordering::Relaxed);
-                    if let Some(file) = &state_file {
-                        if let Ok(mut file) = file.lock() { let _ = writeln!(file, "{}", batch_item.state_key); }
-                    }
                     let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                    emit_batch_item(&app, job_id, "completed", batch_item, current, total, started, None);
+                    emit_batch_item(
+                        &app,
+                        job_id,
+                        "completed",
+                        batch_item,
+                        current,
+                        total,
+                        started,
+                        None,
+                    );
                 }
                 Err(error) if error == "cancelled" => {}
-                Err(error) => {
-                    if let Ok(mut list) = failures.lock() { list.push(format!("{}: {error}", batch_item.input.display())); }
-                    let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-                    emit_batch_item(&app, job_id, "failed", batch_item, current, total, started, Some(error));
-                }
+                Err(error) => report_failure(error),
             }
         };
         let pool_error = if request.options.deterministic {
             items.iter().for_each(process_item);
             None
         } else {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(request.jobs).build();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(request.jobs)
+                .build();
             match pool {
                 Ok(pool) => {
                     pool.install(|| items.par_iter().for_each(process_item));
@@ -698,8 +953,7 @@ fn batch_terminal_outcome(
     skipped_count: usize,
     failure_count: usize,
 ) -> BatchTerminalOutcome {
-    let message =
-        format!("完了 {success_count} · スキップ {skipped_count} · 失敗 {failure_count}");
+    let message = format!("完了 {success_count} · スキップ {skipped_count} · 失敗 {failure_count}");
     if failure_count == 0 {
         BatchTerminalOutcome {
             status: "completed",
@@ -710,9 +964,7 @@ fn batch_terminal_outcome(
         BatchTerminalOutcome {
             status: "failed",
             message,
-            error: Some(format!(
-                "{failure_count}件のファイルを処理できませんでした"
-            )),
+            error: Some(format!("{failure_count}件のファイルを処理できませんでした")),
         }
     }
 }
@@ -725,9 +977,7 @@ fn collect_batch_items(request: &BatchRequest, extension: &str) -> Result<Vec<Ba
         if !root.is_dir() {
             return Err("入力フォルダが存在しません".into());
         }
-        if root == output_root {
-            return Err("入力フォルダと出力フォルダは分けてください".into());
-        }
+        validate_batch_directories(root, output_root)?;
         collect_audio_files(root, request.recursive, &mut sources)?;
         if output_root.starts_with(root) {
             sources.retain(|path| !path.starts_with(output_root));
@@ -736,21 +986,60 @@ fn collect_batch_items(request: &BatchRequest, extension: &str) -> Result<Vec<Ba
     sources.sort();
     sources.dedup();
     let mut destinations = HashSet::new();
-    sources.into_iter().map(|input| {
-        if !input.is_file() { return Err(format!("入力ファイルが存在しません: {}", input.display())); }
-        let relative = input_root.and_then(|root| input.strip_prefix(root).ok())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(input.file_name().unwrap_or_default()));
-        let mut output = output_root.join(&relative);
-        output.set_extension(extension);
-        if !destinations.insert(output.clone()) { return Err(format!("同じ出力先になるファイルがあります: {}", output.display())); }
-        Ok(BatchItem { input, output, state_key: relative.to_string_lossy().replace('\\', "/") })
-    }).collect()
+    let items = sources
+        .into_iter()
+        .map(|input| {
+            if !input.is_file() {
+                return Err(format!("入力ファイルが存在しません: {}", input.display()));
+            }
+            let relative = input_root
+                .and_then(|root| input.strip_prefix(root).ok())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(input.file_name().unwrap_or_default()));
+            let mut output = output_root.join(&relative);
+            output.set_extension(extension);
+            if input.to_str().is_none() || output.to_str().is_none() {
+                return Err(format!(
+                    "GUIバッチではUTF-8で表現できないパスを処理できません: {}",
+                    input.display()
+                ));
+            }
+            if !destinations.insert(output.clone()) {
+                return Err(format!(
+                    "同じ出力先になるファイルがあります: {}",
+                    output.display()
+                ));
+            }
+            let output_relative = output.strip_prefix(output_root).map_err(|error| {
+                format!(
+                    "バッチ出力 {} が出力フォルダ外です: {error}",
+                    output.display()
+                )
+            })?;
+            let output_format = OutputFormat::from_path(&output)?;
+            let input_identity = std::fs::canonicalize(&input).map_err(|error| {
+                format!("バッチ入力 {} を解決できません: {error}", input.display())
+            })?;
+            let state_key =
+                batch_state_key(&input_identity, &relative, output_relative, output_format);
+            Ok(BatchItem {
+                input,
+                output,
+                state_key,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    validate_batch_destinations(input_root, &items)?;
+    Ok(items)
 }
 
-fn collect_audio_files(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    for entry in std::fs::read_dir(dir)
-        .map_err(|error| format!("入力フォルダを読めません: {error}"))?
+fn collect_audio_files(
+    dir: &Path,
+    recursive: bool,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in
+        std::fs::read_dir(dir).map_err(|error| format!("入力フォルダを読めません: {error}"))?
     {
         let entry = entry.map_err(|error| error.to_string())?;
         let file_type = entry.file_type().map_err(|error| error.to_string())?;
@@ -765,17 +1054,320 @@ fn collect_audio_files(dir: &Path, recursive: bool, files: &mut Vec<PathBuf>) ->
 }
 
 fn is_audio_path(path: &Path) -> bool {
-    path.extension().and_then(|value| value.to_str()).is_some_and(|value| {
-        matches!(value.to_ascii_lowercase().as_str(), "wav" | "flac" | "opus" | "ogg" | "mp3" | "m4a" | "aac")
-    })
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "wav" | "flac" | "opus" | "ogg" | "mp3" | "m4a" | "aac"
+            )
+        })
+}
+
+fn batch_collision_key_with_case(path: &Path, case_insensitive: bool) -> PathBuf {
+    if case_insensitive {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn batch_collision_key(path: &Path) -> PathBuf {
+    batch_collision_key_with_case(path, cfg!(any(windows, target_os = "macos")))
+}
+
+fn validate_batch_destinations(
+    input_root: Option<&Path>,
+    items: &[BatchItem],
+) -> Result<(), String> {
+    let input_root = input_root.map(normalize_batch_path).transpose()?;
+    let input_paths = items
+        .iter()
+        .map(|item| normalize_batch_path(&item.input).map(|path| batch_collision_key(&path)))
+        .collect::<Result<HashSet<_>, _>>()?;
+    let mut destinations = Vec::with_capacity(items.len());
+    for item in items {
+        let resolved = normalize_batch_path(&item.output)?;
+        if input_root
+            .as_deref()
+            .is_some_and(|root| resolved.starts_with(root))
+        {
+            return Err(format!(
+                "バッチ出力 {} が入力フォルダ内へ解決されます。出力先のシンボリックリンクを除くか、別の出力フォルダを選択してください",
+                item.output.display()
+            ));
+        }
+        let collision_key = batch_collision_key(&resolved);
+        if input_paths.contains(&collision_key) {
+            return Err(format!(
+                "バッチ出力 {} が入力ファイルを上書きします",
+                item.output.display()
+            ));
+        }
+        destinations.push((collision_key, item));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+
+    for pair in destinations.windows(2) {
+        let (left_path, left) = &pair[0];
+        let (right_path, right) = &pair[1];
+        if right_path == left_path {
+            return Err(format!(
+                "複数の入力が同じバッチ出力になります: {} と {} -> {}",
+                left.input.display(),
+                right.input.display(),
+                right.output.display()
+            ));
+        }
+        if right_path.starts_with(left_path) {
+            return Err(format!(
+                "バッチ出力がファイルとディレクトリとして競合します: {} -> {} / {} -> {}",
+                left.input.display(),
+                left.output.display(),
+                right.input.display(),
+                right.output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_batch_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("現在のフォルダを解決できません: {error}"))?
+            .join(path)
+    };
+    enum MissingComponent {
+        Normal(std::ffi::OsString),
+        Parent,
+    }
+
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "バッチパス {} を確認できません: {error}",
+                    ancestor.display()
+                ));
+            }
+        }
+        let component = ancestor
+            .components()
+            .next_back()
+            .ok_or_else(|| format!("バッチパス {} を解決できません", absolute.display()))?;
+        match component {
+            std::path::Component::Normal(name) => {
+                missing.push(MissingComponent::Normal(name.to_os_string()))
+            }
+            std::path::Component::ParentDir => missing.push(MissingComponent::Parent),
+            std::path::Component::CurDir => {}
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(format!(
+                    "バッチパス {} を解決できません",
+                    absolute.display()
+                ));
+            }
+        }
+        if !ancestor.pop() {
+            return Err(format!(
+                "バッチパス {} を解決できません",
+                absolute.display()
+            ));
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&ancestor)
+        .map_err(|error| format!("{} を解決できません: {error}", ancestor.display()))?;
+    for component in missing.into_iter().rev() {
+        match component {
+            MissingComponent::Normal(name) => resolved.push(name),
+            MissingComponent::Parent => {
+                resolved.pop();
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn validate_batch_directories(input_dir: &Path, output_dir: &Path) -> Result<(), String> {
+    let input = normalize_batch_path(input_dir)?;
+    let output = normalize_batch_path(output_dir)?;
+    if input.starts_with(&output) || output.starts_with(&input) {
+        return Err(format!(
+            "入力フォルダと出力フォルダは重ならない場所を選択してください: {} / {}",
+            input_dir.display(),
+            output_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_batch_reserved_path(items: &[BatchItem], state_path: &Path) -> Result<(), String> {
+    let state_path = batch_collision_key(&normalize_batch_path(state_path)?);
+    for item in items {
+        let output = batch_collision_key(&normalize_batch_path(&item.output)?);
+        if output == state_path
+            || output.starts_with(&state_path)
+            || state_path.starts_with(&output)
+        {
+            return Err(format!(
+                "バッチ出力 {} は再開状態 .denoize-gui-state と競合します",
+                item.output.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn batch_state_nofollow_flag() -> i32 {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    {
+        // O_NOFOLLOW on Linux-family and System V-family targets.
+        0x0002_0000
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "solaris",
+        target_os = "illumos"
+    )))]
+    {
+        // O_NOFOLLOW on Darwin and the BSD desktop targets.
+        0x0000_0100
+    }
+}
+
+fn configure_batch_state_open(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(batch_state_nofollow_flag());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn validate_batch_state_metadata(metadata: &std::fs::Metadata, path: &Path) -> Result<(), String> {
+    if !metadata.is_file() {
+        return Err(format!(
+            "再開状態はシンボリックリンク、ディレクトリ、特殊ファイルではなく通常ファイルである必要があります: {}",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(format!(
+                "再開状態に複数のハードリンクは使用できません: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_state_file(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("再開状態 {} を確認できません: {error}", path.display()))?;
+    validate_batch_state_metadata(&metadata, path)?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live handle and `information` is valid writable storage.
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+        if succeeded == 0 {
+            return Err(format!(
+                "再開状態 {} のハードリンク数を確認できません: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        if information.nNumberOfLinks != 1 {
+            return Err(format!(
+                "再開状態に複数のハードリンクは使用できません: {}",
+                path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_existing_batch_state_path(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_batch_state_metadata(&metadata, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "再開状態 {} を確認できません: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn open_batch_state_for_append(path: &Path) -> Result<std::fs::File, String> {
+    validate_existing_batch_state_path(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    configure_batch_state_open(&mut options);
+    let file = options
+        .open(path)
+        .map_err(|error| format!("再開状態 {} を開けません: {error}", path.display()))?;
+    validate_batch_state_file(&file, path)?;
+    Ok(file)
 }
 
 fn read_batch_state(path: &Path) -> Result<HashSet<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(source) => Ok(source.lines().map(str::to_owned).collect()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
-        Err(error) => Err(format!("再開状態を読めません: {error}")),
-    }
+    use std::io::Read as _;
+
+    validate_existing_batch_state_path(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    configure_batch_state_open(&mut options);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(format!("再開状態 {} を開けません: {error}", path.display())),
+    };
+    validate_batch_state_file(&file, path)?;
+    let mut source = String::new();
+    file.read_to_string(&mut source)
+        .map_err(|error| format!("再開状態 {} を読めません: {error}", path.display()))?;
+    Ok(source
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn append_batch_state_entry(file: &mut impl Write, state_key: &str) -> Result<(), String> {
+    writeln!(file, "{state_key}").map_err(|error| format!("再開状態を書き込めません: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("再開状態を確定できません: {error}"))
 }
 
 #[tauri::command]
@@ -793,32 +1385,37 @@ async fn live_devices() -> Result<LiveDevices, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let (inputs, outputs) = denoize::live::device_names()?;
         Ok(LiveDevices { inputs, outputs })
-    }).await.map_err(|error| format!("デバイス一覧の取得に失敗しました: {error}"))?
+    })
+    .await
+    .map_err(|error| format!("デバイス一覧の取得に失敗しました: {error}"))?
 }
 
 #[tauri::command]
-fn start_live(app: AppHandle, state: State<'_, AppState>, request: LiveRequest) -> Result<(), String> {
-    if !(10..=2_000).contains(&request.chunk_ms) { return Err("チャンク長は10〜2000msにしてください".into()); }
-    if !state.jobs.lock().map_err(|_| "ジョブ状態を取得できません")?.is_empty() { return Err("ファイル処理の完了後に開始してください".into()); }
-    let backend = if request.backend == "auto" { service::select_live_backend() } else {
-        Backend::parse(&request.backend).ok_or_else(|| format!("利用できないバックエンドです: {}", request.backend))?
-    };
-    if service::requires_external_model(backend) {
-        let model = request.options.onnx_model.as_deref().unwrap_or_default();
-        if !Path::new(model).is_file() { return Err("選択したバックエンドのONNXモデルを指定してください".into()); }
+fn start_live(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: LiveRequest,
+) -> Result<(), String> {
+    let backend = validate_live_request(&request)?;
+    let backend_options = resolve_gui_backend_options(backend, &request.options)?;
+    if !state
+        .jobs
+        .lock()
+        .map_err(|_| "ジョブ状態を取得できません")?
+        .is_empty()
+    {
+        return Err("ファイル処理の完了後に開始してください".into());
     }
-    let backend_options = service::resolve_backend_options(backend, BackendOptions {
-        onnx: request.options.onnx_model.as_ref().map(|path| OnnxModelConfig { path: path.into(), sample_rate: request.options.onnx_sample_rate }),
-        channel_mode: ChannelMode::parse(&request.options.channel_mode).ok_or("不明なチャンネルモードです")?,
-        sgmse_profile: SgmseProfile::parse(&request.options.sgmse_profile).ok_or("不明なSGMSEプロファイルです")?,
-        deterministic: request.options.deterministic,
-        seed: request.options.seed,
-    })?;
     let denoiser = processing_config(&request.options, 48_000)?;
     let running = Arc::new(AtomicBool::new(true));
     {
-        let mut live = state.live.lock().map_err(|_| "ライブ状態を更新できません")?;
-        if live.is_some() { return Err("ライブ処理は既に実行中です".into()); }
+        let mut live = state
+            .live
+            .lock()
+            .map_err(|_| "ライブ状態を更新できません")?;
+        if live.is_some() {
+            return Err("ライブ処理は既に実行中です".into());
+        }
         *live = Some(Arc::clone(&running));
     }
     let live_state = Arc::clone(&state.live);
@@ -832,24 +1429,54 @@ fn start_live(app: AppHandle, state: State<'_, AppState>, request: LiveRequest) 
             denoiser,
         };
         let result = denoize::live::run_with_status(config, running, |status| {
-            let _ = app.emit("live-status", LiveEvent {
-                status: "running", message: "ライブ処理中".into(), sample_rate: status.sample_rate,
-                input_channels: status.input_channels, output_channels: status.output_channels,
-                chunk_frames: status.chunk_frames, input_level: status.input_level,
-                output_level: status.output_level, processed_chunks: status.processed_chunks,
-                dropped_chunks: status.dropped_chunks,
-            });
+            let _ = app.emit(
+                "live-status",
+                LiveEvent {
+                    status: "running",
+                    message: "ライブ処理中".into(),
+                    sample_rate: status.sample_rate,
+                    input_channels: status.input_channels,
+                    output_channels: status.output_channels,
+                    chunk_frames: status.chunk_frames,
+                    input_level: status.input_level,
+                    output_level: status.output_level,
+                    processed_chunks: status.processed_chunks,
+                    dropped_chunks: status.dropped_chunks,
+                },
+            );
         });
-        let (status, message) = match result { Ok(()) => ("stopped", "ライブ処理を停止しました".into()), Err(error) => ("failed", error) };
-        let _ = app.emit("live-status", LiveEvent { status, message, sample_rate: 0, input_channels: 0, output_channels: 0, chunk_frames: 0, input_level: 0.0, output_level: 0.0, processed_chunks: 0, dropped_chunks: 0 });
-        if let Ok(mut live) = live_state.lock() { *live = None; }
+        let (status, message) = match result {
+            Ok(()) => ("stopped", "ライブ処理を停止しました".into()),
+            Err(error) => ("failed", error),
+        };
+        let _ = app.emit(
+            "live-status",
+            LiveEvent {
+                status,
+                message,
+                sample_rate: 0,
+                input_channels: 0,
+                output_channels: 0,
+                chunk_frames: 0,
+                input_level: 0.0,
+                output_level: 0.0,
+                processed_chunks: 0,
+                dropped_chunks: 0,
+            },
+        );
+        if let Ok(mut live) = live_state.lock() {
+            *live = None;
+        }
     });
     Ok(())
 }
 
 #[tauri::command]
 fn stop_live(state: State<'_, AppState>) -> Result<(), String> {
-    let live = state.live.lock().map_err(|_| "ライブ状態を取得できません")?;
+    let live = state
+        .live
+        .lock()
+        .map_err(|_| "ライブ状態を取得できません")?;
     let running = live.as_ref().ok_or("ライブ処理は実行されていません")?;
     running.store(false, Ordering::SeqCst);
     Ok(())
@@ -968,20 +1595,50 @@ fn model_action(
             _ => unreachable!(),
         };
         match result {
-            Ok(message) => emit_model_progress(&app, job_id, &name, "completed", &message, 1, Some(1)),
-            Err(error) if error == "cancelled" => emit_model_progress(&app, job_id, &name, "cancelled", "モデル操作を中断しました", 0, None),
+            Ok(message) => {
+                emit_model_progress(&app, job_id, &name, "completed", &message, 1, Some(1))
+            }
+            Err(error) if error == "cancelled" => emit_model_progress(
+                &app,
+                job_id,
+                &name,
+                "cancelled",
+                "モデル操作を中断しました",
+                0,
+                None,
+            ),
             Err(error) => emit_model_progress(&app, job_id, &name, "failed", &error, 0, None),
         }
-        if let Ok(mut jobs) = jobs.lock() { jobs.remove(&job_id); }
+        if let Ok(mut jobs) = jobs.lock() {
+            jobs.remove(&job_id);
+        }
     });
     Ok(job_id)
 }
 
-fn emit_model_progress(app: &AppHandle, job_id: u64, name: &str, status: &'static str, message: &str, downloaded: u64, total: Option<u64>) {
-    let _ = app.emit("model-progress", ModelProgress {
-        job_id, name: name.into(), status, message: message.into(), downloaded, total,
-        fraction: total.filter(|total| *total > 0).map(|total| downloaded as f64 / total as f64),
-    });
+fn emit_model_progress(
+    app: &AppHandle,
+    job_id: u64,
+    name: &str,
+    status: &'static str,
+    message: &str,
+    downloaded: u64,
+    total: Option<u64>,
+) {
+    let _ = app.emit(
+        "model-progress",
+        ModelProgress {
+            job_id,
+            name: name.into(),
+            status,
+            message: message.into(),
+            downloaded,
+            total,
+            fraction: total
+                .filter(|total| *total > 0)
+                .map(|total| downloaded as f64 / total as f64),
+        },
+    );
 }
 
 #[tauri::command]
@@ -1008,13 +1665,20 @@ async fn prepare_preview(path: String, points: Option<usize>) -> Result<PreviewD
             }
         }
         let peak = waveform.iter().copied().fold(0.0f64, f64::max).max(1e-9);
-        for value in &mut waveform { *value /= peak; }
+        for value in &mut waveform {
+            *value /= peak;
+        }
         let rms = (sum_squares / sample_count.max(1) as f64).sqrt();
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
-        source.metadata().and_then(|metadata| metadata.modified()).ok().hash(&mut hasher);
+        source
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .hash(&mut hasher);
         let preview_dir = std::env::temp_dir().join("denoize-previews");
-        std::fs::create_dir_all(&preview_dir).map_err(|error| format!("プレビューフォルダを作成できません: {error}"))?;
+        std::fs::create_dir_all(&preview_dir)
+            .map_err(|error| format!("プレビューフォルダを作成できません: {error}"))?;
         let playable = preview_dir.join(format!("{:016x}.wav", hasher.finish()));
         if !playable.is_file() {
             write_audio(&playable, &audio, EncodeOptions::default())?;
@@ -1026,50 +1690,56 @@ async fn prepare_preview(path: String, points: Option<usize>) -> Result<PreviewD
             rms_db: 20.0 * rms.max(1e-10).log10(),
             waveform,
         })
-    }).await.map_err(|error| format!("プレビュー処理に失敗しました: {error}"))?
+    })
+    .await
+    .map_err(|error| format!("プレビュー処理に失敗しました: {error}"))?
 }
 
 #[tauri::command]
-fn load_gui_config(path: String) -> Result<serde_json::Value, String> {
-    let source = std::fs::read_to_string(&path)
-        .map_err(|error| format!("{path} を読めません: {error}"))?;
-    let value: toml::Value = toml::from_str(&source)
-        .map_err(|error| format!("TOML設定が不正です: {error}"))?;
-    serde_json::to_value(value).map_err(|error| format!("設定を変換できません: {error}"))
+fn load_gui_config(path: String, current: GuiConfig) -> Result<GuiConfig, String> {
+    let source =
+        std::fs::read_to_string(&path).map_err(|error| format!("{path} を読めません: {error}"))?;
+    parse_gui_config(&source, current)
 }
 
 #[tauri::command]
-fn save_gui_config(path: String, mut config: serde_json::Value) -> Result<(), String> {
-    remove_json_nulls(&mut config);
+fn save_gui_config(path: String, config: GuiConfig) -> Result<(), String> {
+    let mut config = config.normalized()?;
+    // `-1` is the CLI-compatible legacy sentinel for explicitly disabling
+    // loudness/true-peak processing. Keeping it in exported TOML distinguishes
+    // a full disabled config from an omitted field in a partial overlay.
+    if config.loudness_lufs.is_none() {
+        config.true_peak_dbtp = Some(-1.0);
+    }
     let source = toml::to_string_pretty(&config)
         .map_err(|error| format!("設定をTOMLへ変換できません: {error}"))?;
     std::fs::write(&path, source).map_err(|error| format!("{path} を保存できません: {error}"))
 }
 
-#[tauri::command]
-fn classify_dropped_paths(paths: Vec<String>) -> DropSelection {
-    let mut selection = DropSelection { audio_files: Vec::new(), directories: Vec::new(), ignored: Vec::new() };
-    for value in paths {
-        let path = Path::new(&value);
-        if path.is_dir() { selection.directories.push(value); }
-        else if path.is_file() && is_audio_path(path) { selection.audio_files.push(value); }
-        else { selection.ignored.push(value); }
-    }
-    selection
+fn parse_gui_config(source: &str, current: GuiConfig) -> Result<GuiConfig, String> {
+    let patch: GuiConfigPatch =
+        toml::from_str(source).map_err(|error| format!("TOML設定が不正です: {error}"))?;
+    patch.merge(current)
 }
 
-fn remove_json_nulls(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            map.retain(|_, value| !value.is_null());
-            for value in map.values_mut() { remove_json_nulls(value); }
+#[tauri::command]
+fn classify_dropped_paths(paths: Vec<String>) -> DropSelection {
+    let mut selection = DropSelection {
+        audio_files: Vec::new(),
+        directories: Vec::new(),
+        ignored: Vec::new(),
+    };
+    for value in paths {
+        let path = Path::new(&value);
+        if path.is_dir() {
+            selection.directories.push(value);
+        } else if path.is_file() && is_audio_path(path) {
+            selection.audio_files.push(value);
+        } else {
+            selection.ignored.push(value);
         }
-        serde_json::Value::Array(values) => {
-            values.retain(|value| !value.is_null());
-            for value in values { remove_json_nulls(value); }
-        }
-        _ => {}
     }
+    selection
 }
 
 #[tauri::command]
@@ -1099,52 +1769,284 @@ fn register_job(state: &State<'_, AppState>) -> Result<(u64, Arc<JobControl>), S
     Ok((job_id, control))
 }
 
-fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Result<(), String> {
-    if !Path::new(input).is_file() {
-        return Err("入力ファイルが存在しません".into());
+fn validate_process_options(options: &ProcessOptions) -> Result<(), String> {
+    if !options.strength.is_finite() || !(0.0..=1.0).contains(&options.strength) {
+        return Err("強度は0〜1の有限値で指定してください".into());
     }
-    OutputFormat::from_path(Path::new(output))?;
-    if !options.force {
-        match std::fs::symlink_metadata(output) {
-            Ok(_) => {
-                return Err(
-                    "出力ファイルが既に存在します。「上書きを許可」を有効にしてください"
-                        .into(),
-                );
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("出力先を確認できません: {error}")),
+    if let Some(target) = options.loudness_lufs {
+        if !target.is_finite() || !(MIN_LOUDNESS_LUFS..=MAX_LOUDNESS_LUFS).contains(&target) {
+            return Err("ラウドネスは-70〜0 LUFSの有限値で指定してください".into());
         }
     }
-    if !(0.0..=1.0).contains(&options.strength) {
-        return Err("強度は0〜1で指定してください".into());
+    if !options.true_peak_dbtp.is_finite()
+        || !(MIN_TRUE_PEAK_DBTP..=MAX_TRUE_PEAK_DBTP).contains(&options.true_peak_dbtp)
+    {
+        return Err("True Peakは-20〜0 dBTPの有限値で指定してください".into());
+    }
+    if options.loudness_lufs.is_none() && options.true_peak_dbtp != -1.0 {
+        return Err("True Peakはラウドネス正規化と一緒に指定してください".into());
     }
     if options.mp3_bitrate_kbps < 32 || options.aac_bitrate_kbps < 32 {
         return Err("ビットレートは32kbps以上にしてください".into());
     }
+    checked_aac_bitrate_bps(options.aac_bitrate_kbps)?;
+    let backend = configured_backend(&options.backend)?;
     if DownmixMode::parse(&options.downmix).is_none() {
         return Err("ダウンミックスは preserve または stereo を指定してください".into());
     }
-    let backend = if options.backend == "auto" {
-        None
-    } else {
-        Some(Backend::parse(&options.backend).ok_or_else(|| {
-            format!(
-                "このビルドでは利用できないバックエンドです: {}",
-                options.backend
-            )
-        })?)
-    };
-    if backend.is_some_and(service::requires_external_model) {
-        let model = options.onnx_model.as_deref().unwrap_or_default();
-        if !Path::new(model).is_file() {
-            return Err("選択したバックエンドのONNXモデルファイルを指定してください".into());
-        }
+    parse_aac_encoder(&options.aac_encoder)?;
+    if backend.is_some_and(service::requires_external_model)
+        && !(1..=MAX_MODEL_SAMPLE_RATE_HZ).contains(&options.onnx_sample_rate)
+    {
+        return Err(format!(
+            "モデルのサンプルレートは1〜{MAX_MODEL_SAMPLE_RATE_HZ}Hzにしてください"
+        ));
     }
-    if options.onnx_sample_rate == 0 {
-        return Err("モデルのサンプルレートは1Hz以上にしてください".into());
+    let mut backend_options = parsed_backend_options(options)?;
+    if let Some(backend) = backend {
+        if !service::requires_external_model(backend) {
+            backend_options.onnx = None;
+        }
+        backend_options
+            .validate_config(backend)
+            .map_err(|error| error.to_string())?;
+    }
+    processing_config(options, VALIDATION_SAMPLE_RATE_HZ)?;
+    Ok(())
+}
+
+fn validate_batch_request(request: &BatchRequest) -> Result<String, String> {
+    validate_process_options(&request.options)?;
+    if !(1..=32).contains(&request.jobs) {
+        return Err("並列数は1〜32にしてください".into());
+    }
+    let extension = request
+        .output_format
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let probe = PathBuf::from(format!("output.{extension}"));
+    let format = OutputFormat::from_path(&probe)?;
+    parsed_encode_options(&request.options)?.validate_options(format)?;
+    Ok(extension)
+}
+
+fn prepare_batch_request(request: &BatchRequest) -> Result<Vec<BatchItem>, String> {
+    let extension = validate_batch_request(request)?;
+    preflight_explicit_backend_resources(&request.options)?;
+    if !Path::new(&request.output_dir).is_dir() {
+        return Err("出力フォルダが存在しません".into());
+    }
+    let items = collect_batch_items(request, &extension)?;
+    if items.is_empty() {
+        return Err("対応する音声ファイルがありません".into());
+    }
+    preflight_batch_codecs(&request.options, &items)?;
+    Ok(items)
+}
+
+fn preflight_batch_codecs(options: &ProcessOptions, items: &[BatchItem]) -> Result<(), String> {
+    let encode = parsed_encode_options(options)?;
+    for item in items {
+        let format = OutputFormat::from_path(&item.output)?;
+        let audio = read_audio(&item.input).map_err(|error| {
+            format!(
+                "バッチ入力 {} を事前検査できません: {error}",
+                item.input.display()
+            )
+        })?;
+        format.validate_config(&audio, &encode).map_err(|error| {
+            format!(
+                "バッチ出力 {} のcodec設定が不正です: {error}",
+                item.output.display()
+            )
+        })?;
+        validated_processing_options(options, &audio).map_err(|error| {
+            format!(
+                "バッチ入力 {} の処理設定が不正です: {error}",
+                item.input.display()
+            )
+        })?;
     }
     Ok(())
+}
+
+fn preflight_batch_outputs(
+    request: &BatchRequest,
+    items: &[BatchItem],
+    completed: &HashSet<String>,
+) -> Result<(), String> {
+    for item in items {
+        let resumable = request.resume
+            && completed.contains(&item.state_key)
+            && batch_output_is_regular_file(&item.output)?;
+        if !resumable {
+            ensure_output_available(&item.output, request.options.force)?;
+        }
+    }
+    Ok(())
+}
+
+fn batch_output_is_regular_file(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "バッチ出力 {} を確認できません: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn validate_live_request(request: &LiveRequest) -> Result<Backend, String> {
+    if !(10..=2_000).contains(&request.chunk_ms) {
+        return Err("チャンク長は10〜2000msにしてください".into());
+    }
+    validate_process_options(&request.options)?;
+    let backend = if request.backend == "auto" {
+        service::select_live_backend()
+    } else {
+        Backend::parse(&request.backend)
+            .ok_or_else(|| format!("利用できないバックエンドです: {}", request.backend))?
+    };
+    if !denoize::live::backend_is_live_capable(backend) {
+        return Err(format!(
+            "ライブ処理に対応していないバックエンドです: {}",
+            service::backend_name(backend)
+        ));
+    }
+    parsed_backend_options_for(backend, &request.options)?
+        .validate_config(backend)
+        .map_err(|error| error.to_string())?;
+    Ok(backend)
+}
+
+fn parse_aac_encoder(value: &str) -> Result<AacEncoder, String> {
+    match value {
+        "oxide" => Ok(AacEncoder::Oxide),
+        "fdk" => Ok(AacEncoder::Fdk),
+        other => Err(format!("不明なAACエンコーダー: {other}")),
+    }
+}
+
+fn checked_aac_bitrate_bps(bitrate_kbps: u32) -> Result<u32, String> {
+    bitrate_kbps
+        .checked_mul(1_000)
+        .ok_or_else(|| "AACビットレートが大きすぎます".to_string())
+}
+
+fn parsed_encode_options(options: &ProcessOptions) -> Result<EncodeOptions, String> {
+    Ok(EncodeOptions {
+        mp3_bitrate_kbps: options.mp3_bitrate_kbps,
+        m4a_bitrate_bps: checked_aac_bitrate_bps(options.aac_bitrate_kbps)?,
+        aac_encoder: parse_aac_encoder(&options.aac_encoder)?,
+        downmix: DownmixMode::parse(&options.downmix).ok_or_else(|| {
+            "ダウンミックスは preserve または stereo を指定してください".to_string()
+        })?,
+    })
+}
+
+fn parsed_backend_options(options: &ProcessOptions) -> Result<BackendOptions, String> {
+    Ok(BackendOptions {
+        onnx: options.onnx_model.as_ref().map(|path| OnnxModelConfig {
+            path: path.into(),
+            sample_rate: options.onnx_sample_rate,
+        }),
+        channel_mode: ChannelMode::parse(&options.channel_mode)
+            .ok_or_else(|| format!("不明なチャンネルモード: {}", options.channel_mode))?,
+        sgmse_profile: SgmseProfile::parse(&options.sgmse_profile)
+            .ok_or_else(|| format!("不明なSGMSEプロファイル: {}", options.sgmse_profile))?,
+        deterministic: options.deterministic,
+        seed: options.seed,
+    })
+}
+
+fn configured_backend(value: &str) -> Result<Option<Backend>, String> {
+    if value == "auto" {
+        Ok(None)
+    } else {
+        Backend::parse(value)
+            .map(Some)
+            .ok_or_else(|| format!("このビルドでは利用できないバックエンドです: {value}"))
+    }
+}
+
+fn parsed_backend_options_for(
+    backend: Backend,
+    options: &ProcessOptions,
+) -> Result<BackendOptions, String> {
+    let mut backend_options = parsed_backend_options(options)?;
+    if !service::requires_external_model(backend) {
+        backend_options.onnx = None;
+    }
+    Ok(backend_options)
+}
+
+fn resolve_gui_backend_options(
+    backend: Backend,
+    options: &ProcessOptions,
+) -> Result<BackendOptions, String> {
+    service::resolve_backend_options(backend, parsed_backend_options_for(backend, options)?)
+}
+
+fn preflight_explicit_backend_resources(options: &ProcessOptions) -> Result<(), String> {
+    if let Some(backend) = configured_backend(&options.backend)? {
+        resolve_gui_backend_options(backend, options)?;
+    }
+    Ok(())
+}
+
+fn ensure_output_available(path: &Path, force: bool) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if force && (metadata.is_file() || metadata.file_type().is_symlink()) => {
+            Ok(())
+        }
+        Ok(_) if force => Err(format!(
+            "出力先は置換可能なファイルまたはシンボリックリンクではありません: {}",
+            path.display()
+        )),
+        Ok(_) => Err("出力ファイルが既に存在します。「上書きを許可」を有効にしてください".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("出力先を確認できません: {error}")),
+    }
+}
+
+fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Result<(), String> {
+    validate_process_options(options)?;
+    let format = OutputFormat::from_path(Path::new(output))?;
+    format.validate_encoder(parse_aac_encoder(&options.aac_encoder)?)?;
+    preflight_explicit_backend_resources(options)?;
+    if !Path::new(input).is_file() {
+        return Err("入力ファイルが存在しません".into());
+    }
+    ensure_output_available(Path::new(output), options.force)
+}
+
+fn validated_processing_options(
+    options: &ProcessOptions,
+    audio: &denoize::Audio,
+) -> Result<ProcessingOptions, String> {
+    let denoiser = processing_config(options, audio.sample_rate)?;
+    let backend = match configured_backend(&options.backend)? {
+        Some(backend) => BackendChoice::Explicit(backend),
+        None => BackendChoice::Auto,
+    };
+    let selected_backend = service::select_backend(
+        backend,
+        audio.frames() as f64 / audio.sample_rate.max(1) as f64,
+        None,
+    );
+    let processing = ProcessingOptions {
+        backend,
+        quality: None,
+        denoiser,
+        backend_options: parsed_backend_options_for(selected_backend, options)?,
+        loudness_lufs: options.loudness_lufs,
+        true_peak_dbtp: options.true_peak_dbtp,
+    };
+    processing
+        .validate_config(audio)
+        .map_err(|error| error.to_string())?;
+    Ok(processing)
 }
 
 fn process_file(
@@ -1161,65 +2063,23 @@ fn process_file(
         None
     };
     let mut audio = read_audio(input)?;
+    let encode = parsed_encode_options(&request.options)?;
+    let format = OutputFormat::from_path(output)?;
+    format.validate_config(&audio, &encode)?;
     progress(1, "ノイズ除去を実行しています");
     check_cancelled(control)?;
-    let config = processing_config(&request.options, audio.sample_rate)?;
-    let backend = if request.options.backend == "auto" {
-        BackendChoice::Auto
-    } else {
-        BackendChoice::Explicit(Backend::parse(&request.options.backend).ok_or_else(|| {
-            format!(
-                "このビルドでは利用できないバックエンドです: {}",
-                request.options.backend
-            )
-        })?)
-    };
-    let backend_options = BackendOptions {
-        onnx: request.options.onnx_model.as_ref().map(|path| OnnxModelConfig {
-            path: path.into(),
-            sample_rate: request.options.onnx_sample_rate,
-        }),
-        channel_mode: ChannelMode::parse(&request.options.channel_mode)
-            .ok_or_else(|| format!("不明なチャンネルモード: {}", request.options.channel_mode))?,
-        sgmse_profile: SgmseProfile::parse(&request.options.sgmse_profile).ok_or_else(|| {
-            format!(
-                "不明なSGMSEプロファイル: {}",
-                request.options.sgmse_profile
-            )
-        })?,
-        deterministic: request.options.deterministic,
-        seed: request.options.seed,
-    };
+    let processing = validated_processing_options(&request.options, &audio)?;
     progress(2, "ラウドネスと出力を準備しています");
-    service::process_audio(
-        &mut audio,
-        ProcessingOptions {
-            backend,
-            quality: None,
-            denoiser: config,
-            backend_options,
-            loudness_lufs: request.options.loudness_lufs,
-            true_peak_dbtp: request.options.true_peak_dbtp,
-        },
-    )?;
+    service::process_audio(&mut audio, processing)?;
     check_cancelled(control)?;
-    let encode = EncodeOptions {
-        mp3_bitrate_kbps: request.options.mp3_bitrate_kbps,
-        m4a_bitrate_bps: request.options.aac_bitrate_kbps.saturating_mul(1000),
-        aac_encoder: match request.options.aac_encoder.as_str() {
-            "oxide" => AacEncoder::Oxide,
-            "fdk" => AacEncoder::Fdk,
-            other => return Err(format!("不明なAACエンコーダー: {other}")),
-        },
-        downmix: DownmixMode::parse(&request.options.downmix)
-            .ok_or_else(|| "ダウンミックスは preserve または stereo を指定してください".to_string())?,
-    };
     progress(3, "ファイルを書き出しています");
-    if let Some(parent) = output.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("出力フォルダを作成できません: {error}"))?;
     }
-    let format = OutputFormat::from_path(output)?;
     let mut transaction = AtomicOutput::new(output)?;
     write_audio_to_file(transaction.file_mut(), format, &audio, encode)?;
     if let Some(metadata) = metadata {
@@ -1250,6 +2110,9 @@ fn processing_config(options: &ProcessOptions, sample_rate: u32) -> Result<Denoi
     config.strength = options.strength;
     config.adaptive_noise = options.adaptive_noise;
     config.vad = options.vad;
+    config
+        .validate_config()
+        .map_err(|error| error.to_string())?;
     Ok(config)
 }
 
@@ -1306,23 +2169,31 @@ fn emit_batch_item(
     error: Option<String>,
 ) {
     let elapsed = started.elapsed().as_secs_f64();
-    let eta = (current > 0).then(|| elapsed / current as f64 * total.saturating_sub(current) as f64);
-    let name = item.input.file_name().and_then(|value| value.to_str()).unwrap_or("audio");
-    let _ = app.emit("job-progress", JobProgress {
-        job_id,
-        kind: "batch",
-        status: "running",
-        message: format!("{name}: {item_status}"),
-        current,
-        total,
-        fraction: current as f64 / total.max(1) as f64,
-        elapsed_seconds: elapsed,
-        output: Some(item.output.to_string_lossy().into_owned()),
-        error,
-        eta_seconds: eta,
-        item: Some(item.input.to_string_lossy().into_owned()),
-        item_status: Some(item_status),
-    });
+    let eta =
+        (current > 0).then(|| elapsed / current as f64 * total.saturating_sub(current) as f64);
+    let name = item
+        .input
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("audio");
+    let _ = app.emit(
+        "job-progress",
+        JobProgress {
+            job_id,
+            kind: "batch",
+            status: "running",
+            message: format!("{name}: {item_status}"),
+            current,
+            total,
+            fraction: current as f64 / total.max(1) as f64,
+            elapsed_seconds: elapsed,
+            output: Some(item.output.to_string_lossy().into_owned()),
+            error,
+            eta_seconds: eta,
+            item: Some(item.input.to_string_lossy().into_owned()),
+            item_status: Some(item_status),
+        },
+    );
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1461,18 +2332,359 @@ mod tests {
         }
     }
 
+    fn gui_config() -> GuiConfig {
+        GuiConfig {
+            backend: "auto".into(),
+            preset: "hifi".into(),
+            mode: "music".into(),
+            strength: 0.4,
+            adaptive_noise: false,
+            vad: false,
+            channels: "linked".into(),
+            downmix: "preserve".into(),
+            loudness_lufs: None,
+            true_peak_dbtp: None,
+            preserve_metadata: true,
+            force: false,
+            mp3_bitrate_kbps: 192,
+            m4a_bitrate_kbps: 192,
+            aac_encoder: "oxide".into(),
+            onnx_model: None,
+            onnx_rate: 16_000,
+            sgmse_profile: "balanced".into(),
+            deterministic: false,
+        }
+    }
+
+    fn gui_config_source() -> String {
+        toml::to_string_pretty(&gui_config()).unwrap()
+    }
+
+    fn batch_request() -> BatchRequest {
+        BatchRequest {
+            inputs: Vec::new(),
+            input_dir: None,
+            output_dir: "missing-output-directory".into(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 1,
+            resume: false,
+            options: options(),
+        }
+    }
+
+    fn live_request() -> LiveRequest {
+        LiveRequest {
+            input_device: None,
+            output_device: None,
+            chunk_ms: 20,
+            backend: "auto".into(),
+            options: options(),
+        }
+    }
+
     #[test]
     fn gui_options_build_a_valid_processing_configuration() {
         let config = processing_config(&options(), 48_000).unwrap();
         assert_eq!(config.strength, 0.4);
         assert!(config.transient_protect);
         let selected = service::select_backend(BackendChoice::Auto, 30.0, None);
-        assert_eq!(Backend::parse(service::backend_name(selected)), Some(selected));
+        assert_eq!(
+            Backend::parse(service::backend_name(selected)),
+            Some(selected)
+        );
     }
 
     #[test]
     fn invalid_backend_is_rejected() {
         assert!(Backend::parse("missing").is_none());
+    }
+
+    #[test]
+    fn app_info_reports_named_backend_model_rates() {
+        let info = app_info();
+        for (name, expected_rate) in [
+            ("mpsenet", 16_000),
+            ("sgmse", 16_000),
+            ("gtcrn", 16_000),
+            ("bsrnn", 48_000),
+            ("mossformer2", 48_000),
+        ] {
+            if let Some(backend) = info.backends.iter().find(|backend| backend.name == name) {
+                assert_eq!(backend.sample_rate, Some(expected_rate), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn process_options_reject_non_finite_numbers() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut process = options();
+            process.strength = value;
+            assert!(validate_process_options(&process)
+                .unwrap_err()
+                .contains("強度"));
+
+            let mut process = options();
+            process.loudness_lufs = Some(value);
+            assert!(validate_process_options(&process)
+                .unwrap_err()
+                .contains("ラウドネス"));
+
+            let mut process = options();
+            process.true_peak_dbtp = value;
+            assert!(validate_process_options(&process)
+                .unwrap_err()
+                .contains("True Peak"));
+        }
+    }
+
+    #[test]
+    fn process_numeric_bounds_are_inclusive() {
+        for strength in [0.0, 1.0] {
+            let mut process = options();
+            process.strength = strength;
+            validate_process_options(&process).unwrap();
+        }
+        for target in [MIN_LOUDNESS_LUFS, MAX_LOUDNESS_LUFS] {
+            let mut process = options();
+            process.loudness_lufs = Some(target);
+            validate_process_options(&process).unwrap();
+        }
+        for peak in [MIN_TRUE_PEAK_DBTP, MAX_TRUE_PEAK_DBTP] {
+            let mut process = options();
+            process.loudness_lufs = Some(-23.0);
+            process.true_peak_dbtp = peak;
+            validate_process_options(&process).unwrap();
+        }
+        if Backend::parse("onnx").is_some() {
+            for sample_rate in [1, MAX_MODEL_SAMPLE_RATE_HZ] {
+                let mut process = options();
+                process.backend = "onnx".into();
+                process.onnx_model = Some("model.onnx".into());
+                process.onnx_sample_rate = sample_rate;
+                validate_process_options(&process).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn process_numeric_values_outside_bounds_are_rejected() {
+        for strength in [-f64::EPSILON, 1.0 + f64::EPSILON] {
+            let mut process = options();
+            process.strength = strength;
+            assert!(validate_process_options(&process).is_err());
+        }
+        for target in [MIN_LOUDNESS_LUFS - 0.1, MAX_LOUDNESS_LUFS + 0.1] {
+            let mut process = options();
+            process.loudness_lufs = Some(target);
+            assert!(validate_process_options(&process).is_err());
+        }
+        for peak in [MIN_TRUE_PEAK_DBTP - 0.1, MAX_TRUE_PEAK_DBTP + 0.1] {
+            let mut process = options();
+            process.loudness_lufs = Some(-23.0);
+            process.true_peak_dbtp = peak;
+            assert!(validate_process_options(&process).is_err());
+        }
+        if Backend::parse("onnx").is_some() {
+            for sample_rate in [0, MAX_MODEL_SAMPLE_RATE_HZ + 1] {
+                let mut process = options();
+                process.backend = "onnx".into();
+                process.onnx_model = Some("model.onnx".into());
+                process.onnx_sample_rate = sample_rate;
+                assert!(validate_process_options(&process)
+                    .unwrap_err()
+                    .contains("サンプルレート"));
+            }
+        }
+        let mut process = options();
+        process.aac_bitrate_kbps = u32::MAX;
+        assert!(validate_process_options(&process)
+            .unwrap_err()
+            .contains("ビットレートが大きすぎます"));
+    }
+
+    #[test]
+    fn true_peak_requires_loudness_normalization() {
+        let mut process = options();
+        process.true_peak_dbtp = -2.0;
+        let error = validate_process_options(&process).unwrap_err();
+        assert!(error.contains("ラウドネス"), "unexpected error: {error}");
+
+        let mut config = gui_config();
+        config.true_peak_dbtp = Some(-2.0);
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("loudness_lufs"), "unexpected error: {error}");
+
+        config.true_peak_dbtp = Some(-1.0);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn selected_backend_contract_is_validated_without_opening_the_model() {
+        if Backend::parse("mpsenet").is_some() {
+            let mut process = options();
+            process.backend = "mpsenet".into();
+            process.onnx_model = Some("model-that-must-not-be-opened.onnx".into());
+            process.onnx_sample_rate = 48_000;
+            assert!(validate_process_options(&process)
+                .unwrap_err()
+                .contains("backend_options.onnx.sample_rate"));
+
+            process.onnx_sample_rate = 16_000;
+            validate_process_options(&process).unwrap();
+        }
+
+        if Backend::parse("onnx").is_some() {
+            let mut process = options();
+            process.backend = "onnx".into();
+            process.onnx_model = None;
+            assert!(validate_process_options(&process)
+                .unwrap_err()
+                .contains("backend_options.onnx"));
+        }
+    }
+
+    #[test]
+    fn managed_gtcrn_ignores_caller_model_configuration() {
+        let Some(backend) = Backend::parse("gtcrn") else {
+            return;
+        };
+        let mut process = options();
+        process.backend = "gtcrn".into();
+        process.onnx_model = Some("caller-model-must-not-be-used.onnx".into());
+        process.onnx_sample_rate = 0;
+
+        validate_process_options(&process).unwrap();
+        assert!(parsed_backend_options_for(backend, &process)
+            .unwrap()
+            .onnx
+            .is_none());
+    }
+
+    #[test]
+    fn non_external_backends_ignore_hidden_model_configuration() {
+        for name in Backend::available_names().iter().copied().filter(|name| {
+            Backend::parse(name).is_some_and(|backend| !service::requires_external_model(backend))
+        }) {
+            let backend = Backend::parse(name).unwrap();
+            let mut process = options();
+            process.backend = name.into();
+            process.onnx_model = Some("hidden-model-must-not-be-used.onnx".into());
+            process.onnx_sample_rate = 0;
+
+            validate_process_options(&process).unwrap();
+            assert!(parsed_backend_options_for(backend, &process)
+                .unwrap()
+                .onnx
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn unknown_ipc_option_strings_are_rejected() {
+        let mutations: &[fn(&mut ProcessOptions)] = &[
+            |process| process.backend = "missing".into(),
+            |process| process.preset = Some("missing".into()),
+            |process| process.mode = Some("missing".into()),
+            |process| process.channel_mode = "missing".into(),
+            |process| process.downmix = "missing".into(),
+            |process| process.aac_encoder = "missing".into(),
+            |process| process.sgmse_profile = "missing".into(),
+        ];
+        for mutate in mutations {
+            let mut process = options();
+            mutate(&mut process);
+            assert!(validate_process_options(&process).is_err());
+        }
+
+        let mut batch = batch_request();
+        batch.output_format = "missing".into();
+        assert!(validate_batch_request(&batch).is_err());
+
+        let mut live = live_request();
+        live.backend = "missing".into();
+        assert!(validate_live_request(&live).is_err());
+    }
+
+    #[test]
+    fn batch_jobs_and_live_chunk_bounds_are_enforced() {
+        for jobs in [1, 32] {
+            let mut batch = batch_request();
+            batch.jobs = jobs;
+            validate_batch_request(&batch).unwrap();
+        }
+        for jobs in [0, 33] {
+            let mut batch = batch_request();
+            batch.jobs = jobs;
+            assert!(validate_batch_request(&batch)
+                .unwrap_err()
+                .contains("並列数"));
+        }
+
+        for chunk_ms in [10, 2_000] {
+            let mut live = live_request();
+            live.chunk_ms = chunk_ms;
+            validate_live_request(&live).unwrap();
+        }
+        for chunk_ms in [9, 2_001] {
+            let mut live = live_request();
+            live.chunk_ms = chunk_ms;
+            assert!(validate_live_request(&live)
+                .unwrap_err()
+                .contains("チャンク長"));
+        }
+    }
+
+    #[test]
+    fn non_live_backends_are_rejected_before_starting_a_session() {
+        let Some(name) = Backend::available_names()
+            .iter()
+            .copied()
+            .find(|name| !matches!(*name, "classical" | "rnnoise"))
+        else {
+            return;
+        };
+        let mut live = live_request();
+        live.backend = name.into();
+        let error = validate_live_request(&live).unwrap_err();
+        assert!(error.contains("ライブ処理"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn invalid_ipc_options_precede_io_and_preserve_state_and_output() {
+        let directory = TestDirectory::create("invalid-ipc");
+        let missing_input = directory.join("missing.wav");
+        let output = directory.join("output.wav");
+        std::fs::write(&output, b"existing output").unwrap();
+        let state = AppState::default();
+        let mut process = classical_options(false);
+        process.strength = f64::NAN;
+
+        let error = validate_request(
+            &missing_input.to_string_lossy(),
+            &output.to_string_lossy(),
+            &process,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("強度"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing output");
+        assert!(state.jobs.lock().unwrap().is_empty());
+        assert!(state.live.lock().unwrap().is_none());
+        directory.assert_no_staged_outputs();
+
+        let mut batch = batch_request();
+        batch.output_dir = directory
+            .join("missing-output")
+            .to_string_lossy()
+            .into_owned();
+        batch.jobs = 0;
+        assert!(prepare_batch_request(&batch)
+            .unwrap_err()
+            .contains("並列数"));
+        assert!(!Path::new(&batch.output_dir).exists());
+        assert!(state.jobs.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1658,6 +2870,38 @@ mod tests {
         directory.assert_no_staged_outputs();
     }
 
+    #[test]
+    fn invalid_codec_config_precedes_processing_and_output_staging() {
+        let directory = TestDirectory::create("codec-preflight");
+        let input = directory.join("input.wav");
+        write_test_wav(&input);
+        let mut wav = std::fs::read(&input).unwrap();
+        wav[24..28].copy_from_slice(&12_345_u32.to_le_bytes());
+        wav[28..32].copy_from_slice(&(12_345_u32 * 2).to_le_bytes());
+        std::fs::write(&input, wav).unwrap();
+        let output_dir = directory.join("new-output-directory");
+        let output = output_dir.join("output.mp3");
+        let request = ProcessRequest {
+            input: input.to_string_lossy().into_owned(),
+            output: output.to_string_lossy().into_owned(),
+            options: classical_options(false),
+        };
+        let stages = Mutex::new(Vec::new());
+
+        let error = process_file(&request, &JobControl::default(), |stage, _| {
+            stages.lock().unwrap().push(stage);
+        })
+        .unwrap_err();
+
+        assert!(
+            error.contains("unsupported sample rate"),
+            "unexpected error: {error}"
+        );
+        assert!(stages.lock().unwrap().is_empty());
+        assert!(!output_dir.exists());
+        directory.assert_no_staged_outputs();
+    }
+
     #[cfg(unix)]
     #[test]
     fn legacy_gui_stage_symlink_does_not_clobber_its_target() {
@@ -1723,6 +2967,225 @@ mod tests {
     }
 
     #[test]
+    fn batch_preflights_every_codec_before_state_or_output_changes() {
+        let directory = TestDirectory::create("batch-codec-preflight");
+        let input = directory.join("input");
+        let output = directory.join("output");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        write_test_wav(&input.join("a-valid.wav"));
+        write_test_wav(&input.join("b-invalid-rate.wav"));
+        let invalid = input.join("b-invalid-rate.wav");
+        let mut wav = std::fs::read(&invalid).unwrap();
+        wav[24..28].copy_from_slice(&12_345_u32.to_le_bytes());
+        wav[28..32].copy_from_slice(&(12_345_u32 * 2).to_le_bytes());
+        std::fs::write(&invalid, wav).unwrap();
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_string_lossy().into_owned()),
+            output_dir: output.to_string_lossy().into_owned(),
+            output_format: "mp3".into(),
+            recursive: false,
+            jobs: 2,
+            resume: true,
+            options: classical_options(false),
+        };
+
+        let error = prepare_batch_request(&request).unwrap_err();
+
+        assert!(error.contains("unsupported sample rate"), "{error}");
+        assert!(!output.join("a-valid.mp3").exists());
+        assert!(!output.join("b-invalid-rate.mp3").exists());
+        assert!(!output.join(".denoize-gui-state").exists());
+    }
+
+    #[test]
+    fn batch_preflights_actual_sample_rate_processing_before_outputs() {
+        let directory = TestDirectory::create("batch-processing-preflight");
+        let input = directory.join("input");
+        let output = directory.join("output");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        write_test_wav(&input.join("a-valid.wav"));
+        write_test_wav(&input.join("b-invalid-processing-rate.wav"));
+        let invalid = input.join("b-invalid-processing-rate.wav");
+        let mut wav = std::fs::read(&invalid).unwrap();
+        let sample_rate = MAX_MODEL_SAMPLE_RATE_HZ + 1;
+        wav[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+        wav[28..32].copy_from_slice(&(sample_rate * 2).to_le_bytes());
+        std::fs::write(&invalid, wav).unwrap();
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_string_lossy().into_owned()),
+            output_dir: output.to_string_lossy().into_owned(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 2,
+            resume: true,
+            options: classical_options(false),
+        };
+
+        let error = prepare_batch_request(&request).unwrap_err();
+
+        assert!(error.contains("sample_rate"), "{error}");
+        assert!(!output.join("a-valid.wav").exists());
+        assert!(!output.join("b-invalid-processing-rate.wav").exists());
+        assert!(!output.join(".denoize-gui-state").exists());
+    }
+
+    #[test]
+    fn batch_preflights_all_destinations_and_replacement_types() {
+        let directory = TestDirectory::create("batch-output-preflight");
+        let input = directory.join("input");
+        let output = directory.join("output");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        write_test_wav(&input.join("a.wav"));
+        write_test_wav(&input.join("b.wav"));
+        let mut request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_string_lossy().into_owned()),
+            output_dir: output.to_string_lossy().into_owned(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 2,
+            resume: false,
+            options: classical_options(false),
+        };
+        let items = prepare_batch_request(&request).unwrap();
+        std::fs::write(output.join("b.wav"), b"existing").unwrap();
+
+        let error = preflight_batch_outputs(&request, &items, &HashSet::new()).unwrap_err();
+        assert!(error.contains("既に存在"), "{error}");
+        assert!(!output.join("a.wav").exists());
+        assert_eq!(std::fs::read(output.join("b.wav")).unwrap(), b"existing");
+
+        request.options.force = true;
+        std::fs::remove_file(output.join("b.wav")).unwrap();
+        std::fs::create_dir(output.join("b.wav")).unwrap();
+        let error = preflight_batch_outputs(&request, &items, &HashSet::new()).unwrap_err();
+        assert!(error.contains("置換可能"), "{error}");
+        assert!(!output.join("a.wav").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_batch_symlinks_are_never_treated_as_resumable_files() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::create("batch-resume-output-symlink");
+        let victim = directory.join("victim.wav");
+        let output = directory.join("output.wav");
+        write_test_wav(&victim);
+        symlink(&victim, &output).unwrap();
+        let item = BatchItem {
+            input: directory.join("input.wav"),
+            output: output.clone(),
+            state_key: "v2:completed".into(),
+        };
+        let mut request = batch_request();
+        request.resume = true;
+        request.options.force = true;
+        let completed = HashSet::from([item.state_key.clone()]);
+
+        assert!(
+            output.is_file(),
+            "the follow-link check would incorrectly skip"
+        );
+        assert!(!batch_output_is_regular_file(&output).unwrap());
+        preflight_batch_outputs(&request, &[item], &completed).unwrap();
+        assert!(std::fs::symlink_metadata(&output)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn batch_destination_preflight_rejects_exact_and_file_directory_collisions() {
+        let directory = TestDirectory::create("batch-destination-collisions");
+        let input_a = directory.join("input-a.wav");
+        let input_b = directory.join("input-b.wav");
+        let output = directory.join("output");
+        write_test_wav(&input_a);
+        write_test_wav(&input_b);
+        std::fs::create_dir(&output).unwrap();
+
+        let exact = vec![
+            BatchItem {
+                input: input_a.clone(),
+                output: output.join("same.wav"),
+                state_key: "a".into(),
+            },
+            BatchItem {
+                input: input_b.clone(),
+                output: output.join("same.wav"),
+                state_key: "b".into(),
+            },
+        ];
+        assert!(validate_batch_destinations(None, &exact)
+            .unwrap_err()
+            .contains("同じバッチ出力"));
+
+        let file_and_directory = vec![
+            BatchItem {
+                input: input_a,
+                output: output.join("foo.flac"),
+                state_key: "a".into(),
+            },
+            BatchItem {
+                input: input_b,
+                output: output.join("foo.flac/bar.flac"),
+                state_key: "b".into(),
+            },
+        ];
+        assert!(validate_batch_destinations(None, &file_and_directory)
+            .unwrap_err()
+            .contains("ファイルとディレクトリ"));
+        assert!(std::fs::read_dir(&output).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn case_insensitive_batch_collision_keys_are_normalized() {
+        assert_eq!(
+            batch_collision_key_with_case(Path::new("Output/Voice.WAV"), true),
+            batch_collision_key_with_case(Path::new("output/voice.wav"), true)
+        );
+        assert_ne!(
+            batch_collision_key_with_case(Path::new("Output/Voice.WAV"), false),
+            batch_collision_key_with_case(Path::new("output/voice.wav"), false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_destination_preflight_rejects_symlinks_back_into_input() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::create("batch-destination-input-symlink");
+        let input = directory.join("input");
+        let nested = input.join("nested");
+        let output = directory.join("output");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        write_test_wav(&nested.join("voice.wav"));
+        symlink(&nested, output.join("nested")).unwrap();
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_str().unwrap().into()),
+            output_dir: output.to_str().unwrap().into(),
+            output_format: "flac".into(),
+            recursive: true,
+            jobs: 1,
+            resume: false,
+            options: classical_options(false),
+        };
+
+        let error = collect_batch_items(&request, "flac").unwrap_err();
+        assert!(error.contains("入力フォルダ内"), "{error}");
+        assert!(!nested.join("voice.flac").exists());
+    }
+
+    #[test]
     fn batch_folder_preserves_relative_paths() {
         let root = std::env::temp_dir().join(format!(
             "denoize-gui-batch-{}-{}",
@@ -1749,11 +3212,104 @@ mod tests {
         };
         let items = collect_batch_items(&request, "opus").unwrap();
         assert_eq!(items.len(), 2);
-        assert!(items.iter().any(|item| item.output == output.join("one.opus")));
+        assert!(items
+            .iter()
+            .any(|item| item.output == output.join("one.opus")));
         assert!(items
             .iter()
             .any(|item| item.output == output.join("nested/two.opus")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_state_keys_include_input_identity_destination_and_format() {
+        let relative = Path::new("voice.wav");
+        let output = Path::new("nested/voice.output");
+        let wav = batch_state_key(
+            Path::new("/input-a/voice.wav"),
+            relative,
+            output,
+            OutputFormat::Wav,
+        );
+
+        assert!(wav.starts_with("v2:"));
+        assert_ne!(
+            wav,
+            batch_state_key(
+                Path::new("/input-b/voice.wav"),
+                relative,
+                output,
+                OutputFormat::Wav,
+            )
+        );
+        assert_ne!(
+            wav,
+            batch_state_key(
+                Path::new("/input-a/voice.wav"),
+                relative,
+                output,
+                OutputFormat::Flac,
+            )
+        );
+        assert_ne!(
+            wav,
+            batch_state_key(
+                Path::new("/input-a/voice.wav"),
+                relative,
+                Path::new("other/voice.output"),
+                OutputFormat::Wav,
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_batch_paths_do_not_collide_and_are_rejected_before_side_effects() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let first_relative = PathBuf::from(OsString::from_vec(b"voice-\x80.wav".to_vec()));
+        let second_relative = PathBuf::from(OsString::from_vec(b"voice-\x81.wav".to_vec()));
+        assert_eq!(
+            first_relative.to_string_lossy(),
+            second_relative.to_string_lossy()
+        );
+        assert_ne!(
+            batch_state_key(
+                Path::new("/input/voice.wav"),
+                &first_relative,
+                &first_relative,
+                OutputFormat::Wav,
+            ),
+            batch_state_key(
+                Path::new("/input/voice.wav"),
+                &second_relative,
+                &second_relative,
+                OutputFormat::Wav,
+            )
+        );
+
+        let directory = TestDirectory::create("batch-non-utf8");
+        let input = directory.join("input");
+        let output = directory.join("output");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        write_test_wav(&input.join(first_relative));
+        let request = BatchRequest {
+            inputs: Vec::new(),
+            input_dir: Some(input.to_str().unwrap().into()),
+            output_dir: output.to_str().unwrap().into(),
+            output_format: "wav".into(),
+            recursive: false,
+            jobs: 1,
+            resume: true,
+            options: classical_options(false),
+        };
+
+        let error = collect_batch_items(&request, "wav").unwrap_err();
+        assert!(error.contains("UTF-8"), "{error}");
+        assert!(std::fs::read_dir(&output).unwrap().next().is_none());
+        assert!(!output.join(".denoize-gui-state").exists());
     }
 
     #[test]
@@ -1764,6 +3320,62 @@ mod tests {
             NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
         ));
         assert!(read_batch_state(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn batch_state_read_and_write_errors_are_not_ignored() {
+        let directory = TestDirectory::create("batch-state-errors");
+        let state = directory.join(".denoize-gui-state");
+        std::fs::write(&state, [0xff]).unwrap();
+        assert!(read_batch_state(&state).unwrap_err().contains("読めません"));
+
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected write failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = append_batch_state_entry(&mut FailingWriter, "input.wav").unwrap_err();
+        assert!(error.contains("書き込めません"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_state_rejects_symlinks_and_hard_links_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::create("batch-state-links");
+        let victim = directory.join("victim.txt");
+        let symlink_state = directory.join("symlink-state");
+        let hardlink_state = directory.join("hardlink-state");
+        std::fs::write(&victim, b"victim\n").unwrap();
+        symlink(&victim, &symlink_state).unwrap();
+
+        assert!(read_batch_state(&symlink_state).is_err());
+        assert!(open_batch_state_for_append(&symlink_state).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim\n");
+
+        std::fs::hard_link(&victim, &hardlink_state).unwrap();
+        assert!(read_batch_state(&hardlink_state).is_err());
+        assert!(open_batch_state_for_append(&hardlink_state).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim\n");
+    }
+
+    #[test]
+    fn batch_outputs_cannot_claim_the_resume_state_path() {
+        let directory = TestDirectory::create("batch-state-reserved");
+        let state = directory.join(".denoize-gui-state");
+        let items = vec![BatchItem {
+            input: directory.join("input.wav"),
+            output: state.join("nested.wav"),
+            state_key: "input.wav".into(),
+        }];
+        assert!(validate_batch_reserved_path(&items, &state).is_err());
     }
 
     #[test]
@@ -1797,22 +3409,105 @@ mod tests {
     }
 
     #[test]
-    fn gui_toml_config_round_trips_without_nulls() {
+    fn valid_gui_toml_config_round_trips_without_nulls() {
         let path = std::env::temp_dir().join(format!(
             "denoize-gui-config-{}-{}.toml",
             std::process::id(),
             NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed)
         ));
-        save_gui_config(
-            path.to_string_lossy().into_owned(),
-            serde_json::json!({"backend":"auto","strength":0.42,"onnx_model":null}),
+        let mut expected = gui_config();
+        expected.strength = 0.42;
+        save_gui_config(path.to_string_lossy().into_owned(), expected.clone()).unwrap();
+        let loaded = load_gui_config(path.to_string_lossy().into_owned(), gui_config()).unwrap();
+        assert_eq!(loaded, expected);
+        let source = std::fs::read_to_string(&path).unwrap();
+        assert!(!source.contains("onnx_model"));
+        assert!(!source.contains("loudness_lufs"));
+        assert!(source.contains("true_peak_dbtp = -1.0"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exported_loudness_sentinel_clears_an_enabled_current_config() {
+        let directory = TestDirectory::create("gui-loudness-clear");
+        let path = directory.join("config.toml");
+        save_gui_config(path.to_str().unwrap().into(), gui_config()).unwrap();
+        let mut current = gui_config();
+        current.loudness_lufs = Some(-16.0);
+        current.true_peak_dbtp = Some(-1.0);
+
+        let loaded = load_gui_config(path.to_str().unwrap().into(), current).unwrap();
+
+        assert!(loaded.loudness_lufs.is_none());
+        assert!(loaded.true_peak_dbtp.is_none());
+    }
+
+    #[test]
+    fn gui_toml_partial_patch_preserves_current_settings() {
+        let mut current = gui_config();
+        current.mode = "ambient".into();
+        current.force = true;
+        let loaded = parse_gui_config(
+            "backend = \"classical\"\nstrength = 0.73\n",
+            current.clone(),
         )
         .unwrap();
-        let loaded = load_gui_config(path.to_string_lossy().into_owned()).unwrap();
-        assert_eq!(loaded["backend"], "auto");
-        assert_eq!(loaded["strength"], 0.42);
-        assert!(loaded.get("onnx_model").is_none());
-        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(loaded.backend, "classical");
+        assert_eq!(loaded.strength, 0.73);
+        assert_eq!(loaded.mode, current.mode);
+        assert_eq!(loaded.force, current.force);
+        assert_eq!(loaded.preset, current.preset);
+    }
+
+    #[test]
+    fn gui_toml_discards_hidden_models_for_non_external_backends() {
+        let loaded = parse_gui_config(
+            "backend = \"classical\"\nonnx_model = \"stale.onnx\"\nonnx_rate = 0\n",
+            gui_config(),
+        )
+        .unwrap();
+
+        assert!(loaded.onnx_model.is_none());
+        assert_eq!(loaded.onnx_rate, DEFAULT_MODEL_SAMPLE_RATE_HZ);
+    }
+
+    #[test]
+    fn gui_toml_config_rejects_boolean_strings() {
+        for field in ["force", "preserve_metadata"] {
+            let source = gui_config_source()
+                .replace(&format!("{field} = false"), &format!("{field} = \"false\""))
+                .replace(&format!("{field} = true"), &format!("{field} = \"true\""));
+            assert!(parse_gui_config(&source, gui_config()).is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn gui_toml_config_rejects_unknown_fields() {
+        let source = format!("{}unknown_option = true\n", gui_config_source());
+        let error = parse_gui_config(&source, gui_config()).unwrap_err();
+        assert!(error.contains("unknown field"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn gui_toml_config_rejects_unknown_enums() {
+        let mut config = gui_config();
+        config.channels = "surround".into();
+        let source = toml::to_string_pretty(&config).unwrap();
+        let error = parse_gui_config(&source, gui_config()).unwrap_err();
+        assert!(
+            error.contains("チャンネルモード"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn gui_toml_config_rejects_out_of_range_values() {
+        let mut config = gui_config();
+        config.strength = 1.01;
+        let source = toml::to_string_pretty(&config).unwrap();
+        let error = parse_gui_config(&source, gui_config()).unwrap_err();
+        assert!(error.contains("強度"), "unexpected error: {error}");
     }
 
     #[test]
@@ -1825,9 +3520,16 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let audio = root.join("voice.wav");
         let ignored = root.join("notes.txt");
-        std::fs::write(&audio, []).unwrap(); std::fs::write(&ignored, []).unwrap();
-        let result = classify_dropped_paths(vec![root.to_string_lossy().into_owned(), audio.to_string_lossy().into_owned(), ignored.to_string_lossy().into_owned()]);
-        assert_eq!(result.directories.len(), 1); assert_eq!(result.audio_files.len(), 1); assert_eq!(result.ignored.len(), 1);
+        std::fs::write(&audio, []).unwrap();
+        std::fs::write(&ignored, []).unwrap();
+        let result = classify_dropped_paths(vec![
+            root.to_string_lossy().into_owned(),
+            audio.to_string_lossy().into_owned(),
+            ignored.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(result.directories.len(), 1);
+        assert_eq!(result.audio_files.len(), 1);
+        assert_eq!(result.ignored.len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

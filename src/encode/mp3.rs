@@ -8,8 +8,8 @@ use shine_rs::{Mp3Encoder, Mp3EncoderConfig, StereoMode, SUPPORTED_BITRATES};
 use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::audio::Audio;
 
-use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
-use super::DownmixMode;
+use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16, EncodeChannels};
+use super::{DownmixMode, EncodeOptions, OutputFormat};
 
 /// Default MP3 bitrate (kbps).
 pub const DEFAULT_MP3_BITRATE: u32 = 192;
@@ -26,6 +26,12 @@ pub fn write_mp3_with_downmix<P: AsRef<Path>>(
     bitrate_kbps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
+    EncodeOptions {
+        mp3_bitrate_kbps: bitrate_kbps,
+        downmix,
+        ..EncodeOptions::default()
+    }
+    .validate_config(OutputFormat::Mp3, audio)?;
     let mut output = AtomicOutput::new(path)?;
     write_mp3_to_writer(output.file_mut(), audio, bitrate_kbps, downmix)?;
     output.commit(CommitMode::Replace)
@@ -37,34 +43,7 @@ pub(super) fn write_mp3_to_writer<W: Write>(
     bitrate_kbps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
-    if audio.frames() == 0 {
-        return Err("MP3 output requires at least one frame".into());
-    }
-    if !shine_rs::SUPPORTED_SAMPLE_RATES.contains(&audio.sample_rate) {
-        return Err(format!(
-            "MP3 encode: unsupported sample rate {} Hz (supported: {:?})",
-            audio.sample_rate,
-            shine_rs::SUPPORTED_SAMPLE_RATES,
-        ));
-    }
-
-    let layout = lossy_channel_layout(audio, downmix)?;
-    let bitrate = pick_mp3_bitrate(bitrate_kbps, audio.sample_rate);
-    let stereo_mode = if layout.is_stereo {
-        StereoMode::JointStereo
-    } else {
-        StereoMode::Mono
-    };
-
-    let config = Mp3EncoderConfig {
-        sample_rate: audio.sample_rate,
-        bitrate,
-        channels: layout.count,
-        stereo_mode,
-        copyright: false,
-        original: true,
-    };
-
+    let (layout, config) = effective_mp3_config(audio, bitrate_kbps, downmix)?;
     let pcm = planar_f64_to_interleaved_i16(audio, layout)?;
     let mut encoder = Mp3Encoder::new(config).map_err(|e| format!("mp3 encoder: {e}"))?;
 
@@ -83,26 +62,59 @@ pub(super) fn write_mp3_to_writer<W: Write>(
     output.flush().map_err(|e| format!("flush mp3: {e}"))
 }
 
-fn pick_mp3_bitrate(requested: u32, sample_rate: u32) -> u32 {
-    let candidates: Vec<u32> = SUPPORTED_BITRATES
+pub(super) fn effective_mp3_config(
+    audio: &Audio,
+    requested_bitrate_kbps: u32,
+    downmix: DownmixMode,
+) -> Result<(EncodeChannels, Mp3EncoderConfig), String> {
+    if audio.frames() == 0 {
+        return Err("MP3 output requires at least one frame".into());
+    }
+    if !shine_rs::SUPPORTED_SAMPLE_RATES.contains(&audio.sample_rate) {
+        return Err(format!(
+            "MP3 encode: unsupported sample rate {} Hz (supported: {:?})",
+            audio.sample_rate,
+            shine_rs::SUPPORTED_SAMPLE_RATES,
+        ));
+    }
+
+    let layout = lossy_channel_layout(audio, downmix)?;
+    let stereo_mode = if layout.is_stereo {
+        StereoMode::JointStereo
+    } else {
+        StereoMode::Mono
+    };
+    let build_config = |bitrate| Mp3EncoderConfig {
+        sample_rate: audio.sample_rate,
+        bitrate,
+        channels: layout.count,
+        stereo_mode,
+        copyright: false,
+        original: true,
+    };
+    let bitrate = SUPPORTED_BITRATES
         .iter()
         .copied()
-        .filter(|b| *b <= requested)
-        .collect();
-    let fallback = *candidates.last().unwrap_or(&SUPPORTED_BITRATES[0]);
-    for &b in candidates.iter().rev() {
-        let cfg = Mp3EncoderConfig {
-            sample_rate,
-            bitrate: b,
-            channels: 2,
-            stereo_mode: StereoMode::Stereo,
-            ..Default::default()
-        };
-        if cfg.validate().is_ok() {
-            return b;
-        }
-    }
-    fallback
+        .filter(|bitrate| *bitrate <= requested_bitrate_kbps)
+        .rev()
+        .find(|bitrate| build_config(*bitrate).validate().is_ok())
+        .or_else(|| {
+            SUPPORTED_BITRATES
+                .iter()
+                .copied()
+                .find(|bitrate| build_config(*bitrate).validate().is_ok())
+        })
+        .ok_or_else(|| {
+            format!(
+                "MP3 encode: no compatible bitrate for {} Hz and {} channel(s)",
+                audio.sample_rate, layout.count
+            )
+        })?;
+    let config = build_config(bitrate);
+    config
+        .validate()
+        .map_err(|error| format!("MP3 encoder config: {error}"))?;
+    Ok((layout, config))
 }
 
 #[cfg(test)]
@@ -156,5 +168,42 @@ mod tests {
         assert!(rms_out < rms_in * 2.0);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn direct_writer_validates_before_staging() {
+        let path = tmp("preserve.mp3");
+        std::fs::write(&path, b"existing output").unwrap();
+        let audio = sine_stereo(12_345, 0.1);
+
+        let error = write_mp3(&path, &audio, 128).unwrap_err();
+
+        assert!(error.contains("unsupported sample rate"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing output");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subminimum_bitrate_uses_the_lowest_rate_compatible_fallback() {
+        for sample_rate in [32_000, 44_100, 48_000] {
+            let audio = sine_stereo(sample_rate, 0.01);
+            for requested in [0, 8, 16, 24, 31] {
+                let (_, config) =
+                    effective_mp3_config(&audio, requested, DownmixMode::Preserve).unwrap();
+                assert_eq!(config.bitrate, 32);
+                config.validate().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn compatible_bitrates_still_round_down() {
+        let audio = sine_stereo(44_100, 0.01);
+        for (requested, expected) in [(33, 32), (191, 160), (u32::MAX, 320)] {
+            let (_, config) =
+                effective_mp3_config(&audio, requested, DownmixMode::Preserve).unwrap();
+            assert_eq!(config.bitrate, expected);
+            config.validate().unwrap();
+        }
     }
 }

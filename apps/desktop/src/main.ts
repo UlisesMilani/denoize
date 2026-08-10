@@ -9,6 +9,13 @@ import "./styles.css";
 
 type BackendInfo = { name: string; externalModel: boolean; managedModel: string | null; sampleRate: number | null };
 type AppInfo = { version: string; backends: BackendInfo[]; formats: string[]; fdkAvailable: boolean };
+type GuiConfig = {
+  backend: string; preset: string; mode: string; strength: number; adaptive_noise: boolean; vad: boolean;
+  channels: string; downmix: string; loudness_lufs?: number | null; true_peak_dbtp?: number | null;
+  preserve_metadata: boolean; force: boolean; mp3_bitrate_kbps: number; m4a_bitrate_kbps: number;
+  aac_encoder: string; onnx_model?: string | null; onnx_rate: number; sgmse_profile: string;
+  deterministic: boolean;
+};
 type JobProgress = {
   jobId: number; kind: string; status: string; message: string; current: number; total: number;
   fraction: number; elapsedSeconds: number; output?: string; error?: string; etaSeconds?: number;
@@ -108,7 +115,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               </div>
               <div id="backend-settings" class="backend-settings hidden">
                 <div class="file-row"><div><label>ONNXモデル</label><div id="model-path-display" class="path empty">モデルファイルを選択</div></div><button class="secondary" id="choose-model">選択</button></div>
-                <div class="form-grid two"><label>モデルレート Hz<input id="onnx-rate" type="number" value="16000" min="1"></label><label id="sgmse-profile-field" class="hidden">SGMSE品質<select id="sgmse-profile"><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="quality">Quality</option></select></label></div>
+                <div class="form-grid two"><label>モデルレート Hz<input id="onnx-rate" type="number" value="16000" min="1" max="768000"></label><label id="sgmse-profile-field" class="hidden">SGMSE品質<select id="sgmse-profile"><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="quality">Quality</option></select></label></div>
                 <input type="hidden" id="model-path"><p id="backend-hint" class="field-hint"></p>
               </div>
               <div class="strength-row"><div><label>除去強度</label><span id="strength-value">40%</span></div><input id="strength" type="range" min="0" max="1" step="0.01" value="0.4"><div class="range-labels"><span>自然</span><span>強力</span></div></div>
@@ -130,7 +137,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <div class="form-grid two"><label>MP3 kbps<input id="mp3-bitrate" type="number" value="192" min="32"></label><label>AAC kbps<input id="aac-bitrate" type="number" value="192" min="32"></label></div>
               <label>AACエンコーダー<select id="aac-encoder"><option value="oxide">OxideAV</option></select></label>
               <label class="toggle inline"><input id="loudness-enabled" type="checkbox"><span></span><div><b>ラウドネス正規化</b></div></label>
-              <div class="form-grid two muted-fields" id="loudness-fields"><label>目標 LUFS<input id="loudness" type="number" value="-16" step="0.5"></label><label>True Peak<input id="true-peak" type="number" value="-1" step="0.1"></label></div>
+              <div class="form-grid two muted-fields" id="loudness-fields"><label>目標 LUFS<input id="loudness" type="number" value="-16" min="-70" max="0" step="0.5"></label><label>True Peak<input id="true-peak" type="number" value="-1" min="-20" max="0" step="0.1"></label></div>
               <div class="preset-manager"><label>ユーザープリセット<select id="user-preset"><option value="">プリセットを選択</option></select></label><div><input id="preset-name" placeholder="プリセット名"><button id="save-preset">保存</button><button id="delete-preset">削除</button></div></div>
             </article>
             <article class="card action-card">
@@ -228,15 +235,60 @@ function captureSettings(): SavedValues {
   }));
 }
 
-function applySettings(values: SavedValues) {
+type SettingUpdate = { element: HTMLInputElement | HTMLSelectElement; value: string | boolean };
+
+function planSettings(values: Record<string, unknown>): SettingUpdate[] {
+  const updates: SettingUpdate[] = [];
   for (const [id, value] of Object.entries(values)) {
     const element = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null; if (!element) continue;
-    if (element instanceof HTMLInputElement && element.type === "checkbox") element.checked = Boolean(value);
-    else element.value = String(value);
+    if (element instanceof HTMLInputElement && element.type === "checkbox") {
+      if (typeof value !== "boolean") throw new Error(`${id} は真偽値で指定してください`);
+      updates.push({ element, value });
+      continue;
+    }
+    if (typeof value !== "string" && (typeof value !== "number" || !Number.isFinite(value))) {
+      throw new Error(`${id} の値が不正です`);
+    }
+    const normalized = String(value);
+    if (element instanceof HTMLSelectElement && ![...element.options].some((option) => option.value === normalized)) {
+      throw new Error(`${id} の選択肢が不正です`);
+    }
+    updates.push({ element, value: normalized });
+  }
+  return updates;
+}
+
+function commitSettings(updates: SettingUpdate[]) {
+  for (const { element, value } of updates) {
+    if (element instanceof HTMLInputElement && element.type === "checkbox") element.checked = value as boolean;
+    else element.value = value as string;
   }
   $("#strength-value").textContent = `${Math.round(Number($<HTMLInputElement>("#strength").value) * 100)}%`;
   $("#loudness-fields").classList.toggle("enabled", $<HTMLInputElement>("#loudness-enabled").checked);
+  const modelPath = $<HTMLInputElement>("#model-path").value || null;
+  setPath("#model-path", "#model-path-display", modelPath);
   updateBackendSettings(); renderBatch();
+}
+
+function applySettings(values: Record<string, unknown>) { commitSettings(planSettings(values)); }
+
+function applyAndSaveSettings(values: SavedValues) {
+  const previousValues = captureSettings();
+  const nextValues: SavedValues = { ...previousValues, ...values };
+  const updates = planSettings(nextValues);
+  const rollback = planSettings(previousValues);
+  const previousStored = localStorage.getItem(SETTINGS_KEY);
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(nextValues));
+    commitSettings(updates);
+  } catch (error) {
+    try {
+      if (previousStored == null) localStorage.removeItem(SETTINGS_KEY);
+      else localStorage.setItem(SETTINGS_KEY, previousStored);
+      commitSettings(rollback);
+    } catch { /* Preserve the original import error. */ }
+    throw error;
+  }
 }
 
 function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(captureSettings())); }
@@ -309,9 +361,19 @@ void getCurrentWebview().onDragDropEvent(async ({ payload }) => {
   } else { overlay.classList.remove("show"); document.querySelectorAll(".drop-active").forEach((element) => element.classList.remove("drop-active")); }
 });
 
-function options() {
+function onnxModelForBackend(backend: string, modelPath = $<HTMLInputElement>("#model-path").value) {
+  const descriptor = appInfo.backends.find(({ name }) => name === backend);
+  return descriptor?.externalModel === true ? modelPath || null : null;
+}
+
+function onnxRateForBackend(backend: string, modelRate = Number($<HTMLInputElement>("#onnx-rate").value)) {
+  const descriptor = appInfo.backends.find(({ name }) => name === backend);
+  return descriptor?.externalModel === true ? modelRate : descriptor?.sampleRate ?? 16000;
+}
+
+function options(backend = $<HTMLSelectElement>("#backend").value) {
   return {
-    backend: $<HTMLSelectElement>("#backend").value,
+    backend,
     preset: $<HTMLSelectElement>("#preset").value,
     mode: $<HTMLSelectElement>("#mode").value,
     strength: Number($<HTMLInputElement>("#strength").value),
@@ -326,8 +388,8 @@ function options() {
     mp3BitrateKbps: Number($<HTMLInputElement>("#mp3-bitrate").value),
     aacBitrateKbps: Number($<HTMLInputElement>("#aac-bitrate").value),
     aacEncoder: $<HTMLSelectElement>("#aac-encoder").value,
-    onnxModel: $<HTMLInputElement>("#model-path").value || null,
-    onnxSampleRate: Number($<HTMLInputElement>("#onnx-rate").value),
+    onnxModel: onnxModelForBackend(backend),
+    onnxSampleRate: onnxRateForBackend(backend),
     sgmseProfile: $<HTMLSelectElement>("#sgmse-profile").value,
     deterministic: $<HTMLInputElement>("#deterministic").checked,
   };
@@ -341,7 +403,8 @@ async function init() {
   const liveBackend = $<HTMLSelectElement>("#live-backend");
   appInfo.backends.forEach(({ name }) => {
     const label = name === "classical" ? "Classical DSP" : name;
-    backend.add(new Option(label, name)); liveBackend.add(new Option(label, name));
+    backend.add(new Option(label, name));
+    if (name === "classical" || name === "rnnoise") liveBackend.add(new Option(label, name));
   });
   if (appInfo.fdkAvailable) $<HTMLSelectElement>("#aac-encoder").add(new Option("FDK-AAC", "fdk"));
   await loadLiveDevices();
@@ -363,7 +426,10 @@ function updateBackendSettings(useDescriptorRate = false) {
     : needsModel ? "このバックエンド用に変換したONNXモデルが必要です。" : "";
 }
 
-$("#backend").addEventListener("change", () => updateBackendSettings(true));
+$("#backend").addEventListener("change", () => {
+  setPath("#model-path", "#model-path-display", null);
+  updateBackendSettings(true);
+});
 $("#choose-model").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
   if (typeof path !== "string") return;
@@ -388,15 +454,16 @@ $("#reset-config").addEventListener("click", () => { localStorage.removeItem(SET
 
 function exportConfig() {
   const values = captureSettings();
-  const loudnessEnabled = Boolean(values["loudness-enabled"]);
+  const loudnessEnabled = values["loudness-enabled"] === true;
+  const backend = String(values.backend);
   return {
-    backend: values.backend, preset: values.preset, mode: values.mode, strength: Number(values.strength),
+    backend, preset: values.preset, mode: values.mode, strength: Number(values.strength),
     adaptive_noise: values.adaptive, vad: values.vad, channels: values.channels, downmix: values.downmix,
     loudness_lufs: loudnessEnabled ? Number(values.loudness) : null,
     true_peak_dbtp: loudnessEnabled ? Number(values["true-peak"]) : null, preserve_metadata: values.metadata, force: values.force,
     mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
-    aac_encoder: values["aac-encoder"], onnx_model: values["model-path"] || null,
-    onnx_rate: Number(values["onnx-rate"]), sgmse_profile: values["sgmse-profile"],
+    aac_encoder: values["aac-encoder"], onnx_model: onnxModelForBackend(backend, String(values["model-path"])),
+    onnx_rate: onnxRateForBackend(backend, Number(values["onnx-rate"])), sgmse_profile: values["sgmse-profile"],
     deterministic: values.deterministic,
   };
 }
@@ -407,15 +474,18 @@ $("#export-config").addEventListener("click", async () => {
 $("#import-config").addEventListener("click", async () => {
   try {
     const path = await open({ multiple: false, filters: [{ name: "TOML", extensions: ["toml"] }] }); if (typeof path !== "string") return;
-    const config = await invoke<Record<string, string | number | boolean>>("load_gui_config", { path });
-    const map: Record<string, string> = { adaptive_noise: "adaptive", channels: "channels", downmix: "downmix", loudness_lufs: "loudness", true_peak_dbtp: "true-peak", preserve_metadata: "metadata", mp3_bitrate_kbps: "mp3-bitrate", m4a_bitrate_kbps: "aac-bitrate", aac_encoder: "aac-encoder", onnx_model: "model-path", onnx_rate: "onnx-rate", sgmse_profile: "sgmse-profile" };
-    const values: SavedValues = {}; for (const [key, value] of Object.entries(config)) values[map[key] ?? key] = value;
-    const modelPath = typeof config.onnx_model === "string" ? config.onnx_model : null;
-    values["loudness-enabled"] = config.loudness_lufs != null;
-    values.loudness = config.loudness_lufs ?? -16;
-    values["true-peak"] = config.true_peak_dbtp ?? -1;
-    values["model-path"] = modelPath ?? "";
-    applySettings(values); setPath("#model-path", "#model-path-display", modelPath); saveSettings(); showToast("設定を読み込みました");
+    const config = await invoke<GuiConfig>("load_gui_config", { path, current: exportConfig() });
+    const values: SavedValues = {
+      backend: config.backend, preset: config.preset, mode: config.mode, strength: config.strength,
+      adaptive: config.adaptive_noise, vad: config.vad, channels: config.channels, downmix: config.downmix,
+      "loudness-enabled": config.loudness_lufs != null, loudness: config.loudness_lufs ?? -16,
+      "true-peak": config.true_peak_dbtp ?? -1, metadata: config.preserve_metadata, force: config.force,
+      "mp3-bitrate": config.mp3_bitrate_kbps, "aac-bitrate": config.m4a_bitrate_kbps,
+      "aac-encoder": config.aac_encoder, "model-path": config.onnx_model ?? "",
+      "onnx-rate": config.onnx_rate, "sgmse-profile": config.sgmse_profile,
+      deterministic: config.deterministic,
+    };
+    applyAndSaveSettings(values); showToast("設定を読み込みました");
   } catch (error) { showToast(errorText(error), true); }
 });
 
@@ -806,7 +876,7 @@ $("#start-live").addEventListener("click", async () => {
       inputDevice: $<HTMLSelectElement>("#live-input").value || null,
       outputDevice: $<HTMLSelectElement>("#live-output").value || null,
       chunkMs: Number($<HTMLInputElement>("#live-chunk").value), backend,
-      options: { ...options(), backend },
+      options: options(backend),
     } });
     $("#start-live").classList.add("hidden"); $("#stop-live").classList.remove("hidden");
     $("#live-status").textContent = "接続中";

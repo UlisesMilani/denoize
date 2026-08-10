@@ -2,9 +2,10 @@
 
 use denoize::audio::{
     ensure_memory_limit, estimate_audio_working_set_bytes, estimate_file_memory_bytes,
-    estimate_stream_memory_bytes, read_audio, read_wav_bytes, write_wav_bytes,
+    estimate_stream_memory_bytes_checked, read_audio, read_wav_bytes, write_wav_bytes,
     write_wav_channel_mask_to_file, WavStreamReader, WavStreamWriter,
 };
+use denoize::config::{MAX_SAMPLE_RATE, MAX_STREAM_BLOCK_FRAMES};
 use denoize::decode::{probe_file as probe_audio_file, AudioCodec, AudioFormat, AudioProbe};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
@@ -21,6 +22,14 @@ use std::time::Instant;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_BLOCK_FRAMES: usize = 8192;
+const MIN_STREAM_BLOCK_FRAMES: usize = 1;
+const MIN_LIVE_CHUNK_MS: u32 = 10;
+const MAX_LIVE_CHUNK_MS: u32 = 2_000;
+const MAX_BATCH_JOBS: usize = 32;
+const VALIDATION_SAMPLE_RATE: u32 = 48_000;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const INPUT_MEMORY_EXPANSION_FACTOR: u64 = 8;
+const STDIN_READ_CHUNK_BYTES: usize = 64 * 1024;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -178,6 +187,10 @@ USAGE:
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
+LIVE:
+    Low-latency live processing supports only classical and rnnoise; other
+    backends are rejected before capture or playback starts.
+
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
     -b, --backend <NAME>     auto|{backends}  (default: classical)
@@ -185,21 +198,21 @@ OPTIONS:
     -p, --preset <NAME>      speech|music|aggressive|gentle|restore|hifi
         --mode <NAME>        speech|music|ambient processing intent
     -s, --strength <0..1>    denoising strength (default: 0.6)
-        --profile <MS>       learn noise from first MS ms (default: auto-detect)
+        --profile <MS>       finite duration: <0 off, 0 auto, >0 up to 60000
         --no-profile         no profiling; rely on blind IMCRA bootstrap
         --no-adapt           freeze the noise estimate
         --adaptive-noise     learn noise from noise-only regions throughout the file
         --vad                speech-aware segmentation and silence suppression
-        --frame <N>          FFT size: 512|1024|2048|4096|8192 (default: 2048)
+        --frame <N>          FFT size: power of two in 256..65536 (default: 2048)
         --overlap <F>        overlap ratio 0.5..0.95 (default: 0.75)
         --window <NAME>      hann|hamming|sine|blackman|kaiser|flattop|dpss
-        --kaiser-beta <B>    Kaiser window beta (default: 8.0)
+        --kaiser-beta <B>    finite Kaiser beta in 0..50 (default: 8.0)
         --dpss-nw <NW>       classical DPSS time-bandwidth product in (0, {MAX_DENOISER_DPSS_NW}] (default: 3.0)
         --multiband          enable multiband spectral subtraction
         --perceptual         enable Bark-scale perceptual gain weighting
         --postfilter         enable musical-noise suppression post-filter
         --smoothing <0..1>   gain release smoothing (default: 0.6)
-        --makeup <DB>        makeup gain in dB (default: 0.0)
+        --makeup <DB>        makeup gain in -120..120 dB (default: 0.0)
         --no-dc-block        disable DC-blocking pre-filter
         --quality <LEVEL>    high|ultra
         --no-transient       disable transient/onset protection
@@ -209,23 +222,23 @@ OPTIONS:
         --no-pre-emphasis    disable pre-emphasis
         --report             print settings report and exit
         --mp3-bitrate <KBPS> MP3 CBR bitrate (default: 192)
-        --m4a-bitrate <KBPS> M4A/AAC CBR bitrate (default: 192)
+        --m4a-bitrate <KBPS> positive M4A/AAC CBR bitrate (default: 192)
         --aac-encoder <NAME> oxide|fdk (default: oxide)
         --downmix <MODE>     preserve|stereo (default: preserve; lossy outputs reject surround unless explicit)
-        --loudness <LUFS>     normalize integrated loudness after denoising
-        --true-peak <DBTP>    true-peak ceiling with --loudness (default: -1)
+        --loudness <LUFS>     finite normalization target in -70..0 LUFS
+        --true-peak <DBTP>    finite ceiling in -20..0 dBTP with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
-        --onnx-rate <HZ>      ONNX model sample rate (default: 16000)
+        --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
-        --stream-frames <N>   streaming block size in frames (default: 8192)
-        --max-memory <MB>     refuse inputs whose estimated working set exceeds MB
+        --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
+        --max-memory <MB>     checked working-set limit in MiB (minimum: 1)
         --recursive           include subdirectories in batch mode
-        --jobs <N>            concurrent batch workers (default: CPU count)
+        --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
         --resume              skip completed files recorded by batch state
@@ -234,7 +247,7 @@ OPTIONS:
         --no-metadata         do not copy input tags/artwork/chapters to the output
         --input-device <NAME> live capture device (default: system default)
         --output-device <NAME> live playback device (default: system default)
-        --chunk-ms <MS>       live processing chunk duration (default: 100)
+        --chunk-ms <MS>       live chunk duration in 10..2000 ms (default: 100)
     -h, --help               show this help
     -V, --version            show version
 
@@ -247,12 +260,17 @@ BACKENDS (build with --features full for all):
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
     mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
-    gtcrn       Official low-complexity streaming GTCRN (requires --features gtcrn)
+    gtcrn       Official causal GTCRN for files/library streams (not the live command)
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP
     speech      Voice-optimised balance
     music       Instruments; enables perceptual + postfilter
+
+CONFIGURATION:
+    TOML syntax and enum names are checked when loaded. CLI values then override
+    TOML numeric defaults, and the final effective configuration is validated
+    before audio decoding, output staging, or batch worker creation.
 "
     )
 }
@@ -332,6 +350,7 @@ struct FileConfig {
     frame_size: Option<usize>,
     overlap: Option<f64>,
     window: Option<String>,
+    kaiser_beta: Option<f64>,
     dpss_nw: Option<f64>,
     smoothing: Option<f64>,
     makeup_db: Option<f64>,
@@ -359,12 +378,25 @@ struct FileConfig {
     resume: bool,
     progress: Option<bool>,
     preserve_metadata: Option<bool>,
+    chunk_ms: Option<u32>,
 }
 
 fn load_config(path: &str) -> Result<Overrides, String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read config {path}: {error}"))?;
     parse_config(&source, path)
+}
+
+fn parse_quality(value: &str, source: &str) -> Result<String, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "high" => Ok("high".into()),
+        // Preserve the long-standing aliases while exposing one canonical
+        // effective value to backend selection and the quality preset logic.
+        "ultra" | "max" | "highest" => Ok("ultra".into()),
+        _ => Err(format!(
+            "unknown quality{source}: {value} (expected high or ultra)"
+        )),
+    }
 }
 
 fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
@@ -431,10 +463,14 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.vad = config.vad;
     ov.frame_size = config.frame_size;
     ov.overlap = config.overlap;
+    ov.kaiser_beta = config.kaiser_beta;
     ov.dpss_nw = config.dpss_nw;
     ov.smoothing = config.smoothing;
     ov.makeup = config.makeup_db;
-    ov.quality = config.quality.map(|value| value.to_ascii_lowercase());
+    ov.quality = config
+        .quality
+        .map(|value| parse_quality(&value, " in config"))
+        .transpose()?;
     ov.mp3_bitrate_kbps = config.mp3_bitrate_kbps;
     ov.m4a_bitrate_kbps = config.m4a_bitrate_kbps;
     ov.loudness_lufs = config.loudness_lufs;
@@ -456,12 +492,19 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.max_memory_mb = config.max_memory_mb;
     ov.recursive = config.recursive;
     ov.jobs = config.jobs;
-    ov.output_format = config.output_format;
+    ov.output_format = config
+        .output_format
+        .map(|value| {
+            normalize_output_extension(&value)
+                .map(|extension| extension.to_ascii_lowercase())
+                .map_err(|error| format!("{error} in config"))
+        })
+        .transpose()?;
     ov.force = config.force;
     ov.resume = config.resume;
     ov.no_progress = config.progress == Some(false);
     ov.no_metadata = config.preserve_metadata == Some(false);
-    validate_resource_options(&ov)?;
+    ov.chunk_ms = config.chunk_ms;
     Ok(ov)
 }
 
@@ -567,7 +610,7 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--report" => ov.report = true,
             "--quality" => {
                 let q: String = parse_value(args, &mut i, a)?;
-                ov.quality = Some(q.to_ascii_lowercase());
+                ov.quality = Some(parse_quality(&q, "")?);
             }
             "--no-transient" => ov.no_transient = true,
             "--cepstral" => ov.cepstral = true,
@@ -619,7 +662,10 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--max-memory" => ov.max_memory_mb = Some(parse_value(args, &mut i, a)?),
             "--recursive" => ov.recursive = true,
             "--jobs" => ov.jobs = Some(parse_value(args, &mut i, a)?),
-            "--output-format" => ov.output_format = Some(parse_value(args, &mut i, a)?),
+            "--output-format" => {
+                let value: String = parse_value(args, &mut i, a)?;
+                ov.output_format = Some(normalize_output_extension(&value)?.to_ascii_lowercase());
+            }
             "--force" => ov.force = true,
             "--resume" => ov.resume = true,
             "--no-progress" => ov.no_progress = true,
@@ -654,25 +700,193 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
         i += 1;
     }
 
+    // Validate the fully merged, effective configuration before looking at
+    // positional paths. This keeps configuration errors deterministic and
+    // guarantees that invalid values cannot trigger input/output I/O.
+    validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
     let input = input.ok_or("missing INPUT")?;
     let output = output.ok_or("missing OUTPUT audio path")?;
     Ok((input, output, ov))
 }
 
-fn validate_resource_options(ov: &Overrides) -> Result<(), String> {
-    if let Some(nw) = ov.dpss_nw {
-        if !nw.is_finite() || nw <= 0.0 || nw > MAX_DENOISER_DPSS_NW {
+fn checked_memory_limit_bytes(max_memory_mb: Option<usize>) -> Result<Option<u64>, String> {
+    let Some(max_memory_mb) = max_memory_mb else {
+        return Ok(None);
+    };
+    if max_memory_mb == 0 {
+        return Err("--max-memory must be at least 1 MiB".into());
+    }
+    let max_memory_mb = u64::try_from(max_memory_mb)
+        .map_err(|_| "--max-memory is too large to represent safely")?;
+    max_memory_mb
+        .checked_mul(BYTES_PER_MIB)
+        .map(Some)
+        .ok_or_else(|| "--max-memory is too large to represent safely".into())
+}
+
+fn checked_m4a_bitrate_bps(kbps: u32) -> Result<u32, String> {
+    kbps.checked_mul(1000).ok_or_else(|| {
+        format!(
+            "invalid --m4a-bitrate/m4a_bitrate_kbps value {kbps}: converting from kbps to bps exceeds the supported u32 representation (maximum {} kbps)",
+            u32::MAX / 1000
+        )
+    })
+}
+
+fn build_encode_options(ov: &Overrides) -> Result<EncodeOptions, String> {
+    let mut options = EncodeOptions::default();
+    if let Some(kbps) = ov.mp3_bitrate_kbps {
+        options.mp3_bitrate_kbps = kbps;
+    }
+    if let Some(kbps) = ov.m4a_bitrate_kbps {
+        options.m4a_bitrate_bps = checked_m4a_bitrate_bps(kbps)?;
+    }
+    if let Some(encoder) = ov.aac_encoder {
+        options.aac_encoder = encoder;
+    }
+    if let Some(downmix) = ov.downmix {
+        options.downmix = downmix;
+    }
+    Ok(options)
+}
+
+fn validate_encode_preflight(
+    options: EncodeOptions,
+    formats: impl IntoIterator<Item = OutputFormat>,
+) -> Result<(), String> {
+    for format in formats {
+        options.validate_options(format)?;
+    }
+    Ok(())
+}
+
+fn validate_batch_audio_configs(
+    items: &[BatchItem],
+    options: EncodeOptions,
+    max_memory_mb: Option<usize>,
+) -> Result<(), String> {
+    for item in items {
+        let estimate = estimate_file_memory_bytes(&item.input).map_err(|error| {
+            format!(
+                "batch input preflight failed for {}: {error}",
+                item.input.display()
+            )
+        })?;
+        ensure_memory_limit(estimate, max_memory_mb, "batch input preflight")?;
+        let audio = read_audio(&item.input).map_err(|error| {
+            format!(
+                "decode batch input {} during preflight: {error}",
+                item.input.display()
+            )
+        })?;
+        ensure_memory_limit(
+            estimate_audio_working_set_bytes(&audio),
+            max_memory_mb,
+            "batch decoded audio working set",
+        )?;
+        item.output_format
+            .validate_config(&audio, &options)
+            .map_err(|error| {
+                format!(
+                    "batch output preflight failed for {}: {error}",
+                    item.input.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn effective_batch_jobs(ov: &Overrides) -> usize {
+    ov.jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(MAX_BATCH_JOBS)
+    })
+}
+
+fn build_backend_options(ov: &Overrides) -> BackendOptions {
+    BackendOptions {
+        onnx: ov.onnx_model.as_ref().map(|path| OnnxModelConfig {
+            path: path.into(),
+            sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
+        }),
+        channel_mode: ov.channel_mode.unwrap_or_default(),
+        sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
+        deterministic: ov.deterministic,
+        seed: ov.seed,
+    }
+}
+
+fn resolve_explicit_backend_options(ov: &Overrides) -> Result<Option<BackendOptions>, String> {
+    if ov.auto_backend {
+        return Ok(None);
+    }
+    let backend = ov.backend.unwrap_or(Backend::Classical);
+    service::resolve_backend_options(backend, build_backend_options(ov)).map(Some)
+}
+
+fn validate_effective_options(ov: &Overrides, sample_rate: u32) -> Result<(), String> {
+    // `parse_config` deliberately postpones numeric checks until after CLI
+    // overrides have been applied. Validate only this final effective config.
+    build_config(ov, sample_rate)
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+
+    if let Some(loudness) = ov.loudness_lufs {
+        if !loudness.is_finite() || !(-70.0..=0.0).contains(&loudness) {
             return Err(format!(
-                "invalid --dpss-nw/dpss_nw value {nw}: expected a finite DPSS time-bandwidth product in (0, {MAX_DENOISER_DPSS_NW}]"
+                "invalid --loudness/loudness_lufs value {loudness}: expected a finite value in [-70, 0] LUFS"
             ));
         }
     }
-    if ov.max_memory_mb == Some(0) {
-        return Err("--max-memory must be at least 1 MiB".into());
+    if let Some(true_peak) = ov.true_peak_dbtp {
+        if !true_peak.is_finite() || !(-20.0..=0.0).contains(&true_peak) {
+            return Err(format!(
+                "invalid --true-peak/true_peak_dbtp value {true_peak}: expected a finite value in [-20, 0] dBTP"
+            ));
+        }
+        if ov.loudness_lufs.is_none() {
+            return Err("--true-peak requires --loudness".into());
+        }
     }
-    if ov.stream_frames == Some(0) {
-        return Err("--stream-frames must be at least 1 frame".into());
+    if let Some(sample_rate) = ov.onnx_sample_rate {
+        if sample_rate == 0 || sample_rate > MAX_SAMPLE_RATE {
+            return Err(format!(
+                "--onnx-rate/onnx_rate must be in 1..={MAX_SAMPLE_RATE} Hz"
+            ));
+        }
     }
+    if !ov.auto_backend {
+        build_backend_options(ov)
+            .validate_config(ov.backend.unwrap_or(Backend::Classical))
+            .map_err(|error| error.to_string())?;
+    }
+    if let Some(stream_frames) = ov.stream_frames {
+        if !(MIN_STREAM_BLOCK_FRAMES..=MAX_STREAM_BLOCK_FRAMES).contains(&stream_frames) {
+            return Err(format!(
+                "--stream-frames/stream_frames must be in {MIN_STREAM_BLOCK_FRAMES}..={MAX_STREAM_BLOCK_FRAMES}"
+            ));
+        }
+    }
+    if let Some(chunk_ms) = ov.chunk_ms {
+        if !(MIN_LIVE_CHUNK_MS..=MAX_LIVE_CHUNK_MS).contains(&chunk_ms) {
+            return Err(format!(
+                "--chunk-ms must be in {MIN_LIVE_CHUNK_MS}..={MAX_LIVE_CHUNK_MS}"
+            ));
+        }
+    }
+    if let Some(jobs) = ov.jobs {
+        if !(1..=MAX_BATCH_JOBS).contains(&jobs) {
+            return Err(format!("--jobs/jobs must be in 1..={MAX_BATCH_JOBS}"));
+        }
+    }
+    let encode_options = build_encode_options(ov)?;
+    if let Some(extension) = ov.output_format.as_deref() {
+        let path = std::path::PathBuf::from(format!("output.{extension}"));
+        validate_encode_preflight(encode_options, [OutputFormat::from_path(&path)?])?;
+    }
+    checked_memory_limit_bytes(ov.max_memory_mb)?;
     Ok(())
 }
 
@@ -887,7 +1101,6 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_compare(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
-    validate_resource_options(&ov)?;
     if ov.batch {
         if ov.stream {
             return Err("--stream cannot be combined with --batch".into());
@@ -905,7 +1118,7 @@ fn run_live(args: &[String]) -> Result<(), String> {
     let mut parseable = vec!["-".to_string(), "-".to_string()];
     parseable.extend_from_slice(args);
     let (_, _, ov) = parse_args(&parseable)?;
-    validate_resource_options(&ov)?;
+    validate_effective_options(&ov, 48_000)?;
     if ov.list_devices {
         let (inputs, outputs) = denoize::live::device_names()?;
         println!("Input devices:");
@@ -925,16 +1138,7 @@ fn run_live(args: &[String]) -> Result<(), String> {
     };
     let sample_rate = 48_000;
     let denoiser = build_config(&ov, sample_rate);
-    let backend_options = BackendOptions {
-        onnx: ov.onnx_model.map(|path| OnnxModelConfig {
-            path: path.into(),
-            sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
-        }),
-        channel_mode: ov.channel_mode.unwrap_or_default(),
-        sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
-        deterministic: ov.deterministic,
-        seed: ov.seed,
-    };
+    let backend_options = build_backend_options(&ov);
     denoize::live::run(denoize::live::LiveConfig {
         input_device: ov.input_device,
         output_device: ov.output_device,
@@ -971,11 +1175,73 @@ fn ensure_output_available(path: &std::path::Path, force: bool) -> Result<(), St
     }
 }
 
+fn read_stdin_bytes(
+    mut input: impl std::io::Read,
+    max_memory_mb: Option<usize>,
+) -> Result<Vec<u8>, String> {
+    let max_encoded_bytes = checked_memory_limit_bytes(max_memory_mb)?
+        .map(|limit| limit / INPUT_MEMORY_EXPANSION_FACTOR);
+    let bounded_read_len = max_encoded_bytes
+        .map(|limit| {
+            limit
+                .checked_add(1)
+                .ok_or_else(|| "--max-memory stdin byte limit overflow".to_string())
+                .and_then(|limit| {
+                    usize::try_from(limit)
+                        .map_err(|_| "--max-memory stdin byte limit is too large".to_string())
+                })
+        })
+        .transpose()?;
+    let initial_capacity = bounded_read_len
+        .unwrap_or(STDIN_READ_CHUNK_BYTES)
+        .min(STDIN_READ_CHUNK_BYTES);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(initial_capacity)
+        .map_err(|_| "unable to reserve memory for stdin input".to_string())?;
+
+    let mut chunk = [0u8; STDIN_READ_CHUNK_BYTES];
+    loop {
+        let read_len = match bounded_read_len {
+            Some(limit) => {
+                let remaining = limit
+                    .checked_sub(bytes.len())
+                    .ok_or_else(|| "stdin byte limit accounting overflow".to_string())?;
+                if remaining == 0 {
+                    break;
+                }
+                remaining.min(chunk.len())
+            }
+            None => chunk.len(),
+        };
+        let read = input
+            .read(&mut chunk[..read_len])
+            .map_err(|error| format!("failed to read stdin: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes
+            .try_reserve_exact(read)
+            .map_err(|_| "unable to reserve memory for stdin input".to_string())?;
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+
+    let encoded_len = u64::try_from(bytes.len())
+        .map_err(|_| "stdin input length is too large to represent safely".to_string())?;
+    let estimate = encoded_len
+        .checked_mul(INPUT_MEMORY_EXPANSION_FACTOR)
+        .ok_or_else(|| "stdin input memory estimate overflow".to_string())?
+        .max(BYTES_PER_MIB);
+    ensure_memory_limit(estimate, max_memory_mb, "stdin input preflight")?;
+    Ok(bytes)
+}
+
 fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     run_one_with_output_format(
         std::path::Path::new(input),
         std::path::Path::new(output),
         ov,
+        None,
         None,
     )
 }
@@ -985,21 +1251,29 @@ fn run_one_with_output_format(
     output: &std::path::Path,
     ov: Overrides,
     planned_output_format: Option<OutputFormat>,
+    pre_resolved_backend_options: Option<BackendOptions>,
 ) -> Result<(), String> {
-    validate_resource_options(&ov)?;
+    validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
     let standard_input = input == std::path::Path::new("-");
     let standard_output = output == std::path::Path::new("-");
+    let encode_options = build_encode_options(&ov)?;
     let output_format = if !ov.report && !standard_output {
-        let format = match planned_output_format {
+        Some(match planned_output_format {
             Some(format) => format,
             None => OutputFormat::from_path(output)?,
-        };
-        format.validate_encoder(ov.aac_encoder.unwrap_or_default())?;
-        ensure_output_available(output, ov.force)?;
-        Some(format)
+        })
     } else {
         None
     };
+    validate_encode_preflight(encode_options, output_format)?;
+
+    let resolved_backend_options = match pre_resolved_backend_options {
+        Some(options) => Some(options),
+        None => resolve_explicit_backend_options(&ov)?,
+    };
+    if output_format.is_some() {
+        ensure_output_available(output, ov.force)?;
+    }
     if !standard_input {
         let estimate = estimate_file_memory_bytes(input)?;
         ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
@@ -1010,12 +1284,8 @@ fn run_one_with_output_format(
         None
     };
     let mut audio = if standard_input {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
-            .map_err(|error| format!("failed to read stdin: {error}"))?;
-        let estimate = (bytes.len() as u64).saturating_mul(8).max(1024 * 1024);
-        ensure_memory_limit(estimate, ov.max_memory_mb, "stdin input preflight")?;
-        read_wav_bytes(bytes)?
+        let stdin = std::io::stdin();
+        read_wav_bytes(read_stdin_bytes(stdin.lock(), ov.max_memory_mb)?)?
     } else {
         read_audio(input)?
     };
@@ -1024,6 +1294,7 @@ fn run_one_with_output_format(
         ov.max_memory_mb,
         "decoded audio working set",
     )?;
+    validate_effective_options(&ov, audio.sample_rate)?;
     let cfg = build_config(&ov, audio.sample_rate);
     let backend_choice = if ov.auto_backend {
         BackendChoice::Auto
@@ -1047,30 +1318,11 @@ fn run_one_with_output_format(
         return Ok(());
     }
 
-    let mut enc = EncodeOptions::default();
-    if let Some(kbps) = ov.mp3_bitrate_kbps {
-        enc.mp3_bitrate_kbps = kbps;
-    }
-    if let Some(kbps) = ov.m4a_bitrate_kbps {
-        enc.m4a_bitrate_bps = kbps.saturating_mul(1000);
-    }
-    if let Some(encoder) = ov.aac_encoder {
-        enc.aac_encoder = encoder;
-    }
-    if let Some(downmix) = ov.downmix {
-        enc.downmix = downmix;
+    if let Some(format) = output_format {
+        format.validate_config(&audio, &encode_options)?;
     }
 
-    let backend_options = BackendOptions {
-        onnx: ov.onnx_model.map(|path| OnnxModelConfig {
-            path: path.into(),
-            sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
-        }),
-        channel_mode: ov.channel_mode.unwrap_or_default(),
-        sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
-        deterministic: ov.deterministic,
-        seed: ov.seed,
-    };
+    let backend_options = resolved_backend_options.unwrap_or_else(|| build_backend_options(&ov));
     let result = service::process_audio(
         &mut audio,
         ProcessingOptions {
@@ -1102,7 +1354,7 @@ fn run_one_with_output_format(
             output,
             output_format,
             &audio,
-            enc,
+            encode_options,
             metadata,
             if ov.force {
                 CommitMode::Replace
@@ -1131,7 +1383,7 @@ fn run_one_with_output_format(
 }
 
 fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
-    validate_resource_options(&ov)?;
+    validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
     if input == "-" || output == "-" {
         return Err("--stream requires filesystem WAV input and output paths".into());
     }
@@ -1146,7 +1398,6 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     if !is_wav(input_path) || !is_wav(output_path) {
         return Err("--stream currently supports WAV-to-WAV paths only".into());
     }
-    ensure_output_available(output_path, ov.force)?;
     if ov.auto_backend
         || ov
             .backend
@@ -1160,33 +1411,33 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     {
         return Err("--stream requires independent channels".into());
     }
-    if ov.vad || ov.loudness_lufs.is_some() || ov.true_peak_dbtp.is_some() {
-        return Err("--stream does not support VAD or loudness normalization".into());
+    let preflight_cfg = build_config(&ov, VALIDATION_SAMPLE_RATE);
+    if preflight_cfg.vad {
+        return Err("--stream does not support VAD; omit --mode speech or --vad".into());
     }
+    if ov.loudness_lufs.is_some() || ov.true_peak_dbtp.is_some() {
+        return Err("--stream does not support loudness normalization".into());
+    }
+    ensure_output_available(output_path, ov.force)?;
 
-    let metadata = if !ov.no_metadata {
-        denoize::metadata::read_extended(input_path)?
-    } else {
-        None
-    };
     let mut reader = WavStreamReader::open(input_path)?;
     let spec = reader.spec();
     let channel_mask = reader.channel_mask();
+    validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
     ensure_memory_limit(
-        estimate_stream_memory_bytes(
+        estimate_stream_memory_bytes_checked(
             spec.channels as usize,
             block_frames,
             cfg.frame_size,
             spec.sample_rate,
-        ),
+            cfg.profile_ms,
+        )
+        .map_err(|error| error.to_string())?,
         ov.max_memory_mb,
         "streaming working set",
     )?;
-    if cfg.vad {
-        return Err("--stream does not support VAD; omit --mode speech or --vad".into());
-    }
     if ov.report {
         println!(
             "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : classical\nstream     : enabled ({} frames/block)",
@@ -1195,9 +1446,17 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         return Ok(());
     }
 
+    // Construct every allocation-sensitive processor before opening the
+    // transactional output. Invalid or hostile resource plans therefore leave
+    // neither a destination nor a temporary `.part` file behind.
+    let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
+    let metadata = if !ov.no_metadata {
+        denoize::metadata::read_extended(input_path)?
+    } else {
+        None
+    };
     let mut transaction = AtomicOutput::new(output_path)?;
     let frames = (|| -> Result<usize, String> {
-        let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
         let sink = std::io::BufWriter::new(transaction.file_mut());
         let mut writer = WavStreamWriter::from_sink(sink, spec)?;
         let mut frames = 0usize;
@@ -1362,7 +1621,6 @@ fn plan_batch_files(
     output_dir: &std::path::Path,
     files: Vec<std::path::PathBuf>,
     output_extension: Option<&str>,
-    aac_encoder: AacEncoder,
 ) -> Result<Vec<BatchItem>, String> {
     let mut items = Vec::with_capacity(files.len());
     for input in files {
@@ -1424,7 +1682,6 @@ fn plan_batch_files(
                 batch_probe_description(&probe)
             ));
         }
-        output_format.validate_encoder(aac_encoder)?;
         let destination_relative = destination.strip_prefix(output_dir).map_err(|error| {
             format!(
                 "batch output {} is outside {}: {error}",
@@ -1601,15 +1858,14 @@ fn validate_batch_directories(
 fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     use rayon::prelude::*;
 
+    validate_effective_options(ov, VALIDATION_SAMPLE_RATE)?;
+    let encode_options = build_encode_options(ov)?;
+    let resolved_backend_options = resolve_explicit_backend_options(ov)?;
+    let jobs = effective_batch_jobs(ov);
     let input_dir = std::path::Path::new(input);
     let output_dir = std::path::Path::new(output);
     if !input_dir.is_dir() {
         return Err(format!("batch input is not a directory: {input}"));
-    }
-    if let Some(jobs) = ov.jobs {
-        if jobs == 0 {
-            return Err("--jobs must be at least 1".into());
-        }
     }
     validate_batch_directories(input_dir, output_dir)?;
     let output_extension = ov
@@ -1621,13 +1877,9 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     if files.is_empty() {
         return Err("batch input contains no supported audio files".into());
     }
-    let items = plan_batch_files(
-        input_dir,
-        output_dir,
-        files,
-        output_extension,
-        ov.aac_encoder.unwrap_or_default(),
-    )?;
+    let items = plan_batch_files(input_dir, output_dir, files, output_extension)?;
+    validate_encode_preflight(encode_options, items.iter().map(|item| item.output_format))?;
+    validate_batch_audio_configs(&items, encode_options, ov.max_memory_mb)?;
 
     let state_path = output_dir.join(".denoize-state");
     if ov.resume {
@@ -1679,6 +1931,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             &item.destination,
             options,
             Some(item.output_format),
+            resolved_backend_options.clone(),
         )?;
         if let Some(file) = &state_file {
             use std::io::Write;
@@ -1700,14 +1953,12 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     };
     let results = if ov.deterministic {
         items.iter().map(process_item).collect::<Vec<_>>()
-    } else if let Some(jobs) = ov.jobs {
+    } else {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build()
             .map_err(|e| format!("create batch worker pool: {e}"))?
             .install(|| items.par_iter().map(process_item).collect::<Vec<_>>())
-    } else {
-        items.par_iter().map(process_item).collect::<Vec<_>>()
     };
     let counts = count_batch_results(&results);
     let failures: Vec<_> = results
@@ -2192,14 +2443,7 @@ mod batch_tests {
         std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
         std::fs::write(&caf, b"caff\0\x01\0\0\0\0\0\0").unwrap();
 
-        let error = plan_batch_files(
-            &input,
-            &output,
-            vec![aiff, caf],
-            Some("flac"),
-            AacEncoder::Oxide,
-        )
-        .unwrap_err();
+        let error = plan_batch_files(&input, &output, vec![aiff, caf], Some("flac")).unwrap_err();
 
         assert!(error.contains("multiple inputs map to the same batch output"));
         assert!(!output.exists());
@@ -2218,14 +2462,7 @@ mod batch_tests {
         std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
         std::fs::write(&caf, b"caff\0\x01\0\0\0\0\0\0").unwrap();
 
-        let error = plan_batch_files(
-            &input,
-            &output,
-            vec![aiff, caf],
-            Some("wav"),
-            AacEncoder::Oxide,
-        )
-        .unwrap_err();
+        let error = plan_batch_files(&input, &output, vec![aiff, caf], Some("wav")).unwrap_err();
 
         assert!(error.contains("conflict as a file and directory"));
         assert!(!output.exists());
@@ -2264,8 +2501,7 @@ mod batch_tests {
         let aiff = input_nested.join("voice.aiff");
         std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
 
-        let error = plan_batch_files(&input, &output, vec![aiff], Some("wav"), AacEncoder::Oxide)
-            .unwrap_err();
+        let error = plan_batch_files(&input, &output, vec![aiff], Some("wav")).unwrap_err();
 
         assert!(error.contains("resolves inside the input directory"));
         std::fs::remove_dir_all(root).unwrap();
@@ -2280,14 +2516,7 @@ mod batch_tests {
         let aiff = input.join("voice.aiff");
         std::fs::write(&aiff, b"FORM\0\0\0\0AIFF").unwrap();
 
-        let items = plan_batch_files(
-            &input,
-            &output,
-            vec![aiff.clone()],
-            Some("wav"),
-            AacEncoder::Oxide,
-        )
-        .unwrap();
+        let items = plan_batch_files(&input, &output, vec![aiff.clone()], Some("wav")).unwrap();
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].input, aiff);
@@ -2442,8 +2671,7 @@ mod batch_tests {
                 sample_rate: 16_000,
                 channels: vec![(0..3_200)
                     .map(|index| {
-                        (2.0 * std::f64::consts::PI * frequency * index as f64 / 16_000.0)
-                            .sin()
+                        (2.0 * std::f64::consts::PI * frequency * index as f64 / 16_000.0).sin()
                             * 0.2
                     })
                     .collect()],
@@ -2556,17 +2784,23 @@ mod streaming_tests {
     }
 
     #[test]
-    fn rejects_zero_resource_limits() {
-        let error = validate_resource_options(&Overrides {
-            max_memory_mb: Some(0),
-            ..Overrides::default()
-        })
+    fn rejects_out_of_range_resource_limits() {
+        let error = validate_effective_options(
+            &Overrides {
+                max_memory_mb: Some(0),
+                ..Overrides::default()
+            },
+            VALIDATION_SAMPLE_RATE,
+        )
         .unwrap_err();
         assert!(error.contains("--max-memory"));
-        let error = validate_resource_options(&Overrides {
-            stream_frames: Some(0),
-            ..Overrides::default()
-        })
+        let error = validate_effective_options(
+            &Overrides {
+                stream_frames: Some(MAX_STREAM_BLOCK_FRAMES + 1),
+                ..Overrides::default()
+            },
+            VALIDATION_SAMPLE_RATE,
+        )
         .unwrap_err();
         assert!(error.contains("--stream-frames"));
     }
@@ -2619,6 +2853,28 @@ mod streaming_tests {
 mod config_file_tests {
     use super::*;
 
+    fn write_test_config(source: &str, label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "denoize-{label}-{}-{}.toml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn cli_error(extra: &[&str]) -> String {
+        let mut args = vec!["input.wav".into(), "output.wav".into()];
+        args.extend(extra.iter().map(|value| (*value).to_string()));
+        parse_args(&args).unwrap_err()
+    }
+
+    fn cli_ok(extra: &[&str]) {
+        let mut args = vec!["input.wav".into(), "output.wav".into()];
+        args.extend(extra.iter().map(|value| (*value).to_string()));
+        parse_args(&args).unwrap();
+    }
+
     #[test]
     fn parses_toml_defaults() {
         let options = parse_config(
@@ -2628,6 +2884,7 @@ preset = "hifi"
 mode = "speech"
 strength = 0.42
 dpss_nw = 2.5
+kaiser_beta = 9.0
 adaptive_noise = true
 vad = true
 preserve_metadata = false
@@ -2636,6 +2893,7 @@ deterministic = true
 seed = 12345
 stream_frames = 4096
 max_memory_mb = 64
+chunk_ms = 100
 "#,
             "test.toml",
         )
@@ -2648,9 +2906,11 @@ max_memory_mb = 64
         assert_eq!(options.mode, Some(ProcessingMode::Speech));
         assert_eq!(options.strength, Some(0.42));
         assert_eq!(options.dpss_nw, Some(2.5));
+        assert_eq!(options.kaiser_beta, Some(9.0));
         assert!(options.adaptive_noise && options.vad && options.no_metadata);
         assert_eq!(options.stream_frames, Some(4096));
         assert_eq!(options.max_memory_mb, Some(64));
+        assert_eq!(options.chunk_ms, Some(100));
     }
 
     #[test]
@@ -2709,6 +2969,9 @@ deterministic = true
 
         let error = parse_config("sgmse_profile = \"invalid\"", "desktop.toml").unwrap_err();
         assert!(error.contains("unknown SGMSE profile in config: invalid"));
+
+        let error = parse_config("quality = \"impossible\"", "desktop.toml").unwrap_err();
+        assert!(error.contains("unknown quality in config: impossible"));
     }
 
     #[test]
@@ -2734,19 +2997,25 @@ deterministic = true
     #[test]
     fn validates_configured_dpss_time_bandwidth_product() {
         for invalid in ["nan", "inf", "+inf", "-inf", "0.0", "-0.5", "8.000001"] {
-            let error = parse_config(&format!("dpss_nw = {invalid}"), "test.toml").unwrap_err();
+            let options = parse_config(
+                &format!("window = \"dpss\"\ndpss_nw = {invalid}"),
+                "test.toml",
+            )
+            .unwrap();
+            let error = validate_effective_options(&options, VALIDATION_SAMPLE_RATE).unwrap_err();
             assert!(
-                error.contains("finite DPSS time-bandwidth product in (0, 8]"),
+                error.contains("DPSS") || error.contains("dpss"),
                 "unexpected error for {invalid}: {error}"
             );
         }
 
-        let options = parse_config("dpss_nw = 8.0", "test.toml").unwrap();
+        let options = parse_config("window = \"dpss\"\ndpss_nw = 8.0", "test.toml").unwrap();
+        validate_effective_options(&options, VALIDATION_SAMPLE_RATE).unwrap();
         assert_eq!(options.dpss_nw, Some(8.0));
     }
 
     #[test]
-    fn invalid_dpss_nw_is_rejected_before_input_or_output_io_even_when_unused() {
+    fn invalid_active_dpss_nw_is_rejected_before_input_or_output_io() {
         let root = std::env::temp_dir().join(format!(
             "denoize-dpss-preflight-{}-{}",
             std::process::id(),
@@ -2758,15 +3027,12 @@ deterministic = true
             input.to_string_lossy().into_owned(),
             output.to_string_lossy().into_owned(),
             "--window".into(),
-            "hann".into(),
-            "--quality".into(),
-            "ultra".into(),
+            "dpss".into(),
             "--dpss-nw".into(),
             "9".into(),
         ])
         .unwrap_err();
-        assert!(error.contains("--dpss-nw"));
-        assert!(error.contains("(0, 8]"));
+        assert!(error.contains("dpss") || error.contains("DPSS"));
         assert!(!output.exists());
     }
 
@@ -2793,16 +3059,10 @@ deterministic = true
 
     #[test]
     fn command_line_overrides_config_defaults() {
-        let path = std::env::temp_dir().join(format!(
-            "denoize-config-{}-{}.toml",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        std::fs::write(
-            &path,
+        let path = write_test_config(
             "backend = \"auto\"\nstrength = 0.25\ndpss_nw = 2.5\n",
-        )
-        .unwrap();
+            "config",
+        );
         let args = vec![
             "input.wav".into(),
             "output.wav".into(),
@@ -2821,6 +3081,301 @@ deterministic = true
         assert!(!options.auto_backend);
         assert_eq!(options.strength, Some(0.75));
         assert_eq!(options.dpss_nw, Some(4.0));
+    }
+
+    #[test]
+    fn numeric_cli_values_override_invalid_toml_defaults_before_validation() {
+        let path = write_test_config(
+            r#"
+strength = nan
+profile_ms = inf
+frame_size = 131072
+window = "kaiser"
+kaiser_beta = nan
+dpss_nw = 9.0
+loudness_lufs = nan
+true_peak_dbtp = -30.0
+onnx_rate = 0
+stream_frames = 0
+max_memory_mb = 0
+jobs = 33
+chunk_ms = 2001
+"#,
+            "numeric-precedence",
+        );
+        let args = vec![
+            "input.wav".into(),
+            "output.wav".into(),
+            "--config".into(),
+            path.to_string_lossy().into_owned(),
+            "--strength".into(),
+            "0.5".into(),
+            "--profile".into(),
+            "-1".into(),
+            "--frame".into(),
+            "256".into(),
+            "--dpss-nw".into(),
+            "4".into(),
+            "--kaiser-beta".into(),
+            "8".into(),
+            "--loudness".into(),
+            "-16".into(),
+            "--true-peak".into(),
+            "-1".into(),
+            "--onnx-rate".into(),
+            "16000".into(),
+            "--stream-frames".into(),
+            "1".into(),
+            "--max-memory".into(),
+            "1".into(),
+            "--jobs".into(),
+            "1".into(),
+            "--chunk-ms".into(),
+            "100".into(),
+        ];
+        let (_, _, options) = parse_args(&args).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(options.strength, Some(0.5));
+        assert_eq!(options.profile_ms, Some(-1.0));
+        assert_eq!(options.frame_size, Some(256));
+        assert_eq!(options.stream_frames, Some(1));
+        assert_eq!(options.jobs, Some(1));
+    }
+
+    #[test]
+    fn invalid_toml_enum_is_not_hidden_by_a_cli_override() {
+        let path = write_test_config("quality = \"impossible\"\n", "enum-precedence");
+        let error = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--config".into(),
+            path.to_string_lossy().into_owned(),
+            "--quality".into(),
+            "high".into(),
+        ])
+        .unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("unknown quality in config"));
+
+        let path = write_test_config("output_format = \"wma\"\n", "format-precedence");
+        let error = parse_args(&[
+            "input".into(),
+            "output".into(),
+            "--config".into(),
+            path.to_string_lossy().into_owned(),
+            "--output-format".into(),
+            "wav".into(),
+        ])
+        .unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("unsupported --output-format"));
+    }
+
+    #[test]
+    fn rejects_unknown_cli_quality_and_normalizes_legacy_aliases() {
+        assert!(cli_error(&["--quality", "impossible"]).contains("unknown quality"));
+        let (_, _, options) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--quality".into(),
+            "highest".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.quality.as_deref(), Some("ultra"));
+    }
+
+    #[test]
+    fn rejects_non_finite_external_float_values() {
+        for value in ["NaN", "inf", "-inf"] {
+            for (flag, prefix) in [
+                ("--strength", &[][..]),
+                ("--profile", &[][..]),
+                ("--overlap", &[][..]),
+                ("--kaiser-beta", &["--window", "kaiser"][..]),
+                ("--dpss-nw", &["--window", "dpss"][..]),
+                ("--smoothing", &[][..]),
+                ("--makeup", &[][..]),
+                ("--loudness", &[][..]),
+                ("--true-peak", &["--loudness", "-16"][..]),
+            ] {
+                let mut extra = prefix.to_vec();
+                extra.extend([flag, value]);
+                let error = cli_error(&extra);
+                assert!(
+                    error.contains("finite"),
+                    "{flag}={value} produced unexpected error: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validates_external_float_and_rate_boundaries() {
+        for (flag, minimum, maximum, below, above, prefix) in [
+            ("--strength", "0", "1", "-0.001", "1.001", &[][..]),
+            ("--overlap", "0.5", "0.95", "0.499", "0.951", &[][..]),
+            ("--smoothing", "0", "1", "-0.001", "1.001", &[][..]),
+            ("--makeup", "-120", "120", "-120.001", "120.001", &[][..]),
+            (
+                "--kaiser-beta",
+                "0",
+                "50",
+                "-0.001",
+                "50.001",
+                &["--window", "kaiser"][..],
+            ),
+            (
+                "--dpss-nw",
+                "0.001",
+                "8",
+                "0",
+                "8.001",
+                &["--window", "dpss"][..],
+            ),
+            ("--loudness", "-70", "0", "-70.001", "0.001", &[][..]),
+            (
+                "--true-peak",
+                "-20",
+                "0",
+                "-20.001",
+                "0.001",
+                &["--loudness", "-16"][..],
+            ),
+        ] {
+            for value in [minimum, maximum] {
+                let mut extra = prefix.to_vec();
+                extra.extend([flag, value]);
+                cli_ok(&extra);
+            }
+            for value in [below, above] {
+                let mut extra = prefix.to_vec();
+                extra.extend([flag, value]);
+                assert!(!cli_error(&extra).is_empty());
+            }
+        }
+
+        cli_ok(&["--profile", "60000"]);
+        assert!(cli_error(&["--profile", "60000.001"]).contains("profile"));
+        for value in ["1", "768000"] {
+            cli_ok(&["--onnx-rate", value]);
+        }
+        for value in ["0", "768001"] {
+            assert!(cli_error(&["--onnx-rate", value]).contains("onnx-rate"));
+        }
+    }
+
+    #[test]
+    fn validates_frame_resource_and_live_boundaries() {
+        for value in ["0", "255", "257", "65537", "131072"] {
+            assert!(cli_error(&["--frame", value]).contains("frame"));
+        }
+        for value in ["256", "65536"] {
+            parse_args(&[
+                "input.wav".into(),
+                "output.wav".into(),
+                "--frame".into(),
+                value.into(),
+            ])
+            .unwrap();
+        }
+
+        for value in ["0", "1048577"] {
+            assert!(cli_error(&["--stream-frames", value]).contains("stream-frames"));
+        }
+        for value in ["1", "1048576"] {
+            parse_args(&[
+                "input.wav".into(),
+                "output.wav".into(),
+                "--stream-frames".into(),
+                value.into(),
+            ])
+            .unwrap();
+        }
+
+        for value in ["0", "33"] {
+            assert!(cli_error(&["--jobs", value]).contains("--jobs"));
+        }
+        for value in ["1", "32"] {
+            parse_args(&[
+                "input.wav".into(),
+                "output.wav".into(),
+                "--jobs".into(),
+                value.into(),
+            ])
+            .unwrap();
+        }
+
+        for value in ["9", "2001"] {
+            assert!(cli_error(&["--chunk-ms", value]).contains("--chunk-ms"));
+        }
+        for value in ["10", "2000"] {
+            parse_args(&[
+                "input.wav".into(),
+                "output.wav".into(),
+                "--chunk-ms".into(),
+                value.into(),
+            ])
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_hostile_integer_values_without_arithmetic_overflow() {
+        let usize_max = usize::MAX.to_string();
+        for (flag, field) in [
+            ("--frame", "frame_size"),
+            ("--stream-frames", "stream-frames"),
+            ("--jobs", "--jobs"),
+            ("--max-memory", "--max-memory"),
+        ] {
+            let error = cli_error(&[flag, &usize_max]);
+            assert!(error.contains(field), "{flag} produced: {error}");
+        }
+        assert!(cli_error(&["--chunk-ms", &u32::MAX.to_string()]).contains("--chunk-ms"));
+    }
+
+    #[test]
+    fn invalid_configuration_precedes_missing_input() {
+        let error = parse_args(&["--strength".into(), "NaN".into()]).unwrap_err();
+        assert!(error.contains("strength"));
+        assert!(!error.contains("missing INPUT"));
+
+        let error = parse_args(&["--jobs".into(), "33".into()]).unwrap_err();
+        assert!(error.contains("--jobs"));
+        assert!(!error.contains("missing INPUT"));
+
+        let error =
+            parse_args(&["--batch".into(), "--output-format".into(), "wma".into()]).unwrap_err();
+        assert!(error.contains("unsupported --output-format"));
+        assert!(!error.contains("missing INPUT"));
+    }
+
+    #[test]
+    fn preserves_profile_and_true_peak_sentinel_semantics() {
+        for profile in ["-1000000", "-1", "0"] {
+            parse_args(&[
+                "input.wav".into(),
+                "output.wav".into(),
+                "--profile".into(),
+                profile.into(),
+            ])
+            .unwrap();
+        }
+        parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--loudness".into(),
+            "-16".into(),
+            "--true-peak".into(),
+            "-1".into(),
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn default_batch_worker_count_is_bounded() {
+        let jobs = effective_batch_jobs(&Overrides::default());
+        assert!((1..=MAX_BATCH_JOBS).contains(&jobs));
     }
 
     #[test]
@@ -3743,6 +4298,19 @@ mod tests {
         assert_eq!(options.backend, Some(Backend::Onnx));
         assert_eq!(options.onnx_model.as_deref(), Some("model.onnx"));
         assert_eq!(options.onnx_sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn selected_external_backend_requires_a_model_before_input_io() {
+        let error = parse_args(&[
+            "--backend".into(),
+            "onnx".into(),
+            "--onnx-rate".into(),
+            "16000".into(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("backend_options.onnx"));
+        assert!(!error.contains("missing INPUT"));
     }
 
     #[test]

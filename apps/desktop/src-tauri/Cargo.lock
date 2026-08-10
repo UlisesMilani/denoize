@@ -1066,12 +1066,14 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "toml 0.8.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

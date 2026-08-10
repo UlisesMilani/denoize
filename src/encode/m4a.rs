@@ -14,7 +14,7 @@ use crate::atomic_output::{AtomicOutput, CommitMode};
 use crate::audio::Audio;
 
 use super::pcm::{lossy_channel_layout, planar_f64_to_interleaved_i16};
-use super::DownmixMode;
+use super::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 
 /// Write planar `f64` audio to an M4A file.
 pub fn write_m4a<P: AsRef<Path>>(path: P, audio: &Audio, bitrate_bps: u32) -> Result<(), String> {
@@ -28,6 +28,13 @@ pub fn write_m4a_with_downmix<P: AsRef<Path>>(
     bitrate_bps: u32,
     downmix: DownmixMode,
 ) -> Result<(), String> {
+    EncodeOptions {
+        m4a_bitrate_bps: bitrate_bps,
+        aac_encoder: AacEncoder::Oxide,
+        downmix,
+        ..EncodeOptions::default()
+    }
+    .validate_config(OutputFormat::M4a, audio)?;
     let mut output = AtomicOutput::new(path)?;
     write_m4a_to_writer(output.file_mut(), audio, bitrate_bps, downmix)?;
     output.commit(CommitMode::Replace)

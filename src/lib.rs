@@ -37,6 +37,7 @@ pub mod backend;
 pub mod benchmark;
 pub mod bessel;
 pub mod channel_layout;
+pub mod config;
 pub mod decode;
 pub mod denoiser;
 pub mod encode;
@@ -62,9 +63,9 @@ pub mod window;
 pub use atomic_output::{AtomicOutput, CommitMode};
 pub use audio::{
     ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,
-    estimate_file_memory_bytes, estimate_stream_memory_bytes, read_audio, read_wav, read_wav_bytes,
-    sanitize_sample, write_audio, write_wav, write_wav_bytes, write_wav_channel_mask, Audio,
-    WavStreamReader, WavStreamWriter,
+    estimate_file_memory_bytes, estimate_stream_memory_bytes, estimate_stream_memory_bytes_checked,
+    read_audio, read_wav, read_wav_bytes, sanitize_sample, write_audio, write_wav, write_wav_bytes,
+    write_wav_channel_mask, Audio, WavStreamReader, WavStreamWriter,
 };
 pub use backend::{
     decode_mid_side, encode_mid_side, Backend, BackendOptions, ChannelMode, OnnxModelConfig,
@@ -72,6 +73,7 @@ pub use backend::{
 };
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
+pub use config::{ConfigError, ResourcePlan};
 pub use decode::{decode_file, probe_file, AudioCodec, AudioFormat, AudioProbe, DecodedPcm};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
@@ -111,7 +113,7 @@ pub fn write_audio_transactional_as(
     commit_mode: CommitMode,
 ) -> Result<(), String> {
     let output = output.as_ref();
-    format.validate_encoder(encode_options.aac_encoder)?;
+    format.validate_config(audio, &encode_options)?;
     let mut transaction = AtomicOutput::new(output)?;
     encode::write_audio_to_file(transaction.file_mut(), format, audio, encode_options)?;
     if let Some(metadata_snapshot) = metadata_snapshot {
@@ -180,13 +182,32 @@ where
 {
     let input = input.as_ref();
     let output = output.as_ref();
-    if backend == Backend::Classical {
-        config.validate()?;
-    }
+    // The file's decoded rate replaces the caller's placeholder rate. Validate
+    // every rate-independent field before touching the filesystem while using
+    // a harmless valid rate solely for this preflight pass.
+    let mut preflight_config = config.clone();
+    preflight_config.sample_rate = 1;
+    preflight_config
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+    backend_options
+        .validate_resolved_config(backend)
+        .map_err(|error| error.to_string())?;
+    let format = OutputFormat::from_path(output)?;
+    encode_opts.validate_options(format)?;
+    backend_options.validate_resolved_resources(backend)?;
     let metadata = metadata::read_extended(input)?;
     let mut audio = read_audio(input)?;
+    format.validate_config(&audio, &encode_opts)?;
     denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
-    write_audio_transactional(output, &audio, encode_opts, metadata, CommitMode::Replace)?;
+    write_audio_transactional_as(
+        output,
+        format,
+        &audio,
+        encode_opts,
+        metadata,
+        CommitMode::Replace,
+    )?;
     Ok(audio)
 }
 
@@ -194,45 +215,70 @@ where
 /// embedders that do not have filesystem-backed input.
 pub fn denoise_audio_with_backend_config(
     audio: &mut Audio,
-    mut config: DenoiserConfig,
+    config: DenoiserConfig,
     backend: Backend,
     backend_options: &BackendOptions,
 ) -> Result<std::time::Duration, String> {
+    let (processed, elapsed) =
+        process_audio_copy_with_backend_config(audio, config, backend, backend_options)?;
+    *audio = processed;
+    Ok(elapsed)
+}
+
+/// Build a processed replacement without changing the caller's audio. This is
+/// also used by delivery layers that have further fallible work, such as
+/// loudness normalization, before committing the result.
+pub(crate) fn process_audio_copy_with_backend_config(
+    audio: &Audio,
+    mut config: DenoiserConfig,
+    backend: Backend,
+    backend_options: &BackendOptions,
+) -> Result<(Audio, std::time::Duration), String> {
     config.sample_rate = audio.sample_rate;
-    if backend == Backend::Classical {
-        config.validate()?;
-    }
-    audio.sanitize_samples();
+    config
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+    backend_options.validate_resolved_resources(backend)?;
+    let mut input = audio.try_clone_fallible("denoising input")?;
+    input.sanitize_samples();
     let t0 = std::time::Instant::now();
-    audio.channels = if config.vad {
+    let channels = if config.vad {
         process_with_vad(
             backend,
-            &audio.channels,
-            audio.sample_rate,
+            &input.channels,
+            input.sample_rate,
             &config,
             backend_options,
         )?
     } else {
         backend::process_channels(
             backend,
-            &audio.channels,
-            audio.sample_rate,
+            &input.channels,
+            input.sample_rate,
             &config,
             backend_options,
         )?
     };
-    audio.sanitize_samples();
+    let mut processed = Audio {
+        sample_rate: audio.sample_rate,
+        channels,
+        bits_per_sample: audio.bits_per_sample,
+        sample_format: audio.sample_format,
+        channel_mask: audio.channel_mask,
+    };
+    processed.sanitize_samples();
     let elapsed = t0.elapsed();
     eprintln!(
         "denoize: {:?} | {}ch x {} frames ({:.2}s) in {:.2?} ({:.1}x realtime)",
         backend,
-        audio.channels(),
-        audio.frames(),
-        audio.frames() as f64 / audio.sample_rate as f64,
+        processed.channels(),
+        processed.frames(),
+        processed.frames() as f64 / processed.sample_rate as f64,
         elapsed,
-        (audio.frames() as f64 / audio.sample_rate as f64) / elapsed.as_secs_f64().max(1e-9),
+        (processed.frames() as f64 / processed.sample_rate as f64)
+            / elapsed.as_secs_f64().max(1e-9),
     );
-    Ok(elapsed)
+    Ok((processed, elapsed))
 }
 
 fn process_with_vad(
@@ -307,9 +353,9 @@ mod vad_mix_tests {
             .collect();
 
         assert!(weights.iter().all(|weight| (0.0..=1.0).contains(weight)));
-        assert!(weights.windows(2).all(|pair| {
-            (pair[1] - pair[0]).abs() <= 1.0 / fade_frames as f64 + f64::EPSILON
-        }));
+        assert!(weights
+            .windows(2)
+            .all(|pair| { (pair[1] - pair[0]).abs() <= 1.0 / fade_frames as f64 + f64::EPSILON }));
         assert!(weights[..=fade_frames]
             .windows(2)
             .all(|pair| pair[1] >= pair[0]));
@@ -333,9 +379,8 @@ mod vad_mix_tests {
         let sample_rate = 16_000;
         let input: Vec<f64> = (0..sample_rate)
             .map(|index| {
-                1.0e-5 * (2.0 * std::f64::consts::PI * 37.0 * index as f64
-                    / sample_rate as f64)
-                    .sin()
+                1.0e-5
+                    * (2.0 * std::f64::consts::PI * 37.0 * index as f64 / sample_rate as f64).sin()
             })
             .collect();
         assert!(vad::speech_regions(std::slice::from_ref(&input), sample_rate).is_empty());
@@ -368,8 +413,7 @@ mod vad_mix_tests {
                 let envelope = if index < active_start.saturating_sub(transition) {
                     0.0
                 } else if index < active_start {
-                    let position = (index - (active_start - transition)) as f64
-                        / transition as f64;
+                    let position = (index - (active_start - transition)) as f64 / transition as f64;
                     let smooth = position * position * (3.0 - 2.0 * position);
                     0.3 * smooth
                 } else if index < active_end {
@@ -382,9 +426,7 @@ mod vad_mix_tests {
                     0.0
                 };
                 envelope
-                    * (2.0 * std::f64::consts::PI * 80.0 * index as f64
-                        / sample_rate as f64)
-                        .sin()
+                    * (2.0 * std::f64::consts::PI * 80.0 * index as f64 / sample_rate as f64).sin()
             })
             .collect();
         let regions = vad::speech_regions(std::slice::from_ref(&input), sample_rate);
@@ -409,11 +451,8 @@ mod vad_mix_tests {
                 if index >= expected.len() {
                     break;
                 }
-                let weight = vad_mix_weight(
-                    offset,
-                    region.end - region.start,
-                    sample_rate as usize / 50,
-                );
+                let weight =
+                    vad_mix_weight(offset, region.end - region.start, sample_rate as usize / 50);
                 expected[index] = expected[index] * (1.0 - weight) + input[index] * weight;
             }
         }
@@ -504,6 +543,131 @@ mod input_safety_tests {
     }
 
     #[test]
+    fn invalid_decoded_config_leaves_audio_completely_unchanged() {
+        let mut audio = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![2.0, -2.0, 0.25]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let original = audio.clone();
+        let mut config = DenoiserConfig::default(48_000);
+        config.vad_speech_mix = f64::NAN;
+
+        let error = denoise_audio_with_backend_config(
+            &mut audio,
+            config,
+            Backend::Classical,
+            &BackendOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("vad_speech_mix"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(audio.sample_rate, original.sample_rate);
+        assert_eq!(audio.channels, original.channels);
+        assert_eq!(audio.bits_per_sample, original.bits_per_sample);
+        assert_eq!(audio.sample_format, original.sample_format);
+        assert_eq!(audio.channel_mask, original.channel_mask);
+    }
+
+    #[test]
+    fn decoded_effective_sample_rate_is_validated_before_mutation() {
+        let mut audio = Audio {
+            sample_rate: 0,
+            channels: vec![vec![2.0]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let original = audio.channels.clone();
+        let error = denoise_audio_with_backend_config(
+            &mut audio,
+            DenoiserConfig::default(48_000),
+            Backend::Classical,
+            &BackendOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("sample_rate"), "unexpected error: {error}");
+        assert_eq!(audio.channels, original);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn decoded_model_resource_is_validated_before_mutation() {
+        let mut audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![2.0]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let original = audio.channels.clone();
+        let backend_options = BackendOptions {
+            onnx: Some(OnnxModelConfig {
+                path: "model-that-does-not-exist.onnx".into(),
+                sample_rate: 48_000,
+            }),
+            ..BackendOptions::default()
+        };
+
+        let error = denoise_audio_with_backend_config(
+            &mut audio,
+            DenoiserConfig::default(48_000),
+            Backend::Onnx,
+            &backend_options,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("model does not exist"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(audio.channels, original);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn malformed_model_failure_does_not_mutate_decoded_audio() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("malformed.onnx");
+        std::fs::write(&model, b"not an ONNX graph").unwrap();
+        let mut audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![2.0, -2.0, 0.25]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let original = audio.clone();
+        let backend_options = BackendOptions {
+            onnx: Some(OnnxModelConfig {
+                path: model,
+                sample_rate: 48_000,
+            }),
+            ..BackendOptions::default()
+        };
+
+        let error = denoise_audio_with_backend_config(
+            &mut audio,
+            DenoiserConfig::default(48_000),
+            Backend::Onnx,
+            &backend_options,
+        )
+        .unwrap_err();
+
+        assert!(!error.is_empty());
+        assert_eq!(audio.sample_rate, original.sample_rate);
+        assert_eq!(audio.channels, original.channels);
+        assert_eq!(audio.bits_per_sample, original.bits_per_sample);
+        assert_eq!(audio.sample_format, original.sample_format);
+        assert_eq!(audio.channel_mask, original.channel_mask);
+    }
+
+    #[test]
     fn file_processing_validates_dpss_before_reading_input() {
         let root = tempfile::tempdir().unwrap();
         let input = root.path().join("missing.wav");
@@ -527,5 +691,166 @@ mod input_safety_tests {
             "unexpected error: {error}"
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn file_processing_rejects_rate_independent_config_before_missing_input() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("missing.wav");
+        let output = root.path().join("output.wav");
+        let mut config = DenoiserConfig::default(0);
+        config.strength = f64::NAN;
+
+        let error = denoise_file_with_backend_config(
+            &input,
+            &output,
+            config,
+            Backend::Classical,
+            EncodeOptions::default(),
+            BackendOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("strength"), "unexpected error: {error}");
+        assert!(!error.contains("sample_rate"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn file_preflight_does_not_reject_placeholder_sample_rate() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("missing.wav");
+        let output = root.path().join("output.wav");
+        let config = DenoiserConfig::default(0);
+
+        let error = denoise_file_with_backend_config(
+            &input,
+            &output,
+            config,
+            Backend::Classical,
+            EncodeOptions::default(),
+            BackendOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(!error.contains("sample_rate"), "unexpected error: {error}");
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn file_processing_validates_backend_options_before_missing_input() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("missing.wav");
+        let output = root.path().join("output.wav");
+        let backend_options = BackendOptions {
+            onnx: Some(OnnxModelConfig {
+                path: root.path().join("model-that-must-not-be-opened.onnx"),
+                sample_rate: 0,
+            }),
+            ..BackendOptions::default()
+        };
+
+        let error = denoise_file_with_backend_config(
+            &input,
+            &output,
+            DenoiserConfig::default(0),
+            Backend::Classical,
+            EncodeOptions::default(),
+            backend_options,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("backend_options.onnx.sample_rate"),
+            "unexpected error: {error}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn file_processing_validates_output_format_before_model_path_io() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("missing.wav");
+        let output = root.path().join("output.invalid");
+        let backend_options = BackendOptions {
+            onnx: Some(OnnxModelConfig {
+                path: root.path().join("model-that-must-not-be-opened.onnx"),
+                sample_rate: 48_000,
+            }),
+            ..BackendOptions::default()
+        };
+
+        let error = denoise_file_with_backend_config(
+            &input,
+            &output,
+            DenoiserConfig::default(0),
+            Backend::Onnx,
+            EncodeOptions::default(),
+            backend_options,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("unsupported output format"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("model does not exist"));
+        assert!(!output.exists());
+    }
+
+    #[cfg(feature = "m4a-encode")]
+    #[test]
+    fn file_processing_validates_encode_options_before_missing_input() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("missing.wav");
+        let output = root.path().join("output.aac");
+        let mut encode_options = EncodeOptions::default();
+        encode_options.m4a_bitrate_bps = 0;
+
+        let error = denoise_file_with_backend_config(
+            &input,
+            &output,
+            DenoiserConfig::default(0),
+            Backend::Classical,
+            encode_options,
+            BackendOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("bitrate must be greater than zero"));
+        assert!(!error.contains("missing.wav"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn transactional_encode_validation_precedes_output_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output.wav");
+        std::fs::write(&output, b"existing output").unwrap();
+        let invalid_audio = Audio {
+            sample_rate: 48_000,
+            channels: Vec::new(),
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+
+        let error = write_audio_transactional_as(
+            &output,
+            OutputFormat::Wav,
+            &invalid_audio,
+            EncodeOptions::default(),
+            None,
+            CommitMode::Replace,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("at least one channel"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing output");
+        assert!(std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".denoize-")));
     }
 }
