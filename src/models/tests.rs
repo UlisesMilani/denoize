@@ -28,6 +28,13 @@ struct TestResponse {
     reason: &'static str,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    content_length: TestContentLength,
+}
+
+enum TestContentLength {
+    Automatic,
+    Omitted,
+    Raw(String),
 }
 
 impl TestResponse {
@@ -37,11 +44,22 @@ impl TestResponse {
             reason: "OK",
             headers: Vec::new(),
             body: body.into(),
+            content_length: TestContentLength::Automatic,
         }
     }
 
     fn with_header(mut self, name: &str, value: impl Into<String>) -> Self {
         self.headers.push((name.to_string(), value.into()));
+        self
+    }
+
+    fn without_content_length(mut self) -> Self {
+        self.content_length = TestContentLength::Omitted;
+        self
+    }
+
+    fn with_raw_content_length(mut self, value: impl Into<String>) -> Self {
+        self.content_length = TestContentLength::Raw(value.into());
         self
     }
 }
@@ -125,6 +143,7 @@ fn test_model(bytes: &[u8]) -> ModelInfo {
         url: "http://127.0.0.1/unused",
         revision: "0000000000000000000000000000000000000000",
         sha256: test_sha256(bytes),
+        size_bytes: bytes.len() as u64,
         license: "MIT",
         sample_rate: 16_000,
     }
@@ -172,12 +191,17 @@ fn read_test_request(stream: &mut TcpStream) -> TestRequest {
 }
 
 fn write_test_response(stream: &mut TcpStream, response: TestResponse) {
-    let mut head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        response.status,
-        response.reason,
-        response.body.len()
-    );
+    let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, response.reason);
+    match response.content_length {
+        TestContentLength::Automatic => {
+            head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
+        }
+        TestContentLength::Omitted => {}
+        TestContentLength::Raw(value) => {
+            head.push_str(&format!("Content-Length: {value}\r\n"));
+        }
+    }
+    head.push_str("Connection: close\r\n");
     for (name, value) in response.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -279,15 +303,54 @@ fn request_range_start(request: &TestRequest) -> usize {
         .expect("expected a byte range request")
 }
 
+fn assert_manifest_progress(progress: &[(u64, Option<u64>)], expected_size: u64) {
+    assert!(!progress.is_empty());
+    assert!(progress
+        .iter()
+        .all(|(downloaded, total)| *downloaded <= expected_size && *total == Some(expected_size)));
+}
+
 #[test]
 fn manifest_has_pinned_integrity_and_metadata() {
     for model in MODELS {
         assert_eq!(model.sha256.len(), 64);
+        assert!(model.size_bytes > 0);
         assert_eq!(model.revision.len(), 40);
         assert!(model.url.contains(model.revision));
         assert!(model.sample_rate > 0);
         assert!(!model.license.is_empty());
     }
+    assert_eq!(find("gtcrn-dns3").unwrap().size_bytes, 535_190);
+}
+
+#[test]
+fn verification_requires_the_manifest_size_and_checksum() {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("model.onnx");
+    let payload = b"verified cache bytes";
+    let model = test_model(payload);
+
+    std::fs::write(&destination, payload).unwrap();
+    assert_eq!(verify_at(&model, &destination).unwrap(), destination);
+
+    std::fs::write(&destination, &payload[..payload.len() - 1]).unwrap();
+    let error = verify_at(&model, &destination).unwrap_err();
+    assert!(error.contains("size mismatch"), "unexpected error: {error}");
+
+    let mut oversized = payload.to_vec();
+    oversized.push(0);
+    std::fs::write(&destination, oversized).unwrap();
+    let error = verify_at(&model, &destination).unwrap_err();
+    assert!(error.contains("size mismatch"), "unexpected error: {error}");
+
+    let mut corrupt = payload.to_vec();
+    corrupt[0] ^= 1;
+    std::fs::write(&destination, corrupt).unwrap();
+    let error = verify_at(&model, &destination).unwrap_err();
+    assert!(
+        error.contains("checksum mismatch"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]
@@ -325,7 +388,7 @@ fn oversized_partial_metadata_is_ignored() {
         vec![b'x'; (MAX_PARTIAL_METADATA_BYTES + 1) as usize],
     )
     .unwrap();
-    assert!(load_matching_metadata(&metadata, "source", "checksum")
+    assert!(load_matching_metadata(&metadata, "source", "checksum", 1)
         .unwrap()
         .is_none());
 }
@@ -513,6 +576,40 @@ fn offline_mode_promotes_a_completed_verified_partial() {
 }
 
 #[test]
+fn offline_mode_discards_oversized_and_complete_corrupt_partials() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let payload = b"manifest bounded offline partial";
+    let model = test_model(payload);
+    let destination = path(&model).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    let partial = sidecar(&destination, ".part");
+    let metadata = sidecar(&destination, ".part.meta");
+    let mut corrupt = payload.to_vec();
+    corrupt[0] ^= 1;
+
+    for partial_bytes in [[payload.as_slice(), b"x"].concat(), corrupt] {
+        std::fs::write(&partial, partial_bytes).unwrap();
+        std::fs::write(&metadata, b"stale metadata").unwrap();
+
+        let error = install_with_options(
+            &model,
+            &ModelDownloadOptions {
+                offline: true,
+                ..direct_options()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("offline mode"), "unexpected error: {error}");
+        assert!(!destination.exists());
+        assert!(!partial.exists());
+        assert!(!metadata.exists());
+    }
+}
+
+#[test]
 fn authentication_rejects_insecure_or_malformed_credentials() {
     let remote = Url::parse("http://models.example.test/model.onnx").unwrap();
     let bearer = ModelAuthentication::Bearer("secret".into());
@@ -540,18 +637,32 @@ fn local_import_accepts_matching_bytes_and_rejects_mismatch() {
     let model = test_model(expected);
     let valid_source = directory.path().join("valid.onnx");
     let invalid_source = directory.path().join("invalid.onnx");
+    let short_source = directory.path().join("short.onnx");
+    let oversized_source = directory.path().join("oversized.onnx");
     std::fs::write(&valid_source, expected).unwrap();
     std::fs::write(&invalid_source, b"tampered local model").unwrap();
+    std::fs::write(&short_source, &expected[..expected.len() - 1]).unwrap();
+    std::fs::write(&oversized_source, [expected.as_slice(), b"x"].concat()).unwrap();
 
     let installed = install_from_file(&model, &valid_source).unwrap();
     assert_eq!(std::fs::read(&installed).unwrap(), expected);
+    let partial = sidecar(&installed, ".part");
+    let metadata = sidecar(&installed, ".part.meta");
+    std::fs::write(&partial, b"preserved partial").unwrap();
+    std::fs::write(&metadata, b"preserved metadata").unwrap();
 
     let error = install_from_file(&model, &invalid_source).unwrap_err();
     assert!(
         error.contains("checksum mismatch"),
         "unexpected error: {error}"
     );
-    assert_eq!(std::fs::read(installed).unwrap(), expected);
+    for source in [&short_source, &oversized_source] {
+        let error = install_from_file(&model, source).unwrap_err();
+        assert!(error.contains("size mismatch"), "unexpected error: {error}");
+    }
+    assert_eq!(std::fs::read(&installed).unwrap(), expected);
+    assert_eq!(std::fs::read(partial).unwrap(), b"preserved partial");
+    assert_eq!(std::fs::read(metadata).unwrap(), b"preserved metadata");
 }
 
 #[test]
@@ -574,6 +685,67 @@ fn local_import_reports_stale_sidecar_errors_before_publishing() {
         "unexpected error: {error}"
     );
     assert!(!destination.exists());
+}
+
+#[test]
+fn local_source_changes_cannot_replace_a_verified_destination() {
+    #[derive(Clone, Copy)]
+    enum Mutation {
+        Grow,
+        Truncate,
+    }
+
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let payload = (0..100_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let model = test_model(&payload);
+    let destination = path(&model).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, &payload).unwrap();
+    let source = directory.path().join("mutable-source.onnx");
+
+    for mutation in [Mutation::Grow, Mutation::Truncate] {
+        std::fs::write(&source, &payload).unwrap();
+        let changed = Cell::new(false);
+        let mut progress_events = Vec::new();
+        let error = install_from_file_with_progress(
+            &model,
+            &source,
+            || false,
+            |copied, total| {
+                progress_events.push((copied, total));
+                if copied == 0 || changed.replace(true) {
+                    return;
+                }
+                match mutation {
+                    Mutation::Grow => {
+                        OpenOptions::new()
+                            .append(true)
+                            .open(&source)
+                            .unwrap()
+                            .write_all(b"x")
+                            .unwrap();
+                    }
+                    Mutation::Truncate => {
+                        OpenOptions::new()
+                            .write(true)
+                            .open(&source)
+                            .unwrap()
+                            .set_len(copied)
+                            .unwrap();
+                    }
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("size"), "unexpected error: {error}");
+        assert_manifest_progress(&progress_events, model.size_bytes);
+        assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    }
 }
 
 #[cfg(unix)]
@@ -609,7 +781,7 @@ fn partial_and_lock_fifos_are_rejected_without_blocking() {
     let metadata = directory.path().join("model.onnx.part.meta");
     create_fifo(&metadata);
     let started = Instant::now();
-    let error = load_matching_metadata(&metadata, "source", "checksum").unwrap_err();
+    let error = load_matching_metadata(&metadata, "source", "checksum", 1).unwrap_err();
     assert!(
         error.contains("not a regular file"),
         "unexpected error: {error}"
@@ -790,6 +962,139 @@ fn authenticated_http_proxy_receives_the_absolute_target() {
 }
 
 #[test]
+fn declared_full_response_size_must_match_the_manifest_before_writing() {
+    let expected = b"manifest-sized model body";
+    let model = test_model(expected);
+    for body in [
+        expected[..expected.len() - 1].to_vec(),
+        [expected.as_slice(), b"x"].concat(),
+    ] {
+        let (source_url, server) = spawn_test_server(1, move |_, _| TestResponse::ok(body.clone()));
+        let directory = tempfile::tempdir().unwrap();
+
+        let error = download_for_test(
+            &model,
+            &source_url,
+            &direct_options(),
+            directory.path(),
+            &mut || false,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("size mismatch"), "unexpected error: {error}");
+        let (partial, metadata) = download_paths(directory.path());
+        assert!(!partial.exists());
+        assert!(!metadata.exists());
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn headerless_full_responses_are_bounded_by_the_manifest() {
+    let expected = b"headerless manifest-sized model";
+    let model = test_model(expected);
+
+    let exact_body = expected.to_vec();
+    let (exact_url, exact_server) = spawn_test_server(1, move |_, _| {
+        TestResponse::ok(exact_body.clone()).without_content_length()
+    });
+    let exact_directory = tempfile::tempdir().unwrap();
+    let mut exact_progress = Vec::new();
+    download_for_test(
+        &model,
+        &exact_url,
+        &direct_options(),
+        exact_directory.path(),
+        &mut || false,
+        &mut |downloaded, total| exact_progress.push((downloaded, total)),
+    )
+    .unwrap();
+    assert_manifest_progress(&exact_progress, model.size_bytes);
+    assert_eq!(
+        exact_progress.last(),
+        Some(&(model.size_bytes, Some(model.size_bytes)))
+    );
+    assert_eq!(exact_server.join().unwrap().len(), 1);
+
+    let short_body = expected[..expected.len() - 1].to_vec();
+    let (short_url, short_server) = spawn_test_server(1, move |_, _| {
+        TestResponse::ok(short_body.clone()).without_content_length()
+    });
+    let short_directory = tempfile::tempdir().unwrap();
+    let mut short_progress = Vec::new();
+    let error = download_for_test(
+        &model,
+        &short_url,
+        &direct_options(),
+        short_directory.path(),
+        &mut || false,
+        &mut |downloaded, total| short_progress.push((downloaded, total)),
+    )
+    .unwrap_err();
+    assert!(error.contains("incomplete"), "unexpected error: {error}");
+    assert_manifest_progress(&short_progress, model.size_bytes);
+    let (short_partial, _) = download_paths(short_directory.path());
+    assert_eq!(
+        std::fs::metadata(short_partial).unwrap().len(),
+        model.size_bytes - 1
+    );
+    assert_eq!(short_server.join().unwrap().len(), 1);
+
+    let oversized_body = [expected.as_slice(), b"x"].concat();
+    let (oversized_url, oversized_server) = spawn_test_server(1, move |_, _| {
+        TestResponse::ok(oversized_body.clone()).without_content_length()
+    });
+    let oversized_directory = tempfile::tempdir().unwrap();
+    let mut oversized_progress = Vec::new();
+    let error = download_for_test(
+        &model,
+        &oversized_url,
+        &direct_options(),
+        oversized_directory.path(),
+        &mut || false,
+        &mut |downloaded, total| oversized_progress.push((downloaded, total)),
+    )
+    .unwrap_err();
+    assert!(error.contains("manifest"), "unexpected error: {error}");
+    assert_manifest_progress(&oversized_progress, model.size_bytes);
+    let (oversized_partial, oversized_metadata) = download_paths(oversized_directory.path());
+    assert!(!oversized_partial.exists());
+    assert!(!oversized_metadata.exists());
+    assert_eq!(oversized_server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn malformed_content_length_is_rejected_without_writing() {
+    let payload = b"malformed-length model";
+    let model = test_model(payload);
+    let response_body = payload.to_vec();
+    let (source_url, server) = spawn_test_server(1, move |_, _| {
+        TestResponse::ok(response_body.clone()).with_raw_content_length("not-a-number")
+    });
+    let directory = tempfile::tempdir().unwrap();
+
+    let error = download_for_test(
+        &model,
+        &source_url,
+        &direct_options(),
+        directory.path(),
+        &mut || false,
+        &mut |_, _| {},
+    )
+    .unwrap_err();
+
+    assert!(
+        error.contains("invalid Content-Length"),
+        "unexpected error: {error}"
+    );
+    let (partial, metadata) = download_paths(directory.path());
+    assert!(!partial.exists());
+    assert!(!metadata.exists());
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
 fn cancelled_download_resumes_with_range_and_if_range() {
     let payload = Arc::new(
         (0..200_000)
@@ -815,6 +1120,7 @@ fn cancelled_download_resumes_with_range_and_if_range() {
                     ("ETag".into(), "\"resume-v1\"".into()),
                 ],
                 body: response_payload[start..].to_vec(),
+                content_length: TestContentLength::Automatic,
             }
         }
     });
@@ -897,6 +1203,41 @@ fn range_ignored_with_200_truncates_the_partial() {
 }
 
 #[test]
+fn oversized_or_exact_corrupt_partials_restart_without_a_range() {
+    let payload = b"manifest bounded partial model";
+    let model = test_model(payload);
+    let mut corrupt = payload.to_vec();
+    corrupt[0] ^= 1;
+    for partial_bytes in [[payload.as_slice(), b"x"].concat(), corrupt] {
+        let response_payload = payload.to_vec();
+        let (source_url, server) =
+            spawn_test_server(1, move |_, _| TestResponse::ok(response_payload.clone()));
+        let directory = tempfile::tempdir().unwrap();
+        seed_partial(
+            directory.path(),
+            &source_url,
+            &model,
+            &partial_bytes,
+            None,
+            Some(model.size_bytes),
+        );
+
+        download_for_test(
+            &model,
+            &source_url,
+            &direct_options(),
+            directory.path(),
+            &mut || false,
+            &mut |_, _| {},
+        )
+        .unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].header("Range"), None);
+    }
+}
+
+#[test]
 fn range_not_satisfiable_discards_partial_then_retries_cleanly() {
     let payload = Arc::new(b"clean response after 416".to_vec());
     let model = test_model(&payload);
@@ -911,6 +1252,7 @@ fn range_not_satisfiable_discards_partial_then_retries_cleanly() {
                     format!("bytes */{}", response_payload.len()),
                 )],
                 body: Vec::new(),
+                content_length: TestContentLength::Automatic,
             }
         } else {
             TestResponse::ok(response_payload.as_ref().clone())
@@ -945,6 +1287,69 @@ fn range_not_satisfiable_discards_partial_then_retries_cleanly() {
 }
 
 #[test]
+fn range_not_satisfiable_completion_requires_exact_size_total_and_checksum() {
+    let directory = tempfile::tempdir().unwrap();
+    let partial = directory.path().join("model.part");
+    let payload = b"completed ranged model";
+    let model = test_model(payload);
+    std::fs::write(&partial, payload).unwrap();
+    let response: ureq::Response = format!(
+        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\n\r\n",
+        model.size_bytes
+    )
+    .parse()
+    .unwrap();
+
+    assert!(handle_range_not_satisfiable(
+        &response,
+        &partial,
+        model.size_bytes,
+        model.size_bytes,
+        model.sha256,
+    )
+    .unwrap());
+    assert!(!handle_range_not_satisfiable(
+        &response,
+        &partial,
+        model.size_bytes - 1,
+        model.size_bytes,
+        model.sha256,
+    )
+    .unwrap());
+    assert!(!handle_range_not_satisfiable(
+        &response,
+        &partial,
+        model.size_bytes,
+        model.size_bytes - 1,
+        model.sha256,
+    )
+    .unwrap());
+    assert!(!handle_range_not_satisfiable(
+        &response,
+        &partial,
+        model.size_bytes,
+        model.size_bytes,
+        test_sha256(b"different checksum"),
+    )
+    .unwrap());
+
+    let wrong_total: ureq::Response = format!(
+        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\n\r\n",
+        model.size_bytes + 1
+    )
+    .parse()
+    .unwrap();
+    assert!(!handle_range_not_satisfiable(
+        &wrong_total,
+        &partial,
+        model.size_bytes,
+        model.size_bytes,
+        model.sha256,
+    )
+    .unwrap());
+}
+
+#[test]
 fn invalid_content_range_discards_partial_then_retries_cleanly() {
     let payload = Arc::new(b"clean response after invalid content range".to_vec());
     let model = test_model(&payload);
@@ -965,6 +1370,7 @@ fn invalid_content_range_discards_partial_then_retries_cleanly() {
                     ),
                 )],
                 body: response_payload[prefix_length..].to_vec(),
+                content_length: TestContentLength::Automatic,
             }
         } else {
             TestResponse::ok(response_payload.as_ref().clone())
@@ -996,6 +1402,141 @@ fn invalid_content_range_discards_partial_then_retries_cleanly() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].header("Range"), Some("bytes=7-"));
     assert_eq!(requests[1].header("Range"), None);
+}
+
+#[test]
+fn bounded_wildcard_partial_response_resumes_with_manifest_progress() {
+    let payload = Arc::new(b"bounded wildcard partial response".to_vec());
+    let model = test_model(&payload);
+    let response_payload = Arc::clone(&payload);
+    let prefix_length = 8;
+    let (source_url, server) = spawn_test_server(1, move |_, request| {
+        let start = request_range_start(request);
+        let end = response_payload.len() - 1;
+        TestResponse {
+            status: 206,
+            reason: "Partial Content",
+            headers: vec![("Content-Range".into(), format!("bytes {start}-{end}/*"))],
+            body: response_payload[start..].to_vec(),
+            content_length: TestContentLength::Omitted,
+        }
+    });
+    let directory = tempfile::tempdir().unwrap();
+    seed_partial(
+        directory.path(),
+        &source_url,
+        &model,
+        &payload[..prefix_length],
+        None,
+        None,
+    );
+    let mut progress = Vec::new();
+
+    download_for_test(
+        &model,
+        &source_url,
+        &direct_options(),
+        directory.path(),
+        &mut || false,
+        &mut |downloaded, total| progress.push((downloaded, total)),
+    )
+    .unwrap();
+
+    assert_manifest_progress(&progress, model.size_bytes);
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0].header("Range"), Some("bytes=8-"));
+}
+
+#[test]
+fn invalid_partial_sizes_and_lengths_reset_before_a_clean_retry() {
+    #[derive(Clone, Copy)]
+    enum InvalidPartial {
+        SmallerTotal,
+        LargerTotal,
+        RangePastManifest,
+        WrongLength,
+        MalformedLength,
+    }
+
+    for invalid in [
+        InvalidPartial::SmallerTotal,
+        InvalidPartial::LargerTotal,
+        InvalidPartial::RangePastManifest,
+        InvalidPartial::WrongLength,
+        InvalidPartial::MalformedLength,
+    ] {
+        let payload = Arc::new(b"partial response bounds model".to_vec());
+        let model = test_model(&payload);
+        let response_payload = Arc::clone(&payload);
+        let prefix_length = 6;
+        let (source_url, server) = spawn_test_server(2, move |index, _| {
+            if index != 0 {
+                return TestResponse::ok(response_payload.as_ref().clone());
+            }
+            let size = response_payload.len();
+            let (end, total, body) = match invalid {
+                InvalidPartial::SmallerTotal => (
+                    size - 2,
+                    (size - 1).to_string(),
+                    response_payload[prefix_length..size - 1].to_vec(),
+                ),
+                InvalidPartial::LargerTotal => (
+                    size - 1,
+                    (size + 1).to_string(),
+                    response_payload[prefix_length..].to_vec(),
+                ),
+                InvalidPartial::RangePastManifest => {
+                    let mut body = response_payload[prefix_length..].to_vec();
+                    body.push(0);
+                    (size, "*".to_string(), body)
+                }
+                InvalidPartial::WrongLength | InvalidPartial::MalformedLength => (
+                    size - 1,
+                    size.to_string(),
+                    response_payload[prefix_length..].to_vec(),
+                ),
+            };
+            let response = TestResponse {
+                status: 206,
+                reason: "Partial Content",
+                headers: vec![(
+                    "Content-Range".into(),
+                    format!("bytes {prefix_length}-{end}/{total}"),
+                )],
+                body,
+                content_length: TestContentLength::Automatic,
+            };
+            match invalid {
+                InvalidPartial::WrongLength => response.with_raw_content_length("1"),
+                InvalidPartial::MalformedLength => response.with_raw_content_length("not-a-number"),
+                _ => response,
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        seed_partial(
+            directory.path(),
+            &source_url,
+            &model,
+            &payload[..prefix_length],
+            None,
+            Some(model.size_bytes),
+        );
+
+        download_for_test(
+            &model,
+            &source_url,
+            &direct_options(),
+            directory.path(),
+            &mut || false,
+            &mut |_, _| {},
+        )
+        .unwrap();
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].header("Range"), Some("bytes=6-"));
+        assert_eq!(requests[1].header("Range"), None);
+    }
 }
 
 #[test]
@@ -1053,6 +1594,7 @@ fn rotated_signed_url_resumes_the_same_verified_object() {
                 ("ETag".into(), "\"stable-object\"".into()),
             ],
             body: response_payload[start..].to_vec(),
+            content_length: TestContentLength::Automatic,
         }
     });
     let old_url = format!("{base_url}?signature=expired");
@@ -1085,11 +1627,117 @@ fn rotated_signed_url_resumes_the_same_verified_object() {
 }
 
 #[test]
+fn legacy_v1_metadata_resumes_with_missing_null_or_matching_total() {
+    #[derive(Clone, Copy)]
+    enum LegacyTotal {
+        Missing,
+        Null,
+        Matching,
+    }
+
+    for legacy_total in [
+        LegacyTotal::Missing,
+        LegacyTotal::Null,
+        LegacyTotal::Matching,
+    ] {
+        let payload = Arc::new(b"legacy metadata resume model".to_vec());
+        let model = test_model(&payload);
+        let response_payload = Arc::clone(&payload);
+        let prefix_length = 7;
+        let (source_url, server) = spawn_test_server(1, move |_, request| {
+            let start = request_range_start(request);
+            let end = response_payload.len() - 1;
+            TestResponse {
+                status: 206,
+                reason: "Partial Content",
+                headers: vec![(
+                    "Content-Range".into(),
+                    format!("bytes {start}-{end}/{}", response_payload.len()),
+                )],
+                body: response_payload[start..].to_vec(),
+                content_length: TestContentLength::Automatic,
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let (partial, metadata_path) = download_paths(directory.path());
+        std::fs::write(&partial, &payload[..prefix_length]).unwrap();
+        let mut metadata = serde_json::json!({
+            "version": 1,
+            "source_id": source_identity(&source_url),
+            "expected_sha256": model.sha256,
+            "etag": null,
+            "last_modified": null,
+            "total": null,
+        });
+        match legacy_total {
+            LegacyTotal::Missing => {
+                metadata.as_object_mut().unwrap().remove("total");
+            }
+            LegacyTotal::Null => {}
+            LegacyTotal::Matching => {
+                metadata["total"] = serde_json::json!(model.size_bytes);
+            }
+        }
+        std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        download_for_test(
+            &model,
+            &source_url,
+            &direct_options(),
+            directory.path(),
+            &mut || false,
+            &mut |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(partial).unwrap(), payload.as_ref().as_slice());
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0].header("Range"), Some("bytes=7-"));
+    }
+}
+
+#[test]
+fn conflicting_v1_metadata_total_resets_the_partial() {
+    let payload = Arc::new(b"conflicting legacy metadata model".to_vec());
+    let model = test_model(&payload);
+    let response_payload = Arc::clone(&payload);
+    let (source_url, server) = spawn_test_server(1, move |_, _| {
+        TestResponse::ok(response_payload.as_ref().clone())
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let (partial, metadata_path) = download_paths(directory.path());
+    std::fs::write(&partial, &payload[..6]).unwrap();
+    let metadata = serde_json::json!({
+        "version": 1,
+        "source_id": source_identity(&source_url),
+        "expected_sha256": model.sha256,
+        "etag": null,
+        "last_modified": null,
+        "total": model.size_bytes + 1,
+    });
+    std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+    download_for_test(
+        &model,
+        &source_url,
+        &direct_options(),
+        directory.path(),
+        &mut || false,
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(std::fs::read(partial).unwrap(), payload.as_ref().as_slice());
+    let requests = server.join().unwrap();
+    assert_eq!(requests[0].header("Range"), None);
+}
+
+#[test]
 fn checksum_mismatch_discards_partial_and_metadata() {
     let expected = b"expected model bytes";
     let model = test_model(expected);
     let (source_url, server) =
-        spawn_test_server(1, |_, _| TestResponse::ok(b"corrupt model bytes".to_vec()));
+        spawn_test_server(1, |_, _| TestResponse::ok(b"tampered model bytes".to_vec()));
     let directory = tempfile::tempdir().unwrap();
 
     let error = download_for_test(
@@ -1127,6 +1775,7 @@ fn failed_update_keeps_the_existing_verified_model() {
         reason: "Service Unavailable",
         headers: Vec::new(),
         body: Vec::new(),
+        content_length: TestContentLength::Automatic,
     });
     let options = ModelDownloadOptions {
         source_url: Some(source_url),
@@ -1139,6 +1788,65 @@ fn failed_update_keeps_the_existing_verified_model() {
     assert_eq!(std::fs::read(&destination).unwrap(), payload);
     assert_eq!(verify_at(&model, &destination).unwrap(), destination);
     assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn wrong_sized_alternate_and_redirected_updates_preserve_the_installed_model() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let payload = b"verified model preserved across bad mirrors";
+    let model = test_model(payload);
+    let destination = path(&model).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, payload).unwrap();
+
+    let oversized = [payload.as_slice(), b"x"].concat();
+    let (alternate_url, alternate_server) =
+        spawn_test_server(1, move |_, _| TestResponse::ok(oversized.clone()));
+    let alternate_error = update_with_options(
+        &model,
+        &ModelDownloadOptions {
+            source_url: Some(alternate_url),
+            ..direct_options()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        alternate_error.contains("size mismatch"),
+        "unexpected error: {alternate_error}"
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    assert_eq!(alternate_server.join().unwrap().len(), 1);
+
+    let short = payload[..payload.len() - 1].to_vec();
+    let (redirect_url, redirect_server) = spawn_test_server(2, move |index, _| {
+        if index == 0 {
+            TestResponse {
+                status: 302,
+                reason: "Found",
+                headers: vec![("Location".into(), "/redirected/model.onnx".into())],
+                body: Vec::new(),
+                content_length: TestContentLength::Automatic,
+            }
+        } else {
+            TestResponse::ok(short.clone())
+        }
+    });
+    let redirect_error = update_with_options(
+        &model,
+        &ModelDownloadOptions {
+            source_url: Some(redirect_url),
+            ..direct_options()
+        },
+    )
+    .unwrap_err();
+    assert!(
+        redirect_error.contains("size mismatch"),
+        "unexpected error: {redirect_error}"
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    assert_eq!(redirect_server.join().unwrap().len(), 2);
 }
 
 #[test]
@@ -1211,6 +1919,7 @@ fn same_host_redirect_preserves_bearer_authentication() {
                 reason: "Found",
                 headers: vec![("Location".into(), "/redirected/model.onnx".into())],
                 body: Vec::new(),
+                content_length: TestContentLength::Automatic,
             }
         } else {
             TestResponse::ok(response_payload.as_ref().clone())
@@ -1264,6 +1973,7 @@ fn cross_origin_redirect_does_not_forward_bearer_authentication() {
         reason: "Found",
         headers: vec![("Location".into(), redirected_to.clone())],
         body: Vec::new(),
+        content_length: TestContentLength::Automatic,
     });
     let directory = tempfile::tempdir().unwrap();
     let options = ModelDownloadOptions {
@@ -1303,6 +2013,7 @@ fn redirect_to_a_signed_http_url_is_rejected_before_the_second_request() {
             "http://models.invalid/model.onnx?signature=redirect-secret".into(),
         )],
         body: Vec::new(),
+        content_length: TestContentLength::Automatic,
     });
     let directory = tempfile::tempdir().unwrap();
 

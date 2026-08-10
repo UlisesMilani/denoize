@@ -304,10 +304,14 @@ connection.
 Interrupted transfers are retained in a `.part` sidecar and resumed with HTTP
 range requests. Saved `ETag` or `Last-Modified` validators and each
 `Content-Range` are checked before appending; changed objects, malformed range
-responses, or an unverified `416` response cause a clean restart. All downloaded
-or local files must match the manifest's pinned SHA-256 before they are
-atomically published, and an update keeps the current verified model until its
-replacement is ready.
+responses, or an unverified `416` response cause a clean restart. Every managed
+model candidate must match both the manifest's exact byte length and SHA-256
+before use: this includes fresh or resumed downloads, alternate `--url`
+sources, `--from` imports, completed partials, and files already in the cache.
+An update keeps the current verified model until its replacement is ready.
+`denoize models info MODEL` reports the pinned length as an unscaled decimal
+`size-bytes` value. This per-model integrity bound is not an aggregate cache
+quota.
 
 HTTPS model connections, including those tunneled through an HTTP CONNECT
 proxy, use the operating system trust store. CLI Bearer tokens and Basic

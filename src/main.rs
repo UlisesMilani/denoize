@@ -3154,6 +3154,21 @@ where
     })
 }
 
+fn model_info_output(model: &denoize::models::ModelInfo, path: &std::path::Path) -> String {
+    format!(
+        "name: {}\nbackend: {}\nsample-rate: {}\nlicense: {}\nrevision: {}\nsize-bytes: {}\nsha256: {}\nurl: {}\npath: {}\n",
+        model.name,
+        model.backend,
+        model.sample_rate,
+        model.license,
+        model.revision,
+        model.size_bytes,
+        model.sha256,
+        denoize::models::redact_url(model.url),
+        path.display(),
+    )
+}
+
 fn run_models(args: &[String]) -> Result<(), String> {
     let help_requested = args
         .iter()
@@ -3210,14 +3225,8 @@ fn run_models(args: &[String]) -> Result<(), String> {
     for model in models {
         match command {
             ModelCommand::Info => {
-                println!("name: {}", model.name);
-                println!("backend: {}", model.backend);
-                println!("sample-rate: {}", model.sample_rate);
-                println!("license: {}", model.license);
-                println!("revision: {}", model.revision);
-                println!("sha256: {}", model.sha256);
-                println!("url: {}", denoize::models::redact_url(model.url));
-                println!("path: {}", denoize::models::path(model)?.display());
+                let path = denoize::models::path(model)?;
+                print!("{}", model_info_output(model, &path));
             }
             ModelCommand::Install => {
                 let installed = if let Some(source) = source_file.as_ref() {
@@ -3266,6 +3275,28 @@ mod model_command_tests {
 
     fn missing_secret(name: &str) -> Result<String, String> {
         Err(format!("{name} is not set"))
+    }
+
+    #[test]
+    fn model_info_reports_exact_manifest_size_in_bytes() {
+        let model = denoize::models::ModelInfo {
+            name: "test-model",
+            backend: "test-backend",
+            filename: "model.onnx",
+            url: "https://models.example/model.onnx",
+            revision: "test-revision",
+            size_bytes: 12_345_678,
+            sha256: "0123456789abcdef",
+            license: "MIT",
+            sample_rate: 16_000,
+        };
+
+        let output = model_info_output(&model, std::path::Path::new("model.onnx"));
+
+        assert_eq!(
+            output,
+            "name: test-model\nbackend: test-backend\nsample-rate: 16000\nlicense: MIT\nrevision: test-revision\nsize-bytes: 12345678\nsha256: 0123456789abcdef\nurl: https://models.example/model.onnx\npath: model.onnx\n"
+        );
     }
 
     #[test]
