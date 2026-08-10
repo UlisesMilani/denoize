@@ -49,7 +49,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | RF64 | native RF64 reader | 64-bit-size PCM/WAVE, bounded chunk reads |
 | AIFF/AIFC | `symphonia` | PCM and supported AIFC codecs |
 | CAF | `symphonia` | PCM and ALAC/other supported CAF codecs |
-| MP3 | `nanomp3` (Pure Rust) | ID3 skip, no resampling |
+| MP3 | `symphonia` + bounded `nanomp3` fallback (Pure Rust) | Xing/Info + LAME gapless trim, ID3v2, no resampling |
 | M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | MP4 demux + AAC-LC/ALAC decode |
 | FLAC | `claxon` | Lossless FLAC |
 | Ogg Opus/Vorbis | `opus` + `ogg` / `symphonia` | Mono/stereo; native sample rate decode |
@@ -63,6 +63,17 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | M4A | `oxideav-aac` + MP4 mux | GitHub/source builds; positive `--m4a-bitrate` (default 192 kbps) |
 | FLAC | `flacenc` | Lossless, pure Rust |
 | Ogg Opus | `opus` + `ogg` | 128 kbps, mono/stereo |
+
+MP3 inputs with a Xing/Info header and a compatible LAME, Lavf, or Lavc
+extension are decoded over their exact signalled presentation span: encoder
+delay and end padding are not exposed to the denoising pipeline. Untagged raw
+MP3 has only MPEG-frame timing, so its decoded duration remains frame-rounded.
+Symphonia remains the primary decoder; a fixed-size streaming compatibility
+fallback is used only for its exact invalid-bit-reservoir error on untagged,
+contiguous Layer III frames, and never for files carrying gapless timing.
+The built-in Shine encoder completes its final bit cache and emits at least two
+MPEG frames for short-clip interoperability; clips shorter than that minimum
+therefore contain trailing encoded silence.
 
 Channel order is kept planar and unchanged through WAV/FLAC and denoising. The
 standard layouts mono, stereo, 2.1, quad, 5.0, 5.1, 6.1, and 7.1 are reported
@@ -742,5 +753,7 @@ criteria and numerical evidence for each named model.
 
 ## License
 
-The Rust project is MIT licensed. See [THIRD_PARTY.md](THIRD_PARTY.md) for the
-Apache-2.0 BSRNN conversion code and CC-BY-4.0 model attribution.
+denoize-authored Rust code is MIT licensed. Bundled dependencies and reference
+materials remain under their respective terms; see
+[THIRD_PARTY.md](THIRD_PARTY.md) and [LICENSES](LICENSES) for notices,
+corresponding-source information, and license texts.

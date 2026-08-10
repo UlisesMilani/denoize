@@ -165,7 +165,8 @@ jobs:
         run: |
           package="denoize-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$package"
-          cp target/release/denoize README.md LICENSE "$package/"
+          cp target/release/denoize README.md LICENSE THIRD_PARTY.md "$package/"
+          cp -R LICENSES "$package/"
           tar -czf "$package.tar.gz" "$package"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$package.tar.gz" > "$package.tar.gz.sha256"
@@ -179,7 +180,8 @@ jobs:
         run: |
           $package = "denoize-$env:GITHUB_REF_NAME-${{ matrix.target }}"
           New-Item -ItemType Directory -Path $package | Out-Null
-          Copy-Item target/release/denoize.exe, README.md, LICENSE -Destination $package
+          Copy-Item target/release/denoize.exe, README.md, LICENSE, THIRD_PARTY.md -Destination $package
+          Copy-Item LICENSES -Destination "$package/LICENSES" -Recurse
           Compress-Archive -Path $package -DestinationPath "$package.zip"
           $hash = (Get-FileHash "$package.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $package.zip" | Set-Content -Encoding ascii "$package.zip.sha256"

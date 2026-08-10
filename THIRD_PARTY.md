@@ -1,5 +1,49 @@
 # Third-party notices
 
+## Symphonia 0.6.0
+
+denoize uses the Symphonia media-decoding project, including
+`symphonia-bundle-mp3` 0.6.0, as unmodified Rust dependencies. Symphonia is
+authored primarily by Philip Deljanov and distributed under the Mozilla Public
+License 2.0.
+
+The exact corresponding source used by this release is available at
+[`pdeljanov/Symphonia` revision
+`980bf5830a90e069fd64641d9c38f067ab772a24`](https://github.com/pdeljanov/Symphonia/tree/980bf5830a90e069fd64641d9c38f067ab772a24).
+The crates.io checksums are
+`1758d6c853020a7244de03cc3e0185eaea3f58715122422dd3cc7452e6d4c16a`
+for `symphonia` and
+`350f1f2f2e19ad4dd315db94304d1eb361b29af070681f94e51b8fdaad769546`
+for `symphonia-bundle-mp3`. The full license text is included at
+[`LICENSES/symphonia-0.6.0-MPL-2.0.txt`](LICENSES/symphonia-0.6.0-MPL-2.0.txt).
+
+## shine-rs 0.1.3
+
+denoize uses the unmodified `shine-rs` MP3 encoder by Shon Wang, distributed
+under the GNU Lesser General Public License 2.0. The exact corresponding source
+is available at [`wshon/shine-rs` revision
+`aeca509f4d859b5c8ee6a00a1a0efabebd7a7c7d`](https://github.com/wshon/shine-rs/tree/aeca509f4d859b5c8ee6a00a1a0efabebd7a7c7d/crate),
+and the crates.io checksum is
+`6135aba5a2334627cc67e726d20cd42d4218654b11d1467aeac83d977bfc70c1`.
+The tagged denoize source and build scripts corresponding to every binary
+release are available from that release's Git tag and can be rebuilt with a
+modified compatible `shine-rs` library.
+The full license text is included at
+[`LICENSES/shine-rs-0.1.3-LGPL-2.0.txt`](LICENSES/shine-rs-0.1.3-LGPL-2.0.txt).
+
+## nanomp3 0.1.1
+
+denoize uses `nanomp3` by Robert B. Langer as the bounded compatibility
+decoder for untagged MP3 streams that trigger a known strict-decoder offset
+error. The crate is dual-licensed under MIT or Apache-2.0; denoize distributes
+it under the MIT option. The exact corresponding source is available at
+[`robbie01/nanomp3` revision
+`801aacbdc0b8de1bf000365e8dfff1412924c68a`](https://github.com/robbie01/nanomp3/tree/801aacbdc0b8de1bf000365e8dfff1412924c68a),
+and the crates.io checksum is
+`f69bdf7e634dc76798adc292ebd4f6e8e125cde6843a264fe398c52c3f7e8541`.
+The MIT license text is included at
+[`LICENSES/nanomp3-0.1.1-MIT.txt`](LICENSES/nanomp3-0.1.1-MIT.txt).
+
 ## ESPnet BSRNN reference
 
 `scripts/export-bsrnn.py` contains an adapted transcription of the BSRNN
@@ -46,7 +90,7 @@ The converter loads the published EMA parameters and replaces only the
 PyTorch complex tensor boundary with explicit real and imaginary ONNX
 channels. The Rust adapter independently implements the documented OUVE
 predictor/corrector sampler and signal-processing frontend.
-# Optional FDK-AAC
+## Optional FDK-AAC
 
 The `fdk-aac-encoder` feature uses the third-party `fdk-aac-rust` port of the
 Fraunhofer FDK AAC Codec Library for Android. It is not enabled by default, by

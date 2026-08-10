@@ -103,6 +103,68 @@ for checksum in "$tmp_dir"/*.sha256; do
   )
 done
 
+archive_contains() {
+  local archive="$1"
+  local expected_path="$2"
+  case "$archive" in
+    *.tar.gz)
+      tar -tzf "$archive" |
+        awk -v expected="$expected_path" '$0 == expected { found = 1 } END { exit !found }'
+      ;;
+    *.zip)
+      unzip -Z1 "$archive" |
+        tr -d '\r' |
+        awk -v expected="$expected_path" '$0 == expected { found = 1 } END { exit !found }'
+      ;;
+    *)
+      echo "unsupported archive for notice verification: $archive" >&2
+      return 1
+      ;;
+  esac
+}
+
+required_notice_files=(
+  "LICENSE"
+  "THIRD_PARTY.md"
+  "LICENSES/nanomp3-0.1.1-MIT.txt"
+  "LICENSES/symphonia-0.6.0-MPL-2.0.txt"
+  "LICENSES/shine-rs-0.1.3-LGPL-2.0.txt"
+)
+
+cli_targets=(
+  "aarch64-apple-darwin"
+  "x86_64-apple-darwin"
+  "x86_64-pc-windows-msvc"
+  "x86_64-unknown-linux-gnu"
+)
+
+for target in "${cli_targets[@]}"; do
+  package="denoize-${tag}-${target}"
+  if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+    archive="$tmp_dir/$package.zip"
+  else
+    archive="$tmp_dir/$package.tar.gz"
+  fi
+  for notice in "${required_notice_files[@]}"; do
+    if ! archive_contains "$archive" "$package/$notice"; then
+      echo "release archive $(basename "$archive") is missing $notice" >&2
+      exit 1
+    fi
+  done
+done
+
+for archive in \
+  "$tmp_dir/denoize_${version}_aarch64.app.tar.gz" \
+  "$tmp_dir/denoize_${version}_x64.app.tar.gz"; do
+  for notice in "${required_notice_files[@]}"; do
+    resource="denoize.app/Contents/Resources/$notice"
+    if ! archive_contains "$archive" "$resource"; then
+      echo "desktop archive $(basename "$archive") is missing $notice" >&2
+      exit 1
+    fi
+  done
+done
+
 jq -e --arg version "$version" '
   . as $root
   | ($root.version == $version)
@@ -161,5 +223,5 @@ while IFS= read -r updater_url; do
   fi
 done < <(jq -r '.platforms[]?.url' "$tmp_dir/latest.json")
 
-printf 'release %s has %d non-empty assets; checksums and updater metadata verified.\n' \
+printf 'release %s has %d non-empty assets; checksums, notices, and updater metadata verified.\n' \
   "$tag" "${#expected_assets[@]}"

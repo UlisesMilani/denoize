@@ -16,7 +16,8 @@
 //! - 知覚重み付け（Bark帯域）+ 音楽ノイズ抑制ポストフィルタ
 //!
 //! ### Input / output codecs (built-in, no ffmpeg)
-//! - **Decode**: WAV / MP3 (`nanomp3`) / M4A (Pure Rust AAC-LC)
+//! - **Decode**: WAV / MP3 (`symphonia`, including Xing/LAME gapless timing,
+//!   with a bounded raw-stream compatibility fallback) / M4A (Pure Rust AAC-LC)
 //! - **Encode**: WAV / MP3 (`shine-rs`) / M4A (`oxideav-aac` Pure-Rust AAC-LC)
 //! - Decoded to `f64` PCM at native sample rate (no extra quantisation)
 //!

@@ -33,7 +33,12 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"]
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "resources": {
+      "../../../LICENSE": "LICENSE",
+      "../../../LICENSES/": "LICENSES/",
+      "../../../THIRD_PARTY.md": "THIRD_PARTY.md"
+    }
   },
   "plugins": {
     "updater": {

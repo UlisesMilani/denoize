@@ -10,7 +10,7 @@
 //! |------|------|
 //! | WAV / BWF | `hound`（既存） |
 //! | RF64 | bounded native PCM reader |
-//! | MP3  | `nanomp3`（Pure Rust / minimp3 移植） |
+//! | MP3  | `symphonia`（Xing / LAME gapless timing）+ bounded `nanomp3` compatibility fallback |
 //! | M4A  | `mp4` demux + `oxideav-aac` Pure-Rust AAC-LC decode |
 //! | AIFF / CAF / Ogg Vorbis / ALAC | `symphonia` |
 
@@ -665,7 +665,7 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
         AudioFormat::Aiff | AudioFormat::Caf | AudioFormat::OggVorbis => decode_symphonia(path),
         AudioFormat::Flac => decode_flac(path),
         AudioFormat::OggOpus => opus::decode_ogg_opus(path),
-        AudioFormat::Mp3 => mp3::decode_mp3_file(path),
+        AudioFormat::Mp3 => decode_mp3(path),
         AudioFormat::M4a => m4a::decode_m4a(path).or_else(|aac_error| {
             decode_symphonia(path).map_err(|symphonia_error| {
                 format!("M4A/AAC decode failed: {aac_error}; ALAC/other decoder: {symphonia_error}")
@@ -684,7 +684,31 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
 /// Symphonia returns a packet-local audio buffer whose sample type depends on
 /// the source codec. Its generic planar conversion keeps the conversion in one
 /// place and avoids assuming that AIFF/CAF/ALAC are always integer PCM.
+#[derive(Default)]
+struct RecoverablePacketErrors {
+    invalid_main_data_offset: bool,
+    other: Option<String>,
+}
+
+struct SymphoniaDecodeOutcome {
+    decoded: Option<DecodedPcm>,
+    expected_sample_rate: Option<u32>,
+    expected_channel_count: Option<usize>,
+    packet_errors: RecoverablePacketErrors,
+}
+
+impl SymphoniaDecodeOutcome {
+    fn into_decoded(self) -> Result<DecodedPcm, String> {
+        self.decoded
+            .ok_or_else(|| "no audio packets decoded".to_string())
+    }
+}
+
 fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
+    decode_symphonia_with_report(path)?.into_decoded()
+}
+
+fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::probe::Hint;
@@ -718,19 +742,26 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
         .channels
         .as_ref()
         .and_then(|channels| match channels {
-        symphonia::core::audio::Channels::Positioned(position) => {
-            u32::try_from(position.bits())
-                .ok()
-                .and_then(crate::channel_layout::ChannelMask::from_bits)
+            symphonia::core::audio::Channels::Positioned(position) => {
+                u32::try_from(position.bits())
+                    .ok()
+                    .and_then(crate::channel_layout::ChannelMask::from_bits)
             }
             _ => None,
         });
+    let expected_sample_rate = codec_params.sample_rate;
+    let expected_channel_count = codec_params
+        .channels
+        .as_ref()
+        .map(|channels| channels.count())
+        .filter(|count| *count > 0);
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|error| format!("decoder: {error}"))?;
     let track_id = track.id;
     let mut sample_rate = None;
     let mut channels: Vec<Vec<f64>> = Vec::new();
+    let mut packet_errors = RecoverablePacketErrors::default();
 
     loop {
         let packet = match format.next_packet() {
@@ -744,7 +775,15 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
         }
         let decoded = match decoder.decode(&packet) {
             Ok(decoded) => decoded,
-            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(SymphoniaError::DecodeError("mpa: invalid main_data offset")) => {
+                packet_errors.invalid_main_data_offset = true;
+                continue;
+            }
+            Err(error @ SymphoniaError::IoError(_))
+            | Err(error @ SymphoniaError::DecodeError(_)) => {
+                packet_errors.other.get_or_insert_with(|| error.to_string());
+                continue;
+            }
             Err(error) => return Err(format!("decode packet: {error}")),
         };
         let rate = decoded.spec().rate();
@@ -775,12 +814,102 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
         }
     }
 
-    let sample_rate = sample_rate.ok_or_else(|| "no audio packets decoded".to_string())?;
-    Ok(DecodedPcm {
+    let decoded = sample_rate.map(|sample_rate| DecodedPcm {
         sample_rate,
         channels,
         channel_mask,
+    });
+    Ok(SymphoniaDecodeOutcome {
+        decoded,
+        expected_sample_rate,
+        expected_channel_count,
+        packet_errors,
     })
+}
+
+fn decode_mp3(path: &Path) -> Result<DecodedPcm, String> {
+    let attempt = decode_symphonia_with_report(path)?;
+    if !attempt.packet_errors.invalid_main_data_offset {
+        return attempt.into_decoded().map(normalize_mp3_layout);
+    }
+
+    if let Some(other) = &attempt.packet_errors.other {
+        return Err(format!(
+            "MP3 decode encountered Symphonia's invalid main-data offset and another packet error ({other}); compatibility fallback is unsafe"
+        ));
+    }
+
+    let (classified_rate, classified_channels) = match mp3::inspect_timing_metadata(path) {
+        mp3::TimingMetadata::Absent {
+            sample_rate,
+            channel_count,
+        } => (sample_rate, channel_count),
+        mp3::TimingMetadata::Present => {
+            return Err(
+                "MP3 decode encountered an invalid main-data offset; compatibility fallback is disabled because the first frame contains Xing/Info/VBRI timing metadata"
+                    .into(),
+            );
+        }
+        mp3::TimingMetadata::Undetermined(reason) => {
+            return Err(format!(
+                "MP3 decode encountered an invalid main-data offset; compatibility fallback is disabled because timing metadata could not be ruled out: {reason}"
+            ));
+        }
+    };
+
+    let SymphoniaDecodeOutcome {
+        decoded,
+        expected_sample_rate,
+        expected_channel_count,
+        ..
+    } = attempt;
+    let primary_frames = decoded.as_ref().map(DecodedPcm::frames).unwrap_or(0);
+    // Do not retain a potentially long partial Symphonia buffer while the
+    // compatibility decoder accumulates a replacement whole-stream PCM.
+    drop(decoded);
+
+    let decoded = mp3::decode_mp3_file_compatibility(path).map_err(|fallback_error| {
+        format!(
+            "MP3 compatibility fallback failed after Symphonia's invalid main-data offset: {fallback_error}"
+        )
+    })?;
+    let fallback_frames = decoded.frames();
+    let fallback_channels = decoded.n_channels();
+    if decoded.sample_rate != classified_rate || fallback_channels != classified_channels {
+        return Err(format!(
+            "MP3 compatibility fallback changed the first-frame format ({} Hz/{classified_channels} ch to {} Hz/{fallback_channels} ch)",
+            classified_rate, decoded.sample_rate
+        ));
+    }
+    if expected_sample_rate.is_some_and(|rate| rate != decoded.sample_rate) {
+        return Err(format!(
+            "MP3 compatibility fallback sample rate {} does not match Symphonia track metadata {:?}",
+            decoded.sample_rate, expected_sample_rate
+        ));
+    }
+    if expected_channel_count.is_some_and(|count| count != fallback_channels) {
+        return Err(format!(
+            "MP3 compatibility fallback channel count {fallback_channels} does not match Symphonia track metadata {:?}",
+            expected_channel_count
+        ));
+    }
+    if fallback_frames <= primary_frames {
+        return Err(format!(
+            "MP3 compatibility fallback did not recover additional audio ({fallback_frames} frames versus {primary_frames} from Symphonia)"
+        ));
+    }
+
+    Ok(normalize_mp3_layout(decoded))
+}
+
+fn normalize_mp3_layout(mut decoded: DecodedPcm) -> DecodedPcm {
+    // MPEG audio only represents mono or stereo. Symphonia's MPEG track
+    // parameters currently label mono as FRONT_LEFT even though the decoder
+    // emits its standard centered mono layout. Preserve the public layout
+    // contract used by every other one-channel decoder.
+    decoded.channel_mask =
+        crate::channel_layout::ChannelLayout::from_channel_count(decoded.channels.len()).mask();
+    decoded
 }
 
 /// Decode RF64 PCM without materialising the encoded file in memory.
