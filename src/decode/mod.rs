@@ -790,11 +790,25 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
 /// payload is still ordinary little-endian WAVE PCM. Broadcast-WAVE (BWF) is
 /// handled by the normal RIFF/WAVE reader because its `bext` chunk is metadata
 /// that can be skipped by `hound`.
+fn checked_rf64_decoded_bytes(frame_count: usize, channel_count: usize) -> Result<usize, String> {
+    frame_count
+        .checked_mul(channel_count)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| "RF64 decoded byte count overflows".to_string())
+}
+
 fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
     use std::collections::HashMap;
-    use std::io::{ErrorKind, Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path).map_err(|error| format!("open RF64: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat RF64: {error}"))?
+        .len();
+    if file_len < 12 {
+        return Err("RF64 header is truncated".into());
+    }
     let mut header = [0u8; 12];
     file.read_exact(&mut header)
         .map_err(|error| format!("read RF64 header: {error}"))?;
@@ -809,12 +823,22 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
     let mut data_size = None;
 
     loop {
-        let mut id = [0u8; 4];
-        match file.read_exact(&mut id) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => break,
-            Err(error) => return Err(format!("read RF64 chunk: {error}")),
+        let chunk_offset = file
+            .stream_position()
+            .map_err(|error| format!("locate RF64 chunk: {error}"))?;
+        if chunk_offset == file_len {
+            break;
         }
+        let chunk_data_offset = chunk_offset
+            .checked_add(8)
+            .ok_or_else(|| "RF64 chunk header offset overflows".to_string())?;
+        if chunk_data_offset > file_len {
+            return Err("RF64 chunk header is truncated".into());
+        }
+
+        let mut id = [0u8; 4];
+        file.read_exact(&mut id)
+            .map_err(|error| format!("read RF64 chunk: {error}"))?;
         let size32 = read_u32_le(&mut file, "RF64 chunk size")?;
         let declared_size = if size32 == u32::MAX {
             *extended_chunk_sizes
@@ -833,6 +857,29 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
         } else {
             u64::from(size32)
         };
+        let chunk_end = chunk_data_offset
+            .checked_add(declared_size)
+            .ok_or_else(|| {
+                format!(
+                    "RF64 chunk {:?} size overflows the file offset",
+                    String::from_utf8_lossy(&id)
+                )
+            })?;
+        let padded_end = chunk_end
+            .checked_add(declared_size & 1)
+            .ok_or_else(|| "RF64 chunk padding offset overflows".to_string())?;
+        if chunk_end > file_len {
+            return Err(format!(
+                "RF64 chunk {:?} exceeds the file length",
+                String::from_utf8_lossy(&id)
+            ));
+        }
+        if padded_end > file_len {
+            return Err(format!(
+                "RF64 chunk {:?} has truncated padding",
+                String::from_utf8_lossy(&id)
+            ));
+        }
 
         match &id {
             b"ds64" => {
@@ -850,7 +897,10 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                 let table_len =
                     u32::from_le_bytes(body[24..28].try_into().expect("fixed ds64 table length"))
                         as usize;
-                let required = 28usize.saturating_add(table_len.saturating_mul(12));
+                let required = table_len
+                    .checked_mul(12)
+                    .and_then(|bytes| bytes.checked_add(28))
+                    .ok_or_else(|| "RF64 ds64 table size overflows".to_string())?;
                 if required > body.len() {
                     return Err("RF64 ds64 chunk ends before its table".into());
                 }
@@ -879,10 +929,10 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                     u32::from_le_bytes(body[4..8].try_into().expect("fixed sample rate"));
                 let block_align =
                     u16::from_le_bytes(body[12..14].try_into().expect("fixed block align"));
-                let bits_per_sample =
+                let container_bits_per_sample =
                     u16::from_le_bytes(body[14..16].try_into().expect("fixed bit depth"));
                 let extensible = format_tag == 0xfffe;
-                let (format_tag, bits_per_sample) = if extensible {
+                let (format_tag, valid_bits_per_sample) = if extensible {
                     if body.len() < 40 {
                         return Err("RF64 extensible fmt chunk is truncated".into());
                     }
@@ -893,10 +943,18 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                         u16::from_le_bytes(body[18..20].try_into().expect("fixed valid bits")),
                     )
                 } else {
-                    (format_tag, bits_per_sample)
+                    (format_tag, container_bits_per_sample)
                 };
-                if channels == 0 || sample_rate == 0 || block_align == 0 || bits_per_sample == 0 {
+                if channels == 0
+                    || sample_rate == 0
+                    || block_align == 0
+                    || container_bits_per_sample == 0
+                    || valid_bits_per_sample == 0
+                {
                     return Err("RF64 fmt chunk contains invalid audio parameters".into());
+                }
+                if valid_bits_per_sample > container_bits_per_sample {
+                    return Err("RF64 valid sample depth exceeds its PCM container width".into());
                 }
                 if !matches!(format_tag, 1 | 3) {
                     return Err(format!("RF64 codec format 0x{format_tag:04x} is unsupported; only PCM and IEEE float are supported"));
@@ -921,40 +979,33 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                     channels as usize,
                     sample_rate,
                     block_align as usize,
-                    bits_per_sample,
+                    container_bits_per_sample,
+                    valid_bits_per_sample,
                     channel_mask,
                 ));
             }
             b"data" => {
-                data_offset = Some(
-                    file.stream_position()
-                        .map_err(|error| format!("locate RF64 data: {error}"))?,
-                );
+                data_offset = Some(chunk_data_offset);
                 data_size = Some(declared_size);
-                file.seek(SeekFrom::Current(i64::try_from(declared_size).map_err(
-                    |_| "RF64 data chunk is too large to seek".to_string(),
-                )?))
-                .map_err(|error| format!("skip RF64 data: {error}"))?;
             }
-            _ => {
-                file.seek(SeekFrom::Current(
-                    i64::try_from(declared_size)
-                        .map_err(|_| "RF64 chunk is too large to seek".to_string())?,
-                ))
-                .map_err(|error| format!("skip RF64 chunk: {error}"))?;
-            }
+            _ => {}
         }
-        if declared_size & 1 != 0 {
-            file.seek(SeekFrom::Current(1))
-                .map_err(|error| format!("skip RF64 chunk padding: {error}"))?;
-        }
+        file.seek(SeekFrom::Start(padded_end))
+            .map_err(|error| format!("skip RF64 chunk: {error}"))?;
         if format.is_some() && data_offset.is_some() {
             break;
         }
     }
 
-    let (is_float, channel_count, sample_rate, block_align, bits_per_sample, channel_mask) =
-        format.ok_or_else(|| "RF64 fmt chunk not found".to_string())?;
+    let (
+        is_float,
+        channel_count,
+        sample_rate,
+        block_align,
+        container_bits_per_sample,
+        valid_bits_per_sample,
+        channel_mask,
+    ) = format.ok_or_else(|| "RF64 fmt chunk not found".to_string())?;
     let data_offset = data_offset.ok_or_else(|| "RF64 data chunk not found".to_string())?;
     let data_size = data_size.ok_or_else(|| "RF64 data size not found".to_string())?;
     if block_align == 0 || data_size % block_align as u64 != 0 {
@@ -962,21 +1013,44 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
     }
     let frame_count = usize::try_from(data_size / block_align as u64)
         .map_err(|_| "RF64 audio is too large for this platform".to_string())?;
-    if bits_per_sample > 64 || (is_float && !matches!(bits_per_sample, 32 | 64)) {
+    let _decoded_bytes = checked_rf64_decoded_bytes(frame_count, channel_count)?;
+    if container_bits_per_sample > 64
+        || valid_bits_per_sample > 64
+        || (is_float
+            && (container_bits_per_sample != valid_bits_per_sample
+                || !matches!(container_bits_per_sample, 32 | 64)))
+    {
         return Err(format!(
-            "RF64 sample depth {bits_per_sample} is unsupported"
+            "RF64 sample depth {valid_bits_per_sample} in a {container_bits_per_sample}-bit container is unsupported"
         ));
     }
-    let bytes_per_sample = (bits_per_sample as usize).div_ceil(8);
+    let bytes_per_sample = (container_bits_per_sample as usize).div_ceil(8);
     if bytes_per_sample == 0 || bytes_per_sample.saturating_mul(channel_count) > block_align {
         return Err("RF64 fmt block alignment is invalid".into());
     }
 
     file.seek(SeekFrom::Start(data_offset))
         .map_err(|error| format!("seek RF64 data: {error}"))?;
-    let mut channels = vec![Vec::with_capacity(frame_count); channel_count];
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(channel_count)
+        .map_err(|_| "unable to reserve RF64 channel list".to_string())?;
+    for _ in 0..channel_count {
+        let mut channel = Vec::new();
+        channel
+            .try_reserve_exact(frame_count)
+            .map_err(|_| "unable to reserve RF64 decoded samples".to_string())?;
+        channels.push(channel);
+    }
     let block_frames = (64 * 1024 / block_align).max(1).min(frame_count.max(1));
-    let mut buffer = vec![0u8; block_frames * block_align];
+    let buffer_len = block_frames
+        .checked_mul(block_align)
+        .ok_or_else(|| "RF64 decode buffer size overflows".to_string())?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(buffer_len)
+        .map_err(|_| "unable to reserve RF64 decode buffer".to_string())?;
+    buffer.resize(buffer_len, 0);
     let mut remaining = data_size;
     while remaining > 0 {
         let wanted =
@@ -987,25 +1061,31 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
             for channel in 0..channel_count {
                 let sample = &frame[channel * bytes_per_sample..][..bytes_per_sample];
                 let value = if is_float {
-                    match bits_per_sample {
+                    match container_bits_per_sample {
                         32 => f32::from_le_bytes(sample.try_into().expect("float32 sample")) as f64,
                         64 => f64::from_le_bytes(sample.try_into().expect("float64 sample")),
                         _ => unreachable!("validated float depth"),
                     }
-                } else if bits_per_sample == 8 {
-                    (sample[0] as f64 - 128.0) / 128.0
                 } else {
                     let mut raw = 0u64;
                     for (index, byte) in sample.iter().enumerate() {
                         raw |= u64::from(*byte) << (index * 8);
                     }
-                    let sign_bit = 1u64 << (bits_per_sample - 1);
-                    let signed = if raw & sign_bit != 0 {
-                        (raw as i64) - (1i64 << bits_per_sample)
+                    if container_bits_per_sample < 64 {
+                        raw &= (1u64 << container_bits_per_sample) - 1;
+                    }
+                    let value_bits = raw >> (container_bits_per_sample - valid_bits_per_sample);
+                    let midpoint = 1u64 << (valid_bits_per_sample - 1);
+                    if container_bits_per_sample == 8 {
+                        (value_bits as f64 - midpoint as f64) / midpoint as f64
                     } else {
-                        raw as i64
-                    };
-                    signed as f64 / (1u64 << (bits_per_sample - 1)) as f64
+                        let signed = if value_bits & midpoint != 0 {
+                            i128::from(value_bits) - (1i128 << valid_bits_per_sample)
+                        } else {
+                            i128::from(value_bits)
+                        };
+                        signed as f64 / midpoint as f64
+                    }
                 };
                 channels[channel].push(crate::audio::sanitize_sample(value));
             }
@@ -1241,5 +1321,13 @@ mod tests {
         std::fs::remove_file(&path).expect("remove probe fixture");
 
         assert!(error.contains("could not identify the audio container"));
+    }
+
+    #[test]
+    fn rf64_decoded_byte_plan_rejects_arithmetic_overflow() {
+        assert_eq!(checked_rf64_decoded_bytes(2, 3).unwrap(), 48);
+        assert!(checked_rf64_decoded_bytes(usize::MAX, 2)
+            .unwrap_err()
+            .contains("decoded byte count overflows"));
     }
 }
