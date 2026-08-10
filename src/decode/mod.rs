@@ -24,6 +24,129 @@ pub use pcm::DecodedPcm;
 
 use std::path::Path;
 
+const FORMAT_SNIFF_BYTES: usize = 4096;
+const ID3V2_HEADER_BYTES: usize = 10;
+
+fn declared_id3v2_payload_offset(header: &[u8]) -> Result<Option<u64>, String> {
+    if !header.starts_with(b"ID3") {
+        return Ok(None);
+    }
+    let header = header
+        .get(..ID3V2_HEADER_BYTES)
+        .ok_or_else(|| "truncated ID3v2 header".to_string())?;
+    if !(2..=4).contains(&header[3]) || header[4] == 0xff {
+        return Err(format!(
+            "unsupported ID3v2 version {}.{}",
+            header[3], header[4]
+        ));
+    }
+    if header[6..10].iter().any(|byte| byte & 0x80 != 0) {
+        return Err("invalid ID3v2 synchsafe size".into());
+    }
+
+    let tag_size = header[6..10]
+        .iter()
+        .fold(0u64, |size, byte| (size << 7) | u64::from(*byte));
+    // Only ID3v2.4 assigns bit 4 to a ten-byte footer. In v2.3 and
+    // earlier that bit is reserved and must never move the audio payload.
+    let footer_size = u64::from(header[3] == 4 && header[5] & 0x10 != 0) * 10;
+    let payload_offset = (ID3V2_HEADER_BYTES as u64)
+        .checked_add(tag_size)
+        .and_then(|offset| offset.checked_add(footer_size))
+        .ok_or_else(|| "ID3v2 size overflows".to_string())?;
+    Ok(Some(payload_offset))
+}
+
+pub(super) fn id3v2_payload_offset(header: &[u8], file_len: u64) -> Result<Option<u64>, String> {
+    let Some(payload_offset) = declared_id3v2_payload_offset(header)? else {
+        return Ok(None);
+    };
+    if payload_offset > file_len {
+        return Err(format!(
+            "ID3v2 tag extends beyond the file ({payload_offset} bytes declared, {file_len} bytes available)"
+        ));
+    }
+    Ok(Some(payload_offset))
+}
+
+/// Remove one leading ID3v2 tag from an in-memory stream without interpreting
+/// its frames. This is shared by raw-stream decoders so routing and decoding
+/// agree on footer and bounds semantics.
+pub(super) fn strip_id3v2_prefix(bytes: &[u8]) -> Result<&[u8], String> {
+    let file_len = u64::try_from(bytes.len()).map_err(|_| "ID3v2 input length overflows u64")?;
+    let Some(payload_offset) = id3v2_payload_offset(bytes, file_len)? else {
+        return Ok(bytes);
+    };
+    let payload_offset = usize::try_from(payload_offset)
+        .map_err(|_| "ID3v2 payload offset does not fit in memory")?;
+    Ok(&bytes[payload_offset..])
+}
+
+enum OggBosDetection {
+    Detected(AudioFormat),
+    Unknown,
+    Incomplete,
+}
+
+fn detect_ogg_bos_format(header: &[u8]) -> OggBosDetection {
+    let Some(fixed_header) = header.get(..27) else {
+        return OggBosDetection::Incomplete;
+    };
+    // Identification packets begin on a non-continuation BOS page. Inspect
+    // only that first packet, never comments or encoded payload bytes.
+    if &fixed_header[..4] != b"OggS"
+        || fixed_header[4] != 0
+        || fixed_header[5] & 0x02 == 0
+        || fixed_header[5] & 0x01 != 0
+    {
+        return OggBosDetection::Unknown;
+    }
+
+    let segment_count = usize::from(fixed_header[26]);
+    let Some(lacing_end) = 27usize.checked_add(segment_count) else {
+        return OggBosDetection::Unknown;
+    };
+    let Some(lacing) = header.get(27..lacing_end) else {
+        return OggBosDetection::Incomplete;
+    };
+    if lacing.is_empty() {
+        return OggBosDetection::Unknown;
+    }
+
+    let mut first_packet_len = 0usize;
+    let mut packet_complete = false;
+    for &segment_len in lacing {
+        let Some(next_len) = first_packet_len.checked_add(usize::from(segment_len)) else {
+            return OggBosDetection::Unknown;
+        };
+        first_packet_len = next_len;
+        if segment_len < 255 {
+            packet_complete = true;
+            break;
+        }
+    }
+    let Some(packet_end) = lacing_end.checked_add(first_packet_len) else {
+        return OggBosDetection::Unknown;
+    };
+    // Codec identification is entirely in the packet prefix. Do not require
+    // a compatible future OpusHead extension to fit in the bounded sniff
+    // buffer, but never inspect bytes beyond the first packet's lacing span.
+    let available_end = packet_end.min(header.len());
+    let first_packet = &header[lacing_end..available_end];
+    if first_packet.starts_with(b"OpusHead") {
+        OggBosDetection::Detected(AudioFormat::OggOpus)
+    } else if first_packet.starts_with(b"\x01vorbis") {
+        OggBosDetection::Detected(AudioFormat::OggVorbis)
+    } else if packet_complete && first_packet.len() == first_packet_len {
+        OggBosDetection::Unknown
+    } else if first_packet.len() >= b"OpusHead".len() {
+        // Eight leading bytes suffice to rule out both supported signatures.
+        OggBosDetection::Unknown
+    } else {
+        OggBosDetection::Incomplete
+    }
+}
+
 /// Detected container / codec family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioFormat {
@@ -74,8 +197,32 @@ pub struct AudioProbe {
 impl AudioFormat {
     /// Sniff from file content and extension.
     pub fn detect(path: &Path, header: &[u8]) -> Self {
+        let mut header = header;
+        while header.starts_with(b"ID3") {
+            match strip_id3v2_prefix(header) {
+                Ok(payload) if payload.len() < header.len() => header = payload,
+                // A bounded caller may not have supplied the whole tag. Do not
+                // guess MP3 from ID3 alone; only the caller's extension remains
+                // available as a fallback in that case.
+                _ => return Self::from_extension(path),
+            }
+        }
+
+        if header.starts_with(b"OggS") {
+            // A recognized Ogg container with an unknown first BOS packet is
+            // not implicitly Opus, even when its filename ends in `.ogg`.
+            return match detect_ogg_bos_format(header) {
+                OggBosDetection::Detected(format) => format,
+                OggBosDetection::Unknown => AudioFormat::Unknown,
+                // `detect` is also a public bounded-header helper. Preserve its
+                // extension fallback when the caller supplied only part of a
+                // structurally valid BOS page.
+                OggBosDetection::Incomplete => Self::from_extension(path),
+            };
+        }
+
         if header.len() >= 12 {
-            if &header[0..4] == b"RIFF" && header.len() >= 12 && &header[8..12] == b"WAVE" {
+            if &header[0..4] == b"RIFF" && &header[8..12] == b"WAVE" {
                 return AudioFormat::Wav;
             }
             if &header[0..4] == b"RF64" && &header[8..12] == b"WAVE" {
@@ -91,12 +238,6 @@ impl AudioFormat {
             if &header[0..4] == b"fLaC" {
                 return AudioFormat::Flac;
             }
-            if &header[0..4] == b"OggS" {
-                if header.windows(7).any(|window| window == b"\x01vorbis") {
-                    return AudioFormat::OggVorbis;
-                }
-                return AudioFormat::OggOpus;
-            }
             if &header[4..8] == b"ftyp" {
                 return AudioFormat::M4a;
             }
@@ -105,14 +246,15 @@ impl AudioFormat {
             if header[0] == 0xFF && (header[1] & 0xF6) == 0xF0 {
                 return AudioFormat::AacAdts;
             }
-            if &header[0..3] == b"ID3" {
-                return AudioFormat::Mp3;
-            }
             if header[0] == 0xFF && (header[1] & 0xE0) == 0xE0 {
                 return AudioFormat::Mp3;
             }
         }
 
+        Self::from_extension(path)
+    }
+
+    fn from_extension(path: &Path) -> Self {
         match path
             .extension()
             .and_then(|e| e.to_str())
@@ -150,16 +292,59 @@ impl AudioFormat {
     }
 }
 
+fn detect_file_format(path: &Path, use_extension_fallback: bool) -> Result<AudioFormat, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for format detection: {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat {} for format detection: {error}", path.display()))?
+        .len();
+
+    let mut header = Vec::with_capacity(FORMAT_SNIFF_BYTES);
+    file.by_ref()
+        .take(FORMAT_SNIFF_BYTES as u64)
+        .read_to_end(&mut header)
+        .map_err(|error| format!("read {} for format detection: {error}", path.display()))?;
+    if let Some(payload_offset) = id3v2_payload_offset(&header, file_len)? {
+        file.seek(SeekFrom::Start(payload_offset))
+            .map_err(|error| {
+                format!(
+                    "seek past ID3v2 tag in {} for format detection: {error}",
+                    path.display()
+                )
+            })?;
+        header.clear();
+        file.take(FORMAT_SNIFF_BYTES as u64)
+            .read_to_end(&mut header)
+            .map_err(|error| {
+                format!(
+                    "read payload of {} for format detection: {error}",
+                    path.display()
+                )
+            })?;
+    }
+
+    Ok(AudioFormat::detect(
+        if use_extension_fallback {
+            path
+        } else {
+            Path::new("")
+        },
+        &header,
+    ))
+}
+
 /// Inspect an audio file's container and codec without decoding its samples.
 ///
 /// Container detection is content-based. Ogg and ISO BMFF containers are then
 /// demuxed with Symphonia so that `.ogg` is not implicitly treated as Opus and
 /// `.m4a` / `.mp4` is not implicitly treated as AAC.
 pub fn probe_file(path: &Path) -> Result<AudioProbe, String> {
-    let header = read_header(path, 4096)?;
     // Suppress extension fallback here. A probe must describe the file's
     // contents, not what its name claims the contents are.
-    let format = AudioFormat::detect(Path::new(""), &header);
+    let format = detect_file_format(path, false)?;
 
     match format {
         AudioFormat::Wav | AudioFormat::Rf64 => probe_wave_file(path, format),
@@ -656,8 +841,7 @@ fn audio_codec_from_symphonia(codec: symphonia::core::codecs::audio::AudioCodecI
 
 /// Decode any supported audio file to high-fidelity planar PCM.
 pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
-    let header = read_header(path, 4096)?;
-    let fmt = AudioFormat::detect(path, &header);
+    let fmt = detect_file_format(path, true)?;
 
     match fmt {
         AudioFormat::Wav => decode_wav(path),
@@ -1253,15 +1437,6 @@ fn decode_flac(path: &Path) -> Result<DecodedPcm, String> {
     })
 }
 
-fn read_header(path: &Path, n: usize) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let mut buf = vec![0u8; n];
-    let got = f.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-    buf.truncate(got);
-    Ok(buf)
-}
-
 fn decode_wav(path: &Path) -> Result<DecodedPcm, String> {
     let audio = crate::audio::read_wav(path)?;
     Ok(DecodedPcm {
@@ -1274,6 +1449,74 @@ fn decode_wav(path: &Path) -> Result<DecodedPcm, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SILENT_STEREO_ADTS: [u8; 13] = [
+        0xff, 0xf1, 0x50, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x00, 0x00, 0x00, 0x00, 0x1c,
+    ];
+
+    fn synchsafe(size: usize) -> [u8; 4] {
+        assert!(size <= 0x0fff_ffff);
+        [
+            ((size >> 21) & 0x7f) as u8,
+            ((size >> 14) & 0x7f) as u8,
+            ((size >> 7) & 0x7f) as u8,
+            (size & 0x7f) as u8,
+        ]
+    }
+
+    fn id3v2_tag(version: u8, flags: u8, body_len: usize, footer: bool) -> Vec<u8> {
+        let size = synchsafe(body_len);
+        let mut tag = b"ID3".to_vec();
+        tag.extend([version, 0, flags]);
+        tag.extend(size);
+        tag.resize(ID3V2_HEADER_BYTES + body_len, 0);
+        if footer {
+            tag.extend(b"3DI");
+            tag.extend([version, 0, flags]);
+            tag.extend(size);
+        }
+        tag
+    }
+
+    fn ogg_opus_with_misleading_tags() -> Vec<u8> {
+        use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+        use std::borrow::Cow;
+
+        let serial = 0x51_0aa_c51;
+        let mut writer = PacketWriter::new(std::io::Cursor::new(Vec::new()));
+        let mut head = b"OpusHead".to_vec();
+        head.extend([1, 1]);
+        head.extend(0u16.to_le_bytes());
+        head.extend(48_000u32.to_le_bytes());
+        head.extend(0i16.to_le_bytes());
+        head.push(0);
+        writer
+            .write_packet(Cow::Owned(head), serial, PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+
+        let vendor = b"\x01vorbis";
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend((vendor.len() as u32).to_le_bytes());
+        tags.extend(vendor);
+        tags.extend(0u32.to_le_bytes());
+        writer
+            .write_packet(Cow::Owned(tags), serial, PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+
+        let mut encoder =
+            ::opus::Encoder::new(48_000, ::opus::Channels::Mono, ::opus::Application::Audio)
+                .unwrap();
+        let packet = encoder.encode_vec_float(&[0.0; 960], 4_000).unwrap();
+        writer
+            .write_packet(
+                Cow::Owned(packet),
+                serial,
+                PacketWriteEndInfo::EndStream,
+                960,
+            )
+            .unwrap();
+        writer.into_inner().into_inner()
+    }
 
     fn symphonia_audio_track(
         id: u32,
@@ -1296,10 +1539,16 @@ mod tests {
     }
 
     #[test]
-    fn detect_mp3_id3() {
+    fn detects_payload_after_in_memory_id3() {
+        let mut mp3 = id3v2_tag(4, 0, 3, false);
+        mp3.extend(b"\xff\xfb\x90\x64\0\0\0\0\0\0\0\0");
+        assert_eq!(AudioFormat::detect(Path::new(""), &mp3), AudioFormat::Mp3);
+
+        let mut aac = id3v2_tag(4, 0, 3, false);
+        aac.extend(SILENT_STEREO_ADTS);
         assert_eq!(
-            AudioFormat::detect(Path::new("x.mp3"), b"ID3"),
-            AudioFormat::Mp3
+            AudioFormat::detect(Path::new(""), &aac),
+            AudioFormat::AacAdts
         );
     }
 
@@ -1319,6 +1568,117 @@ mod tests {
         assert_eq!(
             AudioFormat::detect(Path::new("x.aac"), b""),
             AudioFormat::AacAdts
+        );
+    }
+
+    #[test]
+    fn id3v2_prefix_obeys_versioned_footer_synchsafe_and_file_bounds() {
+        let mut v23 = id3v2_tag(3, 0x10, 4, false);
+        v23.push(0xaa);
+        assert_eq!(strip_id3v2_prefix(&v23).unwrap(), &[0xaa]);
+
+        let mut v24 = id3v2_tag(4, 0x10, 4, true);
+        v24.push(0xbb);
+        assert_eq!(strip_id3v2_prefix(&v24).unwrap(), &[0xbb]);
+
+        let exact = id3v2_tag(4, 0, 4, false);
+        assert_eq!(
+            id3v2_payload_offset(&exact, exact.len() as u64).unwrap(),
+            Some(exact.len() as u64)
+        );
+        assert!(id3v2_payload_offset(&exact, exact.len() as u64 - 1)
+            .unwrap_err()
+            .contains("extends beyond"));
+
+        let mut non_synchsafe = id3v2_tag(4, 0, 0, false);
+        non_synchsafe[6] = 0x80;
+        assert!(strip_id3v2_prefix(&non_synchsafe)
+            .unwrap_err()
+            .contains("synchsafe"));
+        assert!(strip_id3v2_prefix(b"ID3\x04")
+            .unwrap_err()
+            .contains("truncated"));
+    }
+
+    #[test]
+    fn large_id3v2_adts_is_probed_and_decoded_from_its_payload() {
+        let mut bytes = id3v2_tag(4, 0, FORMAT_SNIFF_BYTES + 17, false);
+        bytes.extend(SILENT_STEREO_ADTS);
+        assert_eq!(
+            AudioFormat::detect(Path::new(""), &bytes),
+            AudioFormat::AacAdts
+        );
+
+        let file = tempfile::NamedTempFile::new().expect("create tagged ADTS fixture");
+        std::fs::write(file.path(), &bytes).expect("write tagged ADTS fixture");
+        let probe = probe_file(file.path()).expect("probe tagged ADTS payload");
+        assert_eq!(
+            probe,
+            single_audio_track(AudioFormat::AacAdts, AudioCodec::Aac)
+        );
+
+        let decoded = decode_file(file.path()).expect("decode tagged ADTS payload");
+        assert_eq!(decoded.sample_rate, 44_100);
+        assert_eq!(decoded.n_channels(), 2);
+        assert_eq!(decoded.frames(), 1_024);
+    }
+
+    #[test]
+    fn ogg_detection_uses_only_the_first_bos_packet() {
+        let opus = ogg_opus_with_misleading_tags();
+        assert!(opus
+            .windows(b"\x01vorbis".len())
+            .any(|window| window == b"\x01vorbis"));
+        assert_eq!(
+            AudioFormat::detect(Path::new("misleading.ogg"), &opus),
+            AudioFormat::OggOpus
+        );
+
+        let file = tempfile::NamedTempFile::new().expect("create misleading Opus fixture");
+        std::fs::write(file.path(), &opus).expect("write misleading Opus fixture");
+        let probe = probe_file(file.path()).expect("probe misleading Opus fixture");
+        assert_eq!(
+            probe,
+            single_audio_track(AudioFormat::OggOpus, AudioCodec::Opus)
+        );
+        let decoded = decode_file(file.path()).expect("decode misleading Opus fixture");
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.n_channels(), 1);
+        assert_eq!(decoded.frames(), 960);
+
+        let mut unknown = ogg_opus_with_misleading_tags();
+        let body_offset = 27 + usize::from(unknown[26]);
+        unknown[body_offset..body_offset + 8].copy_from_slice(b"Unknown!");
+        assert_eq!(
+            AudioFormat::detect(Path::new("unknown.ogg"), &unknown),
+            AudioFormat::Unknown
+        );
+
+        assert_eq!(
+            AudioFormat::detect(Path::new("partial.ogg"), b"OggS\0"),
+            AudioFormat::OggOpus
+        );
+
+        use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+        use std::borrow::Cow;
+        let mut extended_head = b"OpusHead".to_vec();
+        extended_head.resize(FORMAT_SNIFF_BYTES + 1_000, 0);
+        let mut writer = PacketWriter::new(Vec::new());
+        writer
+            .write_packet(
+                Cow::Owned(extended_head),
+                51,
+                PacketWriteEndInfo::EndPage,
+                0,
+            )
+            .unwrap();
+        let extended_stream = writer.into_inner();
+        assert_eq!(
+            AudioFormat::detect(
+                Path::new("extended.opus"),
+                &extended_stream[..FORMAT_SNIFF_BYTES]
+            ),
+            AudioFormat::OggOpus
         );
     }
 
