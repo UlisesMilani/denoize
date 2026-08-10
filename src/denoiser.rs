@@ -63,7 +63,7 @@ use crate::noise::{NoiseConfig, NoiseEstimator};
 use crate::perceptual::{apply_perceptual_weights, bin_to_bark_band, N_BARK_BANDS};
 use crate::postfilter::{MusicalNoisePostFilter, PostFilterConfig};
 use crate::stft::{Stft, StftConfig};
-use crate::window::{WindowParams, WindowType};
+use crate::window::{validate_dpss_bandwidth, WindowParams, WindowType, MAX_DENOISER_DPSS_NW};
 
 /// Top-level configuration.
 ///
@@ -308,6 +308,41 @@ impl DenoiserConfig {
         }
     }
 
+    /// Validate configuration that cannot be safely repaired without hiding
+    /// an explicit user choice.
+    ///
+    /// DPSS validation applies only when DPSS is the effective window. Other
+    /// windows intentionally ignore the dormant DPSS parameter.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.window != WindowType::Dpss {
+            return Ok(());
+        }
+
+        let bandwidth = self.window_params.dpss_bandwidth;
+        if !bandwidth.is_finite() {
+            return Err("DPSS bandwidth (NW) must be finite".into());
+        }
+        if bandwidth <= 0.0 {
+            return Err("DPSS bandwidth (NW) must be greater than zero".into());
+        }
+        if bandwidth > MAX_DENOISER_DPSS_NW {
+            return Err(format!(
+                "DPSS bandwidth (NW) must be at most {MAX_DENOISER_DPSS_NW} for denoising"
+            ));
+        }
+
+        // Denoiser::new repairs unsupported frame sizes before constructing
+        // the window. Validate against that effective size so this fallible
+        // API and the infallible constructor use the same solver domain.
+        let frame_size = if self.frame_size.is_power_of_two() && self.frame_size >= 256 {
+            self.frame_size
+        } else {
+            2048
+        };
+        validate_dpss_bandwidth(frame_size, bandwidth)
+            .map_err(|error| format!("invalid DPSS bandwidth (NW): {error}"))
+    }
+
     /// Clamp user-supplied values into safe ranges.
     pub fn sanitized(mut self) -> Self {
         self.strength = self.strength.clamp(0.0, 1.0);
@@ -317,6 +352,13 @@ impl DenoiserConfig {
         self.vad_speech_mix = self.vad_speech_mix.clamp(0.0, 1.0);
         if !self.frame_size.is_power_of_two() || self.frame_size < 256 {
             self.frame_size = 2048;
+        }
+        if self.window == WindowType::Dpss
+            && (self.window_params.dpss_bandwidth > MAX_DENOISER_DPSS_NW
+                || validate_dpss_bandwidth(self.frame_size, self.window_params.dpss_bandwidth)
+                    .is_err())
+        {
+            self.window_params.dpss_bandwidth = WindowParams::default().dpss_bandwidth;
         }
         self.pre_emphasis_alpha = self.pre_emphasis_alpha.clamp(0.0, 0.99);
         // Always enable quality features by default for best results unless explicitly off
@@ -1251,6 +1293,7 @@ impl StreamingDenoiser {
         if channels == 0 {
             return Err("streaming denoiser requires at least one channel".into());
         }
+        config.validate()?;
         Ok(Self {
             channels: (0..channels)
                 .map(|_| ChannelStream::new(config.clone()))
@@ -1320,6 +1363,101 @@ mod tests {
             let u = (self.0 >> 32) as f64 / (u32::MAX as f64 + 1.0);
             u * 2.0 - 1.0 // [-1, 1)
         }
+    }
+
+    #[test]
+    fn default_and_named_presets_keep_expected_windows() {
+        let sample_rate = 48_000;
+        assert_eq!(
+            DenoiserConfig::default(sample_rate).window,
+            WindowType::Hann
+        );
+        for preset in [
+            Preset::Speech,
+            Preset::Music,
+            Preset::Aggressive,
+            Preset::Gentle,
+            Preset::Restore,
+        ] {
+            assert_eq!(
+                preset.config(sample_rate).window,
+                WindowType::Hann,
+                "{preset:?} changed its established window"
+            );
+        }
+
+        let hifi = Preset::HiFi.config(sample_rate);
+        assert_eq!(hifi.window, WindowType::Kaiser);
+        assert_eq!(hifi.window_params.kaiser_beta, 10.0);
+    }
+
+    #[test]
+    fn dpss_configuration_validation_and_sanitization_are_safe() {
+        let mut base = DenoiserConfig::default(48_000);
+        base.frame_size = 256;
+        base.window = WindowType::Dpss;
+
+        for invalid in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            MAX_DENOISER_DPSS_NW + 0.5,
+        ] {
+            let mut config = base.clone();
+            config.window_params.dpss_bandwidth = invalid;
+            let error = config.validate().unwrap_err();
+            assert!(
+                error.contains("DPSS bandwidth"),
+                "unexpected error: {error}"
+            );
+
+            // The legacy infallible constructor must repair bad values before
+            // it reaches the checked window generator.
+            let denoiser = Denoiser::new(config);
+            assert_eq!(
+                denoiser.config().window_params.dpss_bandwidth,
+                WindowParams::default().dpss_bandwidth
+            );
+        }
+
+        for valid in [0.5, 3.0, MAX_DENOISER_DPSS_NW] {
+            let mut config = base.clone();
+            config.window_params.dpss_bandwidth = valid;
+            config.validate().unwrap();
+            assert_eq!(config.sanitized().window_params.dpss_bandwidth, valid);
+        }
+
+        let mut repaired_frame = base.clone();
+        repaired_frame.frame_size = 300;
+        repaired_frame.window_params.dpss_bandwidth = f64::NAN;
+        let repaired_frame = repaired_frame.sanitized();
+        assert_eq!(repaired_frame.frame_size, 2048);
+        assert_eq!(
+            repaired_frame.window_params.dpss_bandwidth,
+            WindowParams::default().dpss_bandwidth
+        );
+
+        let mut dormant = DenoiserConfig::default(48_000);
+        dormant.window_params.dpss_bandwidth = f64::NAN;
+        dormant.validate().unwrap();
+        let dormant = Denoiser::new(dormant);
+        assert_eq!(dormant.config().window, WindowType::Hann);
+        assert!(dormant.config().window_params.dpss_bandwidth.is_nan());
+    }
+
+    #[test]
+    fn streaming_constructor_rejects_invalid_dpss_bandwidth() {
+        let mut config = DenoiserConfig::default(48_000);
+        config.window = WindowType::Dpss;
+        config.window_params.dpss_bandwidth = MAX_DENOISER_DPSS_NW + 0.5;
+
+        let error = StreamingDenoiser::new(config, 1).err().unwrap();
+        assert!(
+            error.contains("DPSS bandwidth"),
+            "unexpected error: {error}"
+        );
     }
 
     fn snr_db(clean: &[f64], test: &[f64]) -> f64 {
@@ -1490,6 +1628,55 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
         assert!(max_error < 1e-9, "streaming drifted from batch by {max_error}");
+    }
+
+    #[test]
+    fn dpss_streaming_matches_batch_with_irregular_blocks() {
+        let sample_rate = 16_000;
+        let mut config = DenoiserConfig::default(sample_rate);
+        config.frame_size = 256;
+        config.overlap = 0.5;
+        config.window = WindowType::Dpss;
+        config.window_params.dpss_bandwidth = 3.0;
+        config.profile_ms = -1.0;
+        config.dc_block = false;
+        config.pre_emphasis = false;
+        let signal_len = 5 * config.frame_size + 37;
+        let signal: Vec<f64> = (0..signal_len)
+            .map(|i| {
+                let t = i as f64 / sample_rate as f64;
+                0.25 * (2.0 * std::f64::consts::PI * 330.0 * t).sin()
+                    + 0.04 * (2.0 * std::f64::consts::PI * 2_700.0 * t).sin()
+            })
+            .collect();
+
+        let mut batch = Denoiser::new(config.clone());
+        let expected = batch.process_channel(&signal);
+        let mut streaming = StreamingDenoiser::new(config, 1).unwrap();
+        let block_sizes = [1, 37, 513, 2, 89, 257, 11];
+        let mut actual = Vec::new();
+        let mut offset = 0;
+        let mut block_index = 0;
+        while offset < signal.len() {
+            let end = (offset + block_sizes[block_index % block_sizes.len()]).min(signal.len());
+            actual.extend(
+                streaming
+                    .process_block(&[signal[offset..end].to_vec()])
+                    .unwrap()
+                    .remove(0),
+            );
+            offset = end;
+            block_index += 1;
+        }
+        actual.extend(streaming.finish().unwrap().remove(0));
+
+        assert_eq!(actual.len(), expected.len());
+        let max_error = actual
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0, f64::max);
+        assert!(max_error < 1e-9, "DPSS streaming drifted by {max_error}");
     }
 
     #[test]

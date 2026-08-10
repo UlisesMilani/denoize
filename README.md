@@ -13,7 +13,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 - Ephraim-Malah Decision-Directed SNR
 - **8 gain estimators**: OMLSA, LogMMSE, MMSE-STSA, Wiener, SpecSub, SpecSub-NL, SpecSub-Geo
 - Transient protection, cepstral smoothing, pre-emphasis
-- **Advanced windows**: Kaiser, Flat-top, DPSS (+ Hann/Hamming/Sine/Blackman)
+- **Advanced windows**: Kaiser, Flat-top, principal DPSS/Slepian (+ Hann/Hamming/Sine/Blackman)
 - **Multiband spectral subtraction** (Bark bands)
 - **Perceptual weighting** (Bark-scale gain shaping)
 - **Musical-noise post-filter**
@@ -262,6 +262,21 @@ cargo build --release --features full
   --window kaiser --kaiser-beta 10 \
   --multiband --perceptual --postfilter \
   -a specsub-nl -s 0.5
+
+# Principal periodic DPSS/Slepian taper (NW must be in (0, 8])
+./target/release/denoize noisy.wav clean.wav \
+  --window dpss --dpss-nw 3.0
+```
+
+For DPSS, `NW` is the time-bandwidth product and defaults to `3.0`. Increasing
+it widens the main lobe and concentrated frequency band while strengthening
+the taper toward the frame edges. DPSS is a classical-backend STFT option; the
+equivalent TOML is:
+
+```toml
+backend = "classical"
+window = "dpss"
+dpss_nw = 3.0
 ```
 
 ### Managed model downloads
@@ -667,7 +682,7 @@ avoiding a silent loss or weakening of its access policy.
 -a, --algorithm <NAME>    omlsa|logmmse|mmse|wiener|specsub|specsub-nl|specsub-geo
 --window <NAME>          hann|hamming|sine|blackman|kaiser|flattop|dpss
 --kaiser-beta <B>        Kaiser β (default 8.0)
---dpss-nw <NW>           DPSS bandwidth (default 3.0)
+--dpss-nw <NW>           Classical DPSS time-bandwidth product in (0, 8] (default: 3.0)
 --multiband              Multiband spectral subtraction
 --perceptual             Bark perceptual gain weighting
 --postfilter             Musical-noise suppression post-filter
