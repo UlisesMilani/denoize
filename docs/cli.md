@@ -31,7 +31,7 @@ OPTIONS:
         --overlap <F>        overlap ratio 0.5..0.95 (default: 0.75)
         --window <NAME>      hann|hamming|sine|blackman|kaiser|flattop|dpss
         --kaiser-beta <B>    Kaiser window beta (default: 8.0)
-        --dpss-nw <NW>       DPSS time-bandwidth product (default: 3.0)
+        --dpss-nw <NW>       classical DPSS time-bandwidth product in (0, 8] (default: 3.0)
         --multiband          enable multiband spectral subtraction
         --perceptual         enable Bark-scale perceptual gain weighting
         --postfilter         enable musical-noise suppression post-filter

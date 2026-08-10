@@ -240,6 +240,9 @@ pub fn process_channels(
     classical_cfg: &crate::denoiser::DenoiserConfig,
     backend_options: &BackendOptions,
 ) -> Result<Vec<Vec<f64>>, String> {
+    if backend == Backend::Classical {
+        classical_cfg.validate()?;
+    }
     let needs_sanitization = channels
         .iter()
         .flatten()

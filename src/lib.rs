@@ -180,6 +180,9 @@ where
 {
     let input = input.as_ref();
     let output = output.as_ref();
+    if backend == Backend::Classical {
+        config.validate()?;
+    }
     let metadata = metadata::read_extended(input)?;
     let mut audio = read_audio(input)?;
     denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
@@ -196,6 +199,9 @@ pub fn denoise_audio_with_backend_config(
     backend_options: &BackendOptions,
 ) -> Result<std::time::Duration, String> {
     config.sample_rate = audio.sample_rate;
+    if backend == Backend::Classical {
+        config.validate()?;
+    }
     audio.sanitize_samples();
     let t0 = std::time::Instant::now();
     audio.channels = if config.vad {
@@ -466,5 +472,60 @@ mod input_safety_tests {
         )
         .unwrap();
         assert_eq!(empty.frames(), 0);
+    }
+
+    #[test]
+    fn classical_high_level_processing_rejects_invalid_dpss_bandwidth() {
+        let mut audio = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.25; 512]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        let original = audio.channels.clone();
+        let mut config = DenoiserConfig::default(audio.sample_rate);
+        config.window = WindowType::Dpss;
+        config.window_params.dpss_bandwidth = crate::window::MAX_DENOISER_DPSS_NW + 0.5;
+
+        let error = denoise_audio_with_backend_config(
+            &mut audio,
+            config,
+            Backend::Classical,
+            &BackendOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("DPSS bandwidth"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(audio.channels, original);
+    }
+
+    #[test]
+    fn file_processing_validates_dpss_before_reading_input() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("missing.wav");
+        let output = root.path().join("output.wav");
+        let mut config = DenoiserConfig::default(16_000);
+        config.window = WindowType::Dpss;
+        config.window_params.dpss_bandwidth = crate::window::MAX_DENOISER_DPSS_NW + 0.5;
+
+        let error = denoise_file_with_backend_config(
+            &input,
+            &output,
+            config,
+            Backend::Classical,
+            EncodeOptions::default(),
+            BackendOptions::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("DPSS bandwidth"),
+            "unexpected error: {error}"
+        );
+        assert!(!output.exists());
     }
 }

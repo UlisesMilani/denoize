@@ -8,6 +8,7 @@ use denoize::audio::{
 use denoize::decode::{probe_file as probe_audio_file, AudioCodec, AudioFormat, AudioProbe};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
+use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::{
     AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode,
     DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile, StreamingDenoiser,
@@ -193,7 +194,7 @@ OPTIONS:
         --overlap <F>        overlap ratio 0.5..0.95 (default: 0.75)
         --window <NAME>      hann|hamming|sine|blackman|kaiser|flattop|dpss
         --kaiser-beta <B>    Kaiser window beta (default: 8.0)
-        --dpss-nw <NW>       DPSS time-bandwidth product (default: 3.0)
+        --dpss-nw <NW>       classical DPSS time-bandwidth product in (0, {MAX_DENOISER_DPSS_NW}] (default: 3.0)
         --multiband          enable multiband spectral subtraction
         --perceptual         enable Bark-scale perceptual gain weighting
         --postfilter         enable musical-noise suppression post-filter
@@ -331,6 +332,7 @@ struct FileConfig {
     frame_size: Option<usize>,
     overlap: Option<f64>,
     window: Option<String>,
+    dpss_nw: Option<f64>,
     smoothing: Option<f64>,
     makeup_db: Option<f64>,
     quality: Option<String>,
@@ -429,6 +431,7 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.vad = config.vad;
     ov.frame_size = config.frame_size;
     ov.overlap = config.overlap;
+    ov.dpss_nw = config.dpss_nw;
     ov.smoothing = config.smoothing;
     ov.makeup = config.makeup_db;
     ov.quality = config.quality.map(|value| value.to_ascii_lowercase());
@@ -657,6 +660,13 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
 }
 
 fn validate_resource_options(ov: &Overrides) -> Result<(), String> {
+    if let Some(nw) = ov.dpss_nw {
+        if !nw.is_finite() || nw <= 0.0 || nw > MAX_DENOISER_DPSS_NW {
+            return Err(format!(
+                "invalid --dpss-nw/dpss_nw value {nw}: expected a finite DPSS time-bandwidth product in (0, {MAX_DENOISER_DPSS_NW}]"
+            ));
+        }
+    }
     if ov.max_memory_mb == Some(0) {
         return Err("--max-memory must be at least 1 MiB".into());
     }
@@ -748,8 +758,12 @@ fn build_config(ov: &Overrides, sample_rate: u32) -> DenoiserConfig {
             "ultra" | "max" | "highest" => {
                 cfg.frame_size = cfg.frame_size.max(4096);
                 cfg.overlap = 0.875;
-                cfg.window = WindowType::Kaiser;
-                cfg.window_params.kaiser_beta = 10.0;
+                if ov.window.is_none() {
+                    cfg.window = WindowType::Kaiser;
+                }
+                if ov.kaiser_beta.is_none() {
+                    cfg.window_params.kaiser_beta = 10.0;
+                }
                 cfg.transient_protect = true;
                 cfg.cepstral_smoothing = true;
                 cfg.perceptual_weighting = true;
@@ -2613,6 +2627,7 @@ backend = "auto"
 preset = "hifi"
 mode = "speech"
 strength = 0.42
+dpss_nw = 2.5
 adaptive_noise = true
 vad = true
 preserve_metadata = false
@@ -2632,6 +2647,7 @@ max_memory_mb = 64
         assert_eq!(options.preset, Some(Preset::HiFi));
         assert_eq!(options.mode, Some(ProcessingMode::Speech));
         assert_eq!(options.strength, Some(0.42));
+        assert_eq!(options.dpss_nw, Some(2.5));
         assert!(options.adaptive_noise && options.vad && options.no_metadata);
         assert_eq!(options.stream_frames, Some(4096));
         assert_eq!(options.max_memory_mb, Some(64));
@@ -2716,13 +2732,77 @@ deterministic = true
     }
 
     #[test]
+    fn validates_configured_dpss_time_bandwidth_product() {
+        for invalid in ["nan", "inf", "+inf", "-inf", "0.0", "-0.5", "8.000001"] {
+            let error = parse_config(&format!("dpss_nw = {invalid}"), "test.toml").unwrap_err();
+            assert!(
+                error.contains("finite DPSS time-bandwidth product in (0, 8]"),
+                "unexpected error for {invalid}: {error}"
+            );
+        }
+
+        let options = parse_config("dpss_nw = 8.0", "test.toml").unwrap();
+        assert_eq!(options.dpss_nw, Some(8.0));
+    }
+
+    #[test]
+    fn invalid_dpss_nw_is_rejected_before_input_or_output_io_even_when_unused() {
+        let root = std::env::temp_dir().join(format!(
+            "denoize-dpss-preflight-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let input = root.join("missing.wav");
+        let output = root.join("output.wav");
+        let error = run(&[
+            input.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+            "--window".into(),
+            "hann".into(),
+            "--quality".into(),
+            "ultra".into(),
+            "--dpss-nw".into(),
+            "9".into(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("--dpss-nw"));
+        assert!(error.contains("(0, 8]"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn explicit_dpss_window_takes_precedence_over_ultra_quality() {
+        let explicit = Overrides {
+            window: Some(WindowType::Dpss),
+            dpss_nw: Some(4.0),
+            quality: Some("ultra".into()),
+            ..Overrides::default()
+        };
+        let config = build_config(&explicit, 48_000);
+        assert_eq!(config.window, WindowType::Dpss);
+        assert_eq!(config.window_params.dpss_bandwidth, 4.0);
+
+        let implicit = Overrides {
+            quality: Some("ultra".into()),
+            ..Overrides::default()
+        };
+        let config = build_config(&implicit, 48_000);
+        assert_eq!(config.window, WindowType::Kaiser);
+        assert_eq!(config.window_params.kaiser_beta, 10.0);
+    }
+
+    #[test]
     fn command_line_overrides_config_defaults() {
         let path = std::env::temp_dir().join(format!(
             "denoize-config-{}-{}.toml",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        std::fs::write(&path, "backend = \"auto\"\nstrength = 0.25\n").unwrap();
+        std::fs::write(
+            &path,
+            "backend = \"auto\"\nstrength = 0.25\ndpss_nw = 2.5\n",
+        )
+        .unwrap();
         let args = vec![
             "input.wav".into(),
             "output.wav".into(),
@@ -2732,12 +2812,15 @@ deterministic = true
             "classical".into(),
             "--strength".into(),
             "0.75".into(),
+            "--dpss-nw".into(),
+            "4.0".into(),
         ];
         let (_, _, options) = parse_args(&args).unwrap();
         std::fs::remove_file(path).unwrap();
         assert_eq!(options.backend, Some(Backend::Classical));
         assert!(!options.auto_backend);
         assert_eq!(options.strength, Some(0.75));
+        assert_eq!(options.dpss_nw, Some(4.0));
     }
 
     #[test]
