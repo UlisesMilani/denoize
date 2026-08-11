@@ -13,6 +13,958 @@ use super::pcm::DecodedPcm;
 /// units within that representable range also prevents a corrupt `stsz` from
 /// turning one tiny input into a multi-gigabyte allocation.
 const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x00ff_ffff;
+const MAX_MP4_BOX_DEPTH: usize = 32;
+const MAX_EMPTY_TRUN_SAMPLES: u64 = 10_000_000;
+
+#[derive(Debug)]
+struct ScanBudget {
+    empty_trun_samples: u64,
+}
+
+impl Default for ScanBudget {
+    fn default() -> Self {
+        Self {
+            empty_trun_samples: MAX_EMPTY_TRUN_SAMPLES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoxListKind {
+    Top,
+    Moov,
+    Trak,
+    Mdia,
+    Minf,
+    Dinf,
+    Dref,
+    Stbl,
+    Stsd,
+    Edts,
+    Udta,
+    Meta,
+    Ilst,
+    IlstItem,
+    Mvex,
+    Moof,
+    Traf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SampleEntryKind {
+    Mp4a,
+    Avc,
+    Hevc,
+    Vp9,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawBoxHeader {
+    start: u64,
+    body_start: u64,
+    end: u64,
+    name: [u8; 4],
+    extends_to_end: bool,
+}
+
+impl RawBoxHeader {
+    fn body_size(self) -> u64 {
+        self.end - self.body_start
+    }
+}
+
+/// Validate the box boundaries that `mp4 0.14` assumes before giving it an
+/// untrusted file. The dependency's nested container loops accept zero-sized
+/// children and seek back to the same header, and several count-bearing boxes
+/// reserve from an unchecked count before reaching EOF. This bounded walker
+/// skips media payloads, but proves forward progress, parent containment, and
+/// allocation-count bounds for every box family the M4A path asks `mp4` to
+/// parse.
+pub(super) fn validate_mp4_structure<R: Read + Seek>(
+    reader: &mut R,
+    file_size: u64,
+) -> Result<(), String> {
+    if file_size < 8 {
+        return Err("file is too short for an MP4 box header".to_string());
+    }
+    scan_box_list(reader, 0, file_size, BoxListKind::Top, 0).map(|_| ())
+}
+
+fn scan_box_list<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    kind: BoxListKind,
+    depth: usize,
+) -> Result<u32, String> {
+    let mut budget = ScanBudget::default();
+    scan_box_list_with_budget(reader, start, end, kind, depth, &mut budget)
+}
+
+fn scan_box_list_with_budget<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    kind: BoxListKind,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<u32, String> {
+    if depth > MAX_MP4_BOX_DEPTH {
+        return Err(format!("MP4 box nesting exceeds {MAX_MP4_BOX_DEPTH}"));
+    }
+    if start > end {
+        return Err("MP4 child range starts after its parent".to_string());
+    }
+
+    let mut cursor = start;
+    let mut count = 0u32;
+    while cursor < end {
+        let header = read_raw_box_header(reader, cursor, end, kind == BoxListKind::Top)?;
+        validate_raw_box(reader, header, kind, depth, budget)?;
+        if header.end <= cursor {
+            return Err(format!(
+                "MP4 box {:?} at byte {cursor} made no forward progress",
+                header.name
+            ));
+        }
+        cursor = header.end;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| "MP4 box count overflow".to_string())?;
+    }
+    if cursor != end {
+        return Err(format!(
+            "MP4 child boxes end at byte {cursor}, expected parent end {end}"
+        ));
+    }
+    Ok(count)
+}
+
+fn read_raw_box_header<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    parent_end: u64,
+    top_level: bool,
+) -> Result<RawBoxHeader, String> {
+    let header_end = start
+        .checked_add(8)
+        .ok_or_else(|| "MP4 box header offset overflow".to_string())?;
+    if header_end > parent_end {
+        return Err(format!(
+            "truncated MP4 box header at byte {start} within parent ending at {parent_end}"
+        ));
+    }
+
+    let mut bytes = [0u8; 8];
+    read_exact_at(reader, start, &mut bytes)?;
+    let size32 = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+    let name: [u8; 4] = bytes[4..].try_into().unwrap();
+    let (box_size, body_start) = match size32 {
+        0 => {
+            if !top_level {
+                return Err(format!(
+                    "zero-sized MP4 box {} is only supported as a final top-level box",
+                    fourcc_text(name)
+                ));
+            }
+            (parent_end - start, header_end)
+        }
+        1 => {
+            let large_header_end = start
+                .checked_add(16)
+                .ok_or_else(|| "large MP4 box header offset overflow".to_string())?;
+            if large_header_end > parent_end {
+                return Err(format!("truncated large MP4 box header at byte {start}"));
+            }
+            let mut large = [0u8; 8];
+            read_exact_at(reader, header_end, &mut large)?;
+            let size = u64::from_be_bytes(large);
+            if size < 16 {
+                return Err(format!(
+                    "large MP4 box {} at byte {start} has invalid size {size}",
+                    fourcc_text(name)
+                ));
+            }
+            (size, large_header_end)
+        }
+        size => {
+            if size < 8 {
+                return Err(format!(
+                    "MP4 box {} at byte {start} is shorter than its header ({size})",
+                    fourcc_text(name)
+                ));
+            }
+            (u64::from(size), header_end)
+        }
+    };
+
+    let end = start.checked_add(box_size).ok_or_else(|| {
+        format!(
+            "MP4 box {} at byte {start} overflows its end offset",
+            fourcc_text(name)
+        )
+    })?;
+    if end > parent_end {
+        return Err(format!(
+            "MP4 box {} range {start}..{end} exceeds parent end {parent_end}",
+            fourcc_text(name)
+        ));
+    }
+    Ok(RawBoxHeader {
+        start,
+        body_start,
+        end,
+        name,
+        extends_to_end: size32 == 0,
+    })
+}
+
+fn validate_raw_box<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    parent: BoxListKind,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    // `mp4 0.14` deliberately stops at any top-level size-zero header without
+    // parsing its payload. Match that compatibility behavior while continuing
+    // to reject size-zero children, which make its container loops stall.
+    if header.extends_to_end {
+        return Ok(());
+    }
+
+    match parent {
+        BoxListKind::Top => match &header.name {
+            b"moov" => scan_children(reader, header, BoxListKind::Moov, depth, budget),
+            b"moof" => scan_children(reader, header, BoxListKind::Moof, depth, budget),
+            b"emsg" => validate_emsg(reader, header),
+            b"ftyp" => require_body_size(header, 8),
+            _ => Ok(()),
+        },
+        BoxListKind::Moov => match &header.name {
+            b"mvhd" => validate_versioned_body(reader, header, 100, 112),
+            b"trak" => scan_children(reader, header, BoxListKind::Trak, depth, budget),
+            b"meta" => scan_meta_children(reader, header, depth, budget),
+            b"mvex" => scan_children(reader, header, BoxListKind::Mvex, depth, budget),
+            b"udta" => scan_children(reader, header, BoxListKind::Udta, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Trak => match &header.name {
+            b"tkhd" => validate_versioned_body(reader, header, 84, 96),
+            b"edts" => scan_required_children(reader, header, BoxListKind::Edts, depth, budget),
+            b"meta" => scan_meta_children(reader, header, depth, budget),
+            b"mdia" => scan_children(reader, header, BoxListKind::Mdia, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Mdia => match &header.name {
+            b"mdhd" => validate_versioned_body(reader, header, 24, 36),
+            b"hdlr" => validate_hdlr(reader, header),
+            b"minf" => scan_children(reader, header, BoxListKind::Minf, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Minf => match &header.name {
+            b"smhd" => require_body_size(header, 8),
+            b"vmhd" => require_body_size(header, 12),
+            b"dinf" => scan_children(reader, header, BoxListKind::Dinf, depth, budget),
+            b"stbl" => scan_children(reader, header, BoxListKind::Stbl, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Dinf => match &header.name {
+            b"dref" => scan_counted_children(reader, header, BoxListKind::Dref, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Dref => match &header.name {
+            b"url " => require_body_size(header, 4),
+            _ => Ok(()),
+        },
+        BoxListKind::Stbl => match &header.name {
+            b"stsd" => scan_stsd_entries(reader, header, depth, budget),
+            b"stts" | b"ctts" => validate_counted_leaf(reader, header, 8, 8),
+            b"stsc" => validate_counted_leaf(reader, header, 12, 8),
+            b"stss" | b"stco" => validate_counted_leaf(reader, header, 4, 8),
+            b"co64" => validate_counted_leaf(reader, header, 8, 8),
+            b"stsz" => validate_stsz(reader, header),
+            _ => Ok(()),
+        },
+        BoxListKind::Stsd => match &header.name {
+            b"mp4a" => validate_sample_entry(reader, header, 28, SampleEntryKind::Mp4a),
+            b"avc1" => validate_sample_entry(reader, header, 78, SampleEntryKind::Avc),
+            b"hev1" => validate_sample_entry(reader, header, 78, SampleEntryKind::Hevc),
+            b"vp09" => validate_sample_entry(reader, header, 78, SampleEntryKind::Vp9),
+            b"tx3g" => require_body_size(header, 38),
+            _ => Ok(()),
+        },
+        BoxListKind::Edts => match &header.name {
+            b"elst" => validate_elst(reader, header),
+            _ => Ok(()),
+        },
+        BoxListKind::Udta => match &header.name {
+            b"meta" => scan_meta_children(reader, header, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Meta => match &header.name {
+            b"hdlr" => validate_hdlr(reader, header),
+            b"ilst" => scan_children(reader, header, BoxListKind::Ilst, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Ilst => match &header.name {
+            b"\xa9nam" | b"\xa9day" | b"covr" | b"desc" => {
+                scan_children(reader, header, BoxListKind::IlstItem, depth, budget)
+            }
+            _ => Ok(()),
+        },
+        BoxListKind::IlstItem => match &header.name {
+            b"data" => require_body_size(header, 8),
+            _ => Ok(()),
+        },
+        BoxListKind::Mvex => match &header.name {
+            b"mehd" => validate_versioned_body(reader, header, 8, 12),
+            b"trex" => require_body_size(header, 24),
+            _ => Ok(()),
+        },
+        BoxListKind::Moof => match &header.name {
+            b"mfhd" => require_body_size(header, 8),
+            b"traf" => scan_children(reader, header, BoxListKind::Traf, depth, budget),
+            _ => Ok(()),
+        },
+        BoxListKind::Traf => match &header.name {
+            b"tfhd" => validate_tfhd(reader, header),
+            b"tfdt" => validate_tfdt(reader, header),
+            b"trun" => validate_trun(reader, header, budget),
+            _ => Ok(()),
+        },
+    }
+}
+
+fn scan_children<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    kind: BoxListKind,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    scan_box_list_with_budget(
+        reader,
+        header.body_start,
+        header.end,
+        kind,
+        depth + 1,
+        budget,
+    )
+    .map(|_| ())
+}
+
+fn scan_required_children<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    kind: BoxListKind,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let count = scan_box_list_with_budget(
+        reader,
+        header.body_start,
+        header.end,
+        kind,
+        depth + 1,
+        budget,
+    )?;
+    if count == 0 {
+        return Err(format!(
+            "MP4 box {} requires at least one child",
+            fourcc_text(header.name)
+        ));
+    }
+    Ok(())
+}
+
+fn scan_counted_children<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    kind: BoxListKind,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let expected = read_u32_at(reader, header.body_start + 4)?;
+    if kind == BoxListKind::Stsd && expected == 0 {
+        return Err("stsd entry_count must be at least one".to_string());
+    }
+    let actual = scan_box_list_with_budget(
+        reader,
+        header.body_start + 8,
+        header.end,
+        kind,
+        depth + 1,
+        budget,
+    )?;
+    if actual != expected {
+        return Err(format!(
+            "MP4 box {} declares {expected} children but contains {actual}",
+            fourcc_text(header.name)
+        ));
+    }
+    Ok(())
+}
+
+fn scan_stsd_entries<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let expected = read_u32_at(reader, header.body_start + 4)?;
+    if expected == 0 {
+        return Err("stsd entry_count must be at least one".to_string());
+    }
+
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| "MP4 box nesting depth overflow".to_string())?;
+    if child_depth > MAX_MP4_BOX_DEPTH {
+        return Err(format!("MP4 box nesting exceeds {MAX_MP4_BOX_DEPTH}"));
+    }
+
+    let mut cursor = header.body_start + 8;
+    let mut actual = 0u32;
+    while cursor < header.end {
+        let entry = read_raw_box_header(reader, cursor, header.end, false)?;
+        // `mp4 0.14` parses only the first sample entry and then seeks to the
+        // end of stsd. Validate every entry's raw boundary and forward
+        // progress, but mirror that parser by interpreting only entry #1.
+        // This keeps unused QuickTime AudioSampleEntry v1/v2 extensions from
+        // being mistaken for child box headers.
+        if actual == 0 {
+            validate_raw_box(reader, entry, BoxListKind::Stsd, child_depth, budget)?;
+        }
+        if entry.end <= cursor {
+            return Err(format!(
+                "MP4 sample entry {:?} at byte {cursor} made no forward progress",
+                entry.name
+            ));
+        }
+        cursor = entry.end;
+        actual = actual
+            .checked_add(1)
+            .ok_or_else(|| "MP4 sample-entry count overflow".to_string())?;
+    }
+    if cursor != header.end {
+        return Err(format!(
+            "MP4 sample entries end at byte {cursor}, expected stsd end {}",
+            header.end
+        ));
+    }
+    if actual != expected {
+        return Err(format!(
+            "MP4 box stsd declares {expected} children but contains {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sample_entry<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    child_offset: u64,
+    kind: SampleEntryKind,
+) -> Result<(), String> {
+    require_body_size(header, child_offset)?;
+    let start = header
+        .body_start
+        .checked_add(child_offset)
+        .ok_or_else(|| "MP4 sample-entry child offset overflow".to_string())?;
+    if start == header.end {
+        return match kind {
+            SampleEntryKind::Mp4a => Ok(()),
+            _ => Err(format!(
+                "MP4 sample entry {} requires a codec configuration child",
+                fourcc_text(header.name)
+            )),
+        };
+    }
+
+    let child = read_raw_box_header(reader, start, header.end, false)?;
+    match kind {
+        SampleEntryKind::Mp4a if child.name == *b"esds" => validate_esds(reader, child),
+        SampleEntryKind::Mp4a => Ok(()),
+        SampleEntryKind::Avc if child.name == *b"avcC" => validate_avcc(reader, child),
+        SampleEntryKind::Avc => Err("avc1 sample entry does not begin with avcC".to_string()),
+        SampleEntryKind::Hevc if child.name == *b"hvcC" => require_body_size(child, 1),
+        SampleEntryKind::Hevc => Err("hev1 sample entry does not begin with hvcC".to_string()),
+        // `mp4 0.14` does not check the first child FourCC before parsing its
+        // body as VpccBox, so validate the same body layout regardless of name.
+        SampleEntryKind::Vp9 => require_body_size(child, 11),
+    }
+}
+
+fn scan_meta_children<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    require_body_size(header, 4)?;
+    let extended = read_u32_at(reader, header.body_start)?;
+    let child_start = if extended == 0 {
+        header.body_start + 4
+    } else {
+        require_body_size(header, 8)?;
+        let possible_hdlr = read_fourcc_at(reader, header.body_start + 4)?;
+        if possible_hdlr != *b"hdlr" {
+            return Err(format!(
+                "MP4 meta box at byte {} has unsupported version/flags {extended:#010x}",
+                header.start
+            ));
+        }
+        header.body_start
+    };
+    scan_box_list_with_budget(
+        reader,
+        child_start,
+        header.end,
+        BoxListKind::Meta,
+        depth + 1,
+        budget,
+    )
+    .map(|_| ())
+}
+
+fn validate_counted_leaf<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    entry_size: u64,
+    entries_offset: u64,
+) -> Result<(), String> {
+    require_body_size(header, entries_offset)?;
+    let count = u64::from(read_u32_at(reader, header.body_start + 4)?);
+    let required = entries_offset
+        .checked_add(
+            count
+                .checked_mul(entry_size)
+                .ok_or_else(|| "MP4 table byte count overflow".to_string())?,
+        )
+        .ok_or_else(|| "MP4 table size overflow".to_string())?;
+    require_body_size(header, required)
+}
+
+fn validate_stsz<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 12)?;
+    let sample_size = read_u32_at(reader, header.body_start + 4)?;
+    if sample_size == 0 {
+        let count = u64::from(read_u32_at(reader, header.body_start + 8)?);
+        let required = 12u64
+            .checked_add(
+                count
+                    .checked_mul(4)
+                    .ok_or_else(|| "stsz byte count overflow".to_string())?,
+            )
+            .ok_or_else(|| "stsz size overflow".to_string())?;
+        require_body_size(header, required)?;
+    }
+    Ok(())
+}
+
+fn validate_elst<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let version = read_u8_at(reader, header.body_start)?;
+    let entry_size = match version {
+        0 => 12,
+        1 => 20,
+        _ => {
+            return Err(format!(
+                "unsupported MP4 edit-list version {version} at byte {}",
+                header.start
+            ))
+        }
+    };
+    validate_counted_leaf(reader, header, entry_size, 8)
+}
+
+fn validate_avcc<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 7)?;
+    let sps_count = read_u8_at(reader, header.body_start + 5)? & 0x1f;
+    let mut cursor = header.body_start + 6;
+    for _ in 0..sps_count {
+        cursor = validate_nal_unit(reader, cursor, header.end, "avcC SPS")?;
+    }
+    require_range_end(cursor, 1, header.end, "avcC PPS count")?;
+    let pps_count = read_u8_at(reader, cursor)?;
+    cursor = cursor
+        .checked_add(1)
+        .ok_or_else(|| "avcC PPS count offset overflow".to_string())?;
+    for _ in 0..pps_count {
+        cursor = validate_nal_unit(reader, cursor, header.end, "avcC PPS")?;
+    }
+    Ok(())
+}
+
+fn validate_nal_unit<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    end: u64,
+    context: &str,
+) -> Result<u64, String> {
+    let length_end = require_range_end(offset, 2, end, context)?;
+    let length = u64::from(read_u16_at(reader, offset)?);
+    require_range_end(length_end, length, end, context)
+}
+
+fn validate_esds<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 4)?;
+    let mut cursor = header.body_start + 4;
+    while cursor < header.end {
+        let descriptor = read_descriptor_header(reader, cursor, header.end)?;
+        if descriptor.tag != 0x03 {
+            // This is exactly where `mp4 0.14` stops and reports that the
+            // required ESDescriptor is absent.
+            return Ok(());
+        }
+        cursor = validate_es_descriptor(reader, descriptor)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DescriptorRange {
+    tag: u8,
+    payload_start: u64,
+    declared_end: u64,
+}
+
+fn read_descriptor_header<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    parent_end: u64,
+) -> Result<DescriptorRange, String> {
+    require_range_end(offset, 1, parent_end, "descriptor tag")?;
+    let tag = read_u8_at(reader, offset)?;
+    let mut cursor = offset + 1;
+    let mut size = 0u32;
+    for _ in 0..4 {
+        require_range_end(cursor, 1, parent_end, "descriptor length")?;
+        let byte = read_u8_at(reader, cursor)?;
+        cursor += 1;
+        size = (size << 7) | u32::from(byte & 0x7f);
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let declared_end =
+        require_range_end(cursor, u64::from(size), parent_end, "descriptor payload")?;
+    Ok(DescriptorRange {
+        tag,
+        payload_start: cursor,
+        declared_end,
+    })
+}
+
+fn validate_es_descriptor<R: Read + Seek>(
+    reader: &mut R,
+    descriptor: DescriptorRange,
+) -> Result<u64, String> {
+    require_range_end(
+        descriptor.payload_start,
+        3,
+        descriptor.declared_end,
+        "ESDescriptor fixed fields",
+    )?;
+    let mut cursor = descriptor.payload_start + 3;
+    while cursor < descriptor.declared_end {
+        let child = read_descriptor_header(reader, cursor, descriptor.declared_end)?;
+        cursor = match child.tag {
+            0x04 => validate_decoder_config_descriptor(reader, child)?,
+            // The pinned writer declares an SLConfigDescriptor length of zero
+            // but the reader always consumes its one predefined byte.
+            0x06 => require_range_end(
+                child.payload_start,
+                1,
+                descriptor.declared_end,
+                "SLConfigDescriptor",
+            )?,
+            _ => child.declared_end,
+        };
+    }
+    Ok(cursor)
+}
+
+fn validate_decoder_config_descriptor<R: Read + Seek>(
+    reader: &mut R,
+    descriptor: DescriptorRange,
+) -> Result<u64, String> {
+    require_range_end(
+        descriptor.payload_start,
+        13,
+        descriptor.declared_end,
+        "DecoderConfigDescriptor fixed fields",
+    )?;
+    let mut cursor = descriptor.payload_start + 13;
+    while cursor < descriptor.declared_end {
+        let child = read_descriptor_header(reader, cursor, descriptor.declared_end)?;
+        cursor = match child.tag {
+            0x05 => validate_decoder_specific_descriptor(reader, child)?,
+            _ => child.declared_end,
+        };
+    }
+    Ok(cursor)
+}
+
+fn validate_decoder_specific_descriptor<R: Read + Seek>(
+    reader: &mut R,
+    descriptor: DescriptorRange,
+) -> Result<u64, String> {
+    let first_two_end = require_range_end(
+        descriptor.payload_start,
+        2,
+        descriptor.declared_end,
+        "DecoderSpecificDescriptor",
+    )?;
+    let byte_a = read_u8_at(reader, descriptor.payload_start)?;
+    let byte_b = read_u8_at(reader, descriptor.payload_start + 1)?;
+    let profile = byte_a >> 3;
+    let extended_profile = profile == 31;
+    let frequency_index = if extended_profile {
+        (byte_b >> 1) & 0x0f
+    } else {
+        ((byte_a & 0x07) << 1) | (byte_b >> 7)
+    };
+    let extra = if frequency_index == 15 {
+        3
+    } else if extended_profile {
+        1
+    } else {
+        0
+    };
+    require_range_end(
+        first_two_end,
+        extra,
+        descriptor.declared_end,
+        "DecoderSpecificDescriptor extension",
+    )?;
+    // The pinned reader needs only the AudioSpecificConfig prefix, but the
+    // descriptor may legally carry additional codec-specific bytes. They are
+    // still part of this descriptor, not sibling descriptor headers.
+    Ok(descriptor.declared_end)
+}
+
+fn validate_emsg<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 4)?;
+    let version = read_u8_at(reader, header.body_start)?;
+    match version {
+        0 => {
+            let scheme_end = find_nul(reader, header.body_start + 4, header.end, "emsg scheme")?;
+            let value_end = find_nul(reader, scheme_end, header.end, "emsg value")?;
+            require_range_end(value_end, 16, header.end, "emsg version 0 fixed fields")?;
+        }
+        1 => {
+            let strings_start = require_range_end(
+                header.body_start,
+                24,
+                header.end,
+                "emsg version 1 fixed fields",
+            )?;
+            let scheme_end = find_nul(reader, strings_start, header.end, "emsg scheme")?;
+            find_nul(reader, scheme_end, header.end, "emsg value")?;
+        }
+        _ => {
+            return Err(format!(
+                "unsupported emsg version {version} at byte {}",
+                header.start
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_tfhd<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let (_, flags) = read_full_box_header_at(reader, header.body_start)?;
+    let optional_size = if flags & 0x000001 != 0 { 8 } else { 0 }
+        + if flags & 0x000002 != 0 { 4 } else { 0 }
+        + if flags & 0x000008 != 0 { 4 } else { 0 }
+        + if flags & 0x000010 != 0 { 4 } else { 0 }
+        + if flags & 0x000020 != 0 { 4 } else { 0 };
+    require_body_size(header, 8 + optional_size)
+}
+
+fn validate_tfdt<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    require_body_size(header, 4)?;
+    let version = read_u8_at(reader, header.body_start)?;
+    match version {
+        0 => require_body_size(header, 8),
+        1 => require_body_size(header, 12),
+        _ => Err(format!(
+            "unsupported tfdt version {version} at byte {}",
+            header.start
+        )),
+    }
+}
+
+fn validate_trun<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let (_, flags) = read_full_box_header_at(reader, header.body_start)?;
+    let sample_count = u64::from(read_u32_at(reader, header.body_start + 4)?);
+    let optional_size =
+        if flags & 0x000001 != 0 { 4 } else { 0 } + if flags & 0x000004 != 0 { 4 } else { 0 };
+    let entry_size = if flags & 0x000100 != 0 { 4 } else { 0 }
+        + if flags & 0x000200 != 0 { 4 } else { 0 }
+        + if flags & 0x000400 != 0 { 4 } else { 0 }
+        + if flags & 0x000800 != 0 { 4 } else { 0 };
+
+    // With no per-sample fields the dependency still loops `sample_count`
+    // times. Charge every such run against one shared budget so many tiny
+    // boxes cannot multiply parser work beyond a fixed bound.
+    if entry_size == 0 {
+        budget.empty_trun_samples = budget
+            .empty_trun_samples
+            .checked_sub(sample_count)
+            .ok_or_else(|| {
+                format!("aggregate empty trun sample_count exceeds {MAX_EMPTY_TRUN_SAMPLES}")
+            })?;
+    }
+    let entries_size = sample_count
+        .checked_mul(entry_size)
+        .ok_or_else(|| "trun entry byte count overflow".to_string())?;
+    let required = 8u64
+        .checked_add(optional_size)
+        .and_then(|size| size.checked_add(entries_size))
+        .ok_or_else(|| "trun body size overflow".to_string())?;
+    require_body_size(header, required)
+}
+
+fn find_nul<R: Read + Seek>(
+    reader: &mut R,
+    mut offset: u64,
+    end: u64,
+    context: &str,
+) -> Result<u64, String> {
+    let mut buffer = [0u8; 4096];
+    while offset < end {
+        let remaining = end - offset;
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| format!("{context} scan length cannot be represented"))?;
+        read_exact_at(reader, offset, &mut buffer[..wanted])?;
+        if let Some(index) = buffer[..wanted].iter().position(|byte| *byte == 0) {
+            return offset
+                .checked_add(index as u64 + 1)
+                .ok_or_else(|| format!("{context} end offset overflow"));
+        }
+        offset = offset
+            .checked_add(wanted as u64)
+            .ok_or_else(|| format!("{context} scan offset overflow"))?;
+    }
+    Err(format!(
+        "{context} is not NUL-terminated within its MP4 box"
+    ))
+}
+
+fn require_range_end(start: u64, len: u64, end: u64, context: &str) -> Result<u64, String> {
+    let required_end = start
+        .checked_add(len)
+        .ok_or_else(|| format!("{context} range overflow"))?;
+    if required_end > end {
+        return Err(format!("{context} exceeds its MP4 box boundary"));
+    }
+    Ok(required_end)
+}
+
+fn validate_versioned_body<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    version_zero_size: u64,
+    version_one_size: u64,
+) -> Result<(), String> {
+    require_body_size(header, 1)?;
+    let version = read_u8_at(reader, header.body_start)?;
+    match version {
+        0 => require_body_size(header, version_zero_size),
+        1 => require_body_size(header, version_one_size),
+        _ => Err(format!(
+            "unsupported MP4 box {} version {version} at byte {}",
+            fourcc_text(header.name),
+            header.start
+        )),
+    }
+}
+
+fn validate_hdlr<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
+    let _ = reader;
+    // QuickTime permits a counted component-name string here, whereas ISO
+    // metadata handlers commonly use NUL-terminated UTF-8. The dependency
+    // consumes exactly the declared body in either form, so length is the
+    // containment invariant and content must remain compatible with both.
+    require_body_size(header, 25)
+}
+
+fn require_body_size(header: RawBoxHeader, minimum: u64) -> Result<(), String> {
+    if header.body_size() < minimum {
+        return Err(format!(
+            "MP4 box {} at byte {} has body size {}, minimum is {minimum}",
+            fourcc_text(header.name),
+            header.start,
+            header.body_size()
+        ));
+    }
+    Ok(())
+}
+
+fn read_exact_at<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    bytes: &mut [u8],
+) -> Result<(), String> {
+    reader
+        .seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek MP4 structure at byte {offset}: {e}"))?;
+    reader
+        .read_exact(bytes)
+        .map_err(|e| format!("read MP4 structure at byte {offset}: {e}"))
+}
+
+fn read_u8_at<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<u8, String> {
+    let mut byte = [0u8; 1];
+    read_exact_at(reader, offset, &mut byte)?;
+    Ok(byte[0])
+}
+
+fn read_u16_at<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<u16, String> {
+    let mut bytes = [0u8; 2];
+    read_exact_at(reader, offset, &mut bytes)?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn read_u32_at<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<u32, String> {
+    let mut bytes = [0u8; 4];
+    read_exact_at(reader, offset, &mut bytes)?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_full_box_header_at<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+) -> Result<(u8, u32), String> {
+    let mut bytes = [0u8; 4];
+    read_exact_at(reader, offset, &mut bytes)?;
+    Ok((
+        bytes[0],
+        u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]),
+    ))
+}
+
+fn read_fourcc_at<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<[u8; 4], String> {
+    let mut bytes = [0u8; 4];
+    read_exact_at(reader, offset, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn fourcc_text(name: [u8; 4]) -> String {
+    String::from_utf8_lossy(&name).into_owned()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SampleDescriptor {
@@ -182,9 +1134,18 @@ pub fn decode_m4a(path: &Path) -> Result<DecodedPcm, String> {
         .metadata()
         .map_err(|e| format!("stat m4a: {e}"))?
         .len();
-    let header_file = payload_reader
+    let mut structure_file = payload_reader
+        .try_clone()
+        .map_err(|e| format!("clone m4a handle for structural validation: {e}"))?;
+    validate_mp4_structure(&mut structure_file, file_size)
+        .map_err(|e| format!("mp4 structure: {e}"))?;
+
+    let mut header_file = payload_reader
         .try_clone()
         .map_err(|e| format!("clone m4a handle for header parsing: {e}"))?;
+    header_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewind m4a header: {e}"))?;
     let mp4 = Mp4Reader::read_header(BufReader::new(header_file), file_size)
         .map_err(|e| format!("mp4 parse: {e}"))?;
 
@@ -786,6 +1747,48 @@ mod tests {
         writer.into_writer().into_inner()
     }
 
+    fn raw_box(name: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8 + body.len()).unwrap();
+        let mut bytes = Vec::with_capacity(size as usize);
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(&name);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn raw_large_box(name: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = u64::try_from(16 + body.len()).unwrap();
+        let mut bytes = Vec::with_capacity(size as usize);
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&name);
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn descriptor(tag: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 128);
+        let mut bytes = vec![tag, payload.len() as u8];
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn canonical_esds_body() -> Vec<u8> {
+        let mut decoder_config_payload = vec![0; 13];
+        decoder_config_payload.extend_from_slice(&descriptor(0x05, &[0x12, 0x10]));
+        let decoder_config = descriptor(0x04, &decoder_config_payload);
+
+        let mut es_payload = vec![0; 3];
+        es_payload.extend_from_slice(&decoder_config);
+        // `mp4 0.14` intentionally writes a zero declared length followed by
+        // the one predefined SLConfig byte and reads it the same way.
+        es_payload.extend_from_slice(&[0x06, 0x00, 0x00]);
+
+        let mut body = vec![0; 4];
+        body.extend_from_slice(&descriptor(0x03, &es_payload));
+        body
+    }
+
     #[test]
     fn validates_variable_stco_and_walks_exact_offsets() {
         let table = TestTable::variable_stco();
@@ -848,6 +1851,7 @@ mod tests {
     fn validates_real_mp4_writer_tables_without_derived_sample_math() {
         for sizes in [&[4usize, 4][..], &[2usize, 5][..]] {
             let (bytes, reader) = encoded_aac_table(sizes);
+            validate_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
             let track = select_aac_track(&reader).unwrap();
             let validated = validate_sample_table(track, bytes.len() as u64).unwrap();
             assert_eq!(validated.sample_count, 2);
@@ -1047,6 +2051,469 @@ mod tests {
             );
             assert_eq!(channels, before);
         }
+    }
+
+    #[test]
+    fn nested_zero_size_box_is_rejected_without_stalling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zero-size-child.m4a");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"isom");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"free");
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = decode_m4a(&path).unwrap_err();
+        assert!(error.contains("zero-sized MP4 box free"), "{error}");
+    }
+
+    #[test]
+    fn structural_preflight_rejects_nonprogress_and_parent_overrun() {
+        let mut too_short = Vec::new();
+        too_short.extend_from_slice(&4u32.to_be_bytes());
+        too_short.extend_from_slice(b"free");
+        let error = scan_box_list(
+            &mut Cursor::new(&too_short),
+            0,
+            too_short.len() as u64,
+            BoxListKind::Moov,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("shorter than its header"), "{error}");
+
+        let mut overrun = Vec::new();
+        overrun.extend_from_slice(&16u32.to_be_bytes());
+        overrun.extend_from_slice(b"free");
+        let error = scan_box_list(
+            &mut Cursor::new(&overrun),
+            0,
+            overrun.len() as u64,
+            BoxListKind::Moov,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds parent end"), "{error}");
+    }
+
+    #[test]
+    fn structural_preflight_keeps_fixed_box_reads_inside_their_siblings() {
+        let cases = [
+            (BoxListKind::Moov, *b"mvhd", vec![0], 100u64),
+            (BoxListKind::Trak, *b"tkhd", vec![0], 84),
+            (BoxListKind::Mdia, *b"mdhd", vec![0], 24),
+            (BoxListKind::Mdia, *b"hdlr", vec![0; 24], 25),
+            (BoxListKind::Minf, *b"smhd", vec![0; 7], 8),
+            (BoxListKind::Minf, *b"vmhd", vec![0; 11], 12),
+            (BoxListKind::Mvex, *b"mehd", vec![0], 8),
+            (BoxListKind::Mvex, *b"trex", vec![0; 23], 24),
+        ];
+        for (kind, name, body, minimum) in cases {
+            let mut bytes = raw_box(name, &body);
+            bytes.extend_from_slice(&raw_box(*b"free", &[0; 128]));
+            let error = scan_box_list(&mut Cursor::new(&bytes), 0, bytes.len() as u64, kind, 0)
+                .expect_err("short fixed box must not borrow its sibling bytes");
+            assert!(
+                error.contains(&format!("minimum is {minimum}")),
+                "{}: {error}",
+                fourcc_text(name)
+            );
+        }
+
+        let hdlr_without_terminator = raw_box(*b"hdlr", &[b'x'; 25]);
+        scan_box_list(
+            &mut Cursor::new(&hdlr_without_terminator),
+            0,
+            hdlr_without_terminator.len() as u64,
+            BoxListKind::Meta,
+            0,
+        )
+        .expect("QuickTime counted-string hdlr names remain compatible");
+    }
+
+    #[test]
+    fn structural_preflight_rejects_empty_stsd_and_edts_boxes() {
+        let stsd = raw_box(*b"stsd", &[0; 8]);
+        let error = scan_box_list(
+            &mut Cursor::new(&stsd),
+            0,
+            stsd.len() as u64,
+            BoxListKind::Stbl,
+            0,
+        )
+        .expect_err("mp4 parser always reads one stsd child");
+        assert!(
+            error.contains("entry_count must be at least one"),
+            "{error}"
+        );
+
+        let edts = raw_box(*b"edts", &[]);
+        let error = scan_box_list(
+            &mut Cursor::new(&edts),
+            0,
+            edts.len() as u64,
+            BoxListKind::Trak,
+            0,
+        )
+        .expect_err("mp4 parser always reads one edts child");
+        assert!(error.contains("minimum is 8"), "{error}");
+    }
+
+    #[test]
+    fn structural_preflight_interprets_only_the_first_stsd_entry() {
+        let first = raw_box(*b"mp4a", &[0; 28]);
+
+        // A valid, unused QuickTime AudioSampleEntry v1. Its extension starts
+        // where a v0 entry would end, and therefore is not a child-box list.
+        let mut second_body = vec![0; 28];
+        second_body[8..10].copy_from_slice(&1u16.to_be_bytes());
+        second_body.extend_from_slice(&1024u32.to_be_bytes()); // samples/packet
+        second_body.extend_from_slice(&0u32.to_be_bytes()); // bytes/packet
+        second_body.extend_from_slice(&0u32.to_be_bytes()); // bytes/frame
+        second_body.extend_from_slice(&2u32.to_be_bytes()); // bytes/sample
+        let second = raw_box(*b"mp4a", &second_body);
+
+        let mut body = vec![0; 4];
+        body.extend_from_slice(&2u32.to_be_bytes());
+        body.extend_from_slice(&first);
+        body.extend_from_slice(&second);
+        let stsd = raw_box(*b"stsd", &body);
+        scan_box_list(
+            &mut Cursor::new(&stsd),
+            0,
+            stsd.len() as u64,
+            BoxListKind::Stbl,
+            0,
+        )
+        .expect("unused QuickTime sample entries remain parser-compatible");
+    }
+
+    #[test]
+    fn structural_preflight_bounds_required_sample_entry_children() {
+        for (name, expected) in [
+            (*b"avc1", "requires a codec configuration child"),
+            (*b"hev1", "requires a codec configuration child"),
+            (*b"vp09", "requires a codec configuration child"),
+        ] {
+            let entry = raw_box(name, &[0; 78]);
+            let error = scan_box_list(
+                &mut Cursor::new(&entry),
+                0,
+                entry.len() as u64,
+                BoxListKind::Stsd,
+                0,
+            )
+            .expect_err("video sample entry must have its codec child");
+            assert!(error.contains(expected), "{}: {error}", fourcc_text(name));
+        }
+
+        let mp4a = raw_box(*b"mp4a", &[0; 28]);
+        scan_box_list(
+            &mut Cursor::new(&mp4a),
+            0,
+            mp4a.len() as u64,
+            BoxListKind::Stsd,
+            0,
+        )
+        .expect("mp4a codec child remains optional to match mp4 0.14");
+
+        for (entry_name, child_name, child_body) in [
+            (*b"avc1", *b"avcC", vec![0; 7]),
+            (*b"hev1", *b"hvcC", vec![1]),
+            (*b"vp09", *b"vpcC", vec![0; 11]),
+        ] {
+            let mut body = vec![0; 78];
+            body.extend_from_slice(&raw_box(child_name, &child_body));
+            let entry = raw_box(entry_name, &body);
+            scan_box_list(
+                &mut Cursor::new(&entry),
+                0,
+                entry.len() as u64,
+                BoxListKind::Stsd,
+                0,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn structural_preflight_bounds_codec_configuration_payloads() {
+        let avcc_short = raw_box(*b"avcC", &[0; 6]);
+        let error = validate_avcc(
+            &mut Cursor::new(&avcc_short),
+            read_raw_box_header(
+                &mut Cursor::new(&avcc_short),
+                0,
+                avcc_short.len() as u64,
+                false,
+            )
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("minimum is 7"), "{error}");
+
+        let mut truncated_sps = vec![1, 0, 0, 0, 0, 1];
+        truncated_sps.extend_from_slice(&5u16.to_be_bytes());
+        truncated_sps.extend_from_slice(&[1, 2, 3]);
+        let avcc = raw_box(*b"avcC", &truncated_sps);
+        let mut cursor = Cursor::new(&avcc);
+        let header = read_raw_box_header(&mut cursor, 0, avcc.len() as u64, false).unwrap();
+        let error = validate_avcc(&mut cursor, header).unwrap_err();
+        assert!(error.contains("avcC SPS exceeds"), "{error}");
+
+        let mut valid_avcc = vec![1, 0, 0, 0, 0, 1];
+        valid_avcc.extend_from_slice(&2u16.to_be_bytes());
+        valid_avcc.extend_from_slice(&[1, 2]);
+        valid_avcc.push(1);
+        valid_avcc.extend_from_slice(&1u16.to_be_bytes());
+        valid_avcc.push(3);
+        valid_avcc.extend_from_slice(&[0xaa, 0xbb]);
+        let avcc = raw_box(*b"avcC", &valid_avcc);
+        let mut cursor = Cursor::new(&avcc);
+        let header = read_raw_box_header(&mut cursor, 0, avcc.len() as u64, false).unwrap();
+        validate_avcc(&mut cursor, header).unwrap();
+
+        for (name, body_len, minimum) in [(*b"hvcC", 0, 1), (*b"vpcC", 10, 11)] {
+            let config = raw_box(name, &vec![0; body_len]);
+            let mut cursor = Cursor::new(&config);
+            let header = read_raw_box_header(&mut cursor, 0, config.len() as u64, false).unwrap();
+            let error = require_body_size(header, minimum).unwrap_err();
+            assert!(error.contains(&format!("minimum is {minimum}")), "{error}");
+        }
+    }
+
+    #[test]
+    fn structural_preflight_bounds_esds_descriptor_hierarchy() {
+        let valid = raw_box(*b"esds", &canonical_esds_body());
+        let mut cursor = Cursor::new(&valid);
+        let header = read_raw_box_header(&mut cursor, 0, valid.len() as u64, false).unwrap();
+        validate_esds(&mut cursor, header).unwrap();
+
+        // FFmpeg commonly emits a five-byte AudioSpecificConfig. Only its
+        // prefix is interpreted by mp4 0.14, but all five bytes belong to the
+        // same DecoderSpecificDescriptor.
+        let mut config = vec![0; 13];
+        config.extend_from_slice(&descriptor(0x05, &[0x11, 0x90, 0x56, 0xe5, 0x00]));
+        let mut es = vec![0; 3];
+        es.extend_from_slice(&descriptor(0x04, &config));
+        let mut extended_asc_body = vec![0; 4];
+        extended_asc_body.extend_from_slice(&descriptor(0x03, &es));
+        let extended_asc = raw_box(*b"esds", &extended_asc_body);
+        let mut cursor = Cursor::new(&extended_asc);
+        let header = read_raw_box_header(&mut cursor, 0, extended_asc.len() as u64, false).unwrap();
+        validate_esds(&mut cursor, header).expect("extended ASC bytes stay inside tag 0x05");
+
+        let cases = [
+            (vec![0, 0, 0, 0, 0x03, 0x80], "descriptor length"),
+            (vec![0, 0, 0, 0, 0x03, 0x7f], "descriptor payload exceeds"),
+            (
+                {
+                    let mut body = vec![0; 4];
+                    body.extend_from_slice(&descriptor(0x03, &[0; 2]));
+                    body
+                },
+                "ESDescriptor fixed fields",
+            ),
+            (
+                {
+                    let mut es = vec![0; 3];
+                    es.extend_from_slice(&descriptor(0x04, &[0; 12]));
+                    let mut body = vec![0; 4];
+                    body.extend_from_slice(&descriptor(0x03, &es));
+                    body
+                },
+                "DecoderConfigDescriptor fixed fields",
+            ),
+            (
+                {
+                    let mut config = vec![0; 13];
+                    config.extend_from_slice(&descriptor(0x05, &[0]));
+                    let mut es = vec![0; 3];
+                    es.extend_from_slice(&descriptor(0x04, &config));
+                    let mut body = vec![0; 4];
+                    body.extend_from_slice(&descriptor(0x03, &es));
+                    body
+                },
+                "DecoderSpecificDescriptor",
+            ),
+            (
+                {
+                    let mut es = vec![0; 3];
+                    es.extend_from_slice(&[0x06, 0x00]);
+                    let mut body = vec![0; 4];
+                    body.extend_from_slice(&descriptor(0x03, &es));
+                    body
+                },
+                "SLConfigDescriptor",
+            ),
+        ];
+        for (body, expected) in cases {
+            let bytes = raw_box(*b"esds", &body);
+            let mut cursor = Cursor::new(&bytes);
+            let header = read_raw_box_header(&mut cursor, 0, bytes.len() as u64, false).unwrap();
+            let error = validate_esds(&mut cursor, header).expect_err("malformed esds must fail");
+            assert!(error.contains(expected), "expected {expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn structural_preflight_uses_physical_offsets_for_large_codec_boxes() {
+        let esds = raw_large_box(*b"esds", &canonical_esds_body());
+        let mut mp4a_body = vec![0; 28];
+        mp4a_body.extend_from_slice(&esds);
+        let mp4a = raw_large_box(*b"mp4a", &mp4a_body);
+        scan_box_list(
+            &mut Cursor::new(&mp4a),
+            0,
+            mp4a.len() as u64,
+            BoxListKind::Stsd,
+            0,
+        )
+        .unwrap();
+
+        let avcc = raw_large_box(*b"avcC", &[0; 7]);
+        let mut avc_body = vec![0; 78];
+        avc_body.extend_from_slice(&avcc);
+        let avc = raw_large_box(*b"avc1", &avc_body);
+        scan_box_list(
+            &mut Cursor::new(&avc),
+            0,
+            avc.len() as u64,
+            BoxListKind::Stsd,
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn structural_preflight_bounds_table_counts_and_metadata_payloads() {
+        let mut stts_body = Vec::new();
+        stts_body.extend_from_slice(&0u32.to_be_bytes());
+        stts_body.extend_from_slice(&u32::MAX.to_be_bytes());
+        let stts = raw_box(*b"stts", &stts_body);
+        let error = scan_box_list(
+            &mut Cursor::new(&stts),
+            0,
+            stts.len() as u64,
+            BoxListKind::Stbl,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("body size"), "{error}");
+
+        let data = raw_box(*b"data", &[]);
+        let error = scan_box_list(
+            &mut Cursor::new(&data),
+            0,
+            data.len() as u64,
+            BoxListKind::IlstItem,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("minimum is 8"), "{error}");
+    }
+
+    #[test]
+    fn structural_preflight_accepts_a_bounded_large_box_header() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(b"free");
+        bytes.extend_from_slice(&16u64.to_be_bytes());
+        validate_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
+    }
+
+    #[test]
+    fn structural_preflight_preserves_terminal_zero_size_box_compatibility() {
+        let mut bytes = encoded_aac_tracks(1);
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"free");
+        bytes.extend_from_slice(b"opaque terminal payload");
+
+        validate_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        Mp4Reader::read_header(Cursor::new(bytes.clone()), bytes.len() as u64).unwrap();
+    }
+
+    #[test]
+    fn structural_preflight_accepts_bounded_emsg_and_fragment_boxes() {
+        let mut version_zero_emsg = vec![0, 0, 0, 0];
+        version_zero_emsg.extend_from_slice(b"urn:example\0value\0");
+        version_zero_emsg.extend_from_slice(&48_000u32.to_be_bytes());
+        version_zero_emsg.extend_from_slice(&0u32.to_be_bytes());
+        version_zero_emsg.extend_from_slice(&960u32.to_be_bytes());
+        version_zero_emsg.extend_from_slice(&1u32.to_be_bytes());
+        version_zero_emsg.extend_from_slice(b"message");
+
+        let mut version_one_emsg = vec![1, 0, 0, 0];
+        version_one_emsg.extend_from_slice(&48_000u32.to_be_bytes());
+        version_one_emsg.extend_from_slice(&960u64.to_be_bytes());
+        version_one_emsg.extend_from_slice(&960u32.to_be_bytes());
+        version_one_emsg.extend_from_slice(&2u32.to_be_bytes());
+        version_one_emsg.extend_from_slice(b"urn:example\0value\0message");
+
+        let mut mfhd_body = vec![0, 0, 0, 0];
+        mfhd_body.extend_from_slice(&1u32.to_be_bytes());
+        let mfhd = raw_box(*b"mfhd", &mfhd_body);
+        let mut tfhd_body = vec![0, 0, 0, 0];
+        tfhd_body.extend_from_slice(&1u32.to_be_bytes());
+        let tfhd = raw_box(*b"tfhd", &tfhd_body);
+        let mut trun_body = vec![0, 0, 2, 0];
+        trun_body.extend_from_slice(&1u32.to_be_bytes());
+        trun_body.extend_from_slice(&10u32.to_be_bytes());
+        let trun = raw_box(*b"trun", &trun_body);
+        let mut traf_body = tfhd;
+        traf_body.extend_from_slice(&trun);
+        let traf = raw_box(*b"traf", &traf_body);
+        let mut moof_body = mfhd;
+        moof_body.extend_from_slice(&traf);
+
+        let mut bytes = encoded_aac_tracks(1);
+        bytes.extend_from_slice(&raw_box(*b"emsg", &version_zero_emsg));
+        bytes.extend_from_slice(&raw_box(*b"emsg", &version_one_emsg));
+        bytes.extend_from_slice(&raw_box(*b"moof", &moof_body));
+
+        validate_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        Mp4Reader::read_header(Cursor::new(bytes.clone()), bytes.len() as u64).unwrap();
+    }
+
+    #[test]
+    fn structural_preflight_bounds_emsg_strings_and_zero_stride_trun_work() {
+        let emsg = raw_box(*b"emsg", &[0, 0, 0, 0, b'x']);
+        let error = validate_mp4_structure(&mut Cursor::new(&emsg), emsg.len() as u64)
+            .expect_err("unterminated emsg strings must fail");
+        assert!(error.contains("not NUL-terminated"), "{error}");
+
+        let mut trun_body = vec![0, 0, 0, 0];
+        trun_body.extend_from_slice(&u32::MAX.to_be_bytes());
+        let trun = raw_box(*b"trun", &trun_body);
+        let error = scan_box_list(
+            &mut Cursor::new(&trun),
+            0,
+            trun.len() as u64,
+            BoxListKind::Traf,
+            0,
+        )
+        .expect_err("tiny trun must not request billions of loop iterations");
+        assert!(error.contains("aggregate empty trun"), "{error}");
+
+        let mut bounded_body = vec![0, 0, 0, 0];
+        bounded_body.extend_from_slice(&6_000_000u32.to_be_bytes());
+        let bounded = raw_box(*b"trun", &bounded_body);
+        let mut repeated = bounded.clone();
+        repeated.extend_from_slice(&bounded);
+        let error = scan_box_list(
+            &mut Cursor::new(&repeated),
+            0,
+            repeated.len() as u64,
+            BoxListKind::Traf,
+            0,
+        )
+        .expect_err("many empty trun boxes must share one work budget");
+        assert!(error.contains("aggregate empty trun"), "{error}");
     }
 
     #[test]

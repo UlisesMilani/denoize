@@ -1,7 +1,8 @@
 use denoize::{decode_file, AudioFormat};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod support;
 use support::extended_audio::{aiff_pcm, alac_m4a, caf_pcm, pcm_samples, rf64_pcm, vorbis_ogg};
@@ -115,6 +116,19 @@ fn rf64_unknown_chunk_without_required_padding() -> Vec<u8> {
 fn fill_only_adts() -> [u8; 10] {
     // AAC-LC, 44.1 kHz, mono ADTS header followed by a fill element and END.
     [0xff, 0xf1, 0x50, 0x40, 0x01, 0x5f, 0xfc, 0xc2, 0x01, 0xc0]
+}
+
+fn nested_zero_size_m4a() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&16u32.to_be_bytes());
+    bytes.extend_from_slice(b"ftyp");
+    bytes.extend_from_slice(b"isom");
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(&16u32.to_be_bytes());
+    bytes.extend_from_slice(b"moov");
+    bytes.extend_from_slice(&0u32.to_be_bytes());
+    bytes.extend_from_slice(b"free");
+    bytes
 }
 
 #[test]
@@ -316,4 +330,78 @@ fn cli_fill_only_aac_failure_preserves_existing_output_and_leaves_no_stage() {
         control_or_stage.is_empty(),
         "AAC failure left control/stage files: {control_or_stage:?}"
     );
+}
+
+#[test]
+fn cli_malformed_m4a_probe_terminates_and_leaves_output_untouched() {
+    let workspace = TestWorkspace::new();
+    let input = workspace.file("input");
+    let output = workspace.file("output");
+    std::fs::create_dir(&input).expect("create batch input directory");
+    std::fs::create_dir(&output).expect("create batch output directory");
+    let malformed = input.join("zero-size-child.m4a");
+    let preserved = output.join("sentinel.bin");
+    let sentinel = b"existing output must survive";
+    std::fs::write(&malformed, nested_zero_size_m4a()).expect("write malformed M4A fixture");
+    std::fs::write(&preserved, sentinel).expect("write output sentinel");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_denoize"))
+        .arg(&input)
+        .arg(&output)
+        .args([
+            "--batch",
+            "--output-format",
+            "wav",
+            "--force",
+            "--no-metadata",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn denoize CLI");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll denoize CLI") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill stalled denoize CLI");
+            child.wait().expect("reap stalled denoize CLI");
+            panic!("malformed M4A probe did not terminate within three seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("capture CLI stdout")
+        .read_to_end(&mut stdout)
+        .expect("read CLI stdout");
+    child
+        .stderr
+        .take()
+        .expect("capture CLI stderr")
+        .read_to_end(&mut stderr)
+        .expect("read CLI stderr");
+
+    assert!(!status.success());
+    assert!(stdout.is_empty(), "failure emitted partial JSON");
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("zero-sized MP4 box free"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        std::fs::read(&preserved).expect("read preserved output"),
+        sentinel
+    );
+    let output_entries: Vec<_> = std::fs::read_dir(&output)
+        .expect("read test directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(output_entries, ["sentinel.bin"]);
 }
