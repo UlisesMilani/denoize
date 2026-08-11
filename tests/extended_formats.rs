@@ -5,7 +5,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod support;
-use support::extended_audio::{aiff_pcm, alac_m4a, caf_pcm, pcm_samples, rf64_pcm, vorbis_ogg};
+use support::extended_audio::{
+    aiff_pcm, alac_m4a, alac_m4a_with_edit_past_stts_media_end, alac_m4a_with_mismatched_stts,
+    alac_m4a_with_non_identity_edit, alac_m4a_without_edit_list, caf_pcm, pcm_samples, rf64_pcm,
+    vorbis_ogg,
+};
 
 struct TestWorkspace {
     path: PathBuf,
@@ -161,6 +165,58 @@ fn decodes_independently_generated_vorbis_and_alac_fixtures() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn alac_fallback_applies_non_identity_edit_list_exactly() {
+    let workspace = TestWorkspace::new();
+    let control_path = workspace.file("alac-no-edit.m4a");
+    let edited_path = workspace.file("alac-edited.m4a");
+    std::fs::write(&control_path, alac_m4a_without_edit_list()).expect("write ALAC control");
+    std::fs::write(&edited_path, alac_m4a_with_non_identity_edit())
+        .expect("write edited ALAC fixture");
+
+    let control = decode_file(&control_path).expect("decode ALAC control through public API");
+    let edited = decode_file(&edited_path).expect("decode edited ALAC through public API");
+    assert_eq!(control.sample_rate, 8_000);
+    assert_eq!(edited.sample_rate, control.sample_rate);
+    assert_eq!(control.n_channels(), 1);
+    assert_eq!(edited.n_channels(), control.n_channels());
+    assert_eq!(control.frames(), 160);
+    assert_eq!(edited.frames(), 80);
+    assert_eq!(edited.channels[0], control.channels[0][40..120]);
+}
+
+#[test]
+fn alac_fallback_rejects_stts_decode_timeline_mismatch_without_panicking() {
+    let workspace = TestWorkspace::new();
+    let path = workspace.file("alac-mismatched-stts.m4a");
+    std::fs::write(&path, alac_m4a_with_mismatched_stts())
+        .expect("write malformed ALAC timing fixture");
+
+    let result = std::panic::catch_unwind(|| decode_file(&path));
+    let error = result
+        .expect("mismatched ALAC timing must not panic")
+        .expect_err("mismatched ALAC timing must fail");
+    assert!(error.contains("stts"), "unexpected error: {error}");
+}
+
+#[test]
+fn alac_fallback_rejects_edit_crossing_nominal_stts_media_end_without_panicking() {
+    let workspace = TestWorkspace::new();
+    let path = workspace.file("alac-edit-past-stts-media-end.m4a");
+    std::fs::write(&path, alac_m4a_with_edit_past_stts_media_end())
+        .expect("write ALAC edit past stts media end fixture");
+
+    let result = std::panic::catch_unwind(|| decode_file(&path));
+    let error = result
+        .expect("ALAC edit past stts media end must not panic")
+        .expect_err("ALAC edit past stts media end must fail");
+    let error_lowercase = error.to_ascii_lowercase();
+    assert!(
+        error_lowercase.contains("stts") && error_lowercase.contains("media"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

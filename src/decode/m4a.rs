@@ -1,4 +1,9 @@
 //! M4A / MP4-AAC decoder — `mp4` demux + Pure-Rust `oxideav-aac` AAC-LC decode.
+//!
+//! Version 0/1 unity-rate edit lists define presentation timing after decode.
+//! Multiple media edits and leading/interior empty edits are composed exactly;
+//! unsupported or malformed edit timelines fail closed instead of returning
+//! untrimmed audio.
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -15,6 +20,7 @@ use super::pcm::DecodedPcm;
 const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x00ff_ffff;
 const MAX_MP4_BOX_DEPTH: usize = 32;
 const MAX_EMPTY_TRUN_SAMPLES: u64 = 10_000_000;
+const MAX_EDIT_WORKING_BYTES: u128 = 512 * 1024 * 1024;
 
 #[derive(Debug)]
 struct ScanBudget {
@@ -243,7 +249,7 @@ fn validate_raw_box<R: Read + Seek>(
         },
         BoxListKind::Moov => match &header.name {
             b"mvhd" => validate_versioned_body(reader, header, 100, 112),
-            b"trak" => scan_children(reader, header, BoxListKind::Trak, depth, budget),
+            b"trak" => scan_trak_children(reader, header, depth, budget),
             b"meta" => scan_meta_children(reader, header, depth, budget),
             b"mvex" => scan_children(reader, header, BoxListKind::Mvex, depth, budget),
             b"udta" => scan_children(reader, header, BoxListKind::Udta, depth, budget),
@@ -251,7 +257,7 @@ fn validate_raw_box<R: Read + Seek>(
         },
         BoxListKind::Trak => match &header.name {
             b"tkhd" => validate_versioned_body(reader, header, 84, 96),
-            b"edts" => scan_required_children(reader, header, BoxListKind::Edts, depth, budget),
+            b"edts" => validate_edts(reader, header, depth, budget),
             b"meta" => scan_meta_children(reader, header, depth, budget),
             b"mdia" => scan_children(reader, header, BoxListKind::Mdia, depth, budget),
             _ => Ok(()),
@@ -354,26 +360,79 @@ fn scan_children<R: Read + Seek>(
     .map(|_| ())
 }
 
-fn scan_required_children<R: Read + Seek>(
+fn scan_trak_children<R: Read + Seek>(
     reader: &mut R,
     header: RawBoxHeader,
-    kind: BoxListKind,
+    depth: usize,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| "MP4 box nesting depth overflow".to_string())?;
+    if child_depth > MAX_MP4_BOX_DEPTH {
+        return Err(format!("MP4 box nesting exceeds {MAX_MP4_BOX_DEPTH}"));
+    }
+
+    let mut cursor = header.body_start;
+    let mut edts_count = 0u32;
+    while cursor < header.end {
+        let child = read_raw_box_header(reader, cursor, header.end, false)?;
+        if child.name == *b"edts" {
+            edts_count = edts_count
+                .checked_add(1)
+                .ok_or_else(|| "trak edts count overflow".to_string())?;
+            if edts_count > 1 {
+                return Err(format!(
+                    "MP4 trak at byte {} contains duplicate edts boxes",
+                    header.start
+                ));
+            }
+        }
+        validate_raw_box(reader, child, BoxListKind::Trak, child_depth, budget)?;
+        if child.end <= cursor {
+            return Err(format!(
+                "MP4 box {:?} at byte {cursor} made no forward progress",
+                child.name
+            ));
+        }
+        cursor = child.end;
+    }
+    if cursor != header.end {
+        return Err(format!(
+            "MP4 trak children end at byte {cursor}, expected parent end {}",
+            header.end
+        ));
+    }
+    Ok(())
+}
+
+fn validate_edts<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
     depth: usize,
     budget: &mut ScanBudget,
 ) -> Result<(), String> {
     require_body_size(header, 8)?;
-    let count = scan_box_list_with_budget(
-        reader,
-        header.body_start,
-        header.end,
-        kind,
-        depth + 1,
-        budget,
-    )?;
-    if count == 0 {
+    let child_depth = depth
+        .checked_add(1)
+        .ok_or_else(|| "MP4 box nesting depth overflow".to_string())?;
+    if child_depth > MAX_MP4_BOX_DEPTH {
+        return Err(format!("MP4 box nesting exceeds {MAX_MP4_BOX_DEPTH}"));
+    }
+
+    let child = read_raw_box_header(reader, header.body_start, header.end, false)?;
+    if child.name != *b"elst" {
         return Err(format!(
-            "MP4 box {} requires at least one child",
-            fourcc_text(header.name)
+            "MP4 edts at byte {} must contain exactly one elst child, found {}",
+            header.start,
+            fourcc_text(child.name)
+        ));
+    }
+    validate_raw_box(reader, child, BoxListKind::Edts, child_depth, budget)?;
+    if child.end != header.end {
+        return Err(format!(
+            "MP4 edts at byte {} must contain exactly one elst child",
+            header.start
         ));
     }
     Ok(())
@@ -568,10 +627,16 @@ fn validate_stsz<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result
 
 fn validate_elst<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
     require_body_size(header, 8)?;
-    let version = read_u8_at(reader, header.body_start)?;
+    let (version, flags) = read_full_box_header_at(reader, header.body_start)?;
+    if flags != 0 {
+        return Err(format!(
+            "MP4 elst at byte {} has nonzero flags {flags:#08x}",
+            header.start
+        ));
+    }
     let entry_size = match version {
-        0 => 12,
-        1 => 20,
+        0 => 12u64,
+        1 => 20u64,
         _ => {
             return Err(format!(
                 "unsupported MP4 edit-list version {version} at byte {}",
@@ -579,7 +644,28 @@ fn validate_elst<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result
             ))
         }
     };
-    validate_counted_leaf(reader, header, entry_size, 8)
+    let count = u64::from(read_u32_at(reader, header.body_start + 4)?);
+    if count == 0 {
+        return Err(format!(
+            "MP4 elst at byte {} must contain at least one entry",
+            header.start
+        ));
+    }
+    let required = 8u64
+        .checked_add(
+            count
+                .checked_mul(entry_size)
+                .ok_or_else(|| "elst byte count overflow".to_string())?,
+        )
+        .ok_or_else(|| "elst size overflow".to_string())?;
+    if header.body_size() != required {
+        return Err(format!(
+            "MP4 elst at byte {} has {} body bytes, expected exactly {required}",
+            header.start,
+            header.body_size()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_avcc<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result<(), String> {
@@ -988,6 +1074,73 @@ struct StscFields {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawEdit {
+    segment_duration: u64,
+    media_time: i64,
+    media_rate: i16,
+    media_rate_fraction: i16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RawEditList {
+    version: u8,
+    flags: u32,
+    entries: Vec<RawEdit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawSttsEntry {
+    sample_count: u32,
+    sample_delta: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct EditContext {
+    edit_list: RawEditList,
+    movie_timescale: u32,
+    media_timescale: u32,
+    composition_offset: i64,
+    sample_count: u32,
+    stts_entries: Vec<RawSttsEntry>,
+}
+
+#[derive(Debug)]
+pub(super) struct FallbackTrackEdit {
+    track_id: u32,
+    edit: Result<Option<EditContext>, String>,
+}
+
+#[derive(Debug)]
+pub(super) enum M4aDecodeError {
+    TryOtherCodec {
+        reason: String,
+        track_edits: Vec<FallbackTrackEdit>,
+    },
+    Fatal(String),
+}
+
+impl M4aDecodeError {
+    #[cfg(test)]
+    fn contains(&self, pattern: &str) -> bool {
+        self.to_string().contains(pattern)
+    }
+}
+
+impl std::fmt::Display for M4aDecodeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TryOtherCodec { reason, .. } | Self::Fatal(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for M4aDecodeError {
+    fn from(error: String) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChunkOffsetsKind {
     Missing,
     Stco(usize),
@@ -1011,12 +1164,18 @@ trait SampleTable {
     fn stsc_len(&self) -> usize;
     fn stsc_entry(&self, index: usize) -> Option<StscFields>;
 
+    fn stts_version(&self) -> u8;
+    fn stts_flags(&self) -> u32;
     fn stts_len(&self) -> usize;
     fn stts_sample_count(&self, index: usize) -> Option<u32>;
+    fn stts_sample_delta(&self, index: usize) -> Option<u32>;
 
     fn has_ctts(&self) -> bool;
+    fn ctts_version(&self) -> Option<u8>;
+    fn ctts_flags(&self) -> Option<u32>;
     fn ctts_len(&self) -> usize;
     fn ctts_sample_count(&self, index: usize) -> Option<u32>;
+    fn ctts_sample_offset(&self, index: usize) -> Option<i32>;
 }
 
 impl SampleTable for Mp4Track {
@@ -1082,6 +1241,14 @@ impl SampleTable for Mp4Track {
         self.trak.mdia.minf.stbl.stts.entries.len()
     }
 
+    fn stts_version(&self) -> u8 {
+        self.trak.mdia.minf.stbl.stts.version
+    }
+
+    fn stts_flags(&self) -> u32 {
+        self.trak.mdia.minf.stbl.stts.flags
+    }
+
     fn stts_sample_count(&self, index: usize) -> Option<u32> {
         self.trak
             .mdia
@@ -1093,8 +1260,39 @@ impl SampleTable for Mp4Track {
             .map(|entry| entry.sample_count)
     }
 
+    fn stts_sample_delta(&self, index: usize) -> Option<u32> {
+        self.trak
+            .mdia
+            .minf
+            .stbl
+            .stts
+            .entries
+            .get(index)
+            .map(|entry| entry.sample_delta)
+    }
+
     fn has_ctts(&self) -> bool {
         self.trak.mdia.minf.stbl.ctts.is_some()
+    }
+
+    fn ctts_version(&self) -> Option<u8> {
+        self.trak
+            .mdia
+            .minf
+            .stbl
+            .ctts
+            .as_ref()
+            .map(|ctts| ctts.version)
+    }
+
+    fn ctts_flags(&self) -> Option<u32> {
+        self.trak
+            .mdia
+            .minf
+            .stbl
+            .ctts
+            .as_ref()
+            .map(|ctts| ctts.flags)
     }
 
     fn ctts_len(&self) -> usize {
@@ -1118,6 +1316,18 @@ impl SampleTable for Mp4Track {
             .get(index)
             .map(|entry| entry.sample_count)
     }
+
+    fn ctts_sample_offset(&self, index: usize) -> Option<i32> {
+        self.trak
+            .mdia
+            .minf
+            .stbl
+            .ctts
+            .as_ref()?
+            .entries
+            .get(index)
+            .map(|entry| entry.sample_offset)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1126,7 +1336,7 @@ struct ValidatedSampleTable {
 }
 
 /// Decode M4A/MP4-AAC from path.
-pub fn decode_m4a(path: &Path) -> Result<DecodedPcm, String> {
+pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
     // Keep the original handle for payload reads. Parsing happens through a
     // clone because each access unit below is read with an absolute seek.
     let mut payload_reader = File::open(path).map_err(|e| format!("open m4a: {e}"))?;
@@ -1149,16 +1359,27 @@ pub fn decode_m4a(path: &Path) -> Result<DecodedPcm, String> {
     let mp4 = Mp4Reader::read_header(BufReader::new(header_file), file_size)
         .map_err(|e| format!("mp4 parse: {e}"))?;
 
-    let track = select_aac_track(&mp4)?;
+    let track = match select_aac_track(&mp4)? {
+        Some(track) => track,
+        None => {
+            let track_edits = fallback_track_edits(&mp4)?;
+            return Err(M4aDecodeError::TryOtherCodec {
+                reason: "no AAC audio track found in M4A/MP4".into(),
+                track_edits,
+            });
+        }
+    };
     if !track.trafs.is_empty() {
         return Err(format!(
             "fragmented AAC track {} is not supported; a regular M4A sample table is required",
             track.track_id()
-        ));
+        )
+        .into());
     }
 
     let validated = validate_sample_table(track, file_size)
         .map_err(|e| format!("AAC track {} sample table: {e}", track.track_id()))?;
+    let edit = extract_edit_context(&mp4, track)?;
 
     let profile = track
         .audio_profile()
@@ -1184,11 +1405,19 @@ pub fn decode_m4a(path: &Path) -> Result<DecodedPcm, String> {
     channels.resize_with(n_ch, Vec::new);
     let mut access_unit = Vec::new();
     let mut decoded_frames = 0usize;
+    let mut stts_timeline = SttsTimeline::default();
+    let edit_active = edit.is_some();
 
     visit_sample_descriptors(track, validated.sample_count, |descriptor| {
         // Zero-sized entries still participate in stsc accounting. They carry
         // no AAC payload, so retain the existing behavior of skipping decode.
         if descriptor.size == 0 {
+            if edit_active {
+                return Err(format!(
+                    "AAC sample {} has zero size while an edit list is active",
+                    descriptor.index
+                ));
+            }
             return Ok(());
         }
 
@@ -1217,28 +1446,56 @@ pub fn decode_m4a(path: &Path) -> Result<DecodedPcm, String> {
         let frame = decoder
             .decode_raw_data_block(aot, fs_index, sample_rate, chan_conf, 1, &access_unit)
             .map_err(|e| format!("decode AAC sample {}: {e}", descriptor.index))?;
-        append_decoded_frame(
+        let frame_count = append_decoded_frame(
             &mut channels,
             &frame,
             n_ch,
             sample_rate,
             &mut decoded_frames,
         )
-        .map_err(|e| format!("AAC sample {}: {e}", descriptor.index))
+        .map_err(|e| format!("AAC sample {}: {e}", descriptor.index))?;
+
+        if edit_active {
+            if frame_count == 0 {
+                return Err(format!(
+                    "AAC sample {} decoded to zero frames while an edit list is active",
+                    descriptor.index
+                ));
+            }
+            let media_units = stts_timeline.advance(track)?;
+            let nominal_frames = round_rescaled(
+                media_units,
+                u128::from(sample_rate),
+                u128::from(track.timescale()),
+                "AAC stts timeline",
+            )?;
+            let actual_frames = decoded_frames as u128;
+            validate_edit_timeline_position(
+                descriptor.index,
+                validated.sample_count,
+                actual_frames,
+                nominal_frames,
+            )?;
+        }
+        Ok(())
     })?;
 
     if decoded_frames == 0 {
-        return Err("M4A decode produced no samples".into());
+        return Err("M4A decode produced no samples".to_string().into());
     }
 
-    Ok(DecodedPcm {
+    let mut decoded = DecodedPcm {
         sample_rate,
         channels,
         channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(n_ch).mask(),
-    })
+    };
+    if let Some(edit) = &edit {
+        apply_edit_to_decoded(&mut decoded, edit)?;
+    }
+    Ok(decoded)
 }
 
-fn select_aac_track<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<&Mp4Track, String> {
+fn select_aac_track<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<Option<&Mp4Track>, String> {
     // `Mp4Reader` stores tracks in a HashMap. Validate IDs and then follow the
     // original moov/trak ordering so selection is deterministic.
     if mp4.tracks().len() != mp4.moov.traks.len() {
@@ -1254,11 +1511,856 @@ fn select_aac_track<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<&Mp4Track, Str
         if track.track_type().ok() == Some(TrackType::Audio)
             && track.media_type().ok() == Some(MediaType::AAC)
         {
-            return Ok(track);
+            return Ok(Some(track));
         }
     }
 
-    Err("no AAC audio track found in M4A/MP4".into())
+    Ok(None)
+}
+
+fn fallback_track_edits<R: Read + Seek>(
+    mp4: &Mp4Reader<R>,
+) -> Result<Vec<FallbackTrackEdit>, String> {
+    let mut track_edits = Vec::new();
+    track_edits
+        .try_reserve_exact(mp4.moov.traks.len())
+        .map_err(|error| format!("reserve M4A fallback track metadata: {error}"))?;
+    for trak in &mp4.moov.traks {
+        let Some(track) = mp4.tracks().get(&trak.tkhd.track_id) else {
+            continue;
+        };
+        if track.track_type().ok() == Some(TrackType::Audio) {
+            track_edits.push(FallbackTrackEdit {
+                track_id: track.track_id(),
+                edit: extract_edit_context(mp4, track),
+            });
+        }
+    }
+    Ok(track_edits)
+}
+
+fn extract_edit_context<R: Read + Seek>(
+    mp4: &Mp4Reader<R>,
+    track: &Mp4Track,
+) -> Result<Option<EditContext>, String> {
+    let Some(edts) = track.trak.edts.as_ref() else {
+        return Ok(None);
+    };
+    let elst = edts
+        .elst
+        .as_ref()
+        .ok_or_else(|| format!("M4A audio track {} edts is missing elst", track.track_id()))?;
+    if !matches!(elst.version, 0 | 1) {
+        return Err(format!(
+            "unsupported edit-list version {} on track {}",
+            elst.version,
+            track.track_id()
+        ));
+    }
+
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(elst.entries.len())
+        .map_err(|error| format!("reserve edit-list entries: {error}"))?;
+    for entry in &elst.entries {
+        let media_time = restore_edit_media_time(elst.version, entry.media_time)?;
+        entries.push(RawEdit {
+            segment_duration: entry.segment_duration,
+            media_time,
+            media_rate: entry.media_rate as i16,
+            media_rate_fraction: entry.media_rate_fraction as i16,
+        });
+    }
+    let edit_list = RawEditList {
+        version: elst.version,
+        flags: elst.flags,
+        entries,
+    };
+    validate_raw_edit_list(&edit_list)?;
+
+    let movie_timescale = mp4.timescale();
+    if movie_timescale == 0 {
+        return Err("M4A edit list has a zero movie timescale".into());
+    }
+    let media_timescale = track.timescale();
+    if media_timescale == 0 {
+        return Err(format!(
+            "M4A edit list track {} has a zero media timescale",
+            track.track_id()
+        ));
+    }
+    let source = validate_edit_active_source_table(track)?;
+
+    Ok(Some(EditContext {
+        edit_list,
+        movie_timescale,
+        media_timescale,
+        composition_offset: source.composition_offset,
+        sample_count: source.sample_count,
+        stts_entries: source.stts_entries,
+    }))
+}
+
+fn restore_edit_media_time(version: u8, raw: u64) -> Result<i64, String> {
+    match version {
+        0 => Ok(i64::from(raw as u32 as i32)),
+        1 => Ok(raw as i64),
+        _ => Err(format!("unsupported M4A edit-list version {version}")),
+    }
+}
+
+fn validate_raw_edit_list(edit_list: &RawEditList) -> Result<(), String> {
+    if !matches!(edit_list.version, 0 | 1) {
+        return Err(format!(
+            "unsupported M4A edit-list version {}",
+            edit_list.version
+        ));
+    }
+    if edit_list.flags != 0 {
+        return Err(format!(
+            "M4A edit-list flags must be zero, found {:#08x}",
+            edit_list.flags
+        ));
+    }
+    if edit_list.entries.is_empty() {
+        return Err("M4A edit list has no entries".into());
+    }
+    for (index, entry) in edit_list.entries.iter().enumerate() {
+        if entry.segment_duration == 0 {
+            return Err(format!(
+                "M4A edit-list entry {} has zero segment duration",
+                index + 1
+            ));
+        }
+        if entry.media_rate != 1 || entry.media_rate_fraction != 0 {
+            return Err(format!(
+                "M4A edit-list entry {} has unsupported media rate {}+{}/65536; only 1+0/65536 is supported",
+                index + 1,
+                entry.media_rate,
+                entry.media_rate_fraction
+            ));
+        }
+        if entry.media_time < -1 {
+            return Err(format!(
+                "M4A edit-list entry {} has unsupported negative media time {}",
+                index + 1,
+                entry.media_time
+            ));
+        }
+    }
+    if edit_list.entries.last().unwrap().media_time == -1 {
+        return Err("M4A edit list must not end with an empty edit".into());
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatedEditSource {
+    composition_offset: i64,
+    sample_count: u32,
+    stts_entries: Vec<RawSttsEntry>,
+}
+
+fn validate_edit_active_source_table<T: SampleTable + ?Sized>(
+    table: &T,
+) -> Result<ValidatedEditSource, String> {
+    let stsz = table.stsz_fields();
+    if stsz.sample_count == 0 {
+        return Err("edit-active M4A track has no access units".into());
+    }
+    if stsz.sample_size == 0 {
+        let count = usize::try_from(stsz.sample_count)
+            .map_err(|_| "edit-active sample count cannot be represented on this platform")?;
+        if stsz.variable_size_count != count {
+            return Err(format!(
+                "edit-active stsz has {} sizes for {} access units",
+                stsz.variable_size_count, stsz.sample_count
+            ));
+        }
+        for index in 0..count {
+            if table.variable_sample_size(index) == Some(0) {
+                return Err(format!(
+                    "M4A audio sample {} has zero size while an edit list is active",
+                    index + 1
+                ));
+            }
+        }
+    }
+    if table.stts_version() != 0 {
+        return Err(format!(
+            "unsupported edit-active stts version {}",
+            table.stts_version()
+        ));
+    }
+    if table.stts_flags() != 0 {
+        return Err(format!(
+            "edit-active stts flags must be zero, found {:#08x}",
+            table.stts_flags()
+        ));
+    }
+    let stts_len = table.stts_len();
+    if stts_len == 0 {
+        return Err("edit-active stts has no entries".into());
+    }
+    let mut stts_entries = Vec::new();
+    stts_entries
+        .try_reserve_exact(stts_len)
+        .map_err(|error| format!("reserve edit-active stts entries: {error}"))?;
+    let mut stts_samples = 0u64;
+    for index in 0..stts_len {
+        let count = table
+            .stts_sample_count(index)
+            .ok_or("stts entry disappeared while validating edit timing")?;
+        if count == 0 {
+            return Err(format!("stts entry {} has zero sample_count", index + 1));
+        }
+        let delta = table
+            .stts_sample_delta(index)
+            .ok_or("stts delta disappeared while validating edit timing")?;
+        if delta == 0 {
+            return Err(format!("stts entry {} has zero sample_delta", index + 1));
+        }
+        stts_samples = stts_samples
+            .checked_add(u64::from(count))
+            .ok_or("stts sample total overflows")?;
+        stts_entries.push(RawSttsEntry {
+            sample_count: count,
+            sample_delta: delta,
+        });
+    }
+    if stts_samples != u64::from(stsz.sample_count) {
+        return Err(format!(
+            "stts covers {stts_samples} samples but stsz declares {}",
+            stsz.sample_count
+        ));
+    }
+    let composition_offset = constant_composition_offset(table, stsz.sample_count)?;
+    Ok(ValidatedEditSource {
+        composition_offset,
+        sample_count: stsz.sample_count,
+        stts_entries,
+    })
+}
+
+fn constant_composition_offset<T: SampleTable + ?Sized>(
+    table: &T,
+    sample_count: u32,
+) -> Result<i64, String> {
+    if !table.has_ctts() {
+        return Ok(0);
+    }
+    let version = table
+        .ctts_version()
+        .ok_or("ctts disappeared while reading its version")?;
+    if !matches!(version, 0 | 1) {
+        return Err(format!("unsupported M4A ctts version {version}"));
+    }
+    let flags = table
+        .ctts_flags()
+        .ok_or("ctts disappeared while reading its flags")?;
+    if flags != 0 {
+        return Err(format!("M4A ctts flags must be zero, found {flags:#08x}"));
+    }
+    let len = table.ctts_len();
+    if len == 0 {
+        return Err("ctts is present but has no entries".into());
+    }
+
+    let mut covered = 0u64;
+    let mut constant = None;
+    for index in 0..len {
+        let count = table
+            .ctts_sample_count(index)
+            .ok_or("ctts entry disappeared while validating edit timing")?;
+        if count == 0 {
+            return Err(format!("ctts entry {} has zero sample_count", index + 1));
+        }
+        covered = covered
+            .checked_add(u64::from(count))
+            .ok_or("ctts sample total overflows")?;
+        let raw = table
+            .ctts_sample_offset(index)
+            .ok_or("ctts offset disappeared while validating edit timing")?;
+        let offset = if version == 0 {
+            i64::from(raw as u32)
+        } else {
+            i64::from(raw)
+        };
+        if let Some(expected) = constant {
+            if offset != expected {
+                return Err(format!(
+                    "M4A edit list requires a constant ctts offset, found {expected} then {offset}"
+                ));
+            }
+        } else {
+            constant = Some(offset);
+        }
+    }
+    if covered != u64::from(sample_count) {
+        return Err(format!(
+            "ctts covers {covered} samples but stsz declares {sample_count}"
+        ));
+    }
+    Ok(constant.unwrap())
+}
+
+#[derive(Default)]
+struct SttsTimeline {
+    entry_index: usize,
+    remaining_in_entry: u32,
+    current_delta: u32,
+    cumulative_media_units: u128,
+}
+
+impl SttsTimeline {
+    fn advance<T: SampleTable + ?Sized>(&mut self, table: &T) -> Result<u128, String> {
+        if self.remaining_in_entry == 0 {
+            let count = table
+                .stts_sample_count(self.entry_index)
+                .ok_or("stts ended before the final AAC access unit")?;
+            if count == 0 {
+                return Err(format!(
+                    "stts entry {} has zero sample_count",
+                    self.entry_index + 1
+                ));
+            }
+            self.current_delta = table
+                .stts_sample_delta(self.entry_index)
+                .ok_or("stts sample delta disappeared during AAC decode")?;
+            self.remaining_in_entry = count;
+            self.entry_index = self
+                .entry_index
+                .checked_add(1)
+                .ok_or("stts entry index overflows")?;
+        }
+        self.remaining_in_entry -= 1;
+        self.cumulative_media_units = self
+            .cumulative_media_units
+            .checked_add(u128::from(self.current_delta))
+            .ok_or("stts cumulative duration overflows")?;
+        Ok(self.cumulative_media_units)
+    }
+}
+
+fn validate_edit_timeline_position(
+    sample_index: u32,
+    sample_count: u32,
+    actual_frames: u128,
+    nominal_frames: u128,
+) -> Result<(), String> {
+    if sample_index < sample_count {
+        if actual_frames != nominal_frames {
+            return Err(format!(
+                "AAC sample {sample_index} cumulative decode is {actual_frames} frames, but stts requires {nominal_frames}"
+            ));
+        }
+    } else if actual_frames < nominal_frames {
+        return Err(format!(
+            "final AAC decode is {actual_frames} frames, shorter than the stts timeline {nominal_frames}"
+        ));
+    }
+    Ok(())
+}
+
+fn round_rescaled(
+    value: u128,
+    multiplier: u128,
+    divisor: u128,
+    label: &str,
+) -> Result<u128, String> {
+    if divisor == 0 {
+        return Err(format!("{label} has a zero timescale"));
+    }
+    let numerator = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{label} rescale overflows"))?;
+    let quotient = numerator / divisor;
+    let remainder = numerator % divisor;
+    let half_up_threshold = divisor / 2 + divisor % 2;
+    if remainder >= half_up_threshold {
+        quotient
+            .checked_add(1)
+            .ok_or_else(|| format!("{label} rounded result overflows"))
+    } else {
+        Ok(quotient)
+    }
+}
+
+fn stts_total_media_units(context: &EditContext) -> Result<u128, String> {
+    let mut covered_samples = 0u64;
+    let mut media_units = 0u128;
+    for (index, entry) in context.stts_entries.iter().enumerate() {
+        if entry.sample_count == 0 {
+            return Err(format!(
+                "M4A edit-active stts entry {} has zero sample_count",
+                index + 1
+            ));
+        }
+        if entry.sample_delta == 0 {
+            return Err(format!(
+                "M4A edit-active stts entry {} has zero sample_delta",
+                index + 1
+            ));
+        }
+        covered_samples = covered_samples
+            .checked_add(u64::from(entry.sample_count))
+            .ok_or("M4A edit-active stts sample total overflows")?;
+        let run_duration = u128::from(entry.sample_count)
+            .checked_mul(u128::from(entry.sample_delta))
+            .ok_or("M4A edit-active stts run duration overflows")?;
+        media_units = media_units
+            .checked_add(run_duration)
+            .ok_or("M4A edit-active stts total duration overflows")?;
+    }
+    if covered_samples != u64::from(context.sample_count) {
+        return Err(format!(
+            "M4A edit-active stts covers {covered_samples} samples but stsz declares {}",
+            context.sample_count
+        ));
+    }
+    Ok(media_units)
+}
+
+fn ceil_rescaled(
+    value: u128,
+    multiplier: u128,
+    divisor: u128,
+    label: &str,
+) -> Result<u128, String> {
+    if divisor == 0 {
+        return Err(format!("{label} has a zero timescale"));
+    }
+    let numerator = value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{label} rescale overflows"))?;
+    let quotient = numerator / divisor;
+    if numerator % divisor == 0 {
+        Ok(quotient)
+    } else {
+        quotient
+            .checked_add(1)
+            .ok_or_else(|| format!("{label} rounded result overflows"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlannedEdit {
+    source_start: Option<usize>,
+    frames: usize,
+    copy_frames: usize,
+}
+
+fn plan_edits(
+    context: &EditContext,
+    sample_rate: u32,
+    raw_frames: usize,
+    channel_count: usize,
+) -> Result<(Vec<PlannedEdit>, usize), String> {
+    validate_raw_edit_list(&context.edit_list)?;
+    if context.movie_timescale == 0 {
+        return Err("M4A edit list has a zero movie timescale".into());
+    }
+    if context.media_timescale == 0 {
+        return Err("M4A edit list has a zero media timescale".into());
+    }
+    if channel_count == 0 {
+        return Err("M4A edit list cannot be applied to zero channels".into());
+    }
+    let stts_media_units = stts_total_media_units(context)?;
+    let stts_frame_end = round_rescaled(
+        stts_media_units,
+        u128::from(sample_rate),
+        u128::from(context.media_timescale),
+        "M4A edit-list stts frame boundary",
+    )?;
+    let stts_movie_end = ceil_rescaled(
+        stts_media_units,
+        u128::from(context.movie_timescale),
+        u128::from(context.media_timescale),
+        "M4A edit-list stts movie boundary",
+    )?;
+    let stts_scaled_end = stts_movie_end
+        .checked_mul(u128::from(context.media_timescale))
+        .ok_or("M4A edit-list stts movie boundary overflows")?;
+
+    let mut planned = Vec::new();
+    planned
+        .try_reserve_exact(context.edit_list.entries.len())
+        .map_err(|error| format!("reserve M4A edit plan: {error}"))?;
+    let mut cumulative_duration = 0u128;
+    let mut previous_boundary = 0u128;
+    let mut output_frames = 0usize;
+    for (index, entry) in context.edit_list.entries.iter().enumerate() {
+        cumulative_duration = cumulative_duration
+            .checked_add(u128::from(entry.segment_duration))
+            .ok_or("M4A edit-list movie duration overflows")?;
+        let boundary = round_rescaled(
+            cumulative_duration,
+            u128::from(sample_rate),
+            u128::from(context.movie_timescale),
+            "M4A edit-list movie boundary",
+        )?;
+        let segment_frames = boundary
+            .checked_sub(previous_boundary)
+            .ok_or("M4A edit-list segment boundary underflows")?;
+        previous_boundary = boundary;
+        let frames = usize::try_from(segment_frames).map_err(|_| {
+            format!(
+                "M4A edit-list entry {} frame count cannot be represented on this platform",
+                index + 1
+            )
+        })?;
+        output_frames = output_frames
+            .checked_add(frames)
+            .ok_or("M4A edit-list output frame count overflows")?;
+
+        let (source_start, copy_frames) = if entry.media_time == -1 {
+            (None, 0)
+        } else {
+            let adjusted = i128::from(entry.media_time)
+                .checked_sub(i128::from(context.composition_offset))
+                .ok_or("M4A edit media-time subtraction overflows")?;
+            if adjusted < 0 {
+                return Err(format!(
+                    "M4A edit-list entry {} media source underflows after ctts offset",
+                    index + 1
+                ));
+            }
+            let adjusted = adjusted as u128;
+            if adjusted >= stts_media_units {
+                return Err(format!(
+                    "M4A edit-list entry {} media start {adjusted} is at or beyond stts media end {stts_media_units}",
+                    index + 1
+                ));
+            }
+            let requested_scaled_end = adjusted
+                .checked_mul(u128::from(context.movie_timescale))
+                .and_then(|start| {
+                    u128::from(entry.segment_duration)
+                        .checked_mul(u128::from(context.media_timescale))
+                        .and_then(|duration| start.checked_add(duration))
+                })
+                .ok_or("M4A edit-list media endpoint calculation overflows")?;
+            if requested_scaled_end > stts_scaled_end {
+                return Err(format!(
+                    "M4A edit-list entry {} ends beyond the globally quantized stts media boundary at movie tick {stts_movie_end}",
+                    index + 1,
+                ));
+            }
+            let source_frame = round_rescaled(
+                adjusted,
+                u128::from(sample_rate),
+                u128::from(context.media_timescale),
+                "M4A edit-list media source",
+            )?;
+            let copy_frames = segment_frames.min(stts_frame_end.saturating_sub(source_frame));
+            let source = usize::try_from(source_frame).map_err(|_| {
+                format!(
+                    "M4A edit-list entry {} media source cannot be represented on this platform",
+                    index + 1
+                )
+            })?;
+            let copy_frames = usize::try_from(copy_frames).map_err(|_| {
+                format!(
+                    "M4A edit-list entry {} copy length cannot be represented on this platform",
+                    index + 1
+                )
+            })?;
+            let source_end = source.checked_add(copy_frames).ok_or_else(|| {
+                format!("M4A edit-list entry {} source range overflows", index + 1)
+            })?;
+            if source_end > raw_frames {
+                return Err(format!(
+                    "M4A edit-list entry {} source range {source}..{source_end} exceeds decoded length {raw_frames}",
+                    index + 1
+                ));
+            }
+            (Some(source), copy_frames)
+        };
+        planned.push(PlannedEdit {
+            source_start,
+            frames,
+            copy_frames,
+        });
+    }
+    if output_frames == 0 {
+        return Err("M4A edit list produces zero output frames".into());
+    }
+
+    let is_single_in_place =
+        planned.len() == 1 && planned[0].source_start.is_some() && output_frames <= raw_frames;
+    if !is_single_in_place {
+        let working_bytes = (raw_frames as u128)
+            .checked_add(output_frames as u128)
+            .and_then(|frames| frames.checked_mul(channel_count as u128))
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u128))
+            .ok_or("M4A edit-list working-set calculation overflows")?;
+        if working_bytes > MAX_EDIT_WORKING_BYTES {
+            return Err(format!(
+                "M4A edit-list working set requires {working_bytes} bytes, limit is {MAX_EDIT_WORKING_BYTES} bytes"
+            ));
+        }
+    }
+
+    Ok((planned, output_frames))
+}
+
+fn apply_edit_to_channels(
+    channels: &mut Vec<Vec<f64>>,
+    sample_rate: u32,
+    context: &EditContext,
+) -> Result<(), String> {
+    let raw_frames = channels
+        .first()
+        .map(Vec::len)
+        .ok_or("M4A edit list cannot be applied to zero channels")?;
+    if let Some((index, length)) = channels.iter().enumerate().find_map(|(index, channel)| {
+        (channel.len() != raw_frames).then_some((index, channel.len()))
+    }) {
+        return Err(format!(
+            "M4A edit source channel {} has {length} frames, expected {raw_frames}",
+            index + 1
+        ));
+    }
+    let (planned, output_frames) = plan_edits(context, sample_rate, raw_frames, channels.len())?;
+
+    if planned.len() == 1 {
+        let edit = planned[0];
+        let source_start = edit
+            .source_start
+            .expect("validated one-entry edit list cannot be empty");
+        if edit.frames <= raw_frames {
+            if source_start == 0 && edit.frames == raw_frames && edit.copy_frames == raw_frames {
+                return Ok(());
+            }
+            let source_end = source_start + edit.copy_frames;
+            for channel in channels.iter_mut() {
+                channel.copy_within(source_start..source_end, 0);
+                channel[edit.copy_frames..edit.frames].fill(0.0);
+                channel.truncate(edit.frames);
+            }
+            return Ok(());
+        }
+    }
+
+    let mut composed = Vec::new();
+    composed
+        .try_reserve_exact(channels.len())
+        .map_err(|error| format!("reserve M4A edited channels: {error}"))?;
+    for source in channels.iter() {
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_frames)
+            .map_err(|error| format!("reserve M4A edited PCM: {error}"))?;
+        for edit in &planned {
+            if let Some(source_start) = edit.source_start {
+                output.extend_from_slice(&source[source_start..source_start + edit.copy_frames]);
+                output.resize(output.len() + edit.frames - edit.copy_frames, 0.0);
+            } else {
+                output.resize(output.len() + edit.frames, 0.0);
+            }
+        }
+        composed.push(output);
+    }
+    std::mem::swap(channels, &mut composed);
+    Ok(())
+}
+
+pub(super) fn apply_edit_to_decoded(
+    decoded: &mut DecodedPcm,
+    context: &EditContext,
+) -> Result<(), String> {
+    apply_edit_to_channels(&mut decoded.channels, decoded.sample_rate, context)
+}
+
+pub(super) fn fallback_track_has_edit(
+    track_edits: &[FallbackTrackEdit],
+    selected_track_id: u32,
+) -> Result<bool, String> {
+    let selected = track_edits
+        .iter()
+        .find(|track| track.track_id == selected_track_id)
+        .ok_or_else(|| {
+            format!(
+                "fallback decoder selected MP4 audio track {selected_track_id}, but its primary track metadata is unavailable"
+            )
+        })?;
+    selected
+        .edit
+        .as_ref()
+        .map(Option::is_some)
+        .map_err(Clone::clone)
+}
+
+/// Validate the packet timeline selected by Symphonia before its decoded PCM
+/// is interpreted through an edit list. This is intentionally absent for
+/// fallback tracks without edits so their historical recovery behavior stays
+/// unchanged.
+pub(super) fn fallback_timeline_verifier(
+    track_edits: &[FallbackTrackEdit],
+    selected_track_id: u32,
+) -> Result<Option<FallbackTimelineVerifier<'_>>, String> {
+    let selected = track_edits
+        .iter()
+        .find(|track| track.track_id == selected_track_id)
+        .ok_or_else(|| {
+            format!(
+                "fallback decoder selected MP4 audio track {selected_track_id}, but its primary track metadata is unavailable"
+            )
+        })?;
+    let Some(context) = selected.edit.as_ref().map_err(Clone::clone)? else {
+        return Ok(None);
+    };
+    Ok(Some(FallbackTimelineVerifier {
+        track_id: selected_track_id,
+        entries: &context.stts_entries,
+        sample_count: context.sample_count,
+        media_timescale: context.media_timescale,
+        entry_index: 0,
+        remaining_in_entry: 0,
+        current_delta: 0,
+        observed_packets: 0,
+        cumulative_media_units: 0,
+        actual_frames: 0,
+        sample_rate: None,
+    }))
+}
+
+pub(super) struct FallbackTimelineVerifier<'a> {
+    track_id: u32,
+    entries: &'a [RawSttsEntry],
+    sample_count: u32,
+    media_timescale: u32,
+    entry_index: usize,
+    remaining_in_entry: u32,
+    current_delta: u32,
+    observed_packets: u32,
+    cumulative_media_units: u128,
+    actual_frames: u128,
+    sample_rate: Option<u32>,
+}
+
+impl FallbackTimelineVerifier<'_> {
+    pub(super) fn observe_packet(
+        &mut self,
+        decoded_frames: usize,
+        sample_rate: u32,
+    ) -> Result<(), String> {
+        if self.observed_packets >= self.sample_count {
+            return Err(format!(
+                "M4A fallback track {} decoded an extra packet beyond the {} samples declared by stts",
+                self.track_id, self.sample_count
+            ));
+        }
+        if decoded_frames == 0 {
+            return Err(format!(
+                "M4A fallback track {} packet {} decoded to zero frames while an edit list is active",
+                self.track_id,
+                self.observed_packets + 1
+            ));
+        }
+        if sample_rate == 0 {
+            return Err(format!(
+                "M4A fallback track {} decoded at a zero sample rate",
+                self.track_id
+            ));
+        }
+        if let Some(expected) = self.sample_rate {
+            if sample_rate != expected {
+                return Err(format!(
+                    "M4A fallback track {} sample rate changed from {expected} to {sample_rate}",
+                    self.track_id
+                ));
+            }
+        } else {
+            self.sample_rate = Some(sample_rate);
+        }
+
+        if self.remaining_in_entry == 0 {
+            let entry = self.entries.get(self.entry_index).ok_or_else(|| {
+                format!(
+                    "M4A fallback track {} stts ended before packet {}",
+                    self.track_id,
+                    self.observed_packets + 1
+                )
+            })?;
+            self.entry_index = self
+                .entry_index
+                .checked_add(1)
+                .ok_or("M4A fallback stts entry index overflows")?;
+            self.remaining_in_entry = entry.sample_count;
+            self.current_delta = entry.sample_delta;
+        }
+        self.remaining_in_entry -= 1;
+        self.observed_packets = self
+            .observed_packets
+            .checked_add(1)
+            .ok_or("M4A fallback packet count overflows")?;
+        self.cumulative_media_units = self
+            .cumulative_media_units
+            .checked_add(u128::from(self.current_delta))
+            .ok_or("M4A fallback stts cumulative duration overflows")?;
+        self.actual_frames = self
+            .actual_frames
+            .checked_add(decoded_frames as u128)
+            .ok_or("M4A fallback decoded-frame total overflows")?;
+
+        let nominal_frames = round_rescaled(
+            self.cumulative_media_units,
+            u128::from(sample_rate),
+            u128::from(self.media_timescale),
+            "M4A fallback stts timeline",
+        )?;
+        if self.observed_packets < self.sample_count {
+            if self.actual_frames != nominal_frames {
+                return Err(format!(
+                    "M4A fallback track {} packet {} cumulative decode is {} frames, but stts requires {nominal_frames}",
+                    self.track_id, self.observed_packets, self.actual_frames
+                ));
+            }
+        } else if self.actual_frames < nominal_frames {
+            return Err(format!(
+                "M4A fallback track {} final decode is {} frames, shorter than the stts timeline {nominal_frames}",
+                self.track_id, self.actual_frames
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(&self) -> Result<(), String> {
+        if self.observed_packets != self.sample_count {
+            return Err(format!(
+                "M4A fallback track {} decoded {} packets, but stts declares {}",
+                self.track_id, self.observed_packets, self.sample_count
+            ));
+        }
+        if self.remaining_in_entry != 0 || self.entry_index != self.entries.len() {
+            return Err(format!(
+                "M4A fallback track {} did not consume its complete stts timeline",
+                self.track_id
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn apply_fallback_track_edit(
+    decoded: &mut DecodedPcm,
+    selected_track_id: u32,
+    track_edits: Vec<FallbackTrackEdit>,
+) -> Result<(), String> {
+    let selected = track_edits
+        .into_iter()
+        .find(|track| track.track_id == selected_track_id)
+        .ok_or_else(|| {
+            format!(
+                "fallback decoder selected MP4 audio track {selected_track_id}, but its primary track metadata is unavailable"
+            )
+        })?;
+    if let Some(context) = selected.edit? {
+        apply_edit_to_decoded(decoded, &context)?;
+    }
+    Ok(())
 }
 
 fn validate_sample_table(track: &Mp4Track, file_size: u64) -> Result<ValidatedSampleTable, String> {
@@ -1540,17 +2642,17 @@ fn append_decoded_frame(
     expected_channels: usize,
     expected_sample_rate: u32,
     total_frames: &mut usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     if frame.channels == 0 {
         if frame.pcm.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         return Err("zero-channel AAC frame unexpectedly contains PCM samples".into());
     }
     // Tolerate an empty channel-bearing frame as a decoder priming/no-output
     // marker, matching the raw ADTS adapter.
     if frame.pcm.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     if channels.len() != expected_channels || frame.channels != expected_channels {
         return Err(format!(
@@ -1588,7 +2690,7 @@ fn append_decoded_frame(
         }
     }
     *total_frames = next_total;
-    Ok(())
+    Ok(frame_count)
 }
 
 #[cfg(test)]
@@ -1605,8 +2707,14 @@ mod tests {
         chunk_kind: ChunkOffsetsKind,
         chunk_offsets: Vec<u64>,
         stsc: Vec<StscFields>,
+        stts_version: u8,
+        stts_flags: u32,
         stts: Vec<u32>,
+        stts_deltas: Vec<u32>,
+        ctts_version: u8,
+        ctts_flags: u32,
         ctts: Option<Vec<u32>>,
+        ctts_offsets: Vec<i32>,
     }
 
     impl TestTable {
@@ -1629,8 +2737,14 @@ mod tests {
                         sample_description_index: 1,
                     },
                 ],
+                stts_version: 0,
+                stts_flags: 0,
                 stts: vec![3],
+                stts_deltas: vec![1_024],
+                ctts_version: 0,
+                ctts_flags: 0,
                 ctts: None,
+                ctts_offsets: Vec::new(),
             }
         }
     }
@@ -1668,12 +2782,32 @@ mod tests {
             self.stts.len()
         }
 
+        fn stts_version(&self) -> u8 {
+            self.stts_version
+        }
+
+        fn stts_flags(&self) -> u32 {
+            self.stts_flags
+        }
+
         fn stts_sample_count(&self, index: usize) -> Option<u32> {
             self.stts.get(index).copied()
         }
 
+        fn stts_sample_delta(&self, index: usize) -> Option<u32> {
+            self.stts_deltas.get(index).copied()
+        }
+
         fn has_ctts(&self) -> bool {
             self.ctts.is_some()
+        }
+
+        fn ctts_version(&self) -> Option<u8> {
+            self.ctts.as_ref().map(|_| self.ctts_version)
+        }
+
+        fn ctts_flags(&self) -> Option<u32> {
+            self.ctts.as_ref().map(|_| self.ctts_flags)
         }
 
         fn ctts_len(&self) -> usize {
@@ -1682,6 +2816,11 @@ mod tests {
 
         fn ctts_sample_count(&self, index: usize) -> Option<u32> {
             self.ctts.as_ref()?.get(index).copied()
+        }
+
+        fn ctts_sample_offset(&self, index: usize) -> Option<i32> {
+            self.ctts.as_ref()?.get(index)?;
+            Some(self.ctts_offsets.get(index).copied().unwrap_or(0))
         }
     }
 
@@ -1789,6 +2928,82 @@ mod tests {
         body
     }
 
+    fn raw_edit(segment_duration: u64, media_time: i64) -> RawEdit {
+        RawEdit {
+            segment_duration,
+            media_time,
+            media_rate: 1,
+            media_rate_fraction: 0,
+        }
+    }
+
+    fn edit_context(
+        entries: Vec<RawEdit>,
+        movie_timescale: u32,
+        media_timescale: u32,
+        composition_offset: i64,
+    ) -> EditContext {
+        EditContext {
+            edit_list: RawEditList {
+                version: 1,
+                flags: 0,
+                entries,
+            },
+            movie_timescale,
+            media_timescale,
+            composition_offset,
+            sample_count: 1,
+            stts_entries: vec![RawSttsEntry {
+                sample_count: 1,
+                sample_delta: u32::MAX,
+            }],
+        }
+    }
+
+    fn raw_elst(version: u8, flags: u32, entries: &[(u64, i64, i16, i16)]) -> Vec<u8> {
+        let mut body = vec![
+            version,
+            ((flags >> 16) & 0xff) as u8,
+            ((flags >> 8) & 0xff) as u8,
+            (flags & 0xff) as u8,
+        ];
+        body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        for &(duration, media_time, rate, fraction) in entries {
+            if version == 1 {
+                body.extend_from_slice(&duration.to_be_bytes());
+                body.extend_from_slice(&media_time.to_be_bytes());
+            } else {
+                body.extend_from_slice(&(duration as u32).to_be_bytes());
+                body.extend_from_slice(&(media_time as i32).to_be_bytes());
+            }
+            body.extend_from_slice(&rate.to_be_bytes());
+            body.extend_from_slice(&fraction.to_be_bytes());
+        }
+        raw_box(*b"elst", &body)
+    }
+
+    fn append_child_to_first_trak(bytes: &mut Vec<u8>, child: &[u8]) {
+        let moov_start = bytes
+            .windows(4)
+            .position(|window| window == b"moov")
+            .unwrap()
+            - 4;
+        let trak_start = bytes
+            .windows(4)
+            .position(|window| window == b"trak")
+            .unwrap()
+            - 4;
+        let moov_size = u32::from_be_bytes(bytes[moov_start..moov_start + 4].try_into().unwrap());
+        let trak_size = u32::from_be_bytes(bytes[trak_start..trak_start + 4].try_into().unwrap());
+        let insert_at = trak_start + trak_size as usize;
+        bytes.splice(insert_at..insert_at, child.iter().copied());
+        let added = u32::try_from(child.len()).unwrap();
+        bytes[moov_start..moov_start + 4]
+            .copy_from_slice(&moov_size.checked_add(added).unwrap().to_be_bytes());
+        bytes[trak_start..trak_start + 4]
+            .copy_from_slice(&trak_size.checked_add(added).unwrap().to_be_bytes());
+    }
+
     #[test]
     fn validates_variable_stco_and_walks_exact_offsets() {
         let table = TestTable::variable_stco();
@@ -1852,7 +3067,7 @@ mod tests {
         for sizes in [&[4usize, 4][..], &[2usize, 5][..]] {
             let (bytes, reader) = encoded_aac_table(sizes);
             validate_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
-            let track = select_aac_track(&reader).unwrap();
+            let track = select_aac_track(&reader).unwrap().unwrap();
             let validated = validate_sample_table(track, bytes.len() as u64).unwrap();
             assert_eq!(validated.sample_count, 2);
 
@@ -1874,7 +3089,7 @@ mod tests {
         let mut bytes = encoded_aac_tracks(2);
         let reader =
             Mp4Reader::read_header(Cursor::new(bytes.clone()), bytes.len() as u64).unwrap();
-        assert_eq!(select_aac_track(&reader).unwrap().track_id(), 1);
+        assert_eq!(select_aac_track(&reader).unwrap().unwrap().track_id(), 1);
 
         let tkhd_offsets = bytes
             .windows(4)
@@ -2001,6 +3216,512 @@ mod tests {
         let descriptors = descriptors(&table).unwrap();
         assert_eq!(descriptors[1].offset, 12);
         assert_eq!(descriptors[2].offset, 20);
+    }
+
+    #[test]
+    fn restores_signed_edit_fields_and_rounds_half_up_from_cumulative_boundaries() {
+        assert_eq!(restore_edit_media_time(0, u64::from(u32::MAX)).unwrap(), -1);
+        assert_eq!(
+            restore_edit_media_time(0, u64::from(0x8000_0000u32)).unwrap(),
+            i64::from(i32::MIN)
+        );
+        assert_eq!(restore_edit_media_time(1, u64::MAX).unwrap(), -1);
+        assert_eq!(
+            restore_edit_media_time(1, i64::MIN as u64).unwrap(),
+            i64::MIN
+        );
+        assert!(restore_edit_media_time(2, 0).is_err());
+
+        assert_eq!(round_rescaled(1, 4, 10, "test").unwrap(), 0);
+        assert_eq!(round_rescaled(1, 5, 10, "test").unwrap(), 1);
+        assert_eq!(round_rescaled(1, 6, 10, "test").unwrap(), 1);
+        assert_eq!(round_rescaled(21, 48_000, 1_001, "test").unwrap(), 1_007);
+
+        let cumulative = edit_context(vec![raw_edit(1, -1), raw_edit(1, 0)], 2, 1, 0);
+        let (planned, total) = plan_edits(&cumulative, 1, 1, 1).unwrap();
+        assert_eq!(planned[0].frames, 1);
+        assert_eq!(planned[1].frames, 0);
+        assert_eq!(
+            total, 1,
+            "two half-frame edits must not round to two frames"
+        );
+
+        let thirds = edit_context(
+            vec![raw_edit(1, -1), raw_edit(1, -1), raw_edit(1, 0)],
+            3,
+            1,
+            0,
+        );
+        let (planned, total) = plan_edits(&thirds, 2, 1, 1).unwrap();
+        assert_eq!(
+            planned.iter().map(|edit| edit.frames).collect::<Vec<_>>(),
+            vec![1, 0, 1]
+        );
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn applies_single_edit_in_place_and_preserves_input_on_validation_failure() {
+        let identity = edit_context(vec![raw_edit(6, 0)], 1, 1, 0);
+        let mut unchanged = vec![vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]];
+        let pointer = unchanged[0].as_ptr();
+        apply_edit_to_channels(&mut unchanged, 1, &identity).unwrap();
+        assert_eq!(unchanged, vec![vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]]);
+        assert_eq!(unchanged[0].as_ptr(), pointer);
+
+        let context = edit_context(vec![raw_edit(3, 2)], 1, 1, 0);
+        let mut channels = vec![vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]];
+        apply_edit_to_channels(&mut channels, 1, &context).unwrap();
+        assert_eq!(channels, vec![vec![2.0, 3.0, 4.0]]);
+
+        let invalid = edit_context(vec![raw_edit(3, 4)], 1, 1, 0);
+        let mut channels = vec![vec![0.0, 1.0, 2.0, 3.0, 4.0]];
+        let before = channels.clone();
+        let error = apply_edit_to_channels(&mut channels, 1, &invalid).unwrap_err();
+        assert!(error.contains("exceeds decoded length"), "{error}");
+        assert_eq!(channels, before);
+
+        let mut unequal = vec![vec![0.0, 1.0], vec![0.0]];
+        let before = unequal.clone();
+        assert!(apply_edit_to_channels(&mut unequal, 1, &context).is_err());
+        assert_eq!(unequal, before);
+    }
+
+    #[test]
+    fn zero_fills_movie_tick_rounding_past_the_stts_media_end() {
+        let mut leading_like = edit_context(vec![raw_edit(122, 0)], 1_000, 48_000, 0);
+        leading_like.sample_count = 1;
+        leading_like.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 5_824,
+        }];
+        let (planned, output_frames) = plan_edits(&leading_like, 48_000, 5_824, 1).unwrap();
+        assert_eq!(output_frames, 5_856);
+        assert_eq!(planned[0].copy_frames, 5_824);
+        let mut shifted_leading = leading_like.clone();
+        shifted_leading.edit_list.entries[0].media_time = 1;
+        assert!(plan_edits(&shifted_leading, 48_000, 5_824, 1)
+            .unwrap_err()
+            .contains("globally quantized stts media boundary"));
+
+        let mut channels = vec![vec![1.0; 5_824]];
+        apply_edit_to_channels(&mut channels, 48_000, &leading_like).unwrap();
+        assert_eq!(channels[0].len(), 5_856);
+        assert!(channels[0][..5_824].iter().all(|sample| *sample == 1.0));
+        assert!(channels[0][5_824..].iter().all(|sample| *sample == 0.0));
+
+        let mut alac_tick = edit_context(vec![raw_edit(1, 152)], 1_000, 8_000, 0);
+        alac_tick.sample_count = 1;
+        alac_tick.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 159,
+        }];
+        let mut channels = vec![(0..160).map(f64::from).collect::<Vec<_>>()];
+        apply_edit_to_channels(&mut channels, 8_000, &alac_tick).unwrap();
+        assert_eq!(
+            channels[0],
+            vec![152.0, 153.0, 154.0, 155.0, 156.0, 157.0, 158.0, 0.0]
+        );
+
+        let mut stereo_end = edit_context(vec![raw_edit(21, 1_024)], 1_001, 48_000, 0);
+        stereo_end.sample_count = 1;
+        stereo_end.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 2_033,
+        }];
+        let (stereo_plan, _) = plan_edits(&stereo_end, 48_000, 2_033, 1).unwrap();
+        assert_eq!(stereo_plan[0].copy_frames, 1_007);
+        stereo_end.edit_list.entries[0].segment_duration = 22;
+        assert!(plan_edits(&stereo_end, 48_000, 2_033, 1)
+            .unwrap_err()
+            .contains("globally quantized stts media boundary"));
+
+        let mut ctts_end = edit_context(vec![raw_edit(122, 37)], 1_000, 48_000, 37);
+        ctts_end.sample_count = 1;
+        ctts_end.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 5_824,
+        }];
+        plan_edits(&ctts_end, 48_000, 5_824, 1).unwrap();
+        ctts_end.edit_list.entries[0].media_time = 38;
+        assert!(plan_edits(&ctts_end, 48_000, 5_824, 1)
+            .unwrap_err()
+            .contains("globally quantized stts media boundary"));
+    }
+
+    #[test]
+    fn composes_leading_and_intermediate_empty_edits_atomically() {
+        let context = edit_context(
+            vec![
+                raw_edit(2, -1),
+                raw_edit(2, 1),
+                raw_edit(1, -1),
+                raw_edit(2, 4),
+            ],
+            1,
+            1,
+            0,
+        );
+        let mut channels = vec![
+            vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            vec![20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
+        ];
+        apply_edit_to_channels(&mut channels, 1, &context).unwrap();
+        assert_eq!(channels[0], vec![0.0, 0.0, 11.0, 12.0, 0.0, 14.0, 15.0]);
+        assert_eq!(channels[1], vec![0.0, 0.0, 21.0, 22.0, 0.0, 24.0, 25.0]);
+
+        let reordered = edit_context(
+            vec![raw_edit(2, 2), raw_edit(2, 0), raw_edit(2, 2)],
+            1,
+            1,
+            0,
+        );
+        let mut channels = vec![vec![0.0, 1.0, 2.0, 3.0]];
+        apply_edit_to_channels(&mut channels, 1, &reordered).unwrap();
+        assert_eq!(channels[0], vec![2.0, 3.0, 0.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn rejects_invalid_edit_shapes_timescales_overflow_ranges_and_zero_output() {
+        let mut trailing = edit_context(vec![raw_edit(1, 0), raw_edit(1, -1)], 1, 1, 0);
+        assert!(plan_edits(&trailing, 1, 2, 1)
+            .unwrap_err()
+            .contains("must not end"));
+
+        trailing.edit_list.entries[1].media_time = 1;
+        trailing.edit_list.entries[0].media_rate = -1;
+        assert!(plan_edits(&trailing, 1, 2, 1)
+            .unwrap_err()
+            .contains("unsupported media rate"));
+
+        trailing.edit_list.entries[0].media_rate = 1;
+        trailing.edit_list.entries[0].media_rate_fraction = 1;
+        assert!(plan_edits(&trailing, 1, 2, 1)
+            .unwrap_err()
+            .contains("unsupported media rate"));
+        trailing.edit_list.entries[0].media_rate_fraction = 0;
+        trailing.edit_list.entries[0].media_time = -2;
+        assert!(plan_edits(&trailing, 1, 2, 1)
+            .unwrap_err()
+            .contains("unsupported negative media time"));
+        trailing.edit_list.entries[0].media_time = 0;
+        trailing.edit_list.entries[0].segment_duration = 0;
+        assert!(plan_edits(&trailing, 1, 2, 1)
+            .unwrap_err()
+            .contains("zero segment duration"));
+
+        let zero_movie = edit_context(vec![raw_edit(1, 0)], 0, 1, 0);
+        assert!(plan_edits(&zero_movie, 1, 1, 1)
+            .unwrap_err()
+            .contains("zero movie"));
+        let zero_media = edit_context(vec![raw_edit(1, 0)], 1, 0, 0);
+        assert!(plan_edits(&zero_media, 1, 1, 1)
+            .unwrap_err()
+            .contains("zero media"));
+
+        let underflow = edit_context(vec![raw_edit(1, 0)], 1, 1, 1);
+        assert!(plan_edits(&underflow, 1, 1, 1)
+            .unwrap_err()
+            .contains("underflows"));
+        let positive_ctts = edit_context(vec![raw_edit(1, 150)], 1, 1, 100);
+        assert_eq!(
+            plan_edits(&positive_ctts, 1, 51, 1).unwrap().0[0].source_start,
+            Some(50)
+        );
+        let negative_ctts = edit_context(vec![raw_edit(1, 0)], 1, 1, -100);
+        assert_eq!(
+            plan_edits(&negative_ctts, 1, 101, 1).unwrap().0[0].source_start,
+            Some(100)
+        );
+        let range = edit_context(vec![raw_edit(2, 1)], 1, 1, 0);
+        assert!(plan_edits(&range, 1, 2, 1)
+            .unwrap_err()
+            .contains("exceeds decoded length"));
+
+        let mut final_padding = edit_context(vec![raw_edit(24, 1_000)], 1, 1, 0);
+        final_padding.sample_count = 1;
+        final_padding.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 1_000,
+        }];
+        let error = plan_edits(&final_padding, 1, 1_024, 1).unwrap_err();
+        assert!(
+            error.contains("media start 1000 is at or beyond stts media end 1000"),
+            "{error}"
+        );
+        final_padding.edit_list.entries[0].media_time = 976;
+        let (boundary, _) = plan_edits(&final_padding, 1, 1_024, 1).unwrap();
+        assert_eq!(boundary[0].source_start, Some(976));
+        assert_eq!(boundary[0].frames, 24);
+
+        let mut quantized_end = edit_context(vec![raw_edit(3, 0)], 1, 2, 0);
+        quantized_end.sample_count = 1;
+        quantized_end.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 5,
+        }];
+        let (rounded_up, _) = plan_edits(&quantized_end, 2, 6, 1).unwrap();
+        assert_eq!(rounded_up[0].frames, 6);
+        quantized_end.edit_list.entries[0].segment_duration = 4;
+        let error = plan_edits(&quantized_end, 2, 8, 1).unwrap_err();
+        assert!(
+            error.contains("globally quantized stts media boundary"),
+            "{error}"
+        );
+
+        let zero_output = edit_context(vec![raw_edit(1, 0)], 3, 1, 0);
+        assert!(plan_edits(&zero_output, 1, 1, 1)
+            .unwrap_err()
+            .contains("zero output"));
+
+        let huge_v1 = edit_context(vec![raw_edit(u64::MAX, -1), raw_edit(1, 0)], 1, 1, 0);
+        assert!(plan_edits(&huge_v1, 1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn bounds_only_allocating_edit_paths_to_512_mib() {
+        let general = edit_context(
+            vec![raw_edit(20_000_000, 0), raw_edit(20_000_000, 20_000_000)],
+            1,
+            1,
+            0,
+        );
+        let error = plan_edits(&general, 1, 40_000_000, 1).unwrap_err();
+        assert!(error.contains("working set"), "{error}");
+
+        let in_place = edit_context(vec![raw_edit(40_000_000, 0)], 1, 1, 0);
+        assert!(plan_edits(&in_place, 1, 40_000_000, 1).is_ok());
+
+        let mut single_zero_tail = edit_context(vec![raw_edit(1, 0)], 1, u32::MAX, 0);
+        single_zero_tail.sample_count = 1;
+        single_zero_tail.stts_entries = vec![RawSttsEntry {
+            sample_count: 1,
+            sample_delta: 1,
+        }];
+        let error = plan_edits(&single_zero_tail, u32::MAX, 1, 1).unwrap_err();
+        assert!(error.contains("working set"), "{error}");
+    }
+
+    #[test]
+    fn restores_constant_ctts_offsets_by_version_and_rejects_variation() {
+        let mut table = TestTable::variable_stco();
+        table.ctts = Some(vec![3]);
+        table.ctts_offsets = vec![i32::MIN];
+        assert_eq!(
+            constant_composition_offset(&table, 3).unwrap(),
+            2_147_483_648
+        );
+
+        table.ctts_version = 1;
+        assert_eq!(
+            constant_composition_offset(&table, 3).unwrap(),
+            -2_147_483_648
+        );
+
+        table.ctts = Some(vec![1, 2]);
+        table.ctts_offsets = vec![7, 8];
+        assert!(constant_composition_offset(&table, 3)
+            .unwrap_err()
+            .contains("constant ctts"));
+        table.ctts_version = 2;
+        assert!(constant_composition_offset(&table, 3)
+            .unwrap_err()
+            .contains("unsupported"));
+    }
+
+    #[test]
+    fn enforces_edit_active_access_unit_and_stts_timeline_safety() {
+        let mut zero_size = TestTable::variable_stco();
+        zero_size.variable_sizes[1] = 0;
+        assert!(validate_edit_active_source_table(&zero_size)
+            .unwrap_err()
+            .contains("zero size"));
+
+        let mut zero_delta = TestTable::variable_stco();
+        zero_delta.stts_deltas[0] = 0;
+        assert!(validate_edit_active_source_table(&zero_delta)
+            .unwrap_err()
+            .contains("zero sample_delta"));
+
+        let mut runs = TestTable::variable_stco();
+        runs.stts = vec![2, 1];
+        runs.stts_deltas = vec![1_024, 960];
+        let mut timeline = SttsTimeline::default();
+        assert_eq!(timeline.advance(&runs).unwrap(), 1_024);
+        assert_eq!(timeline.advance(&runs).unwrap(), 2_048);
+        assert_eq!(timeline.advance(&runs).unwrap(), 3_008);
+
+        assert!(validate_edit_timeline_position(1, 3, 1_023, 1_024).is_err());
+        assert!(validate_edit_timeline_position(2, 3, 2_048, 2_048).is_ok());
+        assert!(validate_edit_timeline_position(3, 3, 3_007, 3_008).is_err());
+        assert!(validate_edit_timeline_position(3, 3, 4_032, 3_008).is_ok());
+
+        let mut channels = vec![Vec::new(), Vec::new()];
+        let mut total = 0;
+        let frames = append_decoded_frame(
+            &mut channels,
+            &DecodedFrame {
+                pcm: Vec::new(),
+                channels: 2,
+                sample_rate: 48_000,
+            },
+            2,
+            48_000,
+            &mut total,
+        )
+        .unwrap();
+        assert_eq!(frames, 0);
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn fallback_edit_is_matched_to_the_decoder_selected_track_id() {
+        let first = edit_context(vec![raw_edit(1, 0)], 1, 1, 0);
+        let second = edit_context(vec![raw_edit(1, 2)], 1, 1, 0);
+        let edits = vec![
+            FallbackTrackEdit {
+                track_id: 7,
+                edit: Ok(Some(first)),
+            },
+            FallbackTrackEdit {
+                track_id: 9,
+                edit: Ok(Some(second)),
+            },
+        ];
+        let mut decoded = DecodedPcm {
+            sample_rate: 1,
+            channels: vec![vec![10.0, 11.0, 12.0]],
+            channel_mask: None,
+        };
+        assert!(fallback_track_has_edit(&edits, 9).unwrap());
+        apply_fallback_track_edit(&mut decoded, 9, edits).unwrap();
+        assert_eq!(decoded.channels, vec![vec![12.0]]);
+
+        let before = decoded.channels.clone();
+        let error = apply_fallback_track_edit(&mut decoded, 11, Vec::new()).unwrap_err();
+        assert!(error.contains("metadata is unavailable"), "{error}");
+        assert_eq!(decoded.channels, before);
+
+        let no_edit = vec![FallbackTrackEdit {
+            track_id: 11,
+            edit: Ok(None),
+        }];
+        assert!(!fallback_track_has_edit(&no_edit, 11).unwrap());
+    }
+
+    #[test]
+    fn fallback_edit_timeline_validates_every_packet_and_stts_coverage() {
+        let timeline = |sample_count, stts_entries| {
+            let mut context = edit_context(vec![raw_edit(1, 0)], 1, 8_000, 0);
+            context.sample_count = sample_count;
+            context.stts_entries = stts_entries;
+            vec![FallbackTrackEdit {
+                track_id: 9,
+                edit: Ok(Some(context)),
+            }]
+        };
+
+        let exact = timeline(
+            2,
+            vec![RawSttsEntry {
+                sample_count: 2,
+                sample_delta: 160,
+            }],
+        );
+        let mut verifier = fallback_timeline_verifier(&exact, 9).unwrap().unwrap();
+        verifier.observe_packet(160, 8_000).unwrap();
+        verifier.observe_packet(160, 8_000).unwrap();
+        verifier.finish().unwrap();
+
+        let final_short = timeline(
+            1,
+            vec![RawSttsEntry {
+                sample_count: 1,
+                sample_delta: 161,
+            }],
+        );
+        let error = fallback_timeline_verifier(&final_short, 9)
+            .unwrap()
+            .unwrap()
+            .observe_packet(160, 8_000)
+            .unwrap_err();
+        assert!(
+            error.contains("shorter than the stts timeline 161"),
+            "{error}"
+        );
+
+        let nonfinal_mismatch = timeline(
+            2,
+            vec![RawSttsEntry {
+                sample_count: 2,
+                sample_delta: 160,
+            }],
+        );
+        let error = fallback_timeline_verifier(&nonfinal_mismatch, 9)
+            .unwrap()
+            .unwrap()
+            .observe_packet(159, 8_000)
+            .unwrap_err();
+        assert!(error.contains("stts requires 160"), "{error}");
+
+        let one_packet = timeline(
+            1,
+            vec![RawSttsEntry {
+                sample_count: 1,
+                sample_delta: 160,
+            }],
+        );
+        let mut extra = fallback_timeline_verifier(&one_packet, 9).unwrap().unwrap();
+        extra.observe_packet(160, 8_000).unwrap();
+        assert!(extra
+            .observe_packet(160, 8_000)
+            .unwrap_err()
+            .contains("extra packet"));
+
+        let missing = timeline(
+            2,
+            vec![RawSttsEntry {
+                sample_count: 2,
+                sample_delta: 160,
+            }],
+        );
+        let mut missing = fallback_timeline_verifier(&missing, 9).unwrap().unwrap();
+        missing.observe_packet(160, 8_000).unwrap();
+        assert!(missing.finish().unwrap_err().contains("decoded 1 packets"));
+
+        let no_edit = vec![FallbackTrackEdit {
+            track_id: 9,
+            edit: Ok(None),
+        }];
+        assert!(fallback_timeline_verifier(&no_edit, 9).unwrap().is_none());
+    }
+
+    #[test]
+    fn selected_aac_edit_error_is_fatal_and_never_reaches_symphonia_fallback() {
+        let (mut bytes, _) = encoded_aac_table(&[4]);
+        let non_unity_edit = raw_box(*b"edts", &raw_elst(0, 0, &[(1, 0, 2, 0)]));
+        append_child_to_first_trak(&mut bytes, &non_unity_edit);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fatal-edit.m4a");
+        std::fs::write(&path, bytes).unwrap();
+
+        let native_error = decode_m4a(&path).unwrap_err();
+        assert!(
+            matches!(native_error, M4aDecodeError::Fatal(_)),
+            "{native_error}"
+        );
+        assert!(
+            native_error.contains("unsupported media rate"),
+            "{native_error}"
+        );
+
+        let public_error = crate::decode::decode_file(&path).unwrap_err();
+        assert!(
+            public_error.contains("unsupported media rate"),
+            "{public_error}"
+        );
+        assert!(!public_error.contains("ALAC/other"), "{public_error}");
     }
 
     #[test]
@@ -2514,6 +4235,97 @@ mod tests {
         )
         .expect_err("many empty trun boxes must share one work budget");
         assert!(error.contains("aggregate empty trun"), "{error}");
+    }
+
+    #[test]
+    fn structural_preflight_requires_one_exact_elst_and_rejects_duplicate_edts() {
+        let elst = raw_elst(0, 0, &[(10, 0, 1, 0)]);
+        let edts = raw_box(*b"edts", &elst);
+
+        let mut duplicate_body = edts.clone();
+        duplicate_body.extend_from_slice(&edts);
+        let duplicate_trak = raw_box(*b"trak", &duplicate_body);
+        let error = scan_box_list(
+            &mut Cursor::new(&duplicate_trak),
+            0,
+            duplicate_trak.len() as u64,
+            BoxListKind::Moov,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate edts"), "{error}");
+
+        let wrong = raw_box(*b"edts", &raw_box(*b"free", &[0; 12]));
+        let error = scan_box_list(
+            &mut Cursor::new(&wrong),
+            0,
+            wrong.len() as u64,
+            BoxListKind::Trak,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("exactly one elst"), "{error}");
+
+        let mut two_children = elst.clone();
+        two_children.extend_from_slice(&raw_box(*b"free", &[]));
+        let extra = raw_box(*b"edts", &two_children);
+        let error = scan_box_list(
+            &mut Cursor::new(&extra),
+            0,
+            extra.len() as u64,
+            BoxListKind::Trak,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("exactly one elst"), "{error}");
+
+        let no_edts = raw_box(*b"trak", &raw_box(*b"free", &[]));
+        scan_box_list(
+            &mut Cursor::new(&no_edts),
+            0,
+            no_edts.len() as u64,
+            BoxListKind::Moov,
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn structural_preflight_requires_exact_nonempty_zero_flag_elst_body() {
+        let valid = raw_elst(1, 0, &[(10, -1, 1, 0), (20, 0, 1, 0)]);
+        scan_box_list(
+            &mut Cursor::new(&valid),
+            0,
+            valid.len() as u64,
+            BoxListKind::Edts,
+            0,
+        )
+        .unwrap();
+
+        for malformed in [raw_elst(0, 0, &[]), raw_elst(0, 1, &[(1, 0, 1, 0)])] {
+            assert!(scan_box_list(
+                &mut Cursor::new(&malformed),
+                0,
+                malformed.len() as u64,
+                BoxListKind::Edts,
+                0,
+            )
+            .is_err());
+        }
+
+        let mut trailing = raw_elst(0, 0, &[(1, 0, 1, 0)]);
+        trailing.push(0xaa);
+        let size = u32::try_from(trailing.len()).unwrap();
+        trailing[..4].copy_from_slice(&size.to_be_bytes());
+        let error = scan_box_list(
+            &mut Cursor::new(&trailing),
+            0,
+            trailing.len() as u64,
+            BoxListKind::Edts,
+            0,
+        )
+        .unwrap_err();
+        assert!(error.contains("expected exactly"), "{error}");
     }
 
     #[test]

@@ -17,7 +17,8 @@
 //!
 //! ### Input / output codecs (built-in, no ffmpeg)
 //! - **Decode**: WAV / MP3 (`symphonia`, including Xing/LAME gapless timing,
-//!   with a bounded raw-stream compatibility fallback) / M4A (Pure Rust AAC-LC)
+//!   with a bounded raw-stream compatibility fallback) / M4A (Pure-Rust AAC-LC
+//!   and ALAC with v0/v1 unity-rate edit-list presentation timing)
 //! - **Encode**: WAV / MP3 (`shine-rs`) / M4A (`oxideav-aac` Pure-Rust AAC-LC)
 //! - Decoded to `f64` PCM at native sample rate (no extra quantisation)
 //!
