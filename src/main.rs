@@ -2427,7 +2427,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "4c6ed5775c736bbe57e4d5d64b8f8e073457d79053b449e98c18e75fb5eaaa80";
+        "b88428f44499753eb5c8cd6ebb553249faeee394b7a25d5952c39f7fbfd9d328";
 
     #[test]
     fn cancellation_while_waiting_for_publication_fence_never_publishes() {
