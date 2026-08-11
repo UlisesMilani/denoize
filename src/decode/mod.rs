@@ -11,7 +11,7 @@
 //! | WAV / BWF | `hound`（既存） |
 //! | RF64 | bounded native PCM reader |
 //! | MP3  | `symphonia`（Xing / LAME gapless timing）+ bounded `nanomp3` compatibility fallback |
-//! | M4A  | `mp4` demux + `oxideav-aac` Pure-Rust AAC-LC decode |
+//! | M4A  | `mp4` demux + `oxideav-aac` AAC-LC / `symphonia` ALAC decode; v0/v1 unity-rate edit-list presentation timing (multiple media edits and leading/interior empty edits; malformed/unsupported edits fail closed) |
 //! | AIFF / CAF / Ogg Vorbis / ALAC | `symphonia` |
 
 mod aac;
@@ -856,11 +856,47 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
         AudioFormat::Flac => decode_flac(path),
         AudioFormat::OggOpus => opus::decode_ogg_opus(path),
         AudioFormat::Mp3 => decode_mp3(path),
-        AudioFormat::M4a => m4a::decode_m4a(path).or_else(|aac_error| {
-            decode_symphonia(path).map_err(|symphonia_error| {
-                format!("M4A/AAC decode failed: {aac_error}; ALAC/other decoder: {symphonia_error}")
-            })
-        }),
+        AudioFormat::M4a => match m4a::decode_m4a(path) {
+            Ok(decoded) => Ok(decoded),
+            Err(m4a::M4aDecodeError::Fatal(error)) => {
+                Err(format!("M4A/AAC decode failed: {error}"))
+            }
+            Err(m4a::M4aDecodeError::TryOtherCodec {
+                reason,
+                track_edits,
+            }) => {
+                let (mut decoded, selected_track_id, packet_errors) =
+                    decode_symphonia_with_track_id(path, &track_edits).map_err(
+                        |symphonia_error| {
+                            format!(
+                                "M4A/AAC decode failed: {reason}; ALAC/other decoder: {symphonia_error}"
+                            )
+                        },
+                    )?;
+                let edit_active =
+                    m4a::fallback_track_has_edit(&track_edits, selected_track_id).map_err(
+                        |edit_error| {
+                            format!(
+                                "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
+                            )
+                        },
+                    )?;
+                if edit_active {
+                    reject_m4a_fallback_packet_errors(&packet_errors).map_err(|edit_error| {
+                        format!(
+                            "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
+                        )
+                    })?;
+                }
+                m4a::apply_fallback_track_edit(&mut decoded, selected_track_id, track_edits)
+                    .map_err(|edit_error| {
+                        format!(
+                            "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
+                        )
+                    })?;
+                Ok(decoded)
+            }
+        },
         AudioFormat::AacAdts => aac::decode_adts(path),
         AudioFormat::Unknown => Err(format!(
             "unsupported audio format ({}); supported input: wav, rf64/bwf, aiff, caf, flac, opus/vorbis, mp3, m4a/alac, aac",
@@ -878,10 +914,13 @@ pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
 struct RecoverablePacketErrors {
     invalid_main_data_offset: bool,
     other: Option<String>,
+    reset_required: bool,
+    empty_decoded_packet: bool,
 }
 
 struct SymphoniaDecodeOutcome {
     decoded: Option<DecodedPcm>,
+    selected_track_id: u32,
     expected_sample_rate: Option<u32>,
     expected_channel_count: Option<usize>,
     packet_errors: RecoverablePacketErrors,
@@ -898,7 +937,48 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
     decode_symphonia_with_report(path)?.into_decoded()
 }
 
+fn decode_symphonia_with_track_id(
+    path: &Path,
+    track_edits: &[m4a::FallbackTrackEdit],
+) -> Result<(DecodedPcm, u32, RecoverablePacketErrors), String> {
+    let SymphoniaDecodeOutcome {
+        decoded,
+        selected_track_id,
+        packet_errors,
+        ..
+    } = decode_symphonia_with_report_inner(path, Some(track_edits))?;
+    let decoded = decoded.ok_or_else(|| "no audio packets decoded".to_string())?;
+    Ok((decoded, selected_track_id, packet_errors))
+}
+
+fn reject_m4a_fallback_packet_errors(errors: &RecoverablePacketErrors) -> Result<(), String> {
+    if errors.reset_required {
+        return Err("M4A fallback decoder stopped early because a reset was required".into());
+    }
+    if errors.empty_decoded_packet {
+        return Err("M4A fallback decoder produced an empty packet on the edited timeline".into());
+    }
+    if errors.invalid_main_data_offset {
+        return Err(
+            "M4A fallback decoder skipped a packet with an invalid main-data offset".into(),
+        );
+    }
+    if let Some(error) = &errors.other {
+        return Err(format!(
+            "M4A fallback decoder skipped a packet error: {error}"
+        ));
+    }
+    Ok(())
+}
+
 fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, String> {
+    decode_symphonia_with_report_inner(path, None)
+}
+
+fn decode_symphonia_with_report_inner(
+    path: &Path,
+    fallback_track_edits: Option<&[m4a::FallbackTrackEdit]>,
+) -> Result<SymphoniaDecodeOutcome, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
     use symphonia::core::formats::probe::Hint;
@@ -945,10 +1025,14 @@ fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, S
         .as_ref()
         .map(|channels| channels.count())
         .filter(|count| *count > 0);
+    let track_id = track.id;
+    let mut timeline_verifier = match fallback_track_edits {
+        Some(track_edits) => m4a::fallback_timeline_verifier(track_edits, track_id)?,
+        None => None,
+    };
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
         .map_err(|error| format!("decoder: {error}"))?;
-    let track_id = track.id;
     let mut sample_rate = None;
     let mut channels: Vec<Vec<f64>> = Vec::new();
     let mut packet_errors = RecoverablePacketErrors::default();
@@ -957,7 +1041,10 @@ fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, S
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
-            Err(SymphoniaError::ResetRequired) => break,
+            Err(SymphoniaError::ResetRequired) => {
+                packet_errors.reset_required = true;
+                break;
+            }
             Err(error) => return Err(format!("read packet: {error}")),
         };
         if packet.track_id != track_id {
@@ -977,9 +1064,17 @@ fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, S
             Err(error) => return Err(format!("decode packet: {error}")),
         };
         let rate = decoded.spec().rate();
+        let decoded_frames = decoded.frames();
+        if let Some(verifier) = timeline_verifier.as_mut() {
+            verifier.observe_packet(decoded_frames, rate)?;
+        }
+        if decoded_frames == 0 {
+            packet_errors.empty_decoded_packet = true;
+        }
         let mut planes = Vec::<Vec<f32>>::new();
         decoded.copy_to_vecs_planar(&mut planes);
         if planes.is_empty() {
+            packet_errors.empty_decoded_packet = true;
             continue;
         }
         if let Some(expected_rate) = sample_rate {
@@ -1004,6 +1099,10 @@ fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, S
         }
     }
 
+    if let Some(verifier) = timeline_verifier.as_ref() {
+        verifier.finish()?;
+    }
+
     let decoded = sample_rate.map(|sample_rate| DecodedPcm {
         sample_rate,
         channels,
@@ -1011,6 +1110,7 @@ fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, S
     });
     Ok(SymphoniaDecodeOutcome {
         decoded,
+        selected_track_id: track_id,
         expected_sample_rate,
         expected_channel_count,
         packet_errors,
@@ -1562,6 +1662,36 @@ mod tests {
     fn detect_m4a_ftyp() {
         let h = b"\x00\x00\x00\x20ftypM4A ";
         assert_eq!(AudioFormat::detect(Path::new("x.m4a"), h), AudioFormat::M4a);
+    }
+
+    #[test]
+    fn m4a_fallback_never_slices_pcm_after_skipped_packet_errors() {
+        let mut errors = RecoverablePacketErrors {
+            invalid_main_data_offset: true,
+            other: None,
+            ..RecoverablePacketErrors::default()
+        };
+        assert!(reject_m4a_fallback_packet_errors(&errors)
+            .unwrap_err()
+            .contains("invalid main-data offset"));
+
+        errors.invalid_main_data_offset = false;
+        errors.other = Some("corrupt ALAC packet".into());
+        assert!(reject_m4a_fallback_packet_errors(&errors)
+            .unwrap_err()
+            .contains("corrupt ALAC packet"));
+
+        errors.other = None;
+        errors.reset_required = true;
+        assert!(reject_m4a_fallback_packet_errors(&errors)
+            .unwrap_err()
+            .contains("reset was required"));
+        errors.reset_required = false;
+        errors.empty_decoded_packet = true;
+        assert!(reject_m4a_fallback_packet_errors(&errors)
+            .unwrap_err()
+            .contains("empty packet"));
+        assert!(reject_m4a_fallback_packet_errors(&RecoverablePacketErrors::default()).is_ok());
     }
 
     #[test]

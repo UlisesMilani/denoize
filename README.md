@@ -50,7 +50,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | AIFF/AIFC | `symphonia` | PCM and supported AIFC codecs |
 | CAF | `symphonia` | PCM and ALAC/other supported CAF codecs |
 | MP3 | `symphonia` + bounded `nanomp3` fallback (Pure Rust) | Xing/Info + LAME gapless trim, ID3v2, no resampling |
-| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | MP4 demux + AAC-LC/ALAC decode |
+| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | AAC-LC/ALAC decode with MP4 v0/v1 unity-rate edit-list presentation timing |
 | FLAC | `claxon` | Lossless FLAC |
 | Ogg Opus/Vorbis | `opus` + `ogg` / `symphonia` | Mono/stereo; native sample rate decode |
 
@@ -74,6 +74,11 @@ contiguous Layer III frames, and never for files carrying gapless timing.
 The built-in Shine encoder completes its final bit cache and emits at least two
 MPEG frames for short-clip interoperability; clips shorter than that minimum
 therefore contain trailing encoded silence.
+
+M4A AAC-LC and ALAC inputs are rendered on the container presentation
+timeline. Unity-rate v0/v1 edit lists may trim or splice media and insert
+leading or interior silence; unsupported rates and malformed timing are
+rejected instead of returning mis-timed PCM.
 
 Channel order is kept planar and unchanged through WAV/FLAC and denoising. The
 standard layouts mono, stereo, 2.1, quad, 5.0, 5.1, 6.1, and 7.1 are reported

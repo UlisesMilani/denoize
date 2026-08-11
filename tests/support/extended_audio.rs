@@ -215,3 +215,124 @@ pub fn vorbis_ogg() -> Vec<u8> {
 pub fn alac_m4a() -> Vec<u8> {
     decode_base64_fixture("AAAAHGZ0eXBNNEEgAAACAE00QSBpc29taXNvMgAAAAhmcmVlAAAAH21kYXQAABAAAAFAAAAPCAEAAAAAAAAA/4BP8AAAAqttb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAFAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAB1XRyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAFAAAAAAAAAAAAAAAAQEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAABQAAAAAAAEAAAAAAU1tZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAB9AAAAAoFXEAAAAAAAtaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAFNvdW5kSGFuZGxlcgAAAAD4bWluZgAAABBzbWhkAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAAC8c3RibAAAAFhzdHNkAAAAAAAAAAEAAABIYWxhYwAAAAAAAAABAAAAAAAAAAAAAQAQAAAAAB9AAAAAAAAkYWxhYwAAAAAAABAAABAoCg4BAAAAACAEAAH0AAAAH0AAAAAYc3R0cwAAAAAAAAABAAAAAQAAAKAAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAEAAAABAAAAFHN0c3oAAAAAAAAAFwAAAAEAAAAUc3RjbwAAAAAAAAABAAAALAAAAGJ1ZHRhAAAAWm1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALWlsc3QAAAAlqXRvbwAAAB1kYXRhAAAAAQAAAABMYXZmNjAuMTYuMTAw")
 }
+
+fn unique_box_type_offset(bytes: &[u8], box_type: &[u8; 4]) -> usize {
+    let mut matches = bytes
+        .windows(box_type.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == box_type).then_some(offset));
+    let offset = matches
+        .next()
+        .unwrap_or_else(|| panic!("embedded ALAC fixture is missing {box_type:?}"));
+    assert!(
+        matches.next().is_none(),
+        "embedded ALAC fixture has duplicate {box_type:?} boxes"
+    );
+    assert!(offset >= 4, "embedded ALAC box has no size field");
+    offset
+}
+
+fn read_box_size(bytes: &[u8], box_type_offset: usize) -> u32 {
+    u32::from_be_bytes(
+        bytes[box_type_offset - 4..box_type_offset]
+            .try_into()
+            .expect("embedded ALAC box size"),
+    )
+}
+
+fn set_u32_be(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+/// The same ALAC payload as [`alac_m4a`], with its `edts` box removed.
+///
+/// `mdat` precedes `moov` in this fixture, so removing `edts` does not change
+/// the sample offset stored in `stco`.
+#[allow(dead_code)]
+pub fn alac_m4a_without_edit_list() -> Vec<u8> {
+    let mut bytes = alac_m4a();
+    let moov_type = unique_box_type_offset(&bytes, b"moov");
+    let trak_type = unique_box_type_offset(&bytes, b"trak");
+    let edts_type = unique_box_type_offset(&bytes, b"edts");
+    let edts_start = edts_type - 4;
+    let edts_size = read_box_size(&bytes, edts_type);
+    assert_eq!(edts_size, 36, "unexpected embedded ALAC edts size");
+
+    let moov_size = read_box_size(&bytes, moov_type);
+    let trak_size = read_box_size(&bytes, trak_type);
+    set_u32_be(&mut bytes, moov_type - 4, moov_size - edts_size);
+    set_u32_be(&mut bytes, trak_type - 4, trak_size - edts_size);
+    bytes.drain(edts_start..edts_start + edts_size as usize);
+    bytes
+}
+
+/// The same ALAC payload as [`alac_m4a`], edited to select source frames
+/// `40..120` (10 ms at 8 kHz).
+#[allow(dead_code)]
+pub fn alac_m4a_with_non_identity_edit() -> Vec<u8> {
+    let mut bytes = alac_m4a();
+    let mvhd_type = unique_box_type_offset(&bytes, b"mvhd");
+    let tkhd_type = unique_box_type_offset(&bytes, b"tkhd");
+    let elst_type = unique_box_type_offset(&bytes, b"elst");
+
+    assert_eq!(&bytes[elst_type + 4..elst_type + 8], &[0, 0, 0, 0]);
+    assert_eq!(&bytes[elst_type + 8..elst_type + 12], &1u32.to_be_bytes());
+    assert_eq!(&bytes[elst_type + 12..elst_type + 16], &20u32.to_be_bytes());
+    assert_eq!(&bytes[elst_type + 16..elst_type + 20], &0u32.to_be_bytes());
+
+    // Keep the container durations consistent with the shortened edit.
+    set_u32_be(&mut bytes, mvhd_type + 20, 10);
+    set_u32_be(&mut bytes, tkhd_type + 24, 10);
+    set_u32_be(&mut bytes, elst_type + 12, 10);
+    set_u32_be(&mut bytes, elst_type + 16, 40);
+    bytes
+}
+
+/// An edit-active ALAC fixture whose sole decoded packet has 160 frames while
+/// `stts` falsely declares 161 media-time units.
+#[allow(dead_code)]
+pub fn alac_m4a_with_mismatched_stts() -> Vec<u8> {
+    let mut bytes = alac_m4a();
+    let stts_type = unique_box_type_offset(&bytes, b"stts");
+    assert_eq!(&bytes[stts_type + 4..stts_type + 8], &[0, 0, 0, 0]);
+    assert_eq!(&bytes[stts_type + 8..stts_type + 12], &1u32.to_be_bytes());
+    assert_eq!(&bytes[stts_type + 12..stts_type + 16], &1u32.to_be_bytes());
+    assert_eq!(
+        &bytes[stts_type + 16..stts_type + 20],
+        &160u32.to_be_bytes()
+    );
+    set_u32_be(&mut bytes, stts_type + 16, 161);
+    bytes
+}
+
+/// An ALAC fixture with eight frames of decoder tail padding beyond its `stts`
+/// timeline. Its edit requests source frames `144..160`, even though the eight
+/// remaining timed frames occupy exactly one 1-ms movie-timescale tick.
+/// The two-tick edit is therefore invalid despite fitting in the raw PCM.
+#[allow(dead_code)]
+pub fn alac_m4a_with_edit_past_stts_media_end() -> Vec<u8> {
+    let mut bytes = alac_m4a();
+    let mvhd_type = unique_box_type_offset(&bytes, b"mvhd");
+    let tkhd_type = unique_box_type_offset(&bytes, b"tkhd");
+    let mdhd_type = unique_box_type_offset(&bytes, b"mdhd");
+    let elst_type = unique_box_type_offset(&bytes, b"elst");
+    let stts_type = unique_box_type_offset(&bytes, b"stts");
+
+    assert_eq!(&bytes[elst_type + 12..elst_type + 16], &20u32.to_be_bytes());
+    assert_eq!(&bytes[elst_type + 16..elst_type + 20], &0u32.to_be_bytes());
+    assert_eq!(
+        &bytes[stts_type + 16..stts_type + 20],
+        &160u32.to_be_bytes()
+    );
+
+    // One movie-timescale unit is 1 ms, or 8 frames at this track's 8 kHz.
+    // Eight timed frames remain after media time 144, so the media timeline
+    // permits exactly one tick but never the two ticks requested here.
+    set_u32_be(&mut bytes, mvhd_type + 20, 2);
+    set_u32_be(&mut bytes, tkhd_type + 24, 2);
+    set_u32_be(&mut bytes, mdhd_type + 20, 152);
+    set_u32_be(&mut bytes, elst_type + 12, 2);
+    set_u32_be(&mut bytes, elst_type + 16, 144);
+    set_u32_be(&mut bytes, stts_type + 16, 152);
+    bytes
+}
