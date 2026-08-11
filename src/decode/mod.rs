@@ -542,17 +542,23 @@ fn wave_codec_from_fmt(fmt: &[u8]) -> AudioCodec {
 }
 
 fn probe_mp4_tracks(path: &Path) -> Result<AudioProbe, String> {
-    use std::io::BufReader;
+    use std::io::{BufReader, Seek, SeekFrom};
 
-    let file = std::fs::File::open(path)
+    let mut file = std::fs::File::open(path)
         .map_err(|error| format!("open {} for MP4 codec probe: {error}", path.display()))?;
     let size = file
         .metadata()
         .map_err(|error| format!("stat {} for MP4 codec probe: {error}", path.display()))?
         .len();
-    let primary = mp4::Mp4Reader::read_header(BufReader::new(file), size)
-        .map(|reader| summarize_mp4_tracks(reader.tracks()))
-        .map_err(|error| format!("parse M4A/MP4 track metadata ({}): {error}", path.display()));
+    let primary = (|| {
+        m4a::validate_mp4_structure(&mut file, size)
+            .map_err(|error| format!("validate M4A/MP4 structure ({}): {error}", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind {} for MP4 codec probe: {error}", path.display()))?;
+        mp4::Mp4Reader::read_header(BufReader::new(file), size)
+            .map(|reader| summarize_mp4_tracks(reader.tracks()))
+            .map_err(|error| format!("parse M4A/MP4 track metadata ({}): {error}", path.display()))
+    })();
 
     if let Ok(probe) = primary {
         if probe.audio_tracks > 0 && probe.codec != AudioCodec::Unknown {
@@ -1773,6 +1779,25 @@ mod tests {
         assert_eq!(probe.codec, AudioCodec::Aac);
         assert_eq!(probe.audio_tracks, 2);
         assert!(probe.has_non_audio_tracks);
+    }
+
+    #[test]
+    fn probe_file_rejects_nested_zero_size_mp4_box_without_stalling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("zero-size-child.m4a");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"isom");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&16u32.to_be_bytes());
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(b"free");
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = probe_file(&path).expect_err("malformed MP4 probe must fail");
+        assert!(error.contains("zero-sized MP4 box free"), "{error}");
     }
 
     #[test]
