@@ -500,6 +500,14 @@ to 100 ms. Only the low-latency Classical and RNNoise backends are live-capable;
 other backend selections are rejected before capture or playback starts. Input
 and output devices must currently share a default sample rate.
 
+Classical and RNNoise sessions preserve denoiser, overlap, partial-frame, and
+sample-rate-converter state across consecutive capture chunks. If an overloaded
+capture queue drops a chunk, the sequence gap clears queued playback and cold
+resets all processing state before the next retained chunk; state is never
+shared between separate live sessions. VAD-enabled live processing keeps the
+legacy chunk-compatible path and prints a one-time warning because causal VAD
+state and delay alignment are not yet available.
+
 ### Batch processing
 
 Process a directory tree concurrently while preserving its relative layout:

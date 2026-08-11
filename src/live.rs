@@ -10,11 +10,14 @@ use cpal::{Device, SampleFormat, Stream, StreamConfig};
 
 use crate::audio::Audio;
 use crate::config::{
-    checked_resource_add, checked_resource_multiply, ConfigError, MAX_STREAM_CHANNELS,
-    MAX_STREAM_STATE_BYTES,
+    checked_profile_target_samples, checked_resource_add, checked_resource_multiply, ConfigError,
+    MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS, MAX_STREAM_STATE_BYTES,
 };
 use crate::denoiser::DenoiserConfig;
-use crate::{denoise_audio_with_backend_config, Backend, BackendOptions, ResourcePlan};
+use crate::{
+    denoise_audio_with_backend_config, Backend, BackendOptions, ChannelMode, ResourcePlan,
+    StreamingDenoiser,
+};
 
 const MIN_CHUNK_MS: u32 = 10;
 const MAX_CHUNK_MS: u32 = 2_000;
@@ -29,6 +32,14 @@ const BASE_WORKER_AUDIO_COPIES: u64 = 9;
 // VAD additionally retains its attenuated output and a region input/output.
 const VAD_WORKER_AUDIO_COPIES: u64 = 12;
 const PLAYBACK_QUEUE_CHUNKS: u64 = 8;
+#[cfg(feature = "rnnoise")]
+const RNNOISE_SAMPLE_RATE: u64 = 48_000;
+#[cfg(feature = "rnnoise")]
+const RNNOISE_FRAME_FRAMES: u64 = 480;
+#[cfg(feature = "rnnoise")]
+const RNNOISE_RESAMPLER_CHUNK_FRAMES: u64 = 1_024;
+#[cfg(feature = "rnnoise")]
+const RNNOISE_RESAMPLER_SUB_CHUNKS: u64 = 2;
 
 static CTRL_C_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 static CTRL_C_SESSION: OnceLock<Mutex<Option<Weak<AtomicBool>>>> = OnceLock::new();
@@ -88,6 +99,135 @@ struct LiveBufferPlan {
     queue_capacity: usize,
 }
 
+fn maximum_ready_burst_frames(
+    config: &LiveConfig,
+    sample_rate: u32,
+    chunk_frames: u64,
+) -> Result<u64, ConfigError> {
+    // The compatibility path returns exactly one input chunk. Stateful paths
+    // can release samples retained by profiling, frame quantization, model
+    // framing, and sample-rate conversion together with the current chunk.
+    if config.denoiser.vad {
+        return Ok(chunk_frames);
+    }
+    match config.backend {
+        Backend::Classical => {
+            // Live automatic profiling starts the adaptive estimator
+            // immediately, so only explicit positive profiles retain a
+            // prefix. Once initialized, at most one classical FFT frame of
+            // original samples can remain unreturned between calls.
+            let profile_target = if config.denoiser.profile_ms > 0.0 {
+                u64::try_from(checked_profile_target_samples(
+                    config.denoiser.profile_ms,
+                    sample_rate,
+                    config.denoiser.frame_size,
+                )?)
+                .map_err(|_| ConfigError::ResourceOverflow {
+                    resource: "live classical ready burst",
+                })?
+            } else {
+                0
+            };
+            let backlog = profile_target.max(config.denoiser.frame_size as u64);
+            checked_resource_add("live classical ready burst", chunk_frames, backlog)
+        }
+        #[cfg(feature = "rnnoise")]
+        Backend::Rnnoise => {
+            let first_src_debt = rnnoise_resampler_output_debt(sample_rate as u64, 48_000)?;
+            let model_debt = RNNOISE_FRAME_FRAMES - 1;
+            let debt_at_48k =
+                checked_resource_add("live RNNoise ready burst", first_src_debt, model_debt)?;
+            let upstream_debt = checked_ceil_scale(
+                "live RNNoise ready burst",
+                debt_at_48k,
+                sample_rate as u64,
+                RNNOISE_SAMPLE_RATE,
+            )?;
+            let second_src_debt =
+                rnnoise_resampler_output_debt(RNNOISE_SAMPLE_RATE, sample_rate as u64)?;
+            let backlog =
+                checked_resource_add("live RNNoise ready burst", upstream_debt, second_src_debt)?;
+            checked_resource_add("live RNNoise ready burst", chunk_frames, backlog)
+        }
+        #[allow(unreachable_patterns)]
+        _ => Err(ConfigError::invalid(
+            "backend",
+            "classical or rnnoise for realtime processing",
+        )),
+    }
+}
+
+#[cfg(feature = "rnnoise")]
+fn rnnoise_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, ConfigError> {
+    if from_rate == to_rate {
+        return Ok(0);
+    }
+    let gcd = greatest_common_divisor(from_rate, to_rate);
+    let minimum_input_chunk = from_rate / gcd;
+    let wanted_subchunk = RNNOISE_RESAMPLER_CHUNK_FRAMES / RNNOISE_RESAMPLER_SUB_CHUNKS;
+    let fft_chunks = checked_ceil_div(
+        "live RNNoise resampler quantum",
+        wanted_subchunk,
+        minimum_input_chunk,
+    )?;
+    let fft_size_in = checked_resource_multiply(
+        "live RNNoise resampler quantum",
+        fft_chunks,
+        from_rate / gcd,
+    )?;
+    let fft_size_out =
+        checked_resource_multiply("live RNNoise resampler quantum", fft_chunks, to_rate / gcd)?;
+    let external_pending = RNNOISE_RESAMPLER_CHUNK_FRAMES - 1;
+    let internal_pending = fft_size_in - 1;
+    let held_input = checked_resource_add(
+        "live RNNoise resampler quantum",
+        external_pending,
+        internal_pending,
+    )?;
+    let held_output = checked_ceil_scale(
+        "live RNNoise resampler quantum",
+        held_input,
+        to_rate,
+        from_rate,
+    )?;
+    let filter_delay = fft_size_out / 2;
+    // One frame covers each nearest-rounded stream clock boundary.
+    let delayed =
+        checked_resource_add("live RNNoise resampler quantum", held_output, filter_delay)?;
+    checked_resource_add("live RNNoise resampler quantum", delayed, 2)
+}
+
+#[cfg(feature = "rnnoise")]
+fn checked_ceil_scale(
+    resource: &'static str,
+    value: u64,
+    numerator: u64,
+    denominator: u64,
+) -> Result<u64, ConfigError> {
+    let product = checked_resource_multiply(resource, value, numerator)?;
+    checked_ceil_div(resource, product, denominator)
+}
+
+#[cfg(feature = "rnnoise")]
+fn checked_ceil_div(
+    resource: &'static str,
+    numerator: u64,
+    denominator: u64,
+) -> Result<u64, ConfigError> {
+    let adjusted = checked_resource_add(resource, numerator, denominator - 1)?;
+    Ok(adjusted / denominator)
+}
+
+#[cfg(feature = "rnnoise")]
+fn greatest_common_divisor(mut lhs: u64, mut rhs: u64) -> u64 {
+    while rhs != 0 {
+        let remainder = lhs % rhs;
+        lhs = rhs;
+        rhs = remainder;
+    }
+    lhs
+}
+
 fn plan_live_buffers(
     config: &LiveConfig,
     sample_rate: u32,
@@ -106,18 +246,26 @@ fn plan_live_buffers(
     denoiser.validate_config()?;
     #[cfg(feature = "rnnoise")]
     let rnnoise_resampler_bytes = if config.backend == Backend::Rnnoise {
-        let mut maximum = 0u64;
+        let processor_channels = if input_channels == 2
+            && config.backend_options.channel_mode == ChannelMode::StereoLinked
+        {
+            1
+        } else {
+            input_channels
+        };
+        let mut total = 0u64;
         for (from_rate, to_rate) in [(sample_rate, 48_000), (48_000, sample_rate)] {
             let bytes =
-                crate::resample::resampler_plan_bytes(1, from_rate, to_rate).map_err(|_| {
-                    ConfigError::invalid(
-                        "sample_rate",
-                        "a rate with a bounded RNNoise 48 kHz resampler plan",
-                    )
-                })?;
-            maximum = maximum.max(bytes);
+                crate::resample::resampler_plan_bytes(processor_channels, from_rate, to_rate)
+                    .map_err(|_| {
+                        ConfigError::invalid(
+                            "sample_rate",
+                            "a rate with a bounded RNNoise 48 kHz resampler plan",
+                        )
+                    })?;
+            total = checked_resource_add("live RNNoise resamplers", total, bytes)?;
         }
-        maximum
+        total
     } else {
         0
     };
@@ -136,15 +284,23 @@ fn plan_live_buffers(
         config.chunk_ms as u64,
     )?;
     let chunk_frames_u64 = (chunk_numerator / 1_000).max(1);
+    let ready_burst_frames = maximum_ready_burst_frames(config, sample_rate, chunk_frames_u64)?;
     let input_samples =
         checked_resource_multiply("live input buffer", chunk_frames_u64, input_channels as u64)?;
-    let queue_samples = checked_resource_multiply(
+    let steady_queue_frames = checked_resource_multiply(
         "live playback queue",
         chunk_frames_u64,
-        output_channels as u64,
+        PLAYBACK_QUEUE_CHUNKS,
+    )?;
+    // Keep the historical eight-chunk scheduling cushion plus one complete
+    // stateful release. The latter can be much larger than an input chunk.
+    let queue_frames = checked_resource_add(
+        "live playback queue",
+        steady_queue_frames,
+        ready_burst_frames,
     )?;
     let queue_samples =
-        checked_resource_multiply("live playback queue", queue_samples, PLAYBACK_QUEUE_CHUNKS)?;
+        checked_resource_multiply("live playback queue", queue_frames, output_channels as u64)?;
 
     let captured_chunk_bytes = checked_resource_multiply(
         "live working set",
@@ -166,14 +322,56 @@ fn plan_live_buffers(
     } else {
         BASE_WORKER_AUDIO_COPIES
     };
-    let worker_bytes =
-        checked_resource_multiply("live working set", worker_chunk_bytes, worker_audio_copies)?;
+    // One of the historical chunk-sized copies is the processed output. Size
+    // that copy by its real maximum burst and retain the other conservative
+    // chunk copies unchanged.
+    let regular_worker_bytes = checked_resource_multiply(
+        "live working set",
+        worker_chunk_bytes,
+        worker_audio_copies - 1,
+    )?;
+    let ready_samples = checked_resource_multiply(
+        "live working set",
+        ready_burst_frames,
+        input_channels as u64,
+    )?;
+    let ready_bytes = checked_resource_multiply(
+        "live working set",
+        ready_samples,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    let worker_bytes = checked_resource_add("live working set", regular_worker_bytes, ready_bytes)?;
+    let linked_alignment_bytes = if !denoiser.vad
+        && input_channels == 2
+        && config.backend_options.channel_mode == ChannelMode::StereoLinked
+    {
+        let retained_frames = ready_burst_frames.checked_sub(chunk_frames_u64).ok_or(
+            ConfigError::ResourceOverflow {
+                resource: "live linked alignment",
+            },
+        )?;
+        let retained_samples = checked_resource_multiply(
+            "live linked alignment",
+            retained_frames,
+            input_channels as u64,
+        )?;
+        checked_resource_multiply(
+            "live linked alignment",
+            retained_samples,
+            std::mem::size_of::<f64>() as u64,
+        )?
+    } else {
+        0
+    };
     let playback_bytes = checked_resource_multiply(
         "live working set",
         queue_samples,
         std::mem::size_of::<f32>() as u64,
     )?;
-    let input_bytes = checked_resource_add("live working set", captured_bytes, worker_bytes)?;
+    let worker_and_alignment =
+        checked_resource_add("live working set", worker_bytes, linked_alignment_bytes)?;
+    let input_bytes =
+        checked_resource_add("live working set", captured_bytes, worker_and_alignment)?;
     let buffer_bytes = checked_resource_add("live working set", input_bytes, playback_bytes)?;
     let stream_and_buffers = checked_resource_add(
         "live working set",
@@ -222,6 +420,366 @@ pub struct LiveStatus {
     pub output_level: f32,
     pub processed_chunks: u64,
     pub dropped_chunks: u64,
+}
+
+struct CapturedChunk {
+    sequence: u64,
+    samples: Vec<f32>,
+}
+
+#[derive(Clone)]
+struct LiveProcessorSpec {
+    backend: Backend,
+    backend_options: BackendOptions,
+    denoiser: DenoiserConfig,
+    channels: usize,
+}
+
+struct ProcessedLiveBlock {
+    channels: Vec<Vec<f64>>,
+    reset_for_gap: bool,
+}
+
+/// All DSP state owned by one live session. Rebuilding `kind` before swapping
+/// it in makes a discontinuity reset transactional: a failed allocation leaves
+/// the old state untouched and terminates the session instead of advancing a
+/// subset of the channel, overlap-add, or resampler state.
+struct LiveProcessor {
+    spec: LiveProcessorSpec,
+    kind: LiveProcessorKind,
+    next_sequence: u64,
+}
+
+enum LiveProcessorKind {
+    Stateful(Box<StatefulLiveProcessor>),
+    Compatibility(CompatibilityLiveProcessor),
+}
+
+struct CompatibilityLiveProcessor {
+    backend: Backend,
+    backend_options: BackendOptions,
+    denoiser: DenoiserConfig,
+}
+
+struct StatefulLiveProcessor {
+    processor: StatefulBackend,
+    channel_mode: ChannelMode,
+    input_channels: usize,
+    linked_original: VecDeque<(f64, f64)>,
+}
+
+enum StatefulBackend {
+    Classical(StreamingDenoiser),
+    #[cfg(feature = "rnnoise")]
+    Rnnoise(Box<crate::backend::RnnoiseStreamingProcessor>),
+}
+
+impl LiveProcessor {
+    fn new(config: &LiveConfig, channels: usize) -> Result<Self, String> {
+        let spec = LiveProcessorSpec {
+            backend: config.backend,
+            backend_options: config.backend_options.clone(),
+            denoiser: config.denoiser.clone(),
+            channels,
+        };
+        let kind = LiveProcessorKind::new(&spec, true)?;
+        Ok(Self {
+            spec,
+            kind,
+            next_sequence: 0,
+        })
+    }
+
+    fn process_chunk(
+        &mut self,
+        sequence: u64,
+        channels: Vec<Vec<f64>>,
+    ) -> Result<ProcessedLiveBlock, String> {
+        validate_live_block(&channels, self.spec.channels)?;
+        let following = sequence
+            .checked_add(1)
+            .ok_or_else(|| "live capture sequence exhausted".to_string())?;
+        let reset_for_gap = sequence != self.next_sequence;
+        if reset_for_gap {
+            let replacement = LiveProcessorKind::new(&self.spec, false)?;
+            self.kind = replacement;
+        }
+        self.next_sequence = following;
+        let mut channels = self.kind.process_block(channels)?;
+        validate_live_block(&channels, self.spec.channels)?;
+        for sample in channels.iter_mut().flatten() {
+            *sample = crate::audio::sanitize_sample(*sample);
+        }
+        Ok(ProcessedLiveBlock {
+            channels,
+            reset_for_gap,
+        })
+    }
+}
+
+impl LiveProcessorKind {
+    fn new(spec: &LiveProcessorSpec, warn_compatibility: bool) -> Result<Self, String> {
+        if spec.denoiser.vad {
+            if warn_compatibility {
+                eprintln!(
+                    "denoize: live VAD uses chunk-compatible processing; persistent DSP state is unavailable"
+                );
+            }
+            return Ok(Self::Compatibility(CompatibilityLiveProcessor {
+                backend: spec.backend,
+                backend_options: spec.backend_options.clone(),
+                denoiser: spec.denoiser.clone(),
+            }));
+        }
+        Ok(Self::Stateful(Box::new(StatefulLiveProcessor::new(spec)?)))
+    }
+
+    fn process_block(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+        match self {
+            Self::Stateful(processor) => processor.process_block(&channels),
+            Self::Compatibility(processor) => processor.process_block(channels),
+        }
+    }
+}
+
+impl CompatibilityLiveProcessor {
+    fn process_block(&mut self, channels: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, String> {
+        let mut audio = Audio {
+            sample_rate: self.denoiser.sample_rate,
+            channels,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        denoise_audio_with_backend_config(
+            &mut audio,
+            self.denoiser.clone(),
+            self.backend,
+            &self.backend_options,
+        )?;
+        Ok(audio.channels)
+    }
+}
+
+impl StatefulLiveProcessor {
+    fn new(spec: &LiveProcessorSpec) -> Result<Self, String> {
+        let stereo_mode =
+            spec.channels == 2 && spec.backend_options.channel_mode != ChannelMode::Independent;
+        let processor_channels =
+            if stereo_mode && spec.backend_options.channel_mode == ChannelMode::StereoLinked {
+                1
+            } else {
+                spec.channels
+            };
+        let processor = match spec.backend {
+            Backend::Classical => {
+                let mut config = spec.denoiser.clone();
+                // Automatic profiling intentionally buffers up to 1.5 seconds
+                // for offline analysis. A realtime session instead starts the
+                // adaptive estimator immediately so the first live chunk is
+                // emitted after only the normal overlap-add latency.
+                if config.profile_ms == 0.0 {
+                    config.profile_ms = -1.0;
+                }
+                StatefulBackend::Classical(StreamingDenoiser::new(config, processor_channels)?)
+            }
+            #[cfg(feature = "rnnoise")]
+            Backend::Rnnoise => {
+                StatefulBackend::Rnnoise(Box::new(crate::backend::RnnoiseStreamingProcessor::new(
+                    spec.denoiser.sample_rate,
+                    processor_channels,
+                )?))
+            }
+            #[allow(unreachable_patterns)]
+            _ => return Err("selected backend is not live-capable".into()),
+        };
+        Ok(Self {
+            processor,
+            channel_mode: if stereo_mode {
+                spec.backend_options.channel_mode
+            } else {
+                ChannelMode::Independent
+            },
+            input_channels: spec.channels,
+            linked_original: VecDeque::new(),
+        })
+    }
+
+    fn process_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        self.process_block_with_limit(channels, MAX_STREAM_BLOCK_FRAMES)
+    }
+
+    fn process_block_with_limit(
+        &mut self,
+        channels: &[Vec<f64>],
+        block_limit: usize,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        validate_live_block(channels, self.input_channels)?;
+        if block_limit == 0 {
+            return Err("live processor block limit must be positive".into());
+        }
+        let frames = channels.first().map(Vec::len).unwrap_or(0);
+        if frames <= block_limit {
+            return self.process_bounded_block(channels);
+        }
+
+        let mut output = try_empty_live_channels(self.input_channels)?;
+        let mut position = 0usize;
+        while position < frames {
+            let end = bounded_subblock_end(position, frames, block_limit);
+            let block = try_clone_live_range(channels, position, end)?;
+            let ready = self.process_bounded_block(&block)?;
+            append_live_channels(&mut output, &ready, self.input_channels)?;
+            position = end;
+        }
+        Ok(output)
+    }
+
+    fn process_bounded_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        debug_assert!(channels.first().map(Vec::len).unwrap_or(0) <= MAX_STREAM_BLOCK_FRAMES);
+        match self.channel_mode {
+            ChannelMode::Independent => self.processor.process_block(channels),
+            ChannelMode::StereoLinked => self.process_linked(channels),
+            ChannelMode::MidSide => self.process_mid_side(channels),
+        }
+    }
+
+    fn process_linked(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        let frames = channels[0].len();
+        self.linked_original
+            .try_reserve(frames)
+            .map_err(|_| ConfigError::allocation_failed("live linked alignment").to_string())?;
+        let mut mid = Vec::new();
+        mid.try_reserve_exact(frames)
+            .map_err(|_| ConfigError::allocation_failed("live linked mid channel").to_string())?;
+        for (&left, &right) in channels[0].iter().zip(&channels[1]) {
+            let left = crate::audio::sanitize_sample(left);
+            let right = crate::audio::sanitize_sample(right);
+            mid.push((left + right) * 0.5);
+            self.linked_original.push_back((left, right));
+        }
+        let mut enhanced = self.processor.process_block(&[mid])?;
+        if enhanced.len() != 1 {
+            return Err("linked live processor must return exactly one channel".into());
+        }
+        let enhanced = enhanced.pop().unwrap_or_default();
+        if enhanced.len() > self.linked_original.len() {
+            return Err("linked live processor returned unaligned frames".into());
+        }
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        left.try_reserve_exact(enhanced.len())
+            .map_err(|_| ConfigError::allocation_failed("live linked output").to_string())?;
+        right
+            .try_reserve_exact(enhanced.len())
+            .map_err(|_| ConfigError::allocation_failed("live linked output").to_string())?;
+        for clean in enhanced {
+            let (original_left, original_right) = self
+                .linked_original
+                .pop_front()
+                .ok_or_else(|| "linked live alignment queue underflow".to_string())?;
+            let original_mid = (original_left + original_right) * 0.5;
+            let correction = clean - original_mid;
+            left.push(crate::audio::sanitize_sample(original_left + correction));
+            right.push(crate::audio::sanitize_sample(original_right + correction));
+        }
+        Ok(vec![left, right])
+    }
+
+    fn process_mid_side(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        let (mid, side) = crate::backend::encode_mid_side(&channels[0], &channels[1])?;
+        let processed = self.processor.process_block(&[mid, side])?;
+        if processed.len() != 2 {
+            return Err("mid-side live processor must return exactly two channels".into());
+        }
+        let (left, right) = crate::backend::decode_mid_side(&processed[0], &processed[1])?;
+        Ok(vec![left, right])
+    }
+}
+
+fn bounded_subblock_end(position: usize, frames: usize, block_limit: usize) -> usize {
+    position.saturating_add(block_limit).min(frames)
+}
+
+fn try_empty_live_channels(channels: usize) -> Result<Vec<Vec<f64>>, String> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(channels)
+        .map_err(|_| ConfigError::allocation_failed("live split output channels").to_string())?;
+    for _ in 0..channels {
+        output.push(Vec::new());
+    }
+    Ok(output)
+}
+
+fn try_clone_live_range(
+    channels: &[Vec<f64>],
+    start: usize,
+    end: usize,
+) -> Result<Vec<Vec<f64>>, String> {
+    let frames = end.checked_sub(start).ok_or_else(|| {
+        ConfigError::ResourceOverflow {
+            resource: "live split block",
+        }
+        .to_string()
+    })?;
+    let mut block = Vec::new();
+    block
+        .try_reserve_exact(channels.len())
+        .map_err(|_| ConfigError::allocation_failed("live split channels").to_string())?;
+    for channel in channels {
+        let mut split = Vec::new();
+        split
+            .try_reserve_exact(frames)
+            .map_err(|_| ConfigError::allocation_failed("live split samples").to_string())?;
+        split.extend_from_slice(&channel[start..end]);
+        block.push(split);
+    }
+    Ok(block)
+}
+
+fn append_live_channels(
+    output: &mut [Vec<f64>],
+    block: &[Vec<f64>],
+    expected_channels: usize,
+) -> Result<(), String> {
+    validate_live_block(block, expected_channels)?;
+    if output.len() != expected_channels {
+        return Err("live split output channel count changed".into());
+    }
+    for (output, block) in output.iter_mut().zip(block) {
+        output
+            .try_reserve_exact(block.len())
+            .map_err(|_| ConfigError::allocation_failed("live split output").to_string())?;
+    }
+    for (output, block) in output.iter_mut().zip(block) {
+        output.extend_from_slice(block);
+    }
+    Ok(())
+}
+
+impl StatefulBackend {
+    fn process_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        match self {
+            Self::Classical(processor) => processor.process_block(channels),
+            #[cfg(feature = "rnnoise")]
+            Self::Rnnoise(processor) => processor.process_block(channels),
+        }
+    }
+}
+
+fn validate_live_block(channels: &[Vec<f64>], expected_channels: usize) -> Result<(), String> {
+    if channels.len() != expected_channels {
+        return Err(format!(
+            "expected {expected_channels} live channels, got {}",
+            channels.len()
+        ));
+    }
+    let frames = channels.first().map(Vec::len).unwrap_or(0);
+    if channels.iter().any(|channel| channel.len() != frames) {
+        return Err("live blocks must have equal channel lengths".into());
+    }
+    Ok(())
 }
 
 /// Return the input and output device names exposed by the default host.
@@ -359,7 +917,8 @@ where
     pending_input
         .try_reserve_exact(buffer_plan.input_capacity)
         .map_err(|_| ConfigError::allocation_failed("live input buffer").to_string())?;
-    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(CAPTURE_QUEUE_CHUNKS);
+    let (tx, rx) = mpsc::sync_channel::<CapturedChunk>(CAPTURE_QUEUE_CHUNKS);
+    let live_processor = LiveProcessor::new(&config, in_channels)?;
     let input_level = Arc::new(AtomicU32::new(0));
     let output_level = Arc::new(AtomicU32::new(0));
     let dropped_chunks = Arc::new(AtomicU64::new(0));
@@ -371,9 +930,10 @@ where
     let worker_processed = Arc::clone(&processed_chunks);
     let worker_failure = Arc::clone(&worker_error);
     let worker = std::thread::spawn(move || {
+        let mut live_processor = live_processor;
         while worker_running.load(Ordering::Relaxed) {
-            let samples = match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(samples) => samples,
+            let captured = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(captured) => captured,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(_) => break,
             };
@@ -403,44 +963,43 @@ where
                 worker_running.store(false, Ordering::Relaxed);
                 break;
             }
-            for frame in samples.chunks_exact(in_channels) {
+            for frame in captured.samples.chunks_exact(in_channels) {
                 for (channel, sample) in channels.iter_mut().zip(frame) {
                     channel.push(*sample as f64);
                 }
             }
-            let mut audio = Audio {
-                sample_rate: rate,
-                channels,
-                bits_per_sample: 32,
-                sample_format: hound::SampleFormat::Float,
-                channel_mask: None,
+            let processed = match live_processor.process_chunk(captured.sequence, channels) {
+                Ok(processed) => processed,
+                Err(error) => {
+                    if let Ok(mut failure) = worker_failure.lock() {
+                        *failure = Some(error);
+                    }
+                    worker_running.store(false, Ordering::Relaxed);
+                    break;
+                }
             };
-            if let Err(error) = denoise_audio_with_backend_config(
-                &mut audio,
-                config.denoiser.clone(),
-                config.backend,
-                &config.backend_options,
-            ) {
-                eprintln!("denoize: live processing error: {error}");
+            let audio = processed.channels;
+            let enqueue_result = match worker_playback.lock() {
+                Ok(mut queue) => {
+                    if processed.reset_for_gap {
+                        queue.clear();
+                    }
+                    enqueue_playback_block(
+                        &mut queue,
+                        &audio,
+                        out_channels,
+                        queue_capacity,
+                        &worker_output_level,
+                    )
+                }
+                Err(_) => Err("live playback queue lock poisoned".into()),
+            };
+            if let Err(error) = enqueue_result {
                 if let Ok(mut failure) = worker_failure.lock() {
                     *failure = Some(error);
                 }
                 worker_running.store(false, Ordering::Relaxed);
                 break;
-            }
-            let frames = audio.frames();
-            if let Ok(mut queue) = worker_playback.lock() {
-                for frame in 0..frames {
-                    for out_ch in 0..out_channels {
-                        let source = out_ch.min(audio.channels().saturating_sub(1));
-                        if queue.len() == queue_capacity {
-                            queue.pop_front();
-                        }
-                        let sample = audio.channels[source][frame] as f32;
-                        store_peak(&worker_output_level, sample.abs());
-                        queue.push_back(sample);
-                    }
-                }
             }
             worker_processed.fetch_add(1, Ordering::Relaxed);
         }
@@ -541,7 +1100,7 @@ fn build_input(
     device: &Device,
     cfg: &StreamConfig,
     format: SampleFormat,
-    tx: mpsc::SyncSender<Vec<f32>>,
+    tx: mpsc::SyncSender<CapturedChunk>,
     chunk_frames: usize,
     pending: Vec<f32>,
     input_level: Arc<AtomicU32>,
@@ -559,14 +1118,29 @@ fn build_input(
     macro_rules! stream {
         ($ty:ty, $convert:expr) => {{
             let mut pending = pending;
-            let session_error = Arc::clone(&session_error);
-            let running = Arc::clone(&running);
+            let mut next_sequence = 0u64;
+            let data_session_error = Arc::clone(&session_error);
+            let stream_session_error = Arc::clone(&session_error);
+            let data_running = Arc::clone(&running);
+            let stream_running = Arc::clone(&running);
             device.build_input_stream(
                 cfg,
                 move |data: &[$ty], _| {
                     for sample in data.iter().map($convert) {
                         pending.push(sample);
                         if pending.len() == capacity {
+                            let sequence = next_sequence;
+                            let Some(following) = next_sequence.checked_add(1) else {
+                                if let Ok(mut failure) = data_session_error.lock() {
+                                    if failure.is_none() {
+                                        *failure = Some("live capture sequence exhausted".into());
+                                    }
+                                }
+                                data_running.store(false, Ordering::Relaxed);
+                                pending.clear();
+                                return;
+                            };
+                            next_sequence = following;
                             let mut chunk = Vec::new();
                             if chunk.try_reserve_exact(capacity).is_err() {
                                 pending.clear();
@@ -577,7 +1151,13 @@ fn build_input(
                             for sample in &chunk {
                                 store_peak(&input_level, sample.abs());
                             }
-                            if tx.try_send(chunk).is_err() {
+                            if tx
+                                .try_send(CapturedChunk {
+                                    sequence,
+                                    samples: chunk,
+                                })
+                                .is_err()
+                            {
                                 dropped_chunks.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -585,12 +1165,12 @@ fn build_input(
                 },
                 move |error| {
                     let message = format!("input stream error: {error}");
-                    if let Ok(mut failure) = session_error.lock() {
+                    if let Ok(mut failure) = stream_session_error.lock() {
                         if failure.is_none() {
                             *failure = Some(message.clone());
                         }
                     }
-                    running.store(false, Ordering::Relaxed);
+                    stream_running.store(false, Ordering::Relaxed);
                     eprintln!("denoize: {message}");
                 },
                 None,
@@ -619,6 +1199,40 @@ fn store_peak(target: &AtomicU32, value: f32) {
             Err(next) => current = next,
         }
     }
+}
+
+fn enqueue_playback_block(
+    queue: &mut VecDeque<f32>,
+    audio: &[Vec<f64>],
+    output_channels: usize,
+    queue_capacity: usize,
+    output_level: &AtomicU32,
+) -> Result<(), String> {
+    let frames = audio.first().map(Vec::len).unwrap_or(0);
+    if audio.is_empty() || audio.iter().any(|channel| channel.len() != frames) {
+        return Err("live processor returned invalid playback channels".into());
+    }
+    let samples = frames
+        .checked_mul(output_channels)
+        .ok_or_else(|| "live playback block size overflow".to_string())?;
+    let required = queue
+        .len()
+        .checked_add(samples)
+        .ok_or_else(|| "live playback queue length overflow".to_string())?;
+    if required > queue_capacity {
+        return Err(format!(
+            "live playback queue invariant exceeded: {required} samples ready, capacity {queue_capacity}"
+        ));
+    }
+    for frame in 0..frames {
+        for out_ch in 0..output_channels {
+            let source = out_ch.min(audio.len() - 1);
+            let sample = audio[source][frame] as f32;
+            store_peak(output_level, sample.abs());
+            queue.push_back(sample);
+        }
+    }
+    Ok(())
 }
 
 fn build_output(
@@ -685,6 +1299,235 @@ mod tests {
         }
     }
 
+    fn processor_config(channel_mode: ChannelMode) -> LiveConfig {
+        let mut config = config();
+        config.denoiser.sample_rate = 48_000;
+        config.denoiser.frame_size = 256;
+        config.denoiser.overlap = 0.75;
+        config.backend_options.channel_mode = channel_mode;
+        config
+    }
+
+    #[cfg(feature = "rnnoise")]
+    fn rnnoise_processor_config(channel_mode: ChannelMode) -> LiveConfig {
+        let mut config = processor_config(channel_mode);
+        config.backend = Backend::Rnnoise;
+        config.denoiser.sample_rate = 44_100;
+        config
+    }
+
+    fn stereo_signal(frames: usize) -> Vec<Vec<f64>> {
+        vec![
+            (0..frames)
+                .map(|frame| (frame as f64 * 0.031).sin() * 0.08)
+                .collect(),
+            (0..frames)
+                .map(|frame| (frame as f64 * 0.047).cos() * 0.06)
+                .collect(),
+        ]
+    }
+
+    fn process_partitions(
+        config: &LiveConfig,
+        input: &[Vec<f64>],
+        partitions: &[usize],
+    ) -> Vec<Vec<f64>> {
+        let mut processor = LiveProcessor::new(config, input.len()).unwrap();
+        let mut output = vec![Vec::new(); input.len()];
+        let mut position = 0usize;
+        let mut sequence = 0u64;
+        let mut partition = 0usize;
+        while position < input[0].len() {
+            let frames = partitions[partition % partitions.len()]
+                .min(input[0].len().saturating_sub(position));
+            let block: Vec<Vec<f64>> = input
+                .iter()
+                .map(|channel| channel[position..position + frames].to_vec())
+                .collect();
+            let processed = processor.process_chunk(sequence, block).unwrap();
+            assert!(!processed.reset_for_gap);
+            for (output, block) in output.iter_mut().zip(processed.channels) {
+                output.extend(block);
+            }
+            position += frames;
+            sequence += 1;
+            partition += 1;
+        }
+        output
+    }
+
+    #[test]
+    fn session_processor_is_partition_invariant_for_all_channel_modes() {
+        let input = stereo_signal(8_193);
+        for mode in [
+            ChannelMode::Independent,
+            ChannelMode::StereoLinked,
+            ChannelMode::MidSide,
+        ] {
+            let config = processor_config(mode);
+            let contiguous = process_partitions(&config, &input, &[input[0].len()]);
+            let irregular = process_partitions(&config, &input, &[1, 17, 3, 511, 64, 2, 997]);
+            assert_eq!(irregular, contiguous, "partition mismatch for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_live_blocks_split_at_the_stream_cap_without_changing_output() {
+        assert_eq!(
+            bounded_subblock_end(0, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_BLOCK_FRAMES),
+            MAX_STREAM_BLOCK_FRAMES
+        );
+        assert_eq!(
+            bounded_subblock_end(0, MAX_STREAM_BLOCK_FRAMES + 1, MAX_STREAM_BLOCK_FRAMES),
+            MAX_STREAM_BLOCK_FRAMES
+        );
+        assert_eq!(
+            bounded_subblock_end(
+                MAX_STREAM_BLOCK_FRAMES,
+                MAX_STREAM_BLOCK_FRAMES + 1,
+                MAX_STREAM_BLOCK_FRAMES
+            ),
+            MAX_STREAM_BLOCK_FRAMES + 1
+        );
+
+        let input = stereo_signal(1_003);
+        for mode in [
+            ChannelMode::Independent,
+            ChannelMode::StereoLinked,
+            ChannelMode::MidSide,
+        ] {
+            let config = processor_config(mode);
+            let spec = LiveProcessorSpec {
+                backend: config.backend,
+                backend_options: config.backend_options.clone(),
+                denoiser: config.denoiser.clone(),
+                channels: 2,
+            };
+            let mut contiguous = StatefulLiveProcessor::new(&spec).unwrap();
+            let mut split = StatefulLiveProcessor::new(&spec).unwrap();
+            let expected = contiguous
+                .process_block_with_limit(&input, input[0].len())
+                .unwrap();
+            let actual = split.process_block_with_limit(&input, 37).unwrap();
+            assert_eq!(actual, expected, "internal split mismatch for {mode:?}");
+        }
+    }
+
+    #[test]
+    fn linked_stream_keeps_original_side_samples_aligned_with_delayed_output() {
+        let input = stereo_signal(4_097);
+        let output = process_partitions(
+            &processor_config(ChannelMode::StereoLinked),
+            &input,
+            &[37, 1, 509, 8, 113],
+        );
+        assert_eq!(output[0].len(), output[1].len());
+        assert!(!output[0].is_empty());
+        for frame in 0..output[0].len() {
+            let original_side = input[0][frame] - input[1][frame];
+            let processed_side = output[0][frame] - output[1][frame];
+            assert!((processed_side - original_side).abs() < 1e-12);
+        }
+    }
+
+    #[cfg(feature = "rnnoise")]
+    #[test]
+    fn rnnoise_live_resamplers_are_partition_invariant_in_all_channel_modes() {
+        let input = stereo_signal(10_003);
+        for mode in [
+            ChannelMode::Independent,
+            ChannelMode::StereoLinked,
+            ChannelMode::MidSide,
+        ] {
+            let config = rnnoise_processor_config(mode);
+            let contiguous = process_partitions(&config, &input, &[input[0].len()]);
+            let irregular = process_partitions(&config, &input, &[1, 441, 7, 1_777, 32, 2, 997]);
+            assert_eq!(irregular, contiguous, "RNNoise mismatch for {mode:?}");
+            assert!(!irregular[0].is_empty());
+        }
+    }
+
+    #[cfg(feature = "rnnoise")]
+    #[test]
+    fn rnnoise_gap_reset_is_cold_across_model_and_both_resamplers() {
+        let config = rnnoise_processor_config(ChannelMode::StereoLinked);
+        let prelude = stereo_signal(5_001);
+        let post_gap = stereo_signal(7_003);
+        let mut interrupted = LiveProcessor::new(&config, 2).unwrap();
+        interrupted.process_chunk(0, prelude).unwrap();
+        let reset = interrupted.process_chunk(3, post_gap.clone()).unwrap();
+        assert!(reset.reset_for_gap);
+
+        let mut cold = LiveProcessor::new(&config, 2).unwrap();
+        let expected = cold.process_chunk(0, post_gap.clone()).unwrap();
+        assert_eq!(reset.channels, expected.channels);
+        for frame in 0..reset.channels[0].len() {
+            let original_side = post_gap[0][frame] - post_gap[1][frame];
+            let processed_side = reset.channels[0][frame] - reset.channels[1][frame];
+            assert!((processed_side - original_side).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn sequence_gap_replaces_every_session_state_with_a_cold_processor() {
+        let config = processor_config(ChannelMode::MidSide);
+        let prelude = stereo_signal(2_048);
+        let post_gap = stereo_signal(3_001);
+        let mut interrupted = LiveProcessor::new(&config, 2).unwrap();
+        let first = interrupted.process_chunk(0, prelude).unwrap();
+        assert!(!first.reset_for_gap);
+        let reset = interrupted.process_chunk(2, post_gap.clone()).unwrap();
+        assert!(reset.reset_for_gap);
+
+        let mut cold = LiveProcessor::new(&config, 2).unwrap();
+        let expected = cold.process_chunk(0, post_gap).unwrap();
+        assert_eq!(reset.channels, expected.channels);
+    }
+
+    #[test]
+    fn new_live_sessions_never_inherit_previous_dsp_state() {
+        let config = processor_config(ChannelMode::Independent);
+        let dirtying_input = stereo_signal(4_000);
+        let session_input = stereo_signal(2_503);
+        let mut old_session = LiveProcessor::new(&config, 2).unwrap();
+        old_session.process_chunk(0, dirtying_input).unwrap();
+
+        let mut first_new_session = LiveProcessor::new(&config, 2).unwrap();
+        let mut second_new_session = LiveProcessor::new(&config, 2).unwrap();
+        let first = first_new_session
+            .process_chunk(0, session_input.clone())
+            .unwrap();
+        let second = second_new_session.process_chunk(0, session_input).unwrap();
+        assert_eq!(first.channels, second.channels);
+    }
+
+    #[test]
+    fn automatic_profile_live_bootstrap_emits_from_the_first_chunk() {
+        let mut config = config();
+        config.denoiser.sample_rate = 48_000;
+        assert_eq!(config.denoiser.profile_ms, 0.0);
+        let input = vec![(0..4_800)
+            .map(|frame| (frame as f64 * 0.029).sin() * 0.1)
+            .collect()];
+        let mut processor = LiveProcessor::new(&config, 1).unwrap();
+        let output = processor.process_chunk(0, input).unwrap().channels;
+        assert!(
+            !output[0].is_empty(),
+            "automatic live profiling must not buffer 1.5 seconds"
+        );
+    }
+
+    #[test]
+    fn vad_retains_the_chunk_compatible_processing_path() {
+        let mut config = processor_config(ChannelMode::Independent);
+        config.denoiser.vad = true;
+        let processor = LiveProcessor::new(&config, 1).unwrap();
+        assert!(matches!(
+            processor.kind,
+            LiveProcessorKind::Compatibility(_)
+        ));
+    }
+
     #[test]
     fn peak_store_only_moves_upward() {
         let peak = AtomicU32::new(0.0_f32.to_bits());
@@ -692,6 +1535,114 @@ mod tests {
         store_peak(&peak, 0.2);
         store_peak(&peak, 0.8);
         assert_eq!(f32::from_bits(peak.load(Ordering::Relaxed)), 0.8);
+    }
+
+    #[test]
+    fn classical_ready_burst_plan_covers_frame_quantization_and_profiles() {
+        let mut config = config();
+        config.chunk_ms = MIN_CHUNK_MS;
+        config.denoiser.sample_rate = 8_000;
+        config.denoiser.frame_size = 4_096;
+        config.denoiser.overlap = 0.5;
+        let plan = plan_live_buffers(&config, 8_000, 1, 1).unwrap();
+        assert_eq!(plan.chunk_frames, 80);
+        assert_eq!(maximum_ready_burst_frames(&config, 8_000, 80), Ok(4_176));
+        assert_eq!(plan.queue_capacity, 4_816);
+
+        let mut processor = LiveProcessor::new(&config, 1).unwrap();
+        let mut largest = Vec::new();
+        for sequence in 0..64u64 {
+            let input = vec![(0..80)
+                .map(|frame| ((sequence * 80 + frame as u64) as f64 * 0.019).sin() * 0.05)
+                .collect()];
+            let ready = processor.process_chunk(sequence, input).unwrap().channels;
+            if ready[0].len() > largest.len() {
+                largest = ready[0].clone();
+            }
+        }
+        let old_capacity = 80 * PLAYBACK_QUEUE_CHUNKS as usize;
+        assert_eq!(largest.len(), 2_048);
+        assert!(largest.len() > old_capacity);
+        let level = AtomicU32::new(0.0f32.to_bits());
+        let mut old_queue = VecDeque::new();
+        assert!(enqueue_playback_block(
+            &mut old_queue,
+            &[largest.clone()],
+            1,
+            old_capacity,
+            &level
+        )
+        .is_err());
+        assert!(old_queue.is_empty());
+        let mut planned_queue = VecDeque::new();
+        enqueue_playback_block(
+            &mut planned_queue,
+            &[largest],
+            1,
+            plan.queue_capacity,
+            &level,
+        )
+        .unwrap();
+
+        let mut full_planned_queue = VecDeque::from(vec![0.0; old_capacity]);
+        enqueue_playback_block(
+            &mut full_planned_queue,
+            &[vec![0.0; 4_176]],
+            1,
+            plan.queue_capacity,
+            &level,
+        )
+        .unwrap();
+        assert_eq!(full_planned_queue.len(), plan.queue_capacity);
+        assert!(enqueue_playback_block(
+            &mut full_planned_queue,
+            &[vec![0.0]],
+            1,
+            plan.queue_capacity,
+            &level,
+        )
+        .is_err());
+        assert_eq!(full_planned_queue.len(), plan.queue_capacity);
+
+        config.denoiser.profile_ms = 100.0;
+        assert_eq!(maximum_ready_burst_frames(&config, 8_000, 80), Ok(4_976));
+        assert_eq!(
+            plan_live_buffers(&config, 8_000, 1, 1)
+                .unwrap()
+                .queue_capacity,
+            5_616
+        );
+    }
+
+    #[cfg(feature = "rnnoise")]
+    #[test]
+    fn rnnoise_low_rate_ready_burst_plan_covers_both_resamplers() {
+        let mut config = config();
+        config.backend = Backend::Rnnoise;
+        config.chunk_ms = MIN_CHUNK_MS;
+        config.denoiser.sample_rate = 8_000;
+        config.denoiser.profile_ms = -1.0;
+        let plan = plan_live_buffers(&config, 8_000, 1, 1).unwrap();
+        assert_eq!(maximum_ready_burst_frames(&config, 8_000, 80), Ok(2_253));
+        assert_eq!(plan.queue_capacity, 2_893);
+
+        let mut processor = LiveProcessor::new(&config, 1).unwrap();
+        let mut largest = Vec::new();
+        for sequence in 0..160u64 {
+            let input = vec![(0..80)
+                .map(|frame| ((sequence * 80 + frame as u64) as f64 * 0.023).sin() * 0.05)
+                .collect()];
+            let ready = processor.process_chunk(sequence, input).unwrap().channels;
+            if ready[0].len() > largest.len() {
+                largest = ready[0].clone();
+            }
+        }
+        let old_capacity = 80 * PLAYBACK_QUEUE_CHUNKS as usize;
+        assert!(largest.len() > old_capacity, "largest={}", largest.len());
+        assert!(largest.len() <= 2_253);
+        let level = AtomicU32::new(0.0f32.to_bits());
+        let mut queue = VecDeque::new();
+        enqueue_playback_block(&mut queue, &[largest], 1, plan.queue_capacity, &level).unwrap();
     }
 
     #[test]
@@ -743,16 +1694,21 @@ mod tests {
 
     #[test]
     fn hardware_plan_uses_effective_rate_and_checked_capacities() {
-        let config = config();
+        let mut config = config();
         assert_eq!(
             plan_live_buffers(&config, 48_000, 2, 2).unwrap(),
             LiveBufferPlan {
                 chunk_frames: 4_800,
                 input_capacity: 9_600,
-                queue_capacity: 76_800,
+                queue_capacity: 90_496,
             }
         );
         assert!(plan_live_buffers(&config, crate::config::MAX_SAMPLE_RATE, 1, 1).is_ok());
+        config.chunk_ms = MAX_CHUNK_MS;
+        let oversized = plan_live_buffers(&config, crate::config::MAX_SAMPLE_RATE, 1, 1).unwrap();
+        assert_eq!(oversized.chunk_frames, 1_536_000);
+        assert!(oversized.chunk_frames > MAX_STREAM_BLOCK_FRAMES);
+        config.chunk_ms = 100;
         for rate in [0, crate::config::MAX_SAMPLE_RATE + 1] {
             assert!(matches!(
                 plan_live_buffers(&config, rate, 1, 1),

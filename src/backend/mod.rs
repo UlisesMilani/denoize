@@ -534,6 +534,8 @@ fn process_channels_independent(
 
 #[cfg(feature = "rnnoise")]
 pub mod rnnoise;
+#[cfg(all(feature = "live", feature = "rnnoise"))]
+pub(crate) use rnnoise::StreamingProcessor as RnnoiseStreamingProcessor;
 
 #[cfg(feature = "deepfilter")]
 pub mod deepfilter;
