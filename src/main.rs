@@ -2,16 +2,21 @@
 
 use denoize::audio::{
     ensure_memory_limit, estimate_audio_working_set_bytes, estimate_file_memory_bytes,
-    estimate_stream_memory_bytes_checked, read_audio, read_wav_bytes, write_wav_bytes,
-    write_wav_channel_mask_to_file, WavStreamReader, WavStreamWriter,
+    estimate_stream_memory_bytes_checked, read_audio, read_audio_with_metadata_limits,
+    read_wav_bytes, write_wav_bytes, write_wav_channel_mask_to_file, WavStreamReader,
+    WavStreamWriter,
 };
 use denoize::batch_resume::{
     self, BatchSession, ConsumedModel, Digest, MetadataPolicy, ResumeDecision, ResumeExpectation,
     LEGACY_DESKTOP_STATE_FILE_NAME, LOCK_FILE_NAME, STATE_FILE_NAME,
 };
 use denoize::config::{MAX_SAMPLE_RATE, MAX_STREAM_BLOCK_FRAMES};
-use denoize::decode::{probe_file as probe_audio_file, AudioCodec, AudioFormat, AudioProbe};
+use denoize::decode::{
+    probe_file_with_metadata_limits as probe_audio_file_with_metadata_limits, AudioCodec,
+    AudioFormat, AudioProbe,
+};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
+use denoize::metadata::MetadataLimits;
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::{
@@ -33,6 +38,8 @@ const MAX_BATCH_JOBS: usize = 32;
 const VALIDATION_SAMPLE_RATE: u32 = 48_000;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const INPUT_MEMORY_EXPANSION_FACTOR: u64 = 8;
+const METADATA_REPRESENTATION_EXPANSION_FACTOR: u64 = 16;
+const METADATA_DESCRIPTOR_BYTES: u64 = 256;
 const STDIN_READ_CHUNK_BYTES: usize = 64 * 1024;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
@@ -258,7 +265,7 @@ OPTIONS:
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
-        --max-memory <MB>     checked working-set limit in MiB (minimum: 1)
+        --max-memory <MB>     checked working-set and metadata limit in MiB (minimum: 1)
         --recursive           include subdirectories in batch mode
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
@@ -746,6 +753,64 @@ fn checked_memory_limit_bytes(max_memory_mb: Option<usize>) -> Result<Option<u64
         .ok_or_else(|| "--max-memory is too large to represent safely".into())
 }
 
+/// Derive parser limits from bytes which are still available to metadata.
+///
+/// Metadata is represented more than once while it is translated between a
+/// native container and Lofty's generic model. Reserving only one sixteenth
+/// of the available working-set budget for payload keeps those copies and
+/// allocator overhead conservative. Descriptor counts receive their own
+/// finite bound so a stream of empty fields, pages, or blocks cannot evade the
+/// byte limits.
+fn metadata_limits_for_available_bytes(available: Option<u64>) -> MetadataLimits {
+    let defaults = MetadataLimits::default();
+    let Some(available) = available else {
+        return defaults;
+    };
+    let payload_bytes = available / METADATA_REPRESENTATION_EXPANSION_FACTOR;
+    let descriptor_count = payload_bytes / METADATA_DESCRIPTOR_BYTES;
+    let payload = usize::try_from(payload_bytes).unwrap_or(usize::MAX);
+    let descriptors = usize::try_from(descriptor_count).unwrap_or(usize::MAX);
+
+    let mut limits = defaults;
+    limits.max_total_bytes = defaults.max_total_bytes.min(payload);
+    limits.max_item_bytes = defaults.max_item_bytes.min(payload);
+    limits.max_items = defaults.max_items.min(descriptors);
+    limits.max_flac_block_bytes = defaults.max_flac_block_bytes.min(payload);
+    limits.max_flac_blocks = defaults.max_flac_blocks.min(descriptors);
+    limits.max_ogg_packet_bytes = defaults.max_ogg_packet_bytes.min(payload);
+    limits.max_ogg_pages = defaults.max_ogg_pages.min(descriptors);
+    limits.max_ogg_streams = defaults.max_ogg_streams.min(descriptors);
+    limits
+}
+
+fn decode_metadata_limits(max_memory_mb: Option<usize>) -> Result<MetadataLimits, String> {
+    Ok(metadata_limits_for_available_bytes(
+        checked_memory_limit_bytes(max_memory_mb)?,
+    ))
+}
+
+fn retained_metadata_limits(
+    max_memory_mb: Option<usize>,
+    retained_working_set_bytes: u64,
+) -> Result<MetadataLimits, String> {
+    let available = checked_memory_limit_bytes(max_memory_mb)?
+        .map(|limit| limit.saturating_sub(retained_working_set_bytes));
+    let mut retained = metadata_limits_for_available_bytes(available);
+
+    // The decoder already proved the container structure against the full
+    // per-file cap. Reuse those structural bounds when the optional metadata
+    // payload has little or no remaining budget: a tagless FLAC still has a
+    // mandatory 34-byte STREAMINFO block, and rejecting that block would make
+    // `--max-memory 1` fail despite retaining no metadata at all.
+    let structural = decode_metadata_limits(max_memory_mb)?;
+    retained.max_flac_block_bytes = structural.max_flac_block_bytes;
+    retained.max_flac_blocks = structural.max_flac_blocks;
+    retained.max_ogg_packet_bytes = structural.max_ogg_packet_bytes;
+    retained.max_ogg_pages = structural.max_ogg_pages;
+    retained.max_ogg_streams = structural.max_ogg_streams;
+    Ok(retained)
+}
+
 fn checked_m4a_bitrate_bps(kbps: u32) -> Result<u32, String> {
     kbps.checked_mul(1000).ok_or_else(|| {
         format!(
@@ -796,6 +861,7 @@ fn preflight_batch_items(
     let mut model_fingerprints =
         std::collections::HashMap::<(std::path::PathBuf, u32), ConsumedModel>::new();
     let mut prepared = Vec::with_capacity(items.len());
+    let decode_limits = decode_metadata_limits(ov.max_memory_mb)?;
     for item in items {
         let input_fingerprint = batch_resume::fingerprint_file(&item.input).map_err(|error| {
             format!(
@@ -810,17 +876,30 @@ fn preflight_batch_items(
             )
         })?;
         ensure_memory_limit(estimate, ov.max_memory_mb, "batch input preflight")?;
-        let audio = read_audio(&item.input).map_err(|error| {
-            format!(
-                "decode batch input {} during preflight: {error}",
-                item.input.display()
-            )
-        })?;
+        let audio =
+            read_audio_with_metadata_limits(&item.input, decode_limits).map_err(|error| {
+                format!(
+                    "decode batch input {} during preflight: {error}",
+                    item.input.display()
+                )
+            })?;
+        let decoded_working_set = estimate_audio_working_set_bytes(&audio);
         ensure_memory_limit(
-            estimate_audio_working_set_bytes(&audio),
+            decoded_working_set,
             ov.max_memory_mb,
             "batch decoded audio working set",
         )?;
+        if !ov.no_metadata {
+            let metadata_limits = retained_metadata_limits(ov.max_memory_mb, decoded_working_set)?;
+            denoize::metadata::read_extended_with_limits(&item.input, metadata_limits).map_err(
+                |error| {
+                    format!(
+                        "read batch input metadata {} during preflight: {error}",
+                        item.input.display()
+                    )
+                },
+            )?;
+        }
         item.output_format
             .validate_config(&audio, &options)
             .map_err(|error| {
@@ -1480,22 +1559,25 @@ fn process_one_to_staged_output(
         let estimate = estimate_file_memory_bytes(input)?;
         ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
     }
-    let metadata = if !standard_input && !ov.no_metadata {
-        denoize::metadata::read_extended(input)?
-    } else {
-        None
-    };
+    let decode_limits = decode_metadata_limits(ov.max_memory_mb)?;
     let mut audio = if standard_input {
         let stdin = std::io::stdin();
         read_wav_bytes(read_stdin_bytes(stdin.lock(), ov.max_memory_mb)?)?
     } else {
-        read_audio(input)?
+        read_audio_with_metadata_limits(input, decode_limits)?
     };
+    let decoded_working_set = estimate_audio_working_set_bytes(&audio);
     ensure_memory_limit(
-        estimate_audio_working_set_bytes(&audio),
+        decoded_working_set,
         ov.max_memory_mb,
         "decoded audio working set",
     )?;
+    let metadata_limits = retained_metadata_limits(ov.max_memory_mb, decoded_working_set)?;
+    let metadata = if !standard_input && !ov.no_metadata {
+        denoize::metadata::read_extended_with_limits(input, metadata_limits)?
+    } else {
+        None
+    };
     validate_effective_options(&ov, audio.sample_rate)?;
     let resolved_processing = match pre_resolved_processing {
         Some(options) => options,
@@ -1566,7 +1648,11 @@ fn process_one_to_staged_output(
             encode_options,
         )?;
         if let Some(metadata) = metadata {
-            denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
+            denoize::metadata::write_extended_to_file_with_limits(
+                metadata,
+                transaction.file_mut(),
+                metadata_limits,
+            )?;
         }
         Ok(Some(StagedProcessOutput {
             transaction,
@@ -1624,18 +1710,20 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
+    let stream_working_set = estimate_stream_memory_bytes_checked(
+        spec.channels as usize,
+        block_frames,
+        cfg.frame_size,
+        spec.sample_rate,
+        cfg.profile_ms,
+    )
+    .map_err(|error| error.to_string())?;
     ensure_memory_limit(
-        estimate_stream_memory_bytes_checked(
-            spec.channels as usize,
-            block_frames,
-            cfg.frame_size,
-            spec.sample_rate,
-            cfg.profile_ms,
-        )
-        .map_err(|error| error.to_string())?,
+        stream_working_set,
         ov.max_memory_mb,
         "streaming working set",
     )?;
+    let metadata_limits = retained_metadata_limits(ov.max_memory_mb, stream_working_set)?;
     if ov.report {
         println!(
             "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : classical\nstream     : enabled ({} frames/block)",
@@ -1649,7 +1737,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     // neither a destination nor a temporary `.part` file behind.
     let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
     let metadata = if !ov.no_metadata {
-        denoize::metadata::read_extended(input_path)?
+        denoize::metadata::read_extended_with_limits(input_path, metadata_limits)?
     } else {
         None
     };
@@ -1671,7 +1759,11 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     })()?;
     write_wav_channel_mask_to_file(transaction.file_mut(), spec.channels as usize, channel_mask)?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
+        denoize::metadata::write_extended_to_file_with_limits(
+            metadata,
+            transaction.file_mut(),
+            metadata_limits,
+        )?;
     }
     transaction.commit(if ov.force {
         CommitMode::Replace
@@ -1782,11 +1874,28 @@ fn batch_can_preserve(probe: &AudioProbe, output_format: OutputFormat) -> bool {
         )
 }
 
+#[cfg(test)]
 fn plan_batch_files(
     input_dir: &std::path::Path,
     output_dir: &std::path::Path,
     files: Vec<std::path::PathBuf>,
     output_extension: Option<&str>,
+) -> Result<Vec<BatchItem>, String> {
+    plan_batch_files_with_metadata_limits(
+        input_dir,
+        output_dir,
+        files,
+        output_extension,
+        MetadataLimits::default(),
+    )
+}
+
+fn plan_batch_files_with_metadata_limits(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+    files: Vec<std::path::PathBuf>,
+    output_extension: Option<&str>,
+    metadata_limits: MetadataLimits,
 ) -> Result<Vec<BatchItem>, String> {
     let mut items = Vec::with_capacity(files.len());
     for input in files {
@@ -1805,7 +1914,7 @@ fn plan_batch_files(
             destination.set_extension(extension);
         }
 
-        let probe = probe_audio_file(&input)
+        let probe = probe_audio_file_with_metadata_limits(&input, metadata_limits)
             .map_err(|error| format!("probe batch input {}: {error}", input.display()))?;
         if probe.audio_tracks != 1 {
             return Err(format!(
@@ -2043,7 +2152,13 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     if files.is_empty() {
         return Err("batch input contains no supported audio files".into());
     }
-    let items = plan_batch_files(input_dir, output_dir, files, output_extension)?;
+    let items = plan_batch_files_with_metadata_limits(
+        input_dir,
+        output_dir,
+        files,
+        output_extension,
+        decode_metadata_limits(ov.max_memory_mb)?,
+    )?;
     let state_path = output_dir.join(STATE_FILE_NAME);
     let legacy_state_path = output_dir.join(LEGACY_DESKTOP_STATE_FILE_NAME);
     let lock_path = output_dir.join(LOCK_FILE_NAME);
@@ -2501,6 +2616,7 @@ aac_encoder = "oxide"
 output_format = "mp3"
 batch = true
 resume = true
+max_memory_mb = 64
 "#,
             "frontend-parity.toml",
         )
@@ -2534,6 +2650,7 @@ resume = true
         assert_eq!(prepared.item.output_format, OutputFormat::Mp3);
         assert_eq!(encode.mp3_bitrate_kbps, 256);
         assert!(options.no_metadata);
+        assert_eq!(options.max_memory_mb, Some(64));
         assert!(prepared.expectation.model().is_none());
         assert_eq!(prepared.expectation.recipe(), prepared.recipe);
         assert_eq!(prepared.recipe.as_hex(), FRONTEND_PARITY_RECIPE_HEX);
@@ -3105,6 +3222,36 @@ mod streaming_tests {
         )
         .unwrap_err();
         assert!(error.contains("--stream-frames"));
+    }
+
+    #[test]
+    fn metadata_limits_reserve_payload_and_descriptor_overhead() {
+        let limits = metadata_limits_for_available_bytes(Some(BYTES_PER_MIB));
+        assert_eq!(limits.max_total_bytes, 64 * 1024);
+        assert_eq!(limits.max_item_bytes, 64 * 1024);
+        assert_eq!(limits.max_flac_block_bytes, 64 * 1024);
+        assert_eq!(limits.max_ogg_packet_bytes, 64 * 1024);
+        assert_eq!(limits.max_items, 256);
+        assert_eq!(limits.max_flac_blocks, 256);
+        assert_eq!(limits.max_ogg_pages, 256);
+        assert_eq!(
+            limits.max_ogg_streams,
+            MetadataLimits::DEFAULT_MAX_OGG_STREAMS
+        );
+
+        let defaults = MetadataLimits::default();
+        let uncapped = metadata_limits_for_available_bytes(None);
+        assert_eq!(uncapped, defaults);
+        let large = metadata_limits_for_available_bytes(Some(u64::MAX));
+        assert_eq!(large, defaults);
+
+        let exhausted = retained_metadata_limits(Some(1), BYTES_PER_MIB).unwrap();
+        assert_eq!(exhausted.max_total_bytes, 0);
+        assert_eq!(exhausted.max_items, 0);
+        assert_eq!(exhausted.max_flac_block_bytes, 64 * 1024);
+        assert_eq!(exhausted.max_flac_blocks, 256);
+        assert_eq!(exhausted.max_ogg_packet_bytes, 64 * 1024);
+        assert_eq!(exhausted.max_ogg_pages, 256);
     }
 
     #[test]

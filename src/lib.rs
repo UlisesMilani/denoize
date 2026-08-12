@@ -68,8 +68,9 @@ pub use atomic_output::{AtomicOutput, CommitMode};
 pub use audio::{
     ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,
     estimate_file_memory_bytes, estimate_stream_memory_bytes, estimate_stream_memory_bytes_checked,
-    read_audio, read_wav, read_wav_bytes, sanitize_sample, write_audio, write_wav, write_wav_bytes,
-    write_wav_channel_mask, Audio, WavStreamReader, WavStreamWriter,
+    read_audio, read_audio_with_metadata_limits, read_wav, read_wav_bytes, sanitize_sample,
+    write_audio, write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamReader,
+    WavStreamWriter,
 };
 pub use backend::{
     decode_mid_side, encode_mid_side, Backend, BackendOptions, ChannelMode, OnnxModelConfig,
@@ -78,7 +79,10 @@ pub use backend::{
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
 pub use config::{ConfigError, ResourcePlan};
-pub use decode::{decode_file, probe_file, AudioCodec, AudioFormat, AudioProbe, DecodedPcm};
+pub use decode::{
+    decode_file, decode_file_with_metadata_limits, probe_file, probe_file_with_metadata_limits,
+    AudioCodec, AudioFormat, AudioProbe, DecodedPcm,
+};
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};

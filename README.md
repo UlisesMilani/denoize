@@ -373,11 +373,20 @@ output begins. Stream resource arithmetic is checked from the input header,
 and the processor is constructed before an output or temporary file is staged.
 
 For the normal (decoded, non-streaming) path, `--max-memory MB` performs a
-conservative preflight and decoded-working-set check before processing. The
-limit is per input file/worker; batch jobs can use memory concurrently, so
-lower `--jobs` when enforcing a process-wide budget. A streaming WAV job stays
-bounded by its block size and denoiser state, and the same option checks that
-bound:
+conservative preflight and decoded-working-set check before processing. FLAC
+and Ogg structure is also checked with finite block, packet, page, stream,
+item, and aggregate metadata limits before a decoder can materialize it—even
+with `--no-metadata`. When tags are preserved, their retained payload budget
+is derived from the memory left after the decoded PCM working set; the same
+limit is enforced again while writing the staged output. The default limits
+remain finite when `--max-memory` is omitted.
+
+The limit is per input file/worker; batch jobs can use memory concurrently, so
+lower `--jobs` when enforcing a process-wide budget. Batch probing, decode,
+and metadata validation all finish before the output directory or staging
+files are created. A streaming WAV job stays bounded by its block size and
+denoiser state, and metadata uses a conservative share of the remaining
+budget:
 
 ```sh
 denoize large.mp3 cleaned.wav --max-memory 1024
@@ -539,6 +548,9 @@ any consumed model bytes, the destination identity, and the published output
 bytes. A file is skipped only when all of those still match and the output is a
 safe regular file with a single link. This also means `--backend auto` records
 the backend it actually selected, not merely the word `auto`.
+Execution-only controls such as `--max-memory`, `--jobs`, and progress output
+do not change that audio recipe, although their validation still applies to
+each run.
 
 ### Automatic backend selection
 
@@ -616,6 +628,11 @@ and description are retained by formats that support embedded pictures.
 
 For FLAC and Ogg outputs, arbitrary Vorbis Comment fields are copied verbatim,
 including the standard `CHAPTER001`/`CHAPTER001NAME` chapter-comment convention.
+Their native metadata is scanned and rewritten incrementally instead of
+loading the complete audio file into memory. Oversized or malformed input
+metadata fails before an output is staged or published.
+ID3v2-prefixed FLAC/Ogg files are rejected by this bounded raw path; place
+metadata in the container's native comment blocks instead.
 When the source and destination use the same native container, format-specific
 ID3v2 frames (including `CHAP`/`CTOC`) and MP4 atoms are retained as well. A
 conversion to a different tag family keeps fields with a defined destination

@@ -292,15 +292,19 @@ impl AudioFormat {
     }
 }
 
-fn detect_file_format(path: &Path, use_extension_fallback: bool) -> Result<AudioFormat, String> {
+fn detect_file_format_from_file(
+    path: &Path,
+    use_extension_fallback: bool,
+    file: &mut std::fs::File,
+) -> Result<AudioFormat, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for format detection: {error}", path.display()))?;
     let file_len = file
         .metadata()
         .map_err(|error| format!("stat {} for format detection: {error}", path.display()))?
         .len();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {} for format detection: {error}", path.display()))?;
 
     let mut header = Vec::with_capacity(FORMAT_SNIFF_BYTES);
     file.by_ref()
@@ -342,18 +346,40 @@ fn detect_file_format(path: &Path, use_extension_fallback: bool) -> Result<Audio
 /// demuxed with Symphonia so that `.ogg` is not implicitly treated as Opus and
 /// `.m4a` / `.mp4` is not implicitly treated as AAC.
 pub fn probe_file(path: &Path) -> Result<AudioProbe, String> {
+    probe_file_with_metadata_limits(path, crate::metadata::MetadataLimits::default())
+}
+
+/// Inspect an audio file while enforcing explicit FLAC/Ogg metadata limits.
+///
+/// The limits are applied before a decoder or demuxer can materialize
+/// container metadata. Other formats retain their existing probe behavior.
+pub fn probe_file_with_metadata_limits(
+    path: &Path,
+    metadata_limits: crate::metadata::MetadataLimits,
+) -> Result<AudioProbe, String> {
     // Suppress extension fallback here. A probe must describe the file's
     // contents, not what its name claims the contents are.
-    let format = detect_file_format(path, false)?;
+    let mut source = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for format detection: {error}", path.display()))?;
+    let format = detect_file_format_from_file(path, false, &mut source)?;
+    use std::io::{Seek, SeekFrom};
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {} after format detection: {error}", path.display()))?;
 
     match format {
-        AudioFormat::Wav | AudioFormat::Rf64 => probe_wave_file(path, format),
+        AudioFormat::Wav | AudioFormat::Rf64 => probe_wave_file_from_file(path, format, source),
         AudioFormat::Aiff | AudioFormat::Caf => Ok(single_audio_track(format, AudioCodec::Pcm)),
-        AudioFormat::Flac => Ok(single_audio_track(format, AudioCodec::Flac)),
+        AudioFormat::Flac => {
+            crate::metadata::preflight_flac_decode(&mut source, metadata_limits)?;
+            Ok(single_audio_track(format, AudioCodec::Flac))
+        }
         AudioFormat::Mp3 => Ok(single_audio_track(format, AudioCodec::Mp3)),
         AudioFormat::AacAdts => Ok(single_audio_track(format, AudioCodec::Aac)),
-        AudioFormat::OggOpus | AudioFormat::OggVorbis => probe_ogg_tracks(path, format),
-        AudioFormat::M4a => probe_mp4_tracks(path),
+        AudioFormat::OggOpus | AudioFormat::OggVorbis => {
+            probe_ogg_tracks(path, format, metadata_limits, source)
+        }
+        AudioFormat::M4a => probe_mp4_tracks_from_file(path, source),
         AudioFormat::Unknown => Err(format!(
             "could not identify the audio container from the file header ({}); verify that the file is a supported, non-truncated audio file",
             path.display()
@@ -371,11 +397,13 @@ fn single_audio_track(format: AudioFormat, codec: AudioCodec) -> AudioProbe {
     }
 }
 
-fn probe_wave_file(path: &Path, format: AudioFormat) -> Result<AudioProbe, String> {
+fn probe_wave_file_from_file(
+    path: &Path,
+    format: AudioFormat,
+    mut file: std::fs::File,
+) -> Result<AudioProbe, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for WAVE codec probe: {error}", path.display()))?;
     let file_len = file
         .metadata()
         .map_err(|error| format!("stat {} for WAVE codec probe: {error}", path.display()))?
@@ -541,11 +569,9 @@ fn wave_codec_from_fmt(fmt: &[u8]) -> AudioCodec {
     }
 }
 
-fn probe_mp4_tracks(path: &Path) -> Result<AudioProbe, String> {
+fn probe_mp4_tracks_from_file(path: &Path, mut file: std::fs::File) -> Result<AudioProbe, String> {
     use std::io::{BufReader, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for MP4 codec probe: {error}", path.display()))?;
     let size = file
         .metadata()
         .map_err(|error| format!("stat {} for MP4 codec probe: {error}", path.display()))?
@@ -637,11 +663,32 @@ fn summarize_mp4_tracks(tracks: &std::collections::HashMap<u32, mp4::Mp4Track>) 
     }
 }
 
-fn probe_ogg_tracks(path: &Path, header_format: AudioFormat) -> Result<AudioProbe, String> {
+fn probe_ogg_tracks(
+    path: &Path,
+    header_format: AudioFormat,
+    metadata_limits: crate::metadata::MetadataLimits,
+    mut source: std::fs::File,
+) -> Result<AudioProbe, String> {
+    use std::io::{Seek, SeekFrom};
+
     // Ask the demuxer to validate the first physical link, then scan every BOS
     // page so chained or multiplexed logical streams cannot be silently lost.
-    probe_container_tracks(path, header_format)?;
-    let codecs = scan_ogg_bos_codecs(path)?;
+    // Preflight, BOS inspection, and demuxing all use handles cloned from this
+    // one open file, so a path replacement cannot make the stages disagree.
+    crate::metadata::preflight_ogg_decode(&mut source, metadata_limits)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {} for Ogg codec probe: {error}", path.display()))?;
+    let mut bos_source = source
+        .try_clone()
+        .map_err(|error| format!("clone {} for Ogg stream probe: {error}", path.display()))?;
+    let codecs = scan_ogg_bos_codecs(&mut bos_source, path, &metadata_limits)?;
+    // File::try_clone may share a cursor with the original handle. Rewind only
+    // after the clone scan is complete, immediately before handing it off.
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {} for Ogg demux probe: {error}", path.display()))?;
+    probe_container_tracks_from_file(path, header_format, source)?;
     let audio_tracks = codecs
         .iter()
         .filter(|codec| matches!(codec, AudioCodec::Opus | AudioCodec::Vorbis))
@@ -672,11 +719,13 @@ fn probe_ogg_tracks(path: &Path, header_format: AudioFormat) -> Result<AudioProb
     })
 }
 
-fn scan_ogg_bos_codecs(path: &Path) -> Result<Vec<AudioCodec>, String> {
+fn scan_ogg_bos_codecs(
+    file: &mut std::fs::File,
+    path: &Path,
+    metadata_limits: &crate::metadata::MetadataLimits,
+) -> Result<Vec<AudioCodec>, String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for Ogg stream probe: {error}", path.display()))?;
     let file_len = file
         .metadata()
         .map_err(|error| format!("stat {} for Ogg stream probe: {error}", path.display()))?
@@ -698,11 +747,19 @@ fn scan_ogg_bos_codecs(path: &Path) -> Result<Vec<AudioCodec>, String> {
         if &header[0..4] != b"OggS" || header[4] != 0 {
             return Err(format!("invalid Ogg page header ({})", path.display()));
         }
-        let mut lacing = vec![0u8; header[26] as usize];
-        file.read_exact(&mut lacing)
+        if header[5] & !0x07 != 0 {
+            return Err(format!("invalid Ogg page flags ({})", path.display()));
+        }
+        let lacing_len = usize::from(header[26]);
+        let mut lacing = [0u8; 255];
+        let lacing = &mut lacing[..lacing_len];
+        file.read_exact(lacing)
             .map_err(|error| format!("read Ogg lacing table {}: {error}", path.display()))?;
         let body_size = lacing.iter().map(|value| *value as u64).sum::<u64>();
-        let body_offset = offset + 27 + lacing.len() as u64;
+        let body_offset = offset
+            .checked_add(27)
+            .and_then(|value| value.checked_add(lacing.len() as u64))
+            .ok_or_else(|| format!("Ogg page offset overflows ({})", path.display()))?;
         let body_end = body_offset
             .checked_add(body_size)
             .ok_or_else(|| format!("Ogg page size overflows ({})", path.display()))?;
@@ -711,10 +768,35 @@ fn scan_ogg_bos_codecs(path: &Path) -> Result<Vec<AudioCodec>, String> {
         }
 
         if header[5] & 0x02 != 0 {
+            if header[5] & 0x01 != 0 {
+                return Err(format!(
+                    "Ogg BOS page cannot continue an earlier packet ({})",
+                    path.display()
+                ));
+            }
+            if codecs.len() >= metadata_limits.max_ogg_streams {
+                return Err(format!(
+                    "Ogg logical stream count exceeds the configured limit of {} ({})",
+                    metadata_limits.max_ogg_streams,
+                    path.display()
+                ));
+            }
+            let mut first_packet_size = 0_u64;
+            for segment in lacing.iter().copied() {
+                first_packet_size = first_packet_size
+                    .checked_add(u64::from(segment))
+                    .ok_or_else(|| format!("Ogg BOS packet size overflows ({})", path.display()))?;
+                if segment < 255 {
+                    break;
+                }
+            }
             let mut prefix = [0u8; 8];
-            let prefix_len = usize::try_from(body_size.min(prefix.len() as u64)).unwrap();
+            let prefix_len = usize::try_from(first_packet_size.min(prefix.len() as u64)).unwrap();
             file.read_exact(&mut prefix[..prefix_len])
                 .map_err(|error| format!("read Ogg BOS packet {}: {error}", path.display()))?;
+            codecs
+                .try_reserve(1)
+                .map_err(|_| format!("allocate Ogg stream probe ({})", path.display()))?;
             codecs.push(if prefix.starts_with(b"OpusHead") {
                 AudioCodec::Opus
             } else if prefix.starts_with(b"\x01vorbis") {
@@ -735,13 +817,21 @@ fn scan_ogg_bos_codecs(path: &Path) -> Result<Vec<AudioCodec>, String> {
 }
 
 fn probe_container_tracks(path: &Path, header_format: AudioFormat) -> Result<AudioProbe, String> {
+    let source = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for codec probe: {error}", path.display()))?;
+    probe_container_tracks_from_file(path, header_format, source)
+}
+
+fn probe_container_tracks_from_file(
+    path: &Path,
+    header_format: AudioFormat,
+    source: std::fs::File,
+) -> Result<AudioProbe, String> {
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let source = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for codec probe: {error}", path.display()))?;
     let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(if header_format == AudioFormat::M4a {
@@ -847,14 +937,46 @@ fn audio_codec_from_symphonia(codec: symphonia::core::codecs::audio::AudioCodecI
 
 /// Decode any supported audio file to high-fidelity planar PCM.
 pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
-    let fmt = detect_file_format(path, true)?;
+    decode_file_with_metadata_limits(path, crate::metadata::MetadataLimits::default())
+}
 
+/// Decode an audio file while enforcing explicit FLAC/Ogg metadata limits.
+///
+/// FLAC and Ogg structures are validated on the same open file handle that is
+/// subsequently passed to the decoder. This prevents oversized metadata from
+/// reaching third-party parsers and avoids a path-reopen race between the
+/// validation and decode stages.
+pub fn decode_file_with_metadata_limits(
+    path: &Path,
+    metadata_limits: crate::metadata::MetadataLimits,
+) -> Result<DecodedPcm, String> {
+    use std::io::{Seek, SeekFrom};
+
+    // Keep the detected file open through FLAC/Ogg preflight and decode. A
+    // concurrent path replacement therefore cannot swap in a different
+    // container after format detection but before a metadata parser runs.
+    let mut source = std::fs::File::open(path)
+        .map_err(|error| format!("open {} for format detection: {error}", path.display()))?;
+    let fmt = detect_file_format_from_file(path, true, &mut source)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {} after format detection: {error}", path.display()))?;
+    decode_file_from_detected_file(path, fmt, source, metadata_limits)
+}
+
+fn decode_file_from_detected_file(
+    path: &Path,
+    fmt: AudioFormat,
+    source: std::fs::File,
+    metadata_limits: crate::metadata::MetadataLimits,
+) -> Result<DecodedPcm, String> {
     match fmt {
         AudioFormat::Wav => decode_wav(path),
         AudioFormat::Rf64 => decode_rf64(path),
-        AudioFormat::Aiff | AudioFormat::Caf | AudioFormat::OggVorbis => decode_symphonia(path),
-        AudioFormat::Flac => decode_flac(path),
-        AudioFormat::OggOpus => opus::decode_ogg_opus(path),
+        AudioFormat::Aiff | AudioFormat::Caf => decode_symphonia(path),
+        AudioFormat::OggVorbis => decode_symphonia_ogg(path, source, metadata_limits),
+        AudioFormat::Flac => decode_flac(source, metadata_limits),
+        AudioFormat::OggOpus => opus::decode_ogg_opus_with_limits(source, metadata_limits),
         AudioFormat::Mp3 => decode_mp3(path),
         AudioFormat::M4a => match m4a::decode_m4a(path) {
             Ok(decoded) => Ok(decoded),
@@ -937,6 +1059,20 @@ fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
     decode_symphonia_with_report(path)?.into_decoded()
 }
 
+fn decode_symphonia_ogg(
+    path: &Path,
+    mut source: std::fs::File,
+    metadata_limits: crate::metadata::MetadataLimits,
+) -> Result<DecodedPcm, String> {
+    use std::io::{Seek, SeekFrom};
+
+    crate::metadata::preflight_ogg_decode(&mut source, metadata_limits)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind Ogg input {}: {error}", path.display()))?;
+    decode_symphonia_with_report_inner(path, None, Some(source))?.into_decoded()
+}
+
 fn decode_symphonia_with_track_id(
     path: &Path,
     track_edits: &[m4a::FallbackTrackEdit],
@@ -946,7 +1082,7 @@ fn decode_symphonia_with_track_id(
         selected_track_id,
         packet_errors,
         ..
-    } = decode_symphonia_with_report_inner(path, Some(track_edits))?;
+    } = decode_symphonia_with_report_inner(path, Some(track_edits), None)?;
     let decoded = decoded.ok_or_else(|| "no audio packets decoded".to_string())?;
     Ok((decoded, selected_track_id, packet_errors))
 }
@@ -972,12 +1108,13 @@ fn reject_m4a_fallback_packet_errors(errors: &RecoverablePacketErrors) -> Result
 }
 
 fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, String> {
-    decode_symphonia_with_report_inner(path, None)
+    decode_symphonia_with_report_inner(path, None, None)
 }
 
 fn decode_symphonia_with_report_inner(
     path: &Path,
     fallback_track_edits: Option<&[m4a::FallbackTrackEdit]>,
+    source: Option<std::fs::File>,
 ) -> Result<SymphoniaDecodeOutcome, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
@@ -986,7 +1123,10 @@ fn decode_symphonia_with_report_inner(
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let source = std::fs::File::open(path).map_err(|error| format!("open: {error}"))?;
+    let source = match source {
+        Some(source) => source,
+        None => std::fs::File::open(path).map_err(|error| format!("open: {error}"))?,
+    };
     let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
@@ -1526,8 +1666,22 @@ fn read_u32_le(file: &mut impl std::io::Read, context: &str) -> Result<u32, Stri
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn decode_flac(path: &Path) -> Result<DecodedPcm, String> {
-    let mut reader = claxon::FlacReader::open(path).map_err(|e| format!("FLAC open: {e}"))?;
+fn decode_flac(
+    mut source: std::fs::File,
+    metadata_limits: crate::metadata::MetadataLimits,
+) -> Result<DecodedPcm, String> {
+    use std::io::{Seek, SeekFrom};
+
+    crate::metadata::preflight_flac_decode(&mut source, metadata_limits)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("FLAC rewind: {error}"))?;
+    let reader_options = claxon::FlacReaderOptions {
+        read_vorbis_comment: false,
+        ..claxon::FlacReaderOptions::default()
+    };
+    let mut reader = claxon::FlacReader::new_ext(source, reader_options)
+        .map_err(|e| format!("FLAC open: {e}"))?;
     let info = reader.streaminfo();
     let channels = info.channels as usize;
     let scale = 1.0 / (1_u64 << (info.bits_per_sample - 1)) as f64;
@@ -1582,6 +1736,26 @@ mod tests {
             tag.extend(size);
         }
         tag
+    }
+
+    fn flac_with_vendor(vendor_len: usize) -> Vec<u8> {
+        let vendor_len = u32::try_from(vendor_len).expect("vendor fixture fits u32");
+        let comment_len = 4_u32
+            .checked_add(vendor_len)
+            .and_then(|length| length.checked_add(4))
+            .expect("comment fixture length");
+        assert!(comment_len <= 0x00ff_ffff);
+
+        let mut bytes = b"fLaC".to_vec();
+        bytes.extend([0, 0, 0, 34]);
+        bytes.extend([0; 34]);
+        bytes.push(0x80 | 4);
+        let comment_len_bytes = comment_len.to_be_bytes();
+        bytes.extend_from_slice(&comment_len_bytes[1..]);
+        bytes.extend(vendor_len.to_le_bytes());
+        bytes.resize(bytes.len() + vendor_len as usize, b'v');
+        bytes.extend(0_u32.to_le_bytes());
+        bytes
     }
 
     fn ogg_opus_with_misleading_tags() -> Vec<u8> {
@@ -1757,6 +1931,64 @@ mod tests {
         assert_eq!(decoded.sample_rate, 44_100);
         assert_eq!(decoded.n_channels(), 2);
         assert_eq!(decoded.frames(), 1_024);
+    }
+
+    #[test]
+    fn oversized_flac_vendor_is_rejected_before_probe_or_decode_parser() {
+        let file = tempfile::NamedTempFile::new().expect("create oversized FLAC fixture");
+        std::fs::write(file.path(), flac_with_vendor(64)).expect("write oversized FLAC fixture");
+        let mut limits = crate::metadata::MetadataLimits::default();
+        limits.max_item_bytes = 32;
+
+        let probe_error = probe_file_with_metadata_limits(file.path(), limits)
+            .expect_err("bounded probe must reject oversized FLAC vendor");
+        assert!(
+            probe_error.contains("32") || probe_error.contains("limit"),
+            "{probe_error}"
+        );
+
+        let decode_error = decode_file_with_metadata_limits(file.path(), limits)
+            .expect_err("bounded decode must reject oversized FLAC vendor");
+        assert!(
+            decode_error.contains("32") || decode_error.contains("limit"),
+            "{decode_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detected_ogg_handle_survives_path_replacement_before_decode() {
+        use std::io::{Seek, SeekFrom};
+
+        let directory = tempfile::tempdir().expect("create replacement fixture directory");
+        let path = directory.path().join("input.ogg");
+        let replacement = directory.path().join("replacement.bin");
+        std::fs::write(&path, ogg_opus_with_misleading_tags()).expect("write original Ogg file");
+
+        let mut source = std::fs::File::open(&path).expect("open original Ogg handle");
+        let format = detect_file_format_from_file(&path, true, &mut source)
+            .expect("detect original Ogg handle");
+        assert_eq!(format, AudioFormat::OggOpus);
+        source
+            .seek(SeekFrom::Start(0))
+            .expect("rewind original Ogg handle");
+
+        std::fs::write(&replacement, flac_with_vendor(64)).expect("write replacement FLAC file");
+        std::fs::rename(&replacement, &path).expect("atomically replace the path");
+
+        let decoded = decode_file_from_detected_file(
+            &path,
+            format,
+            source,
+            crate::metadata::MetadataLimits::default(),
+        )
+        .expect("decode must continue from the already-open Ogg inode");
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.n_channels(), 1);
+        assert_eq!(decoded.frames(), 960);
+        assert!(std::fs::read(&path)
+            .expect("read replacement path")
+            .starts_with(b"fLaC"));
     }
 
     #[test]
