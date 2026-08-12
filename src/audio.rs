@@ -242,6 +242,15 @@ pub fn ensure_memory_limit(
 ///
 /// Compressed formats are decoded losslessly to float precision (no rate conversion).
 pub fn read_audio<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
+    read_audio_with_metadata_limits(path, crate::metadata::MetadataLimits::default())
+}
+
+/// Read any supported audio file while enforcing explicit FLAC/Ogg metadata
+/// limits before the compressed decoder is allowed to parse the container.
+pub fn read_audio_with_metadata_limits<P: AsRef<std::path::Path>>(
+    path: P,
+    metadata_limits: crate::metadata::MetadataLimits,
+) -> Result<Audio, String> {
     let path = path.as_ref();
     // Keep the original WAV representation so WAV -> WAV processing preserves
     // integer/float sample format and bit depth. Compressed decoders do not
@@ -256,7 +265,7 @@ pub fn read_audio<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
     if crate::decode::AudioFormat::detect(path, &header) == crate::decode::AudioFormat::Wav {
         return read_wav(path);
     }
-    let pcm = crate::decode::decode_file(path)?;
+    let pcm = crate::decode::decode_file_with_metadata_limits(path, metadata_limits)?;
     Ok(pcm.into_audio())
 }
 

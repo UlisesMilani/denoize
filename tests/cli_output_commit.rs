@@ -238,7 +238,7 @@ fn metadata_is_committed_with_the_audio() {
     tag.save_to_path(&input, lofty::config::WriteOptions::default())
         .expect("write input metadata");
 
-    let result = run(&input, &output, &[]);
+    let result = run(&input, &output, &["--max-memory", "2"]);
 
     assert_success(&result);
     assert_valid_wav(&output);
@@ -246,5 +246,28 @@ fn metadata_is_committed_with_the_audio() {
         .expect("read output metadata")
         .expect("output metadata is present");
     assert_eq!(tag.title().as_deref(), Some("Atomic metadata"));
+    directory.assert_no_staged_outputs();
+}
+
+#[test]
+fn streaming_metadata_uses_the_remaining_memory_budget() {
+    use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+    let directory = TestDirectory::create();
+    let input = directory.join("input.wav");
+    let output = directory.join("output.wav");
+    write_test_wav(&input);
+    let mut tag = Tag::new(TagType::RiffInfo);
+    tag.set_title("Bounded streaming metadata".into());
+    tag.save_to_path(&input, lofty::config::WriteOptions::default())
+        .expect("write input metadata");
+
+    let result = run(&input, &output, &["--stream", "--max-memory", "64"]);
+
+    assert_success(&result);
+    let tag = denoize::metadata::read(&output)
+        .expect("read output metadata")
+        .expect("output metadata is present");
+    assert_eq!(tag.title().as_deref(), Some("Bounded streaming metadata"));
     directory.assert_no_staged_outputs();
 }

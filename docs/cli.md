@@ -64,7 +64,7 @@ OPTIONS:
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
-        --max-memory <MB>     checked working-set limit in MiB (minimum: 1)
+        --max-memory <MB>     checked working-set and metadata limit in MiB (minimum: 1)
         --recursive           include subdirectories in batch mode
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)

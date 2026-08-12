@@ -1,10 +1,17 @@
 use super::DecodedPcm;
+use crate::metadata::MetadataLimits;
 use opus::{Channels, Decoder};
 use std::ops::Range;
-use std::path::Path;
 
-pub fn decode_ogg_opus(path: &Path) -> Result<DecodedPcm, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("Opus open: {e}"))?;
+pub(super) fn decode_ogg_opus_with_limits(
+    mut file: std::fs::File,
+    metadata_limits: MetadataLimits,
+) -> Result<DecodedPcm, String> {
+    use std::io::{Seek, SeekFrom};
+
+    crate::metadata::preflight_ogg_decode(&mut file, metadata_limits)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("Opus rewind: {error}"))?;
     let mut packets = ogg::PacketReader::new(std::io::BufReader::new(file));
     let head = packets
         .read_packet()
@@ -195,6 +202,14 @@ mod tests {
     use std::borrow::Cow;
 
     fn opus_ogg_with_granules(first_granule: Option<u64>, final_granule: u64) -> Vec<u8> {
+        opus_ogg_with_tag_padding(first_granule, final_granule, 0)
+    }
+
+    fn opus_ogg_with_tag_padding(
+        first_granule: Option<u64>,
+        final_granule: u64,
+        tag_padding: usize,
+    ) -> Vec<u8> {
         let channel_count = 2u8;
         let pre_skip = 312u16;
         let mut head = b"OpusHead".to_vec();
@@ -207,6 +222,7 @@ mod tests {
         let mut tags = b"OpusTags".to_vec();
         tags.extend(0u32.to_le_bytes());
         tags.extend(0u32.to_le_bytes());
+        tags.resize(tags.len() + tag_padding, 0);
 
         let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio)
             .expect("create Opus encoder");
@@ -290,7 +306,12 @@ mod tests {
         std::fs::write(file.path(), opus_ogg_with_granules(None, u64::MAX))
             .expect("write Opus fixture");
 
-        let result = std::panic::catch_unwind(|| decode_ogg_opus(file.path()));
+        let result = std::panic::catch_unwind(|| {
+            decode_ogg_opus_with_limits(
+                std::fs::File::open(file.path()).expect("open Opus fixture"),
+                MetadataLimits::default(),
+            )
+        });
         let error = result
             .expect("unset Opus granule must not panic")
             .expect_err("unset Opus granule must fail");
@@ -312,9 +333,34 @@ mod tests {
         )
         .expect("write positive-origin Opus fixture");
 
-        let standard = decode_ogg_opus(standard_file.path()).expect("decode standard Opus");
-        let offset = decode_ogg_opus(offset_file.path()).expect("decode offset Opus");
+        let standard = decode_ogg_opus_with_limits(
+            std::fs::File::open(standard_file.path()).expect("open standard Opus fixture"),
+            MetadataLimits::default(),
+        )
+        .expect("decode standard Opus");
+        let offset = decode_ogg_opus_with_limits(
+            std::fs::File::open(offset_file.path()).expect("open offset Opus fixture"),
+            MetadataLimits::default(),
+        )
+        .expect("decode offset Opus");
         assert_eq!(standard.channels[0].len(), 1_548);
         assert_eq!(standard.channels, offset.channels);
+    }
+
+    #[test]
+    fn oversized_opus_tags_are_rejected_before_packet_decode() {
+        let file = tempfile::NamedTempFile::new().expect("create oversized OpusTags fixture");
+        std::fs::write(file.path(), opus_ogg_with_tag_padding(None, 1_860, 64))
+            .expect("write oversized OpusTags fixture");
+        let mut limits = MetadataLimits::default();
+        limits.max_ogg_packet_bytes = 32;
+        limits.max_item_bytes = 32;
+
+        let error = decode_ogg_opus_with_limits(
+            std::fs::File::open(file.path()).expect("open oversized OpusTags fixture"),
+            limits,
+        )
+        .expect_err("oversized OpusTags must fail during bounded preflight");
+        assert!(error.contains("limit") || error.contains("32"), "{error}");
     }
 }
