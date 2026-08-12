@@ -64,7 +64,7 @@ OPTIONS:
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
-        --max-memory <MB>     checked working-set and metadata limit in MiB (minimum: 1)
+        --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --recursive           include subdirectories in batch mode
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
@@ -122,6 +122,19 @@ output directory. It then acquires `.denoize-batch.lock` before resume or output
 decisions; a second denoize batch for that directory fails immediately. Both
 state names (`.denoize-state` and the legacy `.denoize-gui-state`) and the lock
 name are rejected as planned outputs.
+
+Filesystem audio inputs are opened as regular files; FIFOs, directories, and
+device files are rejected before parsing or output staging. Within each
+processing phase, size estimation, probing, decoding, and metadata reads use
+the same opened filesystem object rather than reopening its pathname.
+
+`--max-memory` limits denoize-owned decoded PCM capacity, explicitly accounted
+codec scratch space, and native metadata budgets per input/worker. Some private
+allocations inside third-party codec libraries fall outside this enforcement,
+and allocator capacity rounding means it is not an exact process-RSS ceiling.
+Batch workers can run concurrently; reduce `--jobs` when targeting a
+whole-process memory ceiling. Standard-input WAV uses its separate bounded
+buffering path.
 
 On Unix, the batch output root must be owned by the current user and must not be
 group/world writable. On Windows, use an ACL-capable local filesystem and an

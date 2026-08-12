@@ -197,17 +197,32 @@ pub fn estimate_stream_memory_bytes_checked(
     checked_stream_memory_bytes(channels, block_frames, frame_size, sample_rate, profile_ms)
 }
 
-/// Conservative preflight estimate for a filesystem input.
+/// Conservative, stat-only estimate for a filesystem path.
 ///
 /// The normal path decodes to planar `f64` and may retain multiple channel
 /// buffers while processing. Eight times the encoded file size is therefore a
 /// useful upper-bound heuristic for rejecting obviously oversized inputs
 /// before decoding; a one-MiB floor keeps tiny files usable with a 1-MiB cap.
+///
+/// This compatibility helper only reads path metadata: it does not establish
+/// that the path is readable or a regular file. Code which will parse the
+/// input should open an [`crate::AudioInputSession`] first and then call
+/// [`estimate_session_memory_bytes`].
 pub fn estimate_file_memory_bytes<P: AsRef<std::path::Path>>(path: P) -> Result<u64, String> {
     let size = std::fs::metadata(path.as_ref())
         .map_err(|error| format!("read input metadata: {error}"))?
         .len();
     Ok(size.saturating_mul(8).max(MIN_MEMORY_ESTIMATE_BYTES))
+}
+
+/// Estimate the normal-path working set from an already-open input session.
+///
+/// This uses the length of the validated file handle instead of restating the
+/// pathname, so a concurrent path replacement cannot change the estimate's
+/// subject between input setup and decoding.
+pub fn estimate_session_memory_bytes(session: &crate::input::AudioInputSession) -> u64 {
+    let size = session.len();
+    size.saturating_mul(8).max(MIN_MEMORY_ESTIMATE_BYTES)
 }
 
 /// Enforce an optional memory cap in MiB, returning a user-facing diagnostic.
@@ -238,92 +253,253 @@ pub fn ensure_memory_limit(
     Ok(())
 }
 
-/// Read any supported audio file (WAV, MP3, M4A) into de-interleaved `f64` channels.
+/// Read any supported regular-file audio input into de-interleaved `f64` channels.
 ///
 /// Compressed formats are decoded losslessly to float precision (no rate conversion).
+/// FIFOs, directories, and device files are rejected; use [`read_wav_bytes`]
+/// for an in-memory or pipe-fed WAV payload.
 pub fn read_audio<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
-    read_audio_with_metadata_limits(path, crate::metadata::MetadataLimits::default())
+    read_audio_with_limits(path, crate::decode::DecodeLimits::default())
 }
 
-/// Read any supported audio file while enforcing explicit FLAC/Ogg metadata
-/// limits before the compressed decoder is allowed to parse the container.
+/// Read any supported regular-file audio input while enforcing explicit
+/// FLAC/Ogg metadata limits before the compressed decoder parses the container.
 pub fn read_audio_with_metadata_limits<P: AsRef<std::path::Path>>(
     path: P,
     metadata_limits: crate::metadata::MetadataLimits,
 ) -> Result<Audio, String> {
-    let path = path.as_ref();
+    read_audio_with_limits(
+        path,
+        crate::decode::DecodeLimits {
+            metadata: metadata_limits,
+            ..crate::decode::DecodeLimits::default()
+        },
+    )
+}
+
+/// Read any supported regular-file audio input with explicit decode limits.
+pub fn read_audio_with_limits<P: AsRef<std::path::Path>>(
+    path: P,
+    limits: crate::decode::DecodeLimits,
+) -> Result<Audio, String> {
+    let mut session = crate::input::AudioInputSession::open(path)?;
+    read_audio_from_session_with_limits(&mut session, limits)
+}
+
+/// Decode from an already-open input session with default resource limits.
+pub fn read_audio_from_session(
+    session: &mut crate::input::AudioInputSession,
+) -> Result<Audio, String> {
+    read_audio_from_session_with_limits(session, crate::decode::DecodeLimits::default())
+}
+
+/// Decode from an already-open input session without reopening its pathname.
+pub fn read_audio_from_session_with_limits(
+    session: &mut crate::input::AudioInputSession,
+    limits: crate::decode::DecodeLimits,
+) -> Result<Audio, String> {
+    let path = session.path().to_path_buf();
+    let mut source = session.try_clone_rewound("decode audio")?;
+    let mut header = [0u8; 12];
+    let n = source
+        .read(&mut header)
+        .map_err(|e| format!("read audio header: {e}"))?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewind audio input: {e}"))?;
+
     // Keep the original WAV representation so WAV -> WAV processing preserves
     // integer/float sample format and bit depth. Compressed decoders do not
-    // have equivalent PCM container metadata and are promoted to f32 PCM.
-    let header = {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-        let mut header = [0u8; 12];
-        let n = file.read(&mut header).map_err(|e| format!("read: {e}"))?;
-        header[..n].to_vec()
-    };
-    if crate::decode::AudioFormat::detect(path, &header) == crate::decode::AudioFormat::Wav {
-        return read_wav(path);
+    // have equivalent PCM container metadata and are promoted to f64 PCM.
+    if crate::decode::AudioFormat::detect(&path, &header[..n]) == crate::decode::AudioFormat::Wav {
+        return read_wav_from_file_with_limits(source, limits);
     }
-    let pcm = crate::decode::decode_file_with_metadata_limits(path, metadata_limits)?;
+    let pcm = crate::decode::decode_file_from_file_with_limits(&path, source, limits)?;
     Ok(pcm.into_audio())
 }
 
-/// Read a WAV file into de-interleaved `f64` channels.
+/// Read a regular-file WAV into de-interleaved `f64` channels.
 pub fn read_wav<P: AsRef<std::path::Path>>(path: P) -> Result<Audio, String> {
-    let channel_mask = read_wav_channel_mask(path.as_ref())?;
-    let reader = WavReader::open(&path).map_err(|e| format!("open: {e}"))?;
-    read_wav_reader(reader, channel_mask)
+    read_wav_with_limits(path, crate::decode::DecodeLimits::default())
+}
+
+/// Read a regular-file WAV with explicit decode limits.
+pub fn read_wav_with_limits<P: AsRef<std::path::Path>>(
+    path: P,
+    limits: crate::decode::DecodeLimits,
+) -> Result<Audio, String> {
+    let mut session = crate::input::AudioInputSession::open(path)?;
+    read_wav_from_session_with_limits(&mut session, limits)
+}
+
+/// Read WAV from an already-open session with default resource limits.
+pub fn read_wav_from_session(
+    session: &mut crate::input::AudioInputSession,
+) -> Result<Audio, String> {
+    read_wav_from_session_with_limits(session, crate::decode::DecodeLimits::default())
+}
+
+/// Read WAV from an already-open session with explicit decode limits.
+pub fn read_wav_from_session_with_limits(
+    session: &mut crate::input::AudioInputSession,
+    limits: crate::decode::DecodeLimits,
+) -> Result<Audio, String> {
+    let file = session.try_clone_rewound("decode WAV")?;
+    read_wav_from_file_with_limits(file, limits)
+}
+
+/// Inspect WAV stream geometry and the optional speaker mask from a session.
+///
+/// The cloned handle is consumed entirely before this function returns; no
+/// reader that could later move the session's shared cursor escapes the call.
+/// This lets callers plan a bounded stream and read metadata before finally
+/// consuming the session with [`WavStreamReader::from_session`].
+pub fn inspect_wav_session(
+    session: &mut crate::input::AudioInputSession,
+) -> Result<WavStreamInfo, String> {
+    let mut file = session.try_clone_rewound("inspect WAV")?;
+    let channel_mask = read_wav_channel_mask_reader(&mut file)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewind WAV input: {e}"))?;
+    let reader = WavReader::new(file).map_err(|e| format!("open: {e}"))?;
+    let spec = reader.spec();
+    validate_readable_wav_spec(spec)?;
+    Ok(WavStreamInfo { spec, channel_mask })
 }
 
 /// Read WAV data supplied by a pipe or another in-memory source.
 pub fn read_wav_bytes(bytes: Vec<u8>) -> Result<Audio, String> {
-    let channel_mask = read_wav_channel_mask_bytes(&bytes)?;
-    let reader = WavReader::new(std::io::Cursor::new(bytes)).map_err(|e| format!("open: {e}"))?;
-    read_wav_reader(reader, channel_mask)
+    read_wav_bytes_with_limits(bytes, crate::decode::DecodeLimits::default())
+}
+
+/// Read retained in-memory WAV data with explicit decode limits.
+pub fn read_wav_bytes_with_limits(
+    bytes: Vec<u8>,
+    limits: crate::decode::DecodeLimits,
+) -> Result<Audio, String> {
+    let retained_bytes = u64::try_from(bytes.capacity()).unwrap_or(u64::MAX);
+    let budget = crate::decode::DecodeBudget::new(limits).with_retained_bytes(retained_bytes)?;
+    let mut source = std::io::Cursor::new(bytes);
+    let channel_mask = read_wav_channel_mask_reader(&mut source)?;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewind WAV input: {e}"))?;
+    let reader = WavReader::new(source).map_err(|e| format!("open: {e}"))?;
+    read_wav_reader(reader, channel_mask, budget)
+}
+
+pub(crate) fn read_wav_from_file_with_limits(
+    mut file: File,
+    limits: crate::decode::DecodeLimits,
+) -> Result<Audio, String> {
+    let channel_mask = read_wav_channel_mask_reader(&mut file)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewind WAV input: {e}"))?;
+    let reader = WavReader::new(file).map_err(|e| format!("open: {e}"))?;
+    read_wav_reader(
+        reader,
+        channel_mask,
+        crate::decode::DecodeBudget::new(limits),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WavDecodePlan {
+    channels: usize,
+    frames: usize,
+    samples: usize,
+    decoded_bytes: u64,
+}
+
+fn plan_wav_decode(spec: WavSpec, declared_samples: u32) -> Result<WavDecodePlan, String> {
+    validate_readable_wav_spec(spec)?;
+    let channels = usize::from(spec.channels);
+    let samples = usize::try_from(declared_samples)
+        .map_err(|_| "WAV sample count does not fit in memory".to_string())?;
+    if samples % channels != 0 {
+        return Err("truncated WAV frame at end of input".into());
+    }
+    let frames = samples / channels;
+    let planned_samples = frames
+        .checked_mul(channels)
+        .ok_or_else(|| "WAV decoded sample count overflows".to_string())?;
+    let decoded_bytes = u64::try_from(planned_samples)
+        .map_err(|_| "WAV decoded sample count is too large".to_string())?
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .ok_or_else(|| "WAV decoded byte count overflows".to_string())?;
+    Ok(WavDecodePlan {
+        channels,
+        frames,
+        samples: planned_samples,
+        decoded_bytes,
+    })
 }
 
 fn read_wav_reader<R: std::io::Read>(
     mut reader: WavReader<R>,
     channel_mask: Option<ChannelMask>,
+    budget: crate::decode::DecodeBudget,
 ) -> Result<Audio, String> {
     let spec = reader.spec();
-    validate_readable_wav_spec(spec)?;
-    let nchan = spec.channels as usize;
+    let plan = plan_wav_decode(spec, reader.len())?;
+    let checked_bytes = budget.check_planar_frames(plan.channels, plan.frames, 0, "WAV decode")?;
+    debug_assert_eq!(checked_bytes, plan.decoded_bytes);
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(plan.channels)
+        .map_err(|_| "unable to reserve WAV channel list".to_string())?;
+    channels.resize_with(plan.channels, Vec::new);
+    budget.reserve_planar_frames(&mut channels, plan.frames, 0, "WAV decode")?;
 
-    let mut channels: Vec<Vec<f64>> = (0..nchan).map(|_| Vec::new()).collect();
-
-    match spec.sample_format {
+    let decoded_samples = match spec.sample_format {
         SampleFormat::Float => {
-            let samples: Result<Vec<f32>, String> = reader
-                .samples::<f32>()
-                .map(|s| s.map_err(|e| format!("read: {e}")))
-                .collect();
-            for (i, v) in samples?.iter().enumerate() {
-                channels[i % nchan].push(sanitize_sample(*v as f64));
+            let mut count = 0usize;
+            for sample in reader.samples::<f32>() {
+                if count == plan.samples {
+                    return Err("WAV contains more samples than its header declares".into());
+                }
+                channels[count % plan.channels].push(sanitize_sample(
+                    sample.map_err(|e| format!("read: {e}"))? as f64,
+                ));
+                count += 1;
             }
+            count
         }
         SampleFormat::Int => {
             let max = (1u64 << (spec.bits_per_sample - 1)) as f64; // 2^(bits-1)
             let inv = 1.0 / max;
             if spec.bits_per_sample <= 16 {
-                let samples: Result<Vec<i16>, String> = reader
-                    .samples::<i16>()
-                    .map(|s| s.map_err(|e| format!("read: {e}")))
-                    .collect();
-                for (i, v) in samples?.iter().enumerate() {
-                    channels[i % nchan].push(sanitize_sample(*v as f64 * inv));
+                let mut count = 0usize;
+                for sample in reader.samples::<i16>() {
+                    if count == plan.samples {
+                        return Err("WAV contains more samples than its header declares".into());
+                    }
+                    channels[count % plan.channels].push(sanitize_sample(
+                        sample.map_err(|e| format!("read: {e}"))? as f64 * inv,
+                    ));
+                    count += 1;
                 }
+                count
             } else {
-                let samples: Result<Vec<i32>, String> = reader
-                    .samples::<i32>()
-                    .map(|s| s.map_err(|e| format!("read: {e}")))
-                    .collect();
-                for (i, v) in samples?.iter().enumerate() {
-                    channels[i % nchan].push(sanitize_sample(*v as f64 * inv));
+                let mut count = 0usize;
+                for sample in reader.samples::<i32>() {
+                    if count == plan.samples {
+                        return Err("WAV contains more samples than its header declares".into());
+                    }
+                    channels[count % plan.channels].push(sanitize_sample(
+                        sample.map_err(|e| format!("read: {e}"))? as f64 * inv,
+                    ));
+                    count += 1;
                 }
+                count
             }
         }
+    };
+    if decoded_samples != plan.samples {
+        return Err(format!(
+            "WAV ended after {decoded_samples} samples, but its header declares {}",
+            plan.samples
+        ));
     }
 
     Ok(Audio {
@@ -352,9 +528,11 @@ fn validate_readable_wav_spec(spec: WavSpec) -> Result<(), String> {
 
 /// Read the optional WAVE_FORMAT_EXTENSIBLE speaker mask without relying on
 /// hound's intentionally small `WavSpec` abstraction.
-fn read_wav_channel_mask(path: &std::path::Path) -> Result<Option<ChannelMask>, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|error| format!("open WAV header: {error}"))?;
+fn read_wav_channel_mask_reader<R: Read + Seek>(
+    file: &mut R,
+) -> Result<Option<ChannelMask>, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind WAV header: {error}"))?;
     let mut header = [0u8; 12];
     if file.read_exact(&mut header).is_err() || &header[8..12] != b"WAVE" {
         return Ok(None);
@@ -374,40 +552,21 @@ fn read_wav_channel_mask(path: &std::path::Path) -> Result<Option<ChannelMask>, 
             if size > 1 << 20 {
                 return Err("WAV fmt chunk is too large".into());
             }
-            let mut body = vec![0u8; size];
+            // Only the first 40 bytes are needed for WAVE_FORMAT_EXTENSIBLE.
+            // Keeping this buffer fixed prevents a padded fmt declaration
+            // from allocating up to the structural size limit merely to read
+            // the speaker mask.
+            let mut body = [0u8; 40];
             file.read_exact(&mut body)
                 .map_err(|error| format!("read WAV fmt chunk: {error}"))?;
             return parse_wav_channel_mask_fmt(&body);
         }
-        use std::io::{Seek, SeekFrom};
         let skip = size.saturating_add(size & 1);
         file.seek(SeekFrom::Current(
             i64::try_from(skip).map_err(|_| "WAV chunk is too large to seek".to_string())?,
         ))
         .map_err(|error| format!("skip WAV chunk: {error}"))?;
     }
-}
-
-fn read_wav_channel_mask_bytes(bytes: &[u8]) -> Result<Option<ChannelMask>, String> {
-    if bytes.len() < 12 || &bytes[8..12] != b"WAVE" {
-        return Ok(None);
-    }
-    let mut offset = 12usize;
-    while offset.saturating_add(8) <= bytes.len() {
-        let id = &bytes[offset..offset + 4];
-        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
-        let body_start = offset + 8;
-        let body_end = body_start.saturating_add(size);
-        if body_end > bytes.len() {
-            break;
-        }
-        if id == b"fmt " && size >= 40 {
-            let body = &bytes[body_start..body_end];
-            return parse_wav_channel_mask_fmt(body);
-        }
-        offset = body_end.saturating_add(size & 1);
-    }
-    Ok(None)
 }
 
 fn parse_wav_channel_mask_fmt(body: &[u8]) -> Result<Option<ChannelMask>, String> {
@@ -610,6 +769,16 @@ fn write_wav_writer<W: std::io::Write + std::io::Seek>(
     Ok(())
 }
 
+/// Lightweight header information used to plan a bounded WAV stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WavStreamInfo {
+    /// PCM format reported by the WAV header.
+    pub spec: WavSpec,
+    /// WAVE_FORMAT_EXTENSIBLE speaker mask, when present.
+    pub channel_mask: Option<ChannelMask>,
+}
+
 /// Block-oriented WAV reader. Samples are returned as planar `f64` channels,
 /// keeping at most `max_frames` frames in memory per call.
 pub struct WavStreamReader<R: Read + Seek> {
@@ -664,10 +833,24 @@ fn plan_wav_stream_block(channels: usize, max_frames: usize) -> Result<WavStream
 }
 
 impl WavStreamReader<BufReader<std::fs::File>> {
-    /// Open a filesystem WAV for bounded-memory reading.
+    /// Open a regular-file WAV for bounded-memory reading.
+    ///
+    /// FIFOs, directories, and device files are rejected before parsing.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, String> {
-        let channel_mask = read_wav_channel_mask(path.as_ref())?;
-        let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+        let session = crate::input::AudioInputSession::open(path)?;
+        Self::from_session(session)
+    }
+
+    /// Open bounded WAV streaming from an existing input session.
+    ///
+    /// The reader consumes the session because it keeps the file handle alive
+    /// after this call. This prevents another session operation from moving
+    /// the shared file cursor while streaming is in progress.
+    pub fn from_session(session: crate::input::AudioInputSession) -> Result<Self, String> {
+        let mut file = session.into_file_rewound("open WAV stream")?;
+        let channel_mask = read_wav_channel_mask_reader(&mut file)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("rewind WAV input: {e}"))?;
         let reader = WavReader::new(BufReader::new(file)).map_err(|e| format!("open: {e}"))?;
         Self::from_reader_with_mask(reader, channel_mask)
     }
@@ -993,6 +1176,26 @@ mod tests {
         bytes
     }
 
+    fn declared_huge_pcm_wav() -> Vec<u8> {
+        let data_len = u32::MAX - 1;
+        let riff_len = u32::MAX;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&riff_len.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&96_000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        assert_eq!(bytes.len(), 44);
+        bytes
+    }
+
     #[test]
     fn sanitize_samples_maps_nonfinite_and_extreme_values_to_safe_pcm() {
         let mut audio = Audio {
@@ -1134,6 +1337,95 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wav_session_decode_ignores_a_concurrent_path_replacement() {
+        let path = tmp("session_inode.wav");
+        let replacement = tmp("session_inode_replacement.wav");
+        let original = Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.25]],
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+            channel_mask: None,
+        };
+        let swapped = Audio {
+            channels: vec![vec![-0.5, -0.25]],
+            ..original.clone()
+        };
+        write_wav(&path, &original).unwrap();
+        write_wav(&replacement, &swapped).unwrap();
+        let mut session = crate::input::AudioInputSession::open(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let decoded = read_audio_from_session(&mut session).unwrap();
+        assert_eq!(decoded.frames(), 1);
+        assert!((decoded.channels[0][0] - 0.25).abs() < 1e-3);
+        assert_eq!(read_wav(&path).unwrap().frames(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wav_decode_limit_has_an_exact_preallocation_boundary() {
+        let path = tmp("decode_limit.wav");
+        let frames = 32_768usize;
+        let audio = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0; frames], vec![0.0; frames]],
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+            channel_mask: None,
+        };
+        write_wav(&path, &audio).unwrap();
+
+        let plan = plan_wav_decode(audio.wav_spec(), (frames * 2) as u32).unwrap();
+        assert_eq!(plan.frames, frames);
+        let exact_limit = estimate_audio_working_set_bytes(&audio);
+        let exact = crate::decode::DecodeLimits {
+            max_working_set_bytes: Some(exact_limit),
+            ..crate::decode::DecodeLimits::default()
+        };
+        assert_eq!(read_wav_with_limits(&path, exact).unwrap().frames(), frames);
+
+        let below = crate::decode::DecodeLimits {
+            max_working_set_bytes: Some(exact_limit - 1),
+            ..crate::decode::DecodeLimits::default()
+        };
+        let error = read_wav_with_limits(&path, below).unwrap_err();
+        assert!(error.contains("WAV decode requires"), "{error}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn declared_huge_wav_is_rejected_before_pcm_reservation() {
+        let limits = crate::decode::DecodeLimits {
+            max_working_set_bytes: Some(BYTES_PER_MIB),
+            ..crate::decode::DecodeLimits::default()
+        };
+        let error = read_wav_bytes_with_limits(declared_huge_pcm_wav(), limits).unwrap_err();
+        assert!(error.contains("WAV decode requires"), "{error}");
+    }
+
+    #[test]
+    fn retained_wav_bytes_are_part_of_the_decode_peak() {
+        let tiny = Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0]],
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+            channel_mask: None,
+        };
+        let encoded = write_wav_bytes(&tiny).unwrap();
+        let mut retained = Vec::with_capacity(BYTES_PER_MIB as usize + 1);
+        retained.extend_from_slice(&encoded);
+        let limits = crate::decode::DecodeLimits {
+            max_working_set_bytes: Some(BYTES_PER_MIB),
+            ..crate::decode::DecodeLimits::default()
+        };
+        let error = read_wav_bytes_with_limits(retained, limits).unwrap_err();
+        assert!(error.contains("decode retained input"), "{error}");
+    }
+
     #[test]
     fn wav_stream_reader_and_writer_roundtrip_blocks() {
         let input = tmp("stream_in.wav");
@@ -1187,6 +1479,45 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_stream_open_rejects_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("input.fifo");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL terminated and names a directory owned by
+        // this test.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        let error = WavStreamReader::open(&fifo).err().unwrap();
+        assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_file_estimator_stats_fifo_without_opening_it() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("estimate.fifo");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL terminated and names a directory owned by
+        // this test.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        assert_eq!(
+            estimate_file_memory_bytes(&fifo).unwrap(),
+            MIN_MEMORY_ESTIMATE_BYTES
+        );
+        assert!(crate::AudioInputSession::open(&fifo)
+            .unwrap_err()
+            .contains("not a regular file"));
     }
 
     #[test]
@@ -1385,6 +1716,14 @@ mod tests {
             channel_mask: Some(mask),
         };
         write_wav(&path, &audio).unwrap();
+        let mut session = crate::input::AudioInputSession::open(&path).unwrap();
+        let info = inspect_wav_session(&mut session).unwrap();
+        assert_eq!(info.spec.channels, 6);
+        assert_eq!(info.channel_mask, Some(mask));
+        let stream = WavStreamReader::from_session(session).unwrap();
+        assert_eq!(stream.spec(), info.spec);
+        assert_eq!(stream.channel_mask(), info.channel_mask);
+        drop(stream);
         let decoded = read_wav(&path).unwrap();
         assert_eq!(decoded.channel_mask, Some(mask));
         assert_eq!(decoded.channel_layout(), ChannelLayout::Unknown(6));

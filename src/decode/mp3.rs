@@ -7,13 +7,14 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 
 #[cfg(test)]
 use nanomp3::Channels;
 use nanomp3::{Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME};
 
+use super::budget::DecodeBudget;
 use super::pcm::DecodedPcm;
+use super::DecodeLimits;
 
 /// Refill below this threshold so the bounded carry normally holds several
 /// complete MPEG frames before each exact-frame decode.
@@ -36,18 +37,20 @@ pub(super) enum TimingMetadata {
 
 /// Conservatively decide whether a raw-frame fallback may discard no timing
 /// metadata. Unknown inputs are intentionally not eligible.
-pub(super) fn inspect_timing_metadata(path: &Path) -> TimingMetadata {
-    match inspect_timing_metadata_inner(path) {
+pub(super) fn inspect_timing_metadata(mut input: File, limits: DecodeLimits) -> TimingMetadata {
+    match inspect_timing_metadata_inner(&mut input, DecodeBudget::new(limits)) {
         Ok(result) => result,
         Err(error) => TimingMetadata::Undetermined(error),
     }
 }
 
-fn inspect_timing_metadata_inner(path: &Path) -> Result<TimingMetadata, String> {
-    let mut input =
-        File::open(path).map_err(|error| format!("open MP3 fallback probe: {error}"))?;
-    seek_past_id3v2(&mut input)?;
+fn inspect_timing_metadata_inner(
+    input: &mut File,
+    budget: DecodeBudget,
+) -> Result<TimingMetadata, String> {
+    seek_past_id3v2(input)?;
 
+    budget.check_peak(0, INPUT_BUFFER_BYTES as u64, "MP3 fallback timing probe")?;
     let mut encoded = vec![0u8; INPUT_BUFFER_BYTES];
     let mut buffered = 0usize;
     while buffered < encoded.len() {
@@ -112,13 +115,18 @@ fn contains_timing_tag(bytes: &[u8]) -> bool {
 ///
 /// The decoded PCM is necessarily retained because [`DecodedPcm`] is an owned
 /// whole-stream value, but encoded input buffering is capped at 32 KiB.
-pub(super) fn decode_mp3_file_compatibility(path: &Path) -> Result<DecodedPcm, String> {
-    let mut input = File::open(path).map_err(|error| format!("open MP3 fallback: {error}"))?;
+pub(super) fn decode_mp3_file_compatibility(
+    mut input: File,
+    limits: DecodeLimits,
+) -> Result<DecodedPcm, String> {
     seek_past_id3v2(&mut input)?;
-    decode_mp3_stream(&mut input)
+    decode_mp3_stream(&mut input, limits)
 }
 
-fn decode_mp3_stream<R: Read>(input: &mut R) -> Result<DecodedPcm, String> {
+fn decode_mp3_stream<R: Read>(input: &mut R, limits: DecodeLimits) -> Result<DecodedPcm, String> {
+    let budget = DecodeBudget::new(limits);
+    let scratch_bytes = mp3_scratch_bytes()?;
+    budget.check_peak(0, scratch_bytes, "MP3 fallback buffers")?;
     let mut decoder = Decoder::new();
     let mut pcm = vec![0.0f32; MAX_SAMPLES_PER_FRAME];
     let mut encoded = vec![0u8; INPUT_BUFFER_BYTES];
@@ -179,14 +187,14 @@ fn decode_mp3_stream<R: Read>(input: &mut R) -> Result<DecodedPcm, String> {
             ));
         }
 
-        // Re-check on the same file descriptor used for fallback decoding.
-        // The eligibility probe opens the path separately, so a concurrent
-        // atomic replacement must not be able to route a Xing/Info/VBRI file
-        // through the raw-frame decoder and reintroduce encoder delay/padding.
+        // Re-check on the same cloned session handle used for fallback decode.
+        // This keeps format/timing eligibility tied to the selected bytes and
+        // prevents Xing/Info/VBRI delay metadata from reaching the raw path.
         if channels.is_empty() && contains_timing_tag(&buffered[..header.frame_bytes]) {
             return Err("MP3 fallback first frame contains Xing/Info/VBRI timing metadata".into());
         }
 
+        budget.check_planar_capacities(&channels, scratch_bytes, "MP3 fallback decode")?;
         let (consumed, info) = decoder.decode(&buffered[..header.frame_bytes], &mut pcm);
         let info = info.ok_or_else(|| {
             "MP3 fallback could not decode a complete contiguous MPEG frame".to_string()
@@ -208,6 +216,8 @@ fn decode_mp3_stream<R: Read>(input: &mut R) -> Result<DecodedPcm, String> {
             &mut channels,
             &mut sample_rate,
             &mut channel_count,
+            budget,
+            scratch_bytes,
         )?;
 
         start += header.frame_bytes;
@@ -317,13 +327,32 @@ fn append_frame(
     channels: &mut Vec<Vec<f64>>,
     sample_rate: &mut Option<u32>,
     channel_count: &mut Option<usize>,
+    budget: DecodeBudget,
+    temporary_bytes: u64,
 ) -> Result<(), String> {
     let current_channel_count = usize::from(info.channels.num());
+    let interleaved_len = info
+        .samples_produced
+        .checked_mul(current_channel_count)
+        .ok_or_else(|| "MP3 fallback sample count overflows".to_string())?;
+    let interleaved = pcm
+        .get(..interleaved_len)
+        .ok_or_else(|| "MP3 fallback produced more samples than its PCM buffer".to_string())?;
+
     match (*sample_rate, *channel_count) {
         (None, None) => {
+            budget.check_planar_frames(
+                current_channel_count,
+                info.samples_produced,
+                temporary_bytes,
+                "MP3 fallback decode",
+            )?;
             *sample_rate = Some(info.sample_rate);
             *channel_count = Some(current_channel_count);
-            *channels = vec![Vec::new(); current_channel_count];
+            channels
+                .try_reserve_exact(current_channel_count)
+                .map_err(|error| format!("reserve MP3 fallback channels: {error}"))?;
+            channels.resize_with(current_channel_count, Vec::new);
         }
         (Some(expected_rate), Some(expected_channels)) => {
             if info.sample_rate != expected_rate {
@@ -341,18 +370,12 @@ fn append_frame(
         _ => return Err("MP3 fallback decoder state is inconsistent".into()),
     }
 
-    let interleaved_len = info
-        .samples_produced
-        .checked_mul(current_channel_count)
-        .ok_or_else(|| "MP3 fallback sample count overflows".to_string())?;
-    let interleaved = pcm
-        .get(..interleaved_len)
-        .ok_or_else(|| "MP3 fallback produced more samples than its PCM buffer".to_string())?;
-    for channel in channels.iter_mut() {
-        channel
-            .try_reserve(info.samples_produced)
-            .map_err(|error| format!("reserve MP3 fallback PCM: {error}"))?;
-    }
+    budget.reserve_planar_additional(
+        channels,
+        info.samples_produced,
+        temporary_bytes,
+        "MP3 fallback decode",
+    )?;
     for frame in interleaved.chunks_exact(current_channel_count) {
         for (destination, &sample) in channels.iter_mut().zip(frame) {
             destination.push(crate::audio::sanitize_sample(f64::from(sample)));
@@ -361,11 +384,24 @@ fn append_frame(
     Ok(())
 }
 
+fn mp3_scratch_bytes() -> Result<u64, String> {
+    let pcm_bytes = u64::try_from(MAX_SAMPLES_PER_FRAME)
+        .ok()
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| "MP3 fallback PCM scratch byte count overflows".to_string())?;
+    (INPUT_BUFFER_BYTES as u64)
+        .checked_add(pcm_bytes)
+        .ok_or_else(|| "MP3 fallback scratch byte count overflows".to_string())
+}
+
 fn seek_past_id3v2(input: &mut File) -> Result<(), String> {
     let file_len = input
         .metadata()
         .map_err(|error| format!("stat MP3 fallback input: {error}"))?
         .len();
+    input
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind MP3 fallback input: {error}"))?;
     let mut header = [0u8; 10];
     let mut read = 0usize;
     while read < header.len() {
@@ -426,9 +462,94 @@ mod tests {
 
     #[test]
     fn stream_decoder_rejects_empty_and_large_garbage_inputs() {
-        assert!(decode_mp3_stream(&mut std::io::Cursor::new(Vec::<u8>::new())).is_err());
+        assert!(decode_mp3_stream(
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            DecodeLimits::default(),
+        )
+        .is_err());
         let mut garbage = std::io::Cursor::new(vec![0u8; INPUT_BUFFER_BYTES * 2 + 17]);
-        assert!(decode_mp3_stream(&mut garbage).is_err());
+        assert!(decode_mp3_stream(&mut garbage, DecodeLimits::default()).is_err());
+    }
+
+    #[test]
+    fn fixed_mp3_scratch_budget_has_an_exact_boundary() {
+        let scratch = mp3_scratch_bytes().unwrap();
+        let exact_error = decode_mp3_stream(
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            DecodeLimits::default().with_max_working_set_bytes(Some(scratch)),
+        )
+        .unwrap_err();
+        assert!(exact_error.contains("no valid MP3 frames"), "{exact_error}");
+
+        let error = decode_mp3_stream(
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+            DecodeLimits::default().with_max_working_set_bytes(Some(scratch - 1)),
+        )
+        .unwrap_err();
+        assert!(error.contains("working-set limit"), "{error}");
+    }
+
+    #[test]
+    fn decoded_pcm_budget_is_checked_across_mp3_frames_before_growth() {
+        const MIB: u64 = 1024 * 1024;
+        let budget =
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(MIB)));
+        let scratch = mp3_scratch_bytes().unwrap();
+        let info = FrameInfo {
+            samples_produced: 1_152,
+            channels: Channels::Stereo,
+            sample_rate: 44_100,
+            bitrate: 128,
+        };
+        let pcm = vec![0.0; MAX_SAMPLES_PER_FRAME];
+        let mut channels = Vec::new();
+        let mut sample_rate = None;
+        let mut channel_count = None;
+        for _ in 0..18 {
+            append_frame(
+                &info,
+                &pcm,
+                &mut channels,
+                &mut sample_rate,
+                &mut channel_count,
+                budget,
+                scratch,
+            )
+            .expect("PCM below the one-MiB normal-work boundary");
+        }
+        let before = channels[0].len();
+        let error = append_frame(
+            &info,
+            &pcm,
+            &mut channels,
+            &mut sample_rate,
+            &mut channel_count,
+            budget,
+            scratch,
+        )
+        .expect_err("the next complete MP3 frame must cross the cap");
+        assert!(error.contains("working-set limit"), "{error}");
+        assert!(channels.iter().all(|channel| channel.len() == before));
+    }
+
+    #[test]
+    fn spare_pcm_capacity_is_combined_with_mp3_decoder_scratch() {
+        const MIB: u64 = 1024 * 1024;
+        let mut channels = vec![Vec::with_capacity(32_768)];
+        channels[0].resize(1_024, 0.0);
+        let logical_bytes = u64::try_from(channels[0].len() * std::mem::size_of::<f64>()).unwrap()
+            + std::mem::size_of::<Vec<f64>>() as u64;
+        let scratch = MIB - logical_bytes;
+        let budget =
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(MIB)));
+
+        budget
+            .check_planar_frames(1, channels[0].len(), scratch, "logical MP3")
+            .expect("logical frames fit the crafted cap");
+        let error = budget
+            .check_planar_capacities(&channels, scratch, "MP3 fallback decode")
+            .expect_err("retained spare capacity plus decoder scratch must be rejected");
+        assert!(error.contains("working-set limit"), "{error}");
     }
 
     #[test]
@@ -448,6 +569,8 @@ mod tests {
             &mut channels,
             &mut sample_rate,
             &mut channel_count,
+            DecodeBudget::new(DecodeLimits::default()),
+            0,
         )
         .unwrap();
         let error = append_frame(
@@ -461,6 +584,8 @@ mod tests {
             &mut channels,
             &mut sample_rate,
             &mut channel_count,
+            DecodeBudget::new(DecodeLimits::default()),
+            0,
         )
         .unwrap_err();
         assert!(error.contains("sample rate changed"));
@@ -480,7 +605,9 @@ mod tests {
         crate::write_audio(&path, &audio, crate::EncodeOptions::default()).unwrap();
         let encoded = std::fs::read(path).unwrap();
 
-        let decoded = decode_mp3_stream(&mut std::io::Cursor::new(&encoded)).unwrap();
+        let decoded =
+            decode_mp3_stream(&mut std::io::Cursor::new(&encoded), DecodeLimits::default())
+                .unwrap();
         assert_eq!(decoded.sample_rate, 44_100);
         assert_eq!(decoded.channels.len(), 2);
         assert_eq!(decoded.frames(), 2_304);
@@ -489,16 +616,28 @@ mod tests {
         let mut id3v1 = [0u8; 128];
         id3v1[..3].copy_from_slice(b"TAG");
         with_id3v1.extend_from_slice(&id3v1);
-        let tagged = decode_mp3_stream(&mut std::io::Cursor::new(with_id3v1)).unwrap();
+        let tagged = decode_mp3_stream(
+            &mut std::io::Cursor::new(with_id3v1),
+            DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(tagged.frames(), decoded.frames());
 
         let truncated = &encoded[..encoded.len() - 1];
-        let error = decode_mp3_stream(&mut std::io::Cursor::new(truncated)).unwrap_err();
+        let error = decode_mp3_stream(
+            &mut std::io::Cursor::new(truncated),
+            DecodeLimits::default(),
+        )
+        .unwrap_err();
         assert!(error.contains("truncated final MP3 frame"));
 
         let mut timing_tagged = encoded;
         timing_tagged[40..44].copy_from_slice(b"Xing");
-        let error = decode_mp3_stream(&mut std::io::Cursor::new(timing_tagged)).unwrap_err();
+        let error = decode_mp3_stream(
+            &mut std::io::Cursor::new(timing_tagged),
+            DecodeLimits::default(),
+        )
+        .unwrap_err();
         assert!(error.contains("timing metadata"));
     }
 
@@ -518,7 +657,8 @@ mod tests {
         let encoded = std::fs::read(path).unwrap();
         assert!(encoded.len() > INPUT_BUFFER_BYTES);
 
-        let decoded = decode_mp3_stream(&mut std::io::Cursor::new(encoded)).unwrap();
+        let decoded =
+            decode_mp3_stream(&mut std::io::Cursor::new(encoded), DecodeLimits::default()).unwrap();
         assert_eq!(decoded.sample_rate, 44_100);
         assert_eq!(decoded.channels.len(), 2);
         assert!(decoded.frames() >= frames);

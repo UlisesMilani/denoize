@@ -70,6 +70,37 @@ fn run(input: &Path, output: &Path, extra: &[&str]) -> Output {
     command.output().expect("run denoize command")
 }
 
+#[cfg(unix)]
+fn run_with_timeout(input: &Path, output: &Path, extra: &[&str]) -> Output {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_denoize"))
+        .arg(input)
+        .arg(output)
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start denoize command");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if child.try_wait().expect("poll denoize command").is_some() {
+            return child.wait_with_output().expect("collect denoize output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let captured = child.wait_with_output().expect("collect timed-out output");
+            panic!(
+                "denoize blocked on non-regular input:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&captured.stdout),
+                String::from_utf8_lossy(&captured.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -96,6 +127,42 @@ fn assert_untouched_symlink(path: &Path, victim: &Path) {
         victim
     );
     assert_eq!(std::fs::read(victim).expect("read victim"), SENTINEL);
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_and_device_inputs_fail_promptly_without_staging_outputs() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::symlink;
+
+    let directory = TestDirectory::create();
+    let fifo = directory.join("input-fifo.wav");
+    let fifo_name = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+    // SAFETY: `fifo_name` is NUL terminated and names a new entry in the
+    // unique test directory.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    let device = directory.join("input-device.wav");
+    symlink("/dev/null", &device).expect("create device symlink");
+
+    for (label, input, extra) in [
+        ("normal-fifo", &fifo, &[][..]),
+        ("stream-fifo", &fifo, &["--stream"][..]),
+        ("normal-device", &device, &[][..]),
+        ("stream-device", &device, &["--stream"][..]),
+    ] {
+        let output_name = format!("{label}.wav");
+        let output = directory.join(&output_name);
+        let result = run_with_timeout(input, &output, extra);
+        assert!(!result.status.success(), "{label} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("not a regular file"),
+            "unexpected {label} error: {stderr}"
+        );
+        assert!(!output.exists(), "{label} created an output");
+        directory.assert_no_staged_outputs();
+    }
 }
 
 #[cfg(unix)]

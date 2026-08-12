@@ -47,6 +47,7 @@ pub mod denoiser;
 pub mod encode;
 pub mod fft;
 pub mod gain;
+pub mod input;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod loudness;
@@ -67,9 +68,12 @@ pub mod window;
 pub use atomic_output::{AtomicOutput, CommitMode};
 pub use audio::{
     ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,
-    estimate_file_memory_bytes, estimate_stream_memory_bytes, estimate_stream_memory_bytes_checked,
-    read_audio, read_audio_with_metadata_limits, read_wav, read_wav_bytes, sanitize_sample,
-    write_audio, write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamReader,
+    estimate_file_memory_bytes, estimate_session_memory_bytes, estimate_stream_memory_bytes,
+    estimate_stream_memory_bytes_checked, inspect_wav_session, read_audio, read_audio_from_session,
+    read_audio_from_session_with_limits, read_audio_with_limits, read_audio_with_metadata_limits,
+    read_wav, read_wav_bytes, read_wav_bytes_with_limits, read_wav_from_session,
+    read_wav_from_session_with_limits, read_wav_with_limits, sanitize_sample, write_audio,
+    write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamInfo, WavStreamReader,
     WavStreamWriter,
 };
 pub use backend::{
@@ -80,12 +84,15 @@ pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
 pub use config::{ConfigError, ResourcePlan};
 pub use decode::{
-    decode_file, decode_file_with_metadata_limits, probe_file, probe_file_with_metadata_limits,
-    AudioCodec, AudioFormat, AudioProbe, DecodedPcm,
+    decode_file, decode_file_from_session_with_limits, decode_file_with_limits,
+    decode_file_with_metadata_limits, probe_file, probe_file_from_session_with_limits,
+    probe_file_with_limits, probe_file_with_metadata_limits, AudioCodec, AudioFormat, AudioProbe,
+    DecodeLimits, DecodedPcm,
 };
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
+pub use input::AudioInputSession;
 pub use quality::QualityMetrics;
 pub use window::{WindowParams, WindowType};
 
@@ -204,8 +211,7 @@ where
     let format = OutputFormat::from_path(output)?;
     encode_opts.validate_options(format)?;
     backend_options.validate_resolved_resources(backend)?;
-    let metadata = metadata::read_extended(input)?;
-    let mut audio = read_audio(input)?;
+    let (metadata, mut audio) = read_file_input_snapshot(input, || {})?;
     format.validate_config(&audio, &encode_opts)?;
     denoise_audio_with_backend_config(&mut audio, config, backend, &backend_options)?;
     write_audio_transactional_as(
@@ -217,6 +223,21 @@ where
         CommitMode::Replace,
     )?;
     Ok(audio)
+}
+
+/// Read metadata and decoded audio from one validated filesystem object.
+///
+/// The callback exists so tests can deterministically replace the pathname at
+/// the exact boundary which used to separate two independent opens.
+fn read_file_input_snapshot(
+    input: &std::path::Path,
+    after_metadata: impl FnOnce(),
+) -> Result<(Option<metadata::Metadata>, Audio), String> {
+    let mut session = AudioInputSession::open(input)?;
+    let metadata = session.read_metadata()?;
+    after_metadata();
+    let audio = read_audio_from_session(&mut session)?;
+    Ok((metadata, audio))
 }
 
 /// Process already-decoded audio in place. This is the path used by stdin and
@@ -484,6 +505,54 @@ mod vad_mix_tests {
 #[cfg(test)]
 mod input_safety_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn file_input_snapshot_stays_on_one_inode_when_path_changes_after_metadata() {
+        use lofty::tag::{Accessor as _, Tag, TagType};
+
+        fn tagged_wav(path: &std::path::Path, title: &str, samples: Vec<f64>) {
+            let audio = Audio {
+                sample_rate: 16_000,
+                channels: vec![samples],
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+                channel_mask: None,
+            };
+            write_wav(path, &audio).unwrap();
+            let mut tag = Tag::new(TagType::RiffInfo);
+            tag.set_title(title.into());
+            metadata::write(tag, path).unwrap();
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let replacement = root.path().join("replacement.wav");
+        tagged_wav(&input, "original inode", vec![0.25]);
+        tagged_wav(&replacement, "replacement inode", vec![-0.5, -0.25]);
+
+        let (metadata, audio) = read_file_input_snapshot(&input, || {
+            std::fs::rename(&replacement, &input).unwrap();
+        })
+        .unwrap();
+
+        let metadata = metadata.expect("original input has metadata");
+        assert_eq!(metadata.tag().title().as_deref(), Some("original inode"));
+        assert_eq!(audio.frames(), 1);
+        assert!((audio.channels[0][0] - 0.25).abs() < 1e-3);
+
+        let replacement_audio = read_audio(&input).unwrap();
+        assert_eq!(replacement_audio.frames(), 2);
+        assert_eq!(
+            metadata::read_extended(&input)
+                .unwrap()
+                .expect("replacement input has metadata")
+                .tag()
+                .title()
+                .as_deref(),
+            Some("replacement inode")
+        );
+    }
 
     #[test]
     fn high_level_processing_sanitizes_nonfinite_samples_and_keeps_empty_audio_safe() {

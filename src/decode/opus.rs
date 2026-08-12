@@ -1,15 +1,36 @@
 use super::DecodedPcm;
-use crate::metadata::MetadataLimits;
+use super::{budget::DecodeBudget, DecodeLimits};
 use opus::{Channels, Decoder};
 use std::ops::Range;
 
+const MIN_OPUS_RETAINED_SAMPLES: usize = 1024;
+const OGG_MAX_PAGE_BODY_BYTES: u64 = 255 * 255;
+// Page lacing/position vectors, one page body, and fixed HashMap/reader state
+// for the single logical stream proven by our allocation-free preflight.
+const OGG_PACKET_READER_FIXED_BYTES: u64 = 128 * 1024;
+
 pub(super) fn decode_ogg_opus_with_limits(
     mut file: std::fs::File,
-    metadata_limits: MetadataLimits,
+    limits: DecodeLimits,
 ) -> Result<DecodedPcm, String> {
     use std::io::{Seek, SeekFrom};
 
-    crate::metadata::preflight_ogg_decode(&mut file, metadata_limits)?;
+    let budget = DecodeBudget::new(limits);
+    // PacketReader materializes a complete packet before returning it. Check
+    // the structurally enforced maximum before constructing or entering that
+    // third-party reader, including for a real zero-byte decode cap.
+    let packet_allocation_bytes = u64::try_from(limits.metadata.max_ogg_packet_bytes)
+        .map_err(|_| "Ogg packet limit does not fit in u64".to_string())?;
+    let packet_reader_internal_bytes = packet_allocation_bytes
+        .checked_add(OGG_MAX_PAGE_BODY_BYTES)
+        .and_then(|bytes| bytes.checked_add(OGG_PACKET_READER_FIXED_BYTES))
+        .ok_or("Opus packet reader byte count overflows")?;
+    let maximum_packet_reader_bytes = packet_reader_internal_bytes
+        .checked_add(packet_allocation_bytes)
+        .ok_or("Opus packet reader byte count overflows")?;
+    budget.check_peak(0, maximum_packet_reader_bytes, "Opus packet reader")?;
+    crate::metadata::preflight_ogg_decode(&mut file, limits.metadata)?;
+    preflight_single_logical_stream(&mut file)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("Opus rewind: {error}"))?;
     let mut packets = ogg::PacketReader::new(std::io::BufReader::new(file));
@@ -31,24 +52,60 @@ pub(super) fn decode_ogg_opus_with_limits(
     } else {
         Channels::Stereo
     };
-    let mut decoder = Decoder::new(48_000, channels).map_err(|e| format!("Opus decoder: {e}"))?;
-    let _tags = packets
+    drop(head);
+    let tags = packets
         .read_packet()
         .map_err(|e| format!("Ogg tags: {e}"))?;
+    drop(tags);
     let mut decoded = Vec::<f32>::new();
     let mut granules = OpusGranuleTracker::new(pre_skip);
-    let mut buffer = vec![0.0f32; 5_760 * count];
-    while let Some(packet) = packets
-        .read_packet()
-        .map_err(|e| format!("Ogg read: {e}"))?
-    {
+    let scratch_samples = 5_760usize
+        .checked_mul(count)
+        .ok_or("Opus decode scratch sample count overflows")?;
+    let scratch_bytes = allocation_bytes::<f32>(scratch_samples, "Opus decode scratch")?;
+    let packet_and_scratch = maximum_packet_reader_bytes
+        .checked_add(scratch_bytes)
+        .ok_or("Opus packet scratch byte count overflows")?;
+    budget.check_peak(0, packet_and_scratch, "Opus decode scratch")?;
+    let mut decoder = Decoder::new(48_000, channels).map_err(|e| format!("Opus decoder: {e}"))?;
+    let mut buffer = vec![0.0f32; scratch_samples];
+    loop {
+        // Combine already-retained f32 capacity with the maximum packet
+        // allocation before every PacketReader entry. The raw Ogg pass proved
+        // that the configured maximum bounds each packet in this file.
+        let retained_f32 = allocation_bytes::<f32>(decoded.capacity(), "Opus retained PCM")?;
+        budget.check_peak(retained_f32, packet_and_scratch, "Opus packet reader")?;
+        let Some(packet) = packets
+            .read_packet()
+            .map_err(|e| format!("Ogg read: {e}"))?
+        else {
+            break;
+        };
         if packet.stream_serial() != stream_serial {
             return Err("chained or multiplexed Ogg Opus streams are not supported".into());
         }
+        let packet_bytes = u64::try_from(packet.data.capacity())
+            .map_err(|_| "Opus packet capacity does not fit in u64".to_string())?;
+        let retained_f32 = allocation_bytes::<f32>(decoded.capacity(), "Opus retained PCM")?;
+        let live_packet_scratch = packet_reader_internal_bytes
+            .checked_add(packet_bytes)
+            .and_then(|bytes| bytes.checked_add(scratch_bytes))
+            .ok_or("Opus packet scratch byte count overflows")?;
+        budget.check_peak(retained_f32, live_packet_scratch, "Opus packet decode")?;
         let frames = decoder
             .decode_float(&packet.data, &mut buffer, false)
             .map_err(|e| format!("Opus decode: {e}"))?;
-        decoded.extend_from_slice(&buffer[..frames * count]);
+        let packet_samples = frames
+            .checked_mul(count)
+            .ok_or("Opus decoded packet sample count overflows")?;
+        reserve_interleaved_additional(
+            &mut decoded,
+            packet_samples,
+            budget,
+            live_packet_scratch,
+            "Opus retained PCM",
+        )?;
+        decoded.extend_from_slice(&buffer[..packet_samples]);
         granules.push_packet(
             frames,
             packet.last_in_page(),
@@ -57,7 +114,24 @@ pub(super) fn decode_ogg_opus_with_limits(
         )?;
     }
     let range = granules.decoded_sample_range(decoded.len(), count)?;
-    let mut output = vec![Vec::new(); count];
+    let output_frames = range.len() / count;
+    drop(buffer);
+    drop(decoder);
+    drop(packets);
+    let retained_f32 = allocation_bytes::<f32>(decoded.capacity(), "Opus retained PCM")?;
+    budget.check_planar_frames(count, output_frames, retained_f32, "Opus output conversion")?;
+    let mut output = Vec::new();
+    budget.check_planar_frames(count, 0, retained_f32, "Opus output channels")?;
+    output
+        .try_reserve_exact(count)
+        .map_err(|error| format!("reserve Opus output channels: {error}"))?;
+    output.resize_with(count, Vec::new);
+    budget.reserve_planar_frames(
+        &mut output,
+        output_frames,
+        retained_f32,
+        "Opus output conversion",
+    )?;
     for (index, sample) in decoded[range].iter().enumerate() {
         output[index % count].push(*sample as f64);
     }
@@ -66,6 +140,124 @@ pub(super) fn decode_ogg_opus_with_limits(
         channels: output,
         channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(count).mask(),
     })
+}
+
+/// PacketReader retains an unfinished packet for every logical stream. The
+/// decoder rejects chained/multiplexed input anyway, so prove the file uses a
+/// single serial with fixed-size buffers before handing it to PacketReader.
+fn preflight_single_logical_stream(file: &mut std::fs::File) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind Opus stream preflight: {error}"))?;
+    let mut first_serial = None;
+    loop {
+        let mut header = [0u8; 27];
+        let mut read = 0usize;
+        while read < header.len() {
+            let count = file
+                .read(&mut header[read..])
+                .map_err(|error| format!("read Opus page header: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        if read == 0 {
+            break;
+        }
+        if read != header.len() || &header[..4] != b"OggS" {
+            return Err("invalid Ogg page during Opus stream preflight".into());
+        }
+        let serial = u32::from_le_bytes(header[14..18].try_into().unwrap());
+        match first_serial {
+            Some(expected) if serial != expected => {
+                return Err("chained or multiplexed Ogg Opus streams are not supported".into());
+            }
+            None => first_serial = Some(serial),
+            _ => {}
+        }
+        let segment_count = usize::from(header[26]);
+        let mut lacing = [0u8; 255];
+        file.read_exact(&mut lacing[..segment_count])
+            .map_err(|error| format!("read Opus page lacing: {error}"))?;
+        let body_bytes = lacing[..segment_count]
+            .iter()
+            .map(|length| u64::from(*length))
+            .sum::<u64>();
+        let offset = i64::try_from(body_bytes)
+            .map_err(|_| "Opus page body size does not fit in i64".to_string())?;
+        file.seek(SeekFrom::Current(offset))
+            .map_err(|error| format!("skip Opus page body: {error}"))?;
+    }
+    Ok(())
+}
+
+fn allocation_bytes<T>(len: usize, context: &str) -> Result<u64, String> {
+    u64::try_from(len)
+        .ok()
+        .and_then(|len| len.checked_mul(std::mem::size_of::<T>() as u64))
+        .ok_or_else(|| format!("{context} byte count overflows"))
+}
+
+/// Reserve an interleaved f32 accumulator with checked geometric growth.
+/// Near a cap, use all available headroom between the required and doubled
+/// capacity so repeated small packets remain amortized instead of reallocating
+/// for every append.
+fn reserve_interleaved_additional(
+    samples: &mut Vec<f32>,
+    additional: usize,
+    budget: DecodeBudget,
+    temporary_bytes: u64,
+    context: &str,
+) -> Result<usize, String> {
+    let required = samples
+        .len()
+        .checked_add(additional)
+        .ok_or_else(|| format!("{context} sample count overflows"))?;
+    if samples.capacity() >= required {
+        let retained = allocation_bytes::<f32>(samples.capacity(), context)?;
+        budget.check_peak(retained, temporary_bytes, context)?;
+        return Ok(required);
+    }
+
+    let geometric = samples
+        .capacity()
+        .checked_mul(2)
+        .unwrap_or(usize::MAX)
+        .max(MIN_OPUS_RETAINED_SAMPLES)
+        .max(required);
+    let retained = allocation_bytes::<f32>(geometric, context)?;
+    let reserve_capacity = if budget
+        .check_peak(retained, temporary_bytes, context)
+        .is_ok()
+    {
+        geometric
+    } else {
+        let required_bytes = allocation_bytes::<f32>(required, context)?;
+        budget.check_peak(required_bytes, temporary_bytes, context)?;
+        let mut fits = required;
+        let mut fails = geometric;
+        while fails - fits > 1 {
+            let candidate = fits + (fails - fits) / 2;
+            let candidate_bytes = allocation_bytes::<f32>(candidate, context)?;
+            if budget
+                .check_peak(candidate_bytes, temporary_bytes, context)
+                .is_ok()
+            {
+                fits = candidate;
+            } else {
+                fails = candidate;
+            }
+        }
+        fits
+    };
+    samples
+        .try_reserve_exact(reserve_capacity - samples.len())
+        .map_err(|error| format!("reserve {context}: {error}"))?;
+    let actual_bytes = allocation_bytes::<f32>(samples.capacity(), context)?;
+    budget.check_peak(actual_bytes, temporary_bytes, context)?;
+    Ok(required)
 }
 
 #[derive(Debug)]
@@ -301,6 +493,51 @@ mod tests {
     }
 
     #[test]
+    fn retained_pcm_uses_checked_headroom_instead_of_per_packet_reallocation() {
+        let budget =
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(3_000)));
+        let mut samples = Vec::new();
+        reserve_interleaved_additional(&mut samples, 100, budget, 0, "test Opus PCM")
+            .expect("tight cap still reserves useful headroom");
+        assert!(samples.capacity() > 100);
+        assert!(samples.capacity() <= 750);
+        let initial_capacity = samples.capacity();
+        samples.resize(100, 0.0);
+
+        for _ in 0..100 {
+            reserve_interleaved_additional(&mut samples, 1, budget, 0, "test Opus PCM")
+                .expect("small packet fits retained headroom");
+            samples.push(0.0);
+            assert_eq!(samples.capacity(), initial_capacity);
+        }
+
+        let mut rejected = Vec::new();
+        let error = reserve_interleaved_additional(
+            &mut rejected,
+            1,
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(0))),
+            0,
+            "test Opus PCM",
+        )
+        .unwrap_err();
+        assert!(error.contains("working-set limit"), "{error}");
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn packet_reader_budget_is_checked_before_reading_opus_head() {
+        let file = tempfile::NamedTempFile::new().expect("create Opus fixture");
+        std::fs::write(file.path(), opus_ogg_with_granules(None, 1_860))
+            .expect("write Opus fixture");
+        let error = decode_ogg_opus_with_limits(
+            std::fs::File::open(file.path()).expect("open Opus fixture"),
+            DecodeLimits::default().with_max_working_set_bytes(Some(0)),
+        )
+        .expect_err("zero decode cap must fail before PacketReader");
+        assert!(error.contains("Opus packet reader"), "{error}");
+    }
+
+    #[test]
     fn unset_ogg_granule_returns_an_error_instead_of_panicking() {
         let file = tempfile::NamedTempFile::new().expect("create Opus fixture");
         std::fs::write(file.path(), opus_ogg_with_granules(None, u64::MAX))
@@ -309,7 +546,7 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             decode_ogg_opus_with_limits(
                 std::fs::File::open(file.path()).expect("open Opus fixture"),
-                MetadataLimits::default(),
+                DecodeLimits::default(),
             )
         });
         let error = result
@@ -335,12 +572,12 @@ mod tests {
 
         let standard = decode_ogg_opus_with_limits(
             std::fs::File::open(standard_file.path()).expect("open standard Opus fixture"),
-            MetadataLimits::default(),
+            DecodeLimits::default(),
         )
         .expect("decode standard Opus");
         let offset = decode_ogg_opus_with_limits(
             std::fs::File::open(offset_file.path()).expect("open offset Opus fixture"),
-            MetadataLimits::default(),
+            DecodeLimits::default(),
         )
         .expect("decode offset Opus");
         assert_eq!(standard.channels[0].len(), 1_548);
@@ -352,9 +589,9 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("create oversized OpusTags fixture");
         std::fs::write(file.path(), opus_ogg_with_tag_padding(None, 1_860, 64))
             .expect("write oversized OpusTags fixture");
-        let mut limits = MetadataLimits::default();
-        limits.max_ogg_packet_bytes = 32;
-        limits.max_item_bytes = 32;
+        let mut limits = DecodeLimits::default();
+        limits.metadata.max_ogg_packet_bytes = 32;
+        limits.metadata.max_item_bytes = 32;
 
         let error = decode_ogg_opus_with_limits(
             std::fs::File::open(file.path()).expect("open oversized OpusTags fixture"),
