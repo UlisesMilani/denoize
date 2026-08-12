@@ -2281,7 +2281,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "372192f13e3332d2ca81b56eaf4657cd221f8f1a8004d58706270dd96f590178";
+        "c06b33c2d2c5808b54430fb4f83392b4efd5f958eced92e6b49a96fb67834125";
 
     struct TestDirectory {
         path: PathBuf,
