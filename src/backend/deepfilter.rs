@@ -5,101 +5,168 @@
 use df::tract::{DfParams, DfTract, RuntimeParams};
 use df::transforms::resample;
 use ndarray::{Array2, Axis};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Target sample rate for DeepFilterNet (48 kHz).
 const DF_SR: usize = 48_000;
 
 /// Denoise channels using DeepFilterNet v3.
 pub fn process(channels: &[Vec<f64>], sample_rate: u32) -> Result<Vec<Vec<f64>>, String> {
-    let n_ch = channels.len().max(1);
-    let max_len = channels.iter().map(|c| c.len()).max().unwrap_or(0);
-    if max_len == 0 {
-        return Ok(channels.to_vec());
+    DeepFilterModel::load()?.process(channels, sample_rate)
+}
+
+pub(crate) struct DeepFilterModel {
+    id: u64,
+}
+
+struct ThreadModels {
+    session_id: u64,
+    templates: HashMap<usize, DfTract>,
+}
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static THREAD_MODELS: RefCell<Option<ThreadModels>> = const { RefCell::new(None) };
+}
+
+impl DeepFilterModel {
+    pub(crate) fn load() -> Result<Self, String> {
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let model = new_model(1)?;
+        THREAD_MODELS.with(|cache| {
+            let mut templates = HashMap::new();
+            templates.insert(1, model);
+            *cache.borrow_mut() = Some(ThreadModels {
+                session_id: id,
+                templates,
+            });
+        });
+        Ok(Self { id })
     }
 
-    // Build f32 array [channels, samples] at 48 kHz.
-    let mut ch_data: Vec<Vec<f32>> = Vec::with_capacity(n_ch);
-    for ch in channels {
-        let f32_in: Vec<f32> = ch.iter().map(|&x| x as f32).collect();
-        let at_48k = if sample_rate as usize == DF_SR {
-            f32_in
-        } else {
-            resample_to_48k(&f32_in, sample_rate as usize)?
-        };
-        ch_data.push(at_48k);
-    }
+    pub(crate) fn process(
+        &self,
+        channels: &[Vec<f64>],
+        sample_rate: u32,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        let n_ch = channels.len().max(1);
+        let max_len = channels.iter().map(|c| c.len()).max().unwrap_or(0);
+        if max_len == 0 {
+            return Ok(channels.to_vec());
+        }
 
-    let r_params = RuntimeParams::default_with_ch(n_ch)
+        // Build f32 array [channels, samples] at 48 kHz.
+        let mut ch_data: Vec<Vec<f32>> = Vec::with_capacity(n_ch);
+        for ch in channels {
+            let f32_in: Vec<f32> = ch.iter().map(|&x| x as f32).collect();
+            let at_48k = if sample_rate as usize == DF_SR {
+                f32_in
+            } else {
+                resample_to_48k(&f32_in, sample_rate as usize)?
+            };
+            ch_data.push(at_48k);
+        }
+
+        let mut model = THREAD_MODELS.with(|cache| -> Result<DfTract, String> {
+            let mut cache = cache.borrow_mut();
+            if cache
+                .as_ref()
+                .is_none_or(|models| models.session_id != self.id)
+            {
+                *cache = Some(ThreadModels {
+                    session_id: self.id,
+                    templates: HashMap::new(),
+                });
+            }
+            let models = cache
+                .as_mut()
+                .expect("DeepFilterNet thread cache was initialized");
+            if !models.templates.contains_key(&n_ch) {
+                models.templates.insert(n_ch, new_model(n_ch)?);
+            }
+            Ok(models
+                .templates
+                .get(&n_ch)
+                .expect("DeepFilterNet channel template was inserted")
+                .clone())
+        })?;
+
+        // Flush and remove the STFT/model lookahead latency. Processing only the
+        // source frames leaves this delay at the beginning and truncates the same
+        // number of samples from the end.
+        let source_len_48k = ch_data.iter().map(|c| c.len()).max().unwrap_or(0);
+        let stft_delay = model
+            .fft_size
+            .checked_sub(model.hop_size)
+            .ok_or_else(|| "DeepFilterNet reported an invalid FFT size".to_string())?;
+        let model_delay = model
+            .lookahead
+            .checked_mul(model.hop_size)
+            .ok_or_else(|| "DeepFilterNet latency overflow".to_string())?;
+        let delay_48k = stft_delay
+            .checked_add(model_delay)
+            .ok_or_else(|| "DeepFilterNet latency overflow".to_string())?;
+        let flush_len_48k = source_len_48k
+            .checked_add(delay_48k)
+            .ok_or_else(|| "DeepFilterNet input is too long".to_string())?;
+        let len_48k = padded_hop_len(flush_len_48k, model.hop_size);
+        for c in &mut ch_data {
+            c.resize(len_48k, 0.0);
+        }
+
+        let noisy = Array2::from_shape_fn((n_ch, len_48k), |(ch, i)| ch_data[ch][i]);
+        let mut enh = Array2::zeros((n_ch, len_48k));
+
+        for (ns_chunk, enh_chunk) in noisy
+            .view()
+            .axis_chunks_iter(Axis(1), model.hop_size)
+            .zip(enh.view_mut().axis_chunks_iter_mut(Axis(1), model.hop_size))
+        {
+            debug_assert_eq!(ns_chunk.len_of(Axis(1)), model.hop_size);
+            model
+                .process(ns_chunk, enh_chunk)
+                .map_err(|e| format!("DeepFilterNet process failed: {e}"))?;
+        }
+
+        // Extract per-channel output and resample back.
+        let mut result = Vec::with_capacity(n_ch);
+        for ch in 0..n_ch {
+            let row: Vec<f32> = enh
+                .row(ch)
+                .iter()
+                .skip(delay_48k)
+                .take(source_len_48k)
+                .copied()
+                .collect();
+            let f64_out: Vec<f64> = if sample_rate as usize == DF_SR {
+                row.iter().map(|&x| x as f64).collect()
+            } else {
+                resample_from_48k(&row, sample_rate as usize)?
+                    .iter()
+                    .map(|&x| x as f64)
+                    .collect()
+            };
+            let orig_len = channels.get(ch).map(|c| c.len()).unwrap_or(len_48k);
+            let mut trimmed = f64_out;
+            trimmed.truncate(orig_len);
+            if trimmed.len() < orig_len {
+                trimmed.resize(orig_len, 0.0);
+            }
+            result.push(trimmed);
+        }
+        Ok(result)
+    }
+}
+
+fn new_model(channels: usize) -> Result<DfTract, String> {
+    let r_params = RuntimeParams::default_with_ch(channels)
         .with_atten_lim(100.0)
         .with_thresholds(-15.0, 35.0, 35.0);
-    let df_params = DfParams::default();
-    let mut model = DfTract::new(df_params, &r_params)
-        .map_err(|e| format!("DeepFilterNet init failed: {e}"))?;
-
-    // Flush and remove the STFT/model lookahead latency. Processing only the
-    // source frames leaves this delay at the beginning and truncates the same
-    // number of samples from the end.
-    let source_len_48k = ch_data.iter().map(|c| c.len()).max().unwrap_or(0);
-    let stft_delay = model
-        .fft_size
-        .checked_sub(model.hop_size)
-        .ok_or_else(|| "DeepFilterNet reported an invalid FFT size".to_string())?;
-    let model_delay = model
-        .lookahead
-        .checked_mul(model.hop_size)
-        .ok_or_else(|| "DeepFilterNet latency overflow".to_string())?;
-    let delay_48k = stft_delay
-        .checked_add(model_delay)
-        .ok_or_else(|| "DeepFilterNet latency overflow".to_string())?;
-    let flush_len_48k = source_len_48k
-        .checked_add(delay_48k)
-        .ok_or_else(|| "DeepFilterNet input is too long".to_string())?;
-    let len_48k = padded_hop_len(flush_len_48k, model.hop_size);
-    for c in &mut ch_data {
-        c.resize(len_48k, 0.0);
-    }
-
-    let noisy = Array2::from_shape_fn((n_ch, len_48k), |(ch, i)| ch_data[ch][i]);
-    let mut enh = Array2::zeros((n_ch, len_48k));
-
-    for (ns_chunk, enh_chunk) in noisy
-        .view()
-        .axis_chunks_iter(Axis(1), model.hop_size)
-        .zip(enh.view_mut().axis_chunks_iter_mut(Axis(1), model.hop_size))
-    {
-        debug_assert_eq!(ns_chunk.len_of(Axis(1)), model.hop_size);
-        model
-            .process(ns_chunk, enh_chunk)
-            .map_err(|e| format!("DeepFilterNet process failed: {e}"))?;
-    }
-
-    // Extract per-channel output and resample back.
-    let mut result = Vec::with_capacity(n_ch);
-    for ch in 0..n_ch {
-        let row: Vec<f32> = enh
-            .row(ch)
-            .iter()
-            .skip(delay_48k)
-            .take(source_len_48k)
-            .copied()
-            .collect();
-        let f64_out: Vec<f64> = if sample_rate as usize == DF_SR {
-            row.iter().map(|&x| x as f64).collect()
-        } else {
-            resample_from_48k(&row, sample_rate as usize)?
-                .iter()
-                .map(|&x| x as f64)
-                .collect()
-        };
-        let orig_len = channels.get(ch).map(|c| c.len()).unwrap_or(len_48k);
-        let mut trimmed = f64_out;
-        trimmed.truncate(orig_len);
-        if trimmed.len() < orig_len {
-            trimmed.resize(orig_len, 0.0);
-        }
-        result.push(trimmed);
-    }
-    Ok(result)
+    DfTract::new(DfParams::default(), &r_params)
+        .map_err(|error| format!("DeepFilterNet init failed: {error}"))
 }
 
 fn padded_hop_len(input_len: usize, hop_size: usize) -> usize {

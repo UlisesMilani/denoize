@@ -7,6 +7,7 @@
 
 use super::OnnxModelConfig;
 use rustfft::{num_complex::Complex32, FftPlanner};
+use std::sync::Arc;
 use tract_onnx::prelude::*;
 
 const MODEL_RATE: u32 = 16_000;
@@ -23,23 +24,42 @@ pub fn process(
     input_sample_rate: u32,
     config: &OnnxModelConfig,
 ) -> Result<Vec<Vec<f64>>, String> {
-    if config.sample_rate != MODEL_RATE {
-        return Err(format!(
-            "MP-SENet expects a {MODEL_RATE} Hz model, got {} Hz",
-            config.sample_rate
-        ));
+    MpSenetModel::load(config)?.process(channels, input_sample_rate)
+}
+
+pub(crate) struct MpSenetModel {
+    model: Arc<TypedRunnableModel<TypedModel>>,
+}
+
+impl MpSenetModel {
+    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+        if config.sample_rate != MODEL_RATE {
+            return Err(format!(
+                "MP-SENet expects a {MODEL_RATE} Hz model, got {} Hz",
+                config.sample_rate
+            ));
+        }
+        if !config.path.is_file() {
+            return Err(format!(
+                "MP-SENet ONNX model does not exist or is not a file: {}",
+                config.path.display()
+            ));
+        }
+        Ok(Self {
+            model: Arc::new(load_model(config)?),
+        })
     }
-    if !config.path.is_file() {
-        return Err(format!(
-            "MP-SENet ONNX model does not exist or is not a file: {}",
-            config.path.display()
-        ));
+
+    pub(crate) fn process(
+        &self,
+        channels: &[Vec<f64>],
+        input_sample_rate: u32,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        channels
+            .iter()
+            .map(|channel| process_channel(channel, input_sample_rate, &self.model))
+            .collect()
     }
-    let model = load_model(config)?;
-    channels
-        .iter()
-        .map(|channel| process_channel(channel, input_sample_rate, &model))
-        .collect()
 }
 
 fn process_channel(

@@ -405,7 +405,9 @@ async function init() {
   appInfo.backends.forEach(({ name }) => {
     const label = name === "classical" ? "Classical DSP" : name;
     backend.add(new Option(label, name));
-    if (name === "classical" || name === "rnnoise") liveBackend.add(new Option(label, name));
+    if (name === "classical" || name === "rnnoise" || name === "gtcrn") {
+      liveBackend.add(new Option(label, name));
+    }
   });
   if (appInfo.fdkAvailable) $<HTMLSelectElement>("#aac-encoder").add(new Option("FDK-AAC", "fdk"));
   await loadLiveDevices();

@@ -28,7 +28,7 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 | `bsrnn` | `--features bsrnn` | ESPnet BSRNN spectral enhancement adapter (external converted model) |
 | `mossformer2` | `--features mossformer2` | ClearerVoice MossFormer2 48 kHz mask adapter (external converted model) |
 | `sgmse` | `--features sgmse` | SGMSE+ iterative diffusion adapter (external converted model) |
-| `gtcrn` | `--features gtcrn` | Official 48K-parameter causal GTCRN; offline plus the stateful library stream API (not the `live` command) |
+| `gtcrn` | `--features gtcrn` | Official 48K-parameter causal GTCRN; reusable offline, `--stream`, library, and realtime sessions |
 
 Build everything: `cargo build --release --features full`
 
@@ -359,18 +359,20 @@ proxy precedence, and resume validation details.
 
 ### Long recordings with bounded memory
 
-For long WAV recordings, use the classical streaming path. It keeps only the
-STFT overlap and a fixed-size input block in memory instead of loading the
-whole file:
+For long WAV recordings, use the stateful streaming path. It keeps only a
+fixed-size input block plus backend overlap, recurrent, and resampler state in
+memory instead of loading the whole file:
 
 ```sh
 ./target/release/denoize long-noisy.wav long-clean.wav --stream
 ```
 
-`--stream` currently supports filesystem WAV-to-WAV processing with the
-classical backend and independent channels. VAD, loudness normalization,
-mid/side or linked stereo processing, and AI/encoded output require the normal
-(non-streaming) path. The default block size is 8192 frames; use
+`--stream` supports the compiled Classical, RNNoise, and GTCRN backends for
+filesystem WAV-to-WAV processing, including independent, linked-stereo, and
+mid/side channel modes. GTCRN uses an explicit `--onnx-model` or the installed
+managed `gtcrn` model. VAD, loudness normalization, other AI backends, and
+encoded output require the normal (non-streaming) path. The default block size
+is 8192 frames; use
 `--stream-frames N` (1–1,048,576) to trade latency and working memory for
 throughput. Noise profiling retains only a bounded leading segment before
 output begins. Stream resource arithmetic is checked from the input header,
@@ -434,9 +436,12 @@ zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
 The realtime page routes a selected capture device through a low-latency
 backend to a playback device, with input/output meters, dropped-chunk counters,
-and explicit start/stop controls. Live sessions support only the live-capable
-Classical and RNNoise backends; other backends are rejected before capture or
-playback starts. Headphones help prevent acoustic feedback.
+and explicit start/stop controls. Live sessions support the live-capable
+Classical, RNNoise, and GTCRN backends; other backends are rejected before
+capture or playback starts. GTCRN requires its managed model to be installed
+(or an explicit model path) and keeps one optimized graph with independent
+recurrent state per processed channel. Headphones help prevent acoustic
+feedback.
 
 ```sh
 cd apps/desktop
@@ -512,25 +517,28 @@ Build with the optional system-audio integration, list devices, then route a
 microphone through a denoising backend to an output or virtual-audio device:
 
 ```sh
-cargo build --release --features live,rnnoise
+cargo build --release --features live,rnnoise,gtcrn
 denoize live --list-devices
 denoize live --backend rnnoise --input-device "Microphone" --output-device "Virtual Cable"
+denoize live --backend gtcrn --input-device "Microphone" --output-device "Virtual Cable"
 ```
 
 Realtime processing runs outside the device callbacks and uses bounded queues,
 so an overloaded backend drops stale capture chunks instead of blocking the
 audio thread. `--chunk-ms` controls the latency/throughput trade-off and defaults
-to 100 ms. Only the low-latency Classical and RNNoise backends are live-capable;
-other backend selections are rejected before capture or playback starts. Input
-and output devices must currently share a default sample rate.
+to 100 ms. The low-latency Classical, RNNoise, and causal GTCRN backends are
+live-capable; other backend selections are rejected before capture or playback
+starts. Input and output devices must currently share a default sample rate.
 
-Classical and RNNoise sessions preserve denoiser, overlap, partial-frame, and
-sample-rate-converter state across consecutive capture chunks. If an overloaded
-capture queue drops a chunk, the sequence gap clears queued playback and cold
-resets all processing state before the next retained chunk; state is never
-shared between separate live sessions. VAD-enabled live processing keeps the
-legacy chunk-compatible path and prints a one-time warning because causal VAD
-state and delay alignment are not yet available.
+Classical, RNNoise, and GTCRN sessions preserve denoiser, overlap, recurrent,
+partial-frame, and sample-rate-converter state across consecutive capture
+chunks. If an overloaded capture queue drops a chunk, the sequence gap clears
+queued playback and cold resets processing state without reparsing a loaded
+model before the next retained chunk; state is never shared between separate
+live sessions. VAD-enabled Classical/RNNoise live processing keeps the legacy
+chunk-compatible path and prints a one-time warning because causal VAD state
+and delay alignment are not yet available. GTCRN rejects live VAD rather than
+silently discarding its recurrent continuity.
 
 ### Batch processing
 
@@ -839,8 +847,21 @@ For embedders that use `denoise_file_with_backend_config`, set
 model/channel work. Set `seed: Some(value)` to reproduce SGMSE+ sampling with
 an explicit seed.
 
-With the `onnx` feature, repeated in-memory inference can retain the parsed
-model explicitly:
+For reusable finite-file processing, prepare a common backend session once.
+Batch workers and VAD regions use this same API, so fixed graphs are shared and
+dynamic-shape adapters retain their most recent optimized graph:
+
+```rust
+use denoize::{Backend, BackendOptions, BackendSession, DenoiserConfig};
+
+let session = BackendSession::prepare(Backend::Classical, BackendOptions::default())?;
+let channels = vec![vec![0.0; 48_000]];
+let enhanced = session.process(&channels, 48_000, &DenoiserConfig::default(48_000))?;
+assert_eq!(enhanced[0].len(), channels[0].len());
+```
+
+With the `onnx` feature, embedders can also inspect and retain the generic
+waveform model contract explicitly:
 
 ```rust
 use denoize::{OnnxModelConfig, OnnxWaveformLayout, OnnxWaveformModel};

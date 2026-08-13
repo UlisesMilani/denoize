@@ -3,7 +3,7 @@
 ```text
 denoize 0.47.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
-Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
+Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
 Output: WAV, FLAC, Ogg Opus, MP3, M4A, AAC.
 
@@ -16,8 +16,8 @@ USAGE:
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
 LIVE:
-    Low-latency live processing supports only classical and rnnoise; other
-    backends are rejected before capture or playback starts.
+    Low-latency live processing supports classical, rnnoise, and gtcrn when
+    compiled; other backends are rejected before capture or playback starts.
 
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
@@ -62,7 +62,7 @@ OPTIONS:
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
-        --stream              bounded-memory classical WAV-to-WAV processing
+        --stream              bounded-memory stateful WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --recursive           include subdirectories in batch mode
@@ -88,7 +88,7 @@ BACKENDS (build with --features full for all):
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
     mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
-    gtcrn       Official causal GTCRN for files/library streams (not the live command)
+    gtcrn       Official causal GTCRN for files, --stream, and live processing
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP

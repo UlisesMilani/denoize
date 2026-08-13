@@ -43,6 +43,16 @@ therefore neither reparses the graph nor observes later pathname replacement
 on repeated calls. The module-level `onnx::process` function is the compatible
 single-call wrapper.
 
+`BackendSession::prepare` is the common reusable layer for finite processing.
+CLI batches share one prepared session for every equal backend/model option
+set, and VAD regions use the same session instead of reopening a graph per
+region. Fixed-shape adapters retain one optimized graph; dynamic BSRNN,
+SGMSE+, and generic waveform adapters retain the most recently required tensor
+shape. DeepFilterNet's non-`Send` runtime is cached once per worker thread. The
+stateful `StreamingBackendSession` provides the corresponding continuous API
+for Classical, RNNoise, and GTCRN and is used by both WAV `--stream` and live
+capture/playback.
+
 The generated rank-2 and rank-3 ONNX fixtures exercise real tract inference,
 sample-rate conversion, multichannel independence, exact duration restoration,
 deterministic ordering, fixed-shape rejection, and cache reuse. The dedicated

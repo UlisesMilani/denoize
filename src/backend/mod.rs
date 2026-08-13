@@ -1,6 +1,8 @@
 //! Optional AI denoising backends (feature-gated).
 
 mod classical;
+mod session;
+mod stream;
 
 use std::path::PathBuf;
 
@@ -19,6 +21,8 @@ fn finite_sample(sample: f64) -> f64 {
 const MID_SIDE_SCALE: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 pub use classical::process_classical;
+pub use session::BackendSession;
+pub use stream::StreamingBackendSession;
 
 /// Denoising backend selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,180 +366,15 @@ pub fn process_channels(
     classical_cfg: &crate::denoiser::DenoiserConfig,
     backend_options: &BackendOptions,
 ) -> Result<Vec<Vec<f64>>, String> {
-    let mut effective_config = classical_cfg.clone();
-    effective_config.sample_rate = sample_rate;
-    effective_config
-        .validate_config()
-        .map_err(|error| error.to_string())?;
-    backend_options.validate_resolved_resources(backend)?;
-    let needs_sanitization = channels
-        .iter()
-        .flatten()
-        .any(|sample| !sample.is_finite() || *sample < -1.0 || *sample > 1.0);
-    let sanitized;
-    let channels = if needs_sanitization {
-        sanitized = channels
-            .iter()
-            .map(|channel| channel.iter().copied().map(sanitize_sample).collect())
-            .collect::<Vec<Vec<f64>>>();
-        &sanitized
-    } else {
-        channels
-    };
-    let result = if channels.len() == 2 && backend_options.channel_mode != ChannelMode::Independent
-    {
-        process_stereo(
-            backend,
-            channels,
-            sample_rate,
-            &effective_config,
-            backend_options,
-        )
-    } else {
-        process_channels_independent(
-            backend,
-            channels,
-            sample_rate,
-            &effective_config,
-            backend_options,
-        )
-    }?;
-    Ok(result
-        .into_iter()
-        .map(|channel| channel.into_iter().map(sanitize_sample).collect())
-        .collect())
-}
-
-fn process_stereo(
-    backend: Backend,
-    channels: &[Vec<f64>],
-    sample_rate: u32,
-    classical_cfg: &crate::denoiser::DenoiserConfig,
-    backend_options: &BackendOptions,
-) -> Result<Vec<Vec<f64>>, String> {
-    if channels[0].len() != channels[1].len() {
-        return Err("stereo channels must contain the same number of frames".into());
-    }
-    let mid: Vec<f64> = channels[0]
-        .iter()
-        .zip(&channels[1])
-        .map(|(left, right)| (left + right) * 0.5)
-        .collect();
-    match backend_options.channel_mode {
-        ChannelMode::StereoLinked => {
-            let enhanced = process_channels_independent(
-                backend,
-                std::slice::from_ref(&mid),
-                sample_rate,
-                classical_cfg,
-                backend_options,
-            )?
-            .pop()
-            .unwrap_or_default();
-            let mut result = channels.to_vec();
-            let (left_channels, right_channels) = result.split_at_mut(1);
-            for ((left, right), (original, clean)) in left_channels[0]
-                .iter_mut()
-                .zip(&mut right_channels[0])
-                .zip(mid.iter().zip(enhanced.iter()))
-            {
-                let correction = clean - original;
-                *left += correction;
-                *right += correction;
-            }
-            Ok(result)
-        }
-        ChannelMode::MidSide => {
-            let (mid, side) = encode_mid_side(&channels[0], &channels[1])?;
-            let processed = process_channels_independent(
-                backend,
-                &[mid, side],
-                sample_rate,
-                classical_cfg,
-                backend_options,
-            )?;
-            if processed.len() != 2 {
-                return Err("mid-side backend must return exactly two channels".into());
-            }
-            let (left, right) = decode_mid_side(&processed[0], &processed[1])?;
-            Ok(vec![left, right])
-        }
-        ChannelMode::Independent => unreachable!(),
-    }
-}
-
-fn process_channels_independent(
-    backend: Backend,
-    channels: &[Vec<f64>],
-    sample_rate: u32,
-    classical_cfg: &crate::denoiser::DenoiserConfig,
-    backend_options: &BackendOptions,
-) -> Result<Vec<Vec<f64>>, String> {
-    let _ = sample_rate; // used by AI backends; classical reads from cfg
-    let _ = backend_options; // used by configured model backends when enabled
-    match backend {
-        Backend::Classical => Ok(process_classical(channels, classical_cfg)),
-        #[cfg(feature = "rnnoise")]
-        Backend::Rnnoise => rnnoise::process(channels, sample_rate),
-        #[cfg(feature = "deepfilter")]
-        Backend::DeepFilter => deepfilter::process(channels, sample_rate),
-        #[cfg(feature = "onnx")]
-        Backend::Onnx => {
-            let config = backend_options.onnx.as_ref().ok_or_else(|| {
-                "ONNX backend requires a model path (CLI: --onnx-model <PATH>)".to_string()
-            })?;
-            onnx::process(channels, sample_rate, config, backend_options.deterministic)
-        }
-        #[cfg(feature = "mpsenet")]
-        Backend::MpSenet => {
-            let config = backend_options.onnx.as_ref().ok_or_else(|| {
-                "MP-SENet backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
-            })?;
-            mpsenet::process(channels, sample_rate, config)
-        }
-        #[cfg(feature = "bsrnn")]
-        Backend::Bsrnn => {
-            let config = backend_options.onnx.as_ref().ok_or_else(|| {
-                "BSRNN backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
-            })?;
-            bsrnn::process(channels, sample_rate, config)
-        }
-        #[cfg(feature = "mossformer2")]
-        Backend::Mossformer2 => {
-            let config = backend_options.onnx.as_ref().ok_or_else(|| {
-                "MossFormer2 backend requires a converted model (CLI: --onnx-model <PATH>)"
-                    .to_string()
-            })?;
-            mossformer2::process(channels, sample_rate, config)
-        }
-        #[cfg(feature = "sgmse")]
-        Backend::Sgmse => {
-            let config = backend_options.onnx.as_ref().ok_or_else(|| {
-                "SGMSE+ backend requires a converted model (CLI: --onnx-model <PATH>)".to_string()
-            })?;
-            sgmse::process(
-                channels,
-                sample_rate,
-                config,
-                backend_options.sgmse_profile,
-                backend_options.seed,
-            )
-        }
-        #[cfg(feature = "gtcrn")]
-        Backend::Gtcrn => {
-            let config = backend_options.onnx.as_ref().ok_or_else(|| {
-                "GTCRN backend requires the official streaming model (CLI: --onnx-model <PATH>)"
-                    .to_string()
-            })?;
-            gtcrn::process(channels, sample_rate, config)
-        }
-    }
+    BackendSession::prepare(backend, backend_options.clone())?.process(
+        channels,
+        sample_rate,
+        classical_cfg,
+    )
 }
 
 #[cfg(feature = "rnnoise")]
 pub mod rnnoise;
-#[cfg(all(feature = "live", feature = "rnnoise"))]
-pub(crate) use rnnoise::StreamingProcessor as RnnoiseStreamingProcessor;
 
 #[cfg(feature = "deepfilter")]
 pub mod deepfilter;

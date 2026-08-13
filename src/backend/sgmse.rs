@@ -7,6 +7,7 @@
 
 use super::{OnnxModelConfig, SgmseProfile};
 use rustfft::{num_complex::Complex32, FftPlanner};
+use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
 
 const MODEL_RATE: u32 = 16_000;
@@ -29,43 +30,89 @@ pub fn process(
     profile: SgmseProfile,
     seed: Option<u64>,
 ) -> Result<Vec<Vec<f64>>, String> {
-    if config.sample_rate != MODEL_RATE {
-        return Err(format!(
-            "SGMSE+ expects a {MODEL_RATE} Hz model, got {} Hz",
-            config.sample_rate
-        ));
-    }
-    if !config.path.is_file() {
-        return Err(format!(
-            "SGMSE+ ONNX model does not exist or is not a file: {}",
-            config.path.display()
-        ));
-    }
-    if channels.is_empty() {
-        return Ok(Vec::new());
+    SgmseModel::load(config)?.process(channels, input_sample_rate, profile, seed)
+}
+
+struct CompiledSgmseModel {
+    frames: usize,
+    model: Arc<TypedRunnableModel<TypedModel>>,
+}
+
+pub(crate) struct SgmseModel {
+    template: InferenceModel,
+    compiled: Mutex<Option<CompiledSgmseModel>>,
+}
+
+impl SgmseModel {
+    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+        if config.sample_rate != MODEL_RATE {
+            return Err(format!(
+                "SGMSE+ expects a {MODEL_RATE} Hz model, got {} Hz",
+                config.sample_rate
+            ));
+        }
+        if !config.path.is_file() {
+            return Err(format!(
+                "SGMSE+ ONNX model does not exist or is not a file: {}",
+                config.path.display()
+            ));
+        }
+        Ok(Self {
+            template: load_template(config)?,
+            compiled: Mutex::new(None),
+        })
     }
 
-    let model_samples =
-        crate::resample::resample(&channels[0], input_sample_rate, MODEL_RATE)?.len();
-    if model_samples == 0 {
-        return Ok(channels.iter().map(|_| Vec::new()).collect());
+    pub(crate) fn process(
+        &self,
+        channels: &[Vec<f64>],
+        input_sample_rate: u32,
+        profile: SgmseProfile,
+        seed: Option<u64>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model_samples =
+            crate::resample::resample(&channels[0], input_sample_rate, MODEL_RATE)?.len();
+        if model_samples == 0 {
+            return Ok(channels.iter().map(|_| Vec::new()).collect());
+        }
+        let frames = padded_frame_count(model_samples);
+        let model = self.compiled_model(frames)?;
+        channels
+            .iter()
+            .enumerate()
+            .map(|(index, channel)| {
+                process_channel(
+                    channel,
+                    input_sample_rate,
+                    frames,
+                    seed.unwrap_or(DEFAULT_SEED).wrapping_add(index as u64),
+                    profile.steps(),
+                    &model,
+                )
+            })
+            .collect()
     }
-    let frames = padded_frame_count(model_samples);
-    let model = load_model(config, frames)?;
-    channels
-        .iter()
-        .enumerate()
-        .map(|(index, channel)| {
-            process_channel(
-                channel,
-                input_sample_rate,
-                frames,
-                seed.unwrap_or(DEFAULT_SEED).wrapping_add(index as u64),
-                profile.steps(),
-                &model,
-            )
-        })
-        .collect()
+
+    fn compiled_model(&self, frames: usize) -> Result<Arc<TypedRunnableModel<TypedModel>>, String> {
+        let mut compiled = self
+            .compiled
+            .lock()
+            .map_err(|_| "SGMSE+ compiled-model cache lock was poisoned".to_string())?;
+        if let Some(cached) = compiled.as_ref() {
+            if cached.frames == frames {
+                return Ok(Arc::clone(&cached.model));
+            }
+        }
+        let model = Arc::new(compile_model(&self.template, frames)?);
+        *compiled = Some(CompiledSgmseModel {
+            frames,
+            model: Arc::clone(&model),
+        });
+        Ok(model)
+    }
 }
 
 fn process_channel(
@@ -283,11 +330,8 @@ fn marginal_std(time: f32) -> f32 {
     (numerator / (THETA + log_sigma)).sqrt()
 }
 
-fn load_model(
-    config: &OnnxModelConfig,
-    frames: usize,
-) -> Result<TypedRunnableModel<TypedModel>, String> {
-    let mut model = tract_onnx::onnx()
+fn load_template(config: &OnnxModelConfig) -> Result<InferenceModel, String> {
+    let model = tract_onnx::onnx()
         .model_for_path(&config.path)
         .map_err(|error| model_error("load", error))?;
     if model
@@ -303,6 +347,14 @@ fn load_model(
     {
         return Err("SGMSE+ ONNX model must have two inputs and one output".into());
     }
+    Ok(model)
+}
+
+fn compile_model(
+    template: &InferenceModel,
+    frames: usize,
+) -> Result<TypedRunnableModel<TypedModel>, String> {
+    let mut model = template.clone();
     model
         .set_input_fact(0, f32::fact(tvec!(1, 4, BINS, frames)).into())
         .map_err(|error| model_error("configure features", error))?;
