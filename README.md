@@ -35,6 +35,10 @@ Build everything: `cargo build --release --features full`
 The generic ONNX backend is the deployment foundation for future neural
 models. It intentionally accepts only single-input/single-output waveform
 models; spectral models and diffusion samplers require dedicated adapters.
+Library embedders can load [`OnnxWaveformModel`](https://docs.rs/denoize/latest/denoize/struct.OnnxWaveformModel.html)
+once, inspect its validated `float32` waveform contract, and reuse the most
+recently compiled input length instead of parsing and optimizing the graph on
+every call. The CLI convenience path keeps the same `--onnx-model` contract.
 
 > The prebuilt GitHub binaries include every backend. Because the DeepFilterNet
 > Rust crate is not available from crates.io, the crates.io package's `full`
@@ -835,6 +839,25 @@ For embedders that use `denoise_file_with_backend_config`, set
 model/channel work. Set `seed: Some(value)` to reproduce SGMSE+ sampling with
 an explicit seed.
 
+With the `onnx` feature, repeated in-memory inference can retain the parsed
+model explicitly:
+
+```rust
+use denoize::{OnnxModelConfig, OnnxWaveformLayout, OnnxWaveformModel};
+
+let model = OnnxWaveformModel::load(OnnxModelConfig {
+    path: "model.onnx".into(),
+    sample_rate: 16_000,
+})?;
+assert!(matches!(
+    model.contract().layout(),
+    OnnxWaveformLayout::BatchSamples | OnnxWaveformLayout::BatchChannelsSamples
+));
+let channels = vec![vec![0.0; 16_000]];
+let enhanced = model.process(&channels, 16_000, true)?;
+assert_eq!(enhanced[0].len(), channels[0].len());
+```
+
 ## Roadmap status
 
 | Priority | Technology | Status |
@@ -844,7 +867,7 @@ an explicit seed.
 | 3 | Kaiser/Flat-top/DPSS windows | ✅ |
 | 4 | Multiband / nonlinear SpecSub | ✅ |
 | 5 | Perceptual weighting + musical-noise PF | ✅ |
-| 6 | Pure-Rust external ONNX inference foundation | 🟨 waveform contract implemented |
+| 6 | Pure-Rust external ONNX inference foundation | ✅ validated reusable waveform runtime (`--features onnx`) |
 | 7 | BSRNN / MP-SENet / MossFormer2 adapters | ✅ implemented and quality-gated |
 | 8 | SGMSE+ | ✅ 30-step PC sampler + score-model adapter |
 

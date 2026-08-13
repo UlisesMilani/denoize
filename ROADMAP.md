@@ -1,9 +1,14 @@
 # Neural backend roadmap
 
 This document separates deployable implementations from architectural names.
-A backend is complete only when denoize can load a documented pretrained model,
-run it without Python, preserve the input channel count and duration, and pass
-an end-to-end audio fixture test.
+A named model backend is complete only when denoize can load a documented
+pretrained model, run it without Python, preserve the input channel count and
+duration, and pass an end-to-end audio fixture test. The model-agnostic ONNX
+foundation is complete when its public tensor contract is validated before
+inference, a loaded graph can be reused without reopening its pathname, and
+end-to-end fixtures cover the accepted layouts, resampling, channels, and
+duration. Model quality remains a gate for each named adapter, not for an
+arbitrary user-supplied graph.
 
 ## Investigation status
 
@@ -30,6 +35,21 @@ one-output `float32` waveform models:
 - output duration and original channel count are preserved;
 - missing files, unsupported ranks, short outputs, and non-finite samples are
   rejected with explicit errors.
+
+`OnnxWaveformModel::load` establishes that contract once and exposes its layout
+and any fixed input/output length to embedders. It retains the parsed graph,
+caches the optimized graph for the most recent model-rate input length, and
+therefore neither reparses the graph nor observes later pathname replacement
+on repeated calls. The module-level `onnx::process` function is the compatible
+single-call wrapper.
+
+The generated rank-2 and rank-3 ONNX fixtures exercise real tract inference,
+sample-rate conversion, multichannel independence, exact duration restoration,
+deterministic ordering, fixed-shape rejection, and cache reuse. The dedicated
+model adapters demonstrate the same Pure-Rust deployment layer with real
+pretrained graphs and their own numerical and speech-quality gates; the managed
+official GTCRN graph additionally exercises stateful multi-input inference
+without Python. These checks complete the external ONNX inference foundation.
 
 This contract can host exported waveform models, but it does not make any of
 the named roadmap models complete by itself.

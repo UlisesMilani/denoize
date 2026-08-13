@@ -26,6 +26,7 @@
 //! - `rnnoise` feature: RNNoise via nnnoiseless (pure-Rust)
 //! - `deepfilter` feature: DeepFilterNet v3 via tract ONNX
 //! - `onnx` feature: user-supplied waveform ONNX models via tract
+//!   (including a reusable, contract-checked loaded-model API)
 //! - `mpsenet` feature: MP-SENet compressed-magnitude/phase ONNX adapter
 //! - `bsrnn` feature: ESPnet BSRNN spectral ONNX adapter
 //! - `mossformer2` feature: ClearerVoice MossFormer2 48 kHz ONNX adapter
@@ -76,6 +77,8 @@ pub use audio::{
     write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamInfo, WavStreamReader,
     WavStreamWriter,
 };
+#[cfg(feature = "onnx")]
+pub use backend::onnx::{OnnxWaveformContract, OnnxWaveformLayout, OnnxWaveformModel};
 pub use backend::{
     decode_mid_side, encode_mid_side, Backend, BackendOptions, ChannelMode, OnnxModelConfig,
     SgmseProfile,
