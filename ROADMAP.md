@@ -10,6 +10,27 @@ end-to-end fixtures cover the accepted layouts, resampling, channels, and
 duration. Model quality remains a gate for each named adapter, not for an
 arbitrary user-supplied graph.
 
+## Managed model operations roadmap
+
+Model distribution and local lifecycle work proceeds in this order. A stage is
+complete only when its CLI and desktop surfaces, offline behavior, failure
+atomicity, documentation, and release assets are covered by automated tests.
+
+| Order | Stage | Status |
+|---:|---|---|
+| 1 | Signed, sequence-monotonic model catalog; exact artifact size/SHA-256; content-addressed installation provenance | Implemented |
+| 2 | `models doctor`, `verify`, `repair`, and `prune` for corrupt, missing, stale, and orphaned cache state | Planned next |
+| 3 | Signing-key rotation, explicit revocation, expiry policy, and emergency trust-root recovery | Planned |
+| 4 | Signed offline bundles containing catalog, signature, models, licenses, and provenance for closed networks | Planned |
+| 5 | Stable JSON output for catalog/model health, provenance, recipe identity, and automation | Planned |
+| 6 | Hardware capability discovery, explicit accelerator selection, and deterministic CPU fallback | Planned |
+| 7 | Process-level resource controls, worker admission based on memory, and stronger isolation of third-party codec/model allocations | Planned |
+| 8 | Input-aware quality/model recommendation with reproducible calibration evidence | Planned |
+
+Stages 2–5 extend the authenticated distribution system without weakening its
+rollback or provenance guarantees. Stages 6–8 are runtime improvements and
+must retain a portable CPU path and deterministic validation fixtures.
+
 ## Investigation status
 
 | Model | Upstream artifact | Native integration gap | Status |

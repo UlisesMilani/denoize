@@ -226,12 +226,17 @@ pub fn resolve_backend_options(
         .map_err(|error| error.to_string())?;
     #[cfg(feature = "gtcrn")]
     if _backend == Backend::Gtcrn && options.onnx.is_none() {
-        let model = crate::models::find("gtcrn").expect("built-in GTCRN manifest entry");
+        let catalog = crate::models::active_catalog()?;
+        let model = catalog
+            .find("gtcrn")
+            .ok_or_else(|| "active model catalog has no unambiguous GTCRN package".to_string())?;
         options.onnx = Some(OnnxModelConfig {
-            path: crate::models::verify(model).map_err(|_| {
-                "GTCRN model is not installed; run `denoize models install gtcrn`".to_string()
+            path: crate::models::verify_catalog_model(model).map_err(|error| {
+                format!(
+                    "GTCRN managed model is unavailable ({error}); run `denoize models install gtcrn`"
+                )
             })?,
-            sample_rate: model.sample_rate,
+            sample_rate: model.sample_rate(),
         });
     }
     options.validate_resolved_resources(_backend)?;

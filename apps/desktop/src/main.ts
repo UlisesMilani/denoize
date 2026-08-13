@@ -39,7 +39,12 @@ type ComparisonMetricValues = {
 };
 type ModelRow = {
   name: string; backend: string; license: string; sampleRate: number; revision: string;
-  installed: boolean; path: string;
+  installed: boolean; path: string; catalogSequence: number; catalogSha256: string;
+  catalogSigningKey: string; provenanceSource: string | null; installedAtUnixSeconds: number | null;
+};
+type ModelCatalogRow = {
+  sequence: number; sha256: string; signingKey: string; origin: string;
+  modelCount: number; highestAcceptedSequence: number; cachedPath: string;
 };
 type ModelProgress = {
   jobId: number; name: string; status: "running" | "completed" | "failed" | "cancelled";
@@ -190,7 +195,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div class="card-heading"><div><span class="step">NET</span><h2>セッション限定の導入設定</h2></div><span class="hint">保存・書き出し対象外</span></div>
           <p class="section-copy">未指定時は環境のプロキシ設定を使います。認証情報は操作開始後に消去され、この端末の設定には保存されません。</p>
           <div class="form-grid two model-network-fields">
-            <label>取得元URL<input id="model-source-url" type="url" placeholder="マニフェスト既定URL" autocomplete="off" spellcheck="false"></label>
+            <label>モデル取得元URL<input id="model-source-url" type="url" placeholder="カタログ既定のモデルURL" autocomplete="off" spellcheck="false"></label>
+            <label>カタログ取得元URL<input id="model-catalog-source-url" type="url" placeholder="既定の署名カタログURL" autocomplete="off" spellcheck="false"></label>
             <label id="model-proxy-field">プロキシURL<input id="model-proxy-url" type="url" placeholder="環境設定を使用" autocomplete="off" spellcheck="false"></label>
           </div>
           <div class="toggle-grid model-policy-toggles">
@@ -204,9 +210,9 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           </div>
           <div class="file-row model-local-file"><div><label>ローカルモデル（導入時に使用）</label><div id="model-local-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="clear-model-local" disabled>解除</button><button class="secondary" id="choose-model-local">選択</button></div></div>
           <input id="model-local-path" type="hidden">
-          <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルもマニフェスト固定のSHA-256で検証されます。</p>
+          <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルも署名カタログ固定のSHA-256で検証されます。ローカルモデル導入時、共有ネットワーク欄はモデル本体には使われず、カタログ更新にだけ使用できます。</p>
         </article>
-        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><button class="secondary" id="refresh-models">更新</button></div><p class="section-copy">外部モデルはチェックサム検証後、ローカルキャッシュに保存されます。中断したダウンロードは次回の導入・更新で再開されます。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
+        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p class="section-copy">外部モデルはカタログ署名、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。中断したダウンロードは次回の導入・更新で再開されます。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
       </section>
       <div id="toast" role="status"></div>
       <div id="drop-overlay"><strong>ここにドロップ</strong><span>音声ファイルまたはフォルダ</span></div>
@@ -666,8 +672,8 @@ $("#export-report").addEventListener("click", async () => {
   if (path) { await invoke("save_text_file", { path, contents: comparison.html }); showToast("レポートを保存しました"); }
 });
 
-function modelDownloadOptions(action: string): ModelActionOptions {
-  const selectedSourcePath = $<HTMLInputElement>("#model-local-path").value || null;
+function modelDownloadOptions(action: string, ignoreLocalSource = false, catalog = false): ModelActionOptions {
+  const selectedSourcePath = ignoreLocalSource ? null : ($<HTMLInputElement>("#model-local-path").value || null);
   if (selectedSourcePath && action !== "install") throw new Error("ローカルファイルは導入操作でのみ使用できます");
   const sourcePath = action === "install" ? selectedSourcePath : null;
   if (sourcePath) {
@@ -680,7 +686,7 @@ function modelDownloadOptions(action: string): ModelActionOptions {
   const value = (selector: string) => $<HTMLInputElement>(selector).value || null;
   return {
     offline: $<HTMLInputElement>("#model-offline").checked,
-    sourceUrl: value("#model-source-url"),
+    sourceUrl: value(catalog ? "#model-catalog-source-url" : "#model-source-url"),
     proxyUrl: direct ? null : value("#model-proxy-url"),
     direct,
     bearerToken: value("#model-bearer-token"),
@@ -694,7 +700,7 @@ function clearModelSecrets() {
   $<HTMLInputElement>("#model-bearer-token").value = "";
   $<HTMLInputElement>("#model-basic-username").value = "";
   $<HTMLInputElement>("#model-basic-password").value = "";
-  for (const selector of ["#model-source-url", "#model-proxy-url"] as const) {
+  for (const selector of ["#model-source-url", "#model-catalog-source-url", "#model-proxy-url"] as const) {
     const input = $<HTMLInputElement>(selector);
     if (!input.value) continue;
     try {
@@ -709,18 +715,14 @@ function clearModelSecrets() {
 }
 
 function updateModelProxyField() {
-  const local = Boolean($<HTMLInputElement>("#model-local-path").value);
   const direct = $<HTMLInputElement>("#model-direct").checked;
-  $<HTMLInputElement>("#model-proxy-url").disabled = direct || local;
-  $("#model-proxy-field").classList.toggle("muted-control", direct || local);
+  $<HTMLInputElement>("#model-proxy-url").disabled = direct;
+  $("#model-proxy-field").classList.toggle("muted-control", direct);
 }
 
 function updateModelLocalPolicy() {
   const local = Boolean($<HTMLInputElement>("#model-local-path").value);
-  for (const selector of [
-    "#model-source-url", "#model-offline", "#model-direct", "#model-bearer-token",
-    "#model-basic-username", "#model-basic-password",
-  ]) $<HTMLInputElement>(selector).disabled = local;
+  $<HTMLInputElement>("#model-source-url").disabled = local;
   updateModelProxyField();
 }
 
@@ -728,12 +730,7 @@ $("#model-direct").addEventListener("change", updateModelProxyField);
 $("#choose-model-local").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
   if (typeof path !== "string") return;
-  for (const selector of [
-    "#model-source-url", "#model-proxy-url", "#model-bearer-token",
-    "#model-basic-username", "#model-basic-password",
-  ]) $<HTMLInputElement>(selector).value = "";
-  $<HTMLInputElement>("#model-offline").checked = false;
-  $<HTMLInputElement>("#model-direct").checked = false;
+  $<HTMLInputElement>("#model-source-url").value = "";
   setPath("#model-local-path", "#model-local-display", path);
   $<HTMLButtonElement>("#clear-model-local").disabled = false;
   updateModelLocalPolicy();
@@ -747,8 +744,17 @@ updateModelLocalPolicy();
 
 async function loadModels() {
   try {
-    const models = await invoke<ModelRow[]>("list_models");
-    $("#model-list").innerHTML = models.map((model) => `<div class="model-row" data-model-row="${model.name}"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${model.installed ? "installed" : ""}">${model.installed ? "インストール済み" : "未導入"}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small><div class="model-progress hidden"><div><i></i></div><span></span></div></div><div class="model-actions">${model.installed ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>` : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`}<button class="remove hidden" data-cancel-model>中断</button></div></div>`).join("");
+    const [models, catalog] = await Promise.all([
+      invoke<ModelRow[]>("list_models"),
+      invoke<ModelCatalogRow>("model_catalog_status"),
+    ]);
+    $("#model-catalog-status").textContent = `カタログ sequence ${catalog.sequence}（rollback floor ${catalog.highestAcceptedSequence}）· ${catalog.sha256.slice(0, 16)}… · 鍵 ${catalog.signingKey} · ${catalog.modelCount}件 · ${catalog.origin}`;
+    $("#model-list").innerHTML = models.map((model) => {
+      const installedAt = model.installedAtUnixSeconds === null
+        ? ""
+        : ` · installed ${new Date(model.installedAtUnixSeconds * 1000).toLocaleString()}`;
+      return `<div class="model-row" data-model-row="${model.name}"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${model.installed ? "installed" : ""}">${model.installed ? "インストール済み" : "未導入"}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small><small>catalog #${model.catalogSequence} · ${escapeHtml(model.catalogSha256.slice(0, 16))}… · key ${escapeHtml(model.catalogSigningKey)}${model.provenanceSource ? ` · ${escapeHtml(model.provenanceSource)}` : ""}${escapeHtml(installedAt)}</small><div class="model-progress hidden"><div><i></i></div><span></span></div></div><div class="model-actions">${model.installed ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>` : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`}<button class="remove hidden" data-cancel-model>中断</button></div></div>`;
+    }).join("");
     document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.addEventListener("click", async () => {
       try {
         const action = button.dataset.action!;
@@ -770,10 +776,27 @@ async function loadModels() {
   } catch (error) { $("#model-list").textContent = errorText(error); }
 }
 $("#refresh-models").addEventListener("click", () => void loadModels());
+$("#update-model-catalog").addEventListener("click", async () => {
+  try {
+    setModelUiBusy(true);
+    const options = modelDownloadOptions("update", true, true);
+    clearModelSecrets();
+    const status = await invoke<ModelCatalogRow>("update_model_catalog", {
+      options,
+    });
+    showToast(`署名カタログ sequence ${status.sequence} を検証しました`);
+    await loadModels();
+  } catch (error) {
+    showToast(errorText(error), true);
+  } finally {
+    setModelUiBusy(false);
+  }
+});
 
 function setModelUiBusy(busy: boolean) {
   document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.disabled = busy);
   $<HTMLButtonElement>("#refresh-models").disabled = busy;
+  $<HTMLButtonElement>("#update-model-catalog").disabled = busy;
 }
 
 function showModelJobRow(name: string) {

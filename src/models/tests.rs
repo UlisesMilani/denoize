@@ -149,6 +149,22 @@ fn test_model(bytes: &[u8]) -> ModelInfo {
     }
 }
 
+fn test_catalog_model(bytes: &[u8]) -> CatalogModel {
+    let catalog = embedded_catalog();
+    CatalogModel {
+        name: "catalog-model-test".into(),
+        backend: "catalog-model-test".into(),
+        filename: "catalog-model.onnx".into(),
+        url: "https://models.example.test/catalog-model.onnx".into(),
+        revision: "catalog-test-revision".into(),
+        sha256: test_sha256(bytes).into(),
+        size_bytes: bytes.len() as u64,
+        license: "MIT".into(),
+        sample_rate: 16_000,
+        catalog: catalog.identity().clone(),
+    }
+}
+
 fn direct_options() -> ModelDownloadOptions {
     ModelDownloadOptions {
         proxy: ModelProxy::Disabled,
@@ -319,6 +335,7 @@ fn manifest_has_pinned_integrity_and_metadata() {
         assert!(model.url.contains(model.revision));
         assert!(model.sample_rate > 0);
         assert!(!model.license.is_empty());
+        assert!(ModelSpec::legacy(model).catalog.is_some());
     }
     assert_eq!(find("gtcrn-dns3").unwrap().size_bytes, 535_190);
 }
@@ -451,6 +468,266 @@ fn diagnostics_redact_url_credentials_and_query() {
 }
 
 #[test]
+fn signed_catalog_import_enforces_rollback_equivocation_and_key_rotation() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+
+    let fixtures = [
+        (
+            "seq2",
+            include_bytes!("testdata/catalog-seq2.json").as_slice(),
+            include_bytes!("testdata/catalog-seq2.json.sig").as_slice(),
+        ),
+        (
+            "seq2-alt",
+            include_bytes!("testdata/catalog-seq2-alt.json").as_slice(),
+            include_bytes!("testdata/catalog-seq2-alt.json.sig").as_slice(),
+        ),
+        (
+            "seq3",
+            include_bytes!("testdata/catalog-seq3.json").as_slice(),
+            include_bytes!("testdata/catalog-seq3.json.sig").as_slice(),
+        ),
+        (
+            "seq4",
+            include_bytes!("testdata/catalog-seq4.json").as_slice(),
+            include_bytes!("testdata/catalog-seq4.json.sig").as_slice(),
+        ),
+    ];
+    let mut paths = Vec::new();
+    for (name, catalog, signature) in fixtures {
+        let catalog_path = directory.path().join(format!("{name}.json"));
+        let signature_path = directory.path().join(format!("{name}.json.sig"));
+        std::fs::write(&catalog_path, catalog).unwrap();
+        std::fs::write(&signature_path, signature).unwrap();
+        paths.push((catalog_path, signature_path));
+    }
+
+    assert_eq!(active_catalog().unwrap().sequence(), 1);
+    assert_eq!(
+        import_catalog(&paths[0].0, &paths[0].1).unwrap().sequence(),
+        2
+    );
+    let error = import_catalog(&paths[1].0, &paths[1].1).unwrap_err();
+    assert!(error.contains("different model catalog content"), "{error}");
+
+    assert_eq!(
+        import_catalog(&paths[2].0, &paths[2].1).unwrap().sequence(),
+        3
+    );
+    let error = import_catalog(&paths[0].0, &paths[0].1).unwrap_err();
+    assert!(error.contains("rollback from sequence 3 to 2"), "{error}");
+
+    let active_path = directory.path().join(".catalog/active.json");
+    std::fs::remove_file(&active_path).unwrap();
+    let error = active_catalog().unwrap_err();
+    assert!(error.contains("signed cache is missing"), "{error}");
+    assert_eq!(
+        import_catalog(&paths[2].0, &paths[2].1).unwrap().sequence(),
+        3
+    );
+
+    let rotated = import_catalog(&paths[3].0, &paths[3].1).unwrap();
+    assert_eq!(rotated.sequence(), 4);
+    assert_eq!(rotated.signing_key_id(), "557E67D5F983C071");
+    let status = catalog_status().unwrap();
+    assert_eq!(status.sequence, 4);
+    assert_eq!(status.highest_accepted_sequence, 4);
+    assert!(matches!(status.origin, CatalogOrigin::Signed { .. }));
+}
+
+#[test]
+fn newer_embedded_catalog_persists_its_rollback_floor() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let sequence_two = directory.path().join("sequence-two.json");
+    let sequence_two_signature = directory.path().join("sequence-two.json.sig");
+    std::fs::write(&sequence_two, include_bytes!("testdata/catalog-seq2.json")).unwrap();
+    std::fs::write(
+        &sequence_two_signature,
+        include_bytes!("testdata/catalog-seq2.json.sig"),
+    )
+    .unwrap();
+    import_catalog(&sequence_two, &sequence_two_signature).unwrap();
+
+    // A newer trusted binary must supersede even an obsolete corrupt envelope,
+    // then durably raise the floor before returning its embedded catalog.
+    std::fs::write(directory.path().join(".catalog/active.json"), b"corrupt").unwrap();
+    let embedded_sequence_three = catalog::parse_catalog(
+        include_bytes!("testdata/catalog-seq3.json"),
+        CatalogOrigin::Embedded,
+    )
+    .unwrap();
+    let expected_sha256 = embedded_sequence_three.sha256().to_string();
+    let promoted = catalog::promote_embedded_catalog(embedded_sequence_three).unwrap();
+    assert_eq!(promoted.sequence(), 3);
+
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.path().join(".catalog/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["highest_sequence"], 3);
+    assert_eq!(state["catalog_sha256"], expected_sha256);
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_storage_rejects_a_symlinked_state_directory() {
+    use std::os::unix::fs::symlink;
+
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let redirected = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    symlink(redirected.path(), directory.path().join(".catalog")).unwrap();
+
+    let error = active_catalog().unwrap_err();
+    assert!(error.contains("symbolic link for model state"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn catalog_import_rejects_fifo_inputs_without_blocking() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let catalog_fifo = directory.path().join("catalog.fifo");
+    let signature_fifo = directory.path().join("catalog.sig.fifo");
+    let regular_catalog = directory.path().join("catalog.json");
+    let regular_signature = directory.path().join("catalog.json.sig");
+    create_fifo(&catalog_fifo);
+    create_fifo(&signature_fifo);
+    std::fs::write(
+        &regular_catalog,
+        include_bytes!("testdata/catalog-seq2.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        &regular_signature,
+        include_bytes!("testdata/catalog-seq2.json.sig"),
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let error = import_catalog(&catalog_fifo, &regular_signature).unwrap_err();
+    assert!(error.contains("not a regular file"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+    let started = Instant::now();
+    let error = import_catalog(&regular_catalog, &signature_fifo).unwrap_err();
+    assert!(error.contains("not a regular file"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn catalog_model_install_records_validates_and_removes_provenance() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let bytes = b"catalog model provenance bytes";
+    let model = test_catalog_model(bytes);
+    let source = directory.path().join("source.onnx");
+    std::fs::write(&source, bytes).unwrap();
+
+    let installed = install_catalog_model_from_file(&model, &source).unwrap();
+    assert_eq!(verify_catalog_model(&model).unwrap(), installed);
+    let provenance = catalog_model_provenance(&model).unwrap();
+    assert_eq!(provenance.model_name, model.name);
+    assert_eq!(provenance.artifact_sha256, model.sha256);
+    assert_eq!(provenance.catalog_sha256, model.catalog_sha256());
+    assert_eq!(
+        provenance.installation_source,
+        ModelInstallationSource::LocalFile
+    );
+
+    let spec = ModelSpec::catalog(&model);
+    let provenance_path = provenance_path(&spec, &installed).unwrap();
+    let mut tampered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provenance_path).unwrap()).unwrap();
+    tampered["revision"] = serde_json::Value::String("tampered".into());
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let error = verify_catalog_model(&model).unwrap_err();
+    assert!(error.contains("provenance does not match"), "{error}");
+
+    tampered["revision"] = serde_json::Value::String(model.revision.clone());
+    tampered["installation_source"] = serde_json::json!({
+        "kind": "alternate-url",
+        "url": "https://user:secret@models.example.test/model.onnx?token=secret"
+    });
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let error = verify_catalog_model(&model).unwrap_err();
+    assert!(error.contains("provenance does not match"), "{error}");
+
+    tampered["installation_source"] = serde_json::json!({ "kind": "local-file" });
+    tampered["catalog_origin"] = serde_json::json!({
+        "kind": "signed",
+        "source": "https://user:secret@models.example.test/catalog.json?token=secret"
+    });
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let error = verify_catalog_model(&model).unwrap_err();
+    assert!(error.contains("provenance does not match"), "{error}");
+
+    tampered["catalog_origin"] = serde_json::json!({ "kind": "embedded", "source": "forged" });
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let error = verify_catalog_model(&model).unwrap_err();
+    assert!(error.contains("invalid model provenance"), "{error}");
+
+    tampered["catalog_origin"] = serde_json::json!({ "kind": "embedded" });
+    std::fs::write(
+        &provenance_path,
+        serde_json::to_vec_pretty(&tampered).unwrap(),
+    )
+    .unwrap();
+    let mut same_catalog_from_another_origin = model.clone();
+    same_catalog_from_another_origin.catalog.origin = CatalogOrigin::Signed {
+        source: "local-import".into(),
+    };
+    assert_eq!(
+        verify_catalog_model(&same_catalog_from_another_origin).unwrap(),
+        installed
+    );
+
+    assert!(remove_catalog_model(&model).unwrap());
+    assert!(!installed.exists());
+    assert!(!provenance_path.exists());
+}
+
+#[test]
+fn cancelled_catalog_install_leaves_no_model_or_partial_provenance() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let bytes = b"cancelled catalog model";
+    let model = test_catalog_model(bytes);
+    let source = directory.path().join("source.onnx");
+    std::fs::write(&source, bytes).unwrap();
+
+    let error = install_catalog_model_from_file_with_progress(&model, &source, || true, |_, _| {})
+        .unwrap_err();
+    assert_eq!(error, "cancelled");
+    let destination = path_for_catalog_model(&model).unwrap();
+    assert!(!destination.exists());
+    assert!(!destination.parent().unwrap().join(".provenance").exists());
+}
+
+#[test]
 fn loopback_origin_credentials_are_rejected_when_an_http_proxy_is_selected() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -561,8 +838,8 @@ fn offline_mode_promotes_a_completed_verified_partial() {
     let directory = tempfile::tempdir().unwrap();
     let _model_dir = ModelDirGuard::set(directory.path());
     let payload = b"completed offline partial model";
-    let model = test_model(payload);
-    let destination = path(&model).unwrap();
+    let model = test_catalog_model(payload);
+    let destination = path_for_catalog_model(&model).unwrap();
     std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
     std::fs::write(sidecar(&destination, ".part"), payload).unwrap();
     let options = ModelDownloadOptions {
@@ -570,9 +847,18 @@ fn offline_mode_promotes_a_completed_verified_partial() {
         ..direct_options()
     };
 
-    assert_eq!(install_with_options(&model, &options).unwrap(), destination);
+    assert_eq!(
+        install_catalog_model_with_options(&model, &options).unwrap(),
+        destination
+    );
     assert_eq!(std::fs::read(&destination).unwrap(), payload);
     assert!(!sidecar(&destination, ".part").exists());
+    assert_eq!(
+        catalog_model_provenance(&model)
+            .unwrap()
+            .installation_source,
+        ModelInstallationSource::CompletedPartial
+    );
 }
 
 #[test]
@@ -646,6 +932,9 @@ fn local_import_accepts_matching_bytes_and_rejects_mismatch() {
 
     let installed = install_from_file(&model, &valid_source).unwrap();
     assert_eq!(std::fs::read(&installed).unwrap(), expected);
+    let error = provenance(&model).unwrap_err();
+    assert!(error.contains("provenance is unavailable"), "{error}");
+    assert!(!installed.parent().unwrap().join(".provenance").exists());
     let partial = sidecar(&installed, ".part");
     let metadata = sidecar(&installed, ".part.meta");
     std::fs::write(&partial, b"preserved partial").unwrap();
@@ -1056,7 +1345,10 @@ fn headerless_full_responses_are_bounded_by_the_manifest() {
         &mut |downloaded, total| oversized_progress.push((downloaded, total)),
     )
     .unwrap_err();
-    assert!(error.contains("manifest"), "unexpected error: {error}");
+    assert!(
+        error.contains("catalog metadata"),
+        "unexpected error: {error}"
+    );
     assert_manifest_progress(&oversized_progress, model.size_bytes);
     let (oversized_partial, oversized_metadata) = download_paths(oversized_directory.path());
     assert!(!oversized_partial.exists());

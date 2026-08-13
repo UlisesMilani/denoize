@@ -40,6 +40,7 @@ oxideav-aac-encoder = { git = "https://github.com/OxideAV/oxideav-aac", rev = "e
 mp4 = "0.14.0"
 rubato = "0.16.2"
 sha2 = "0.10.9"
+minisign-verify = "0.2.5"
 base64 = "0.22.1"
 fs2 = "0.4.3"
 percent-encoding = "2.3.2"

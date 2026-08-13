@@ -1,0 +1,29 @@
+{
+  "schema": "denoize-model-catalog-v1",
+  "sequence": 3,
+  "signing_key_id": "DF5F0E9ED6135C46",
+  "models": [
+    {
+      "name": "gtcrn-dns3",
+      "backend": "gtcrn",
+      "filename": "gtcrn_simple.onnx",
+      "url": "https://models.example.test/gtcrn_simple.onnx",
+      "revision": "catalog-sequence-3",
+      "sha256": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+      "size_bytes": 535190,
+      "license": "MIT",
+      "sample_rate": 16000
+    },
+    {
+      "name": "gtcrn-studio",
+      "backend": "gtcrn",
+      "filename": "gtcrn_studio.onnx",
+      "url": "https://models.example.test/gtcrn_studio.onnx",
+      "revision": "catalog-sequence-3",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "size_bytes": 1048576,
+      "license": "MIT",
+      "sample_rate": 16000
+    }
+  ]
+}

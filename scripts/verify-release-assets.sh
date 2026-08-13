@@ -49,6 +49,8 @@ expected_assets=(
   "denoize_${version}_x64.dmg"
   "denoize_${version}_x64_en-US.msi"
   "denoize_${version}_x64_en-US.msi.sig"
+  "denoize-model-catalog-v1.json"
+  "denoize-model-catalog-v1.json.sig"
   "latest.json"
 )
 
@@ -110,6 +112,7 @@ gh release download "$tag" \
   --pattern '*.sig' \
   --pattern '*.zip' \
   --pattern '*.sha256' \
+  --pattern 'denoize-model-catalog-v1.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -120,6 +123,17 @@ for checksum in "$tmp_dir"/*.sha256; do
     sha256sum --check "$(basename "$checksum")"
   )
 done
+
+if ! cmp -s models/catalog-v1.json "$tmp_dir/denoize-model-catalog-v1.json"; then
+  echo "release model catalog differs from tagged models/catalog-v1.json" >&2
+  exit 1
+fi
+
+DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
+  cargo run --locked --no-default-features --bin denoize -- \
+  models catalog import \
+  "$tmp_dir/denoize-model-catalog-v1.json" \
+  "$tmp_dir/denoize-model-catalog-v1.json.sig" >/dev/null
 
 archive_contains() {
   local archive="$1"
@@ -145,6 +159,7 @@ required_notice_files=(
   "LICENSE"
   "THIRD_PARTY.md"
   "LICENSES/nanomp3-0.1.1-MIT.txt"
+  "LICENSES/minisign-verify-0.2.5-MIT.txt"
   "LICENSES/symphonia-0.6.0-MPL-2.0.txt"
   "LICENSES/shine-rs-0.1.3-LGPL-2.0.txt"
 )

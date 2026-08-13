@@ -1,5 +1,13 @@
-//! Versioned external-model manifest and verified local cache.
+//! Signed external-model catalog, verified local cache, and installation provenance.
 
+mod catalog;
+
+pub use catalog::{
+    active_catalog, catalog_status, embedded_catalog, import_catalog, update_catalog, CatalogModel,
+    CatalogOrigin, CatalogStatus, ModelCatalog,
+};
+
+use self::catalog::CatalogIdentity;
 use crate::{AtomicOutput, CommitMode};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use fs2::FileExt;
@@ -10,11 +18,14 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const PARTIAL_METADATA_VERSION: u32 = 1;
 const MAX_PARTIAL_METADATA_BYTES: u64 = 64 * 1024;
+const MODEL_PROVENANCE_VERSION: u32 = 1;
+const MAX_MODEL_PROVENANCE_BYTES: u64 = 64 * 1024;
+const MAX_JSON_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const USER_AGENT: &str = concat!("denoize-model-manager/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Copy, Debug)]
@@ -74,11 +85,12 @@ impl fmt::Debug for ModelAuthentication {
 /// Network and source policy for model installation and updates.
 #[derive(Clone)]
 pub struct ModelDownloadOptions {
-    /// Refuse every network request. A verified destination or completed
-    /// verified `.part` file can still be used.
+    /// Refuse every network request. Model operations may use verified cached
+    /// data; catalog update revalidates the current embedded/cached catalog.
     pub offline: bool,
-    /// Override the pinned manifest URL, for example with an authenticated
-    /// mirror. Integrity remains pinned by the manifest size and SHA-256.
+    /// Override the model-artifact or catalog URL for the operation, for
+    /// example with an authenticated mirror. Signed catalog metadata remains
+    /// authoritative.
     pub source_url: Option<String>,
     pub proxy: ModelProxy,
     pub authentication: Option<ModelAuthentication>,
@@ -189,6 +201,142 @@ pub const MODELS: &[ModelInfo] = &[ModelInfo {
     sample_rate: 16_000,
 }];
 
+#[derive(Clone)]
+struct ModelSpec<'a> {
+    name: &'a str,
+    backend: &'a str,
+    filename: &'a str,
+    url: &'a str,
+    revision: &'a str,
+    sha256: &'a str,
+    size_bytes: u64,
+    license: &'a str,
+    sample_rate: u32,
+    catalog: Option<CatalogIdentity>,
+}
+
+impl<'a> ModelSpec<'a> {
+    fn legacy(model: &'a ModelInfo) -> Self {
+        let catalog = embedded_catalog();
+        let identity = catalog.models().iter().find(|candidate| {
+            candidate.name() == model.name
+                && candidate.backend() == model.backend
+                && candidate.filename() == model.filename
+                && candidate.url() == model.url
+                && candidate.revision() == model.revision
+                && candidate.sha256() == model.sha256
+                && candidate.size_bytes() == model.size_bytes
+                && candidate.license() == model.license
+                && candidate.sample_rate() == model.sample_rate
+        });
+        Self {
+            name: model.name,
+            backend: model.backend,
+            filename: model.filename,
+            url: model.url,
+            revision: model.revision,
+            sha256: model.sha256,
+            size_bytes: model.size_bytes,
+            license: model.license,
+            sample_rate: model.sample_rate,
+            catalog: identity.map(|_| catalog.identity().clone()),
+        }
+    }
+
+    fn catalog(model: &'a CatalogModel) -> Self {
+        Self {
+            name: &model.name,
+            backend: &model.backend,
+            filename: &model.filename,
+            url: &model.url,
+            revision: &model.revision,
+            sha256: &model.sha256,
+            size_bytes: model.size_bytes,
+            license: &model.license,
+            sample_rate: model.sample_rate,
+            catalog: Some(model.catalog.clone()),
+        }
+    }
+}
+
+/// How the installed artifact bytes reached the local cache.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModelInstallationSource {
+    CatalogUrl {
+        url: String,
+    },
+    AlternateUrl {
+        url: String,
+    },
+    LocalFile,
+    /// A checksum-valid completed `.part` created by an earlier invocation.
+    CompletedPartial,
+    ExistingCacheMigration,
+}
+
+impl<'de> Deserialize<'de> for ModelInstallationSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            kind: String,
+            url: Option<String>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        match (wire.kind.as_str(), wire.url) {
+            ("catalog-url", Some(url)) => Ok(Self::CatalogUrl { url }),
+            ("alternate-url", Some(url)) => Ok(Self::AlternateUrl { url }),
+            ("local-file", None) => Ok(Self::LocalFile),
+            ("completed-partial", None) => Ok(Self::CompletedPartial),
+            ("existing-cache-migration", None) => Ok(Self::ExistingCacheMigration),
+            ("catalog-url" | "alternate-url", None) => Err(serde::de::Error::missing_field("url")),
+            ("local-file" | "completed-partial" | "existing-cache-migration", Some(_)) => Err(
+                serde::de::Error::custom("this installation source must not contain url"),
+            ),
+            _ => Err(serde::de::Error::unknown_variant(
+                &wire.kind,
+                &[
+                    "catalog-url",
+                    "alternate-url",
+                    "local-file",
+                    "completed-partial",
+                    "existing-cache-migration",
+                ],
+            )),
+        }
+    }
+}
+
+/// Package metadata bound to an authenticated catalog identity. Artifact and
+/// catalog digests bind the package to exact bytes; origin, installation
+/// source, and timestamp are local diagnostics rather than a signed attestation.
+#[non_exhaustive]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProvenance {
+    pub version: u32,
+    pub model_name: String,
+    pub backend: String,
+    pub filename: String,
+    pub revision: String,
+    pub license: String,
+    pub sample_rate: u32,
+    pub artifact_sha256: String,
+    pub artifact_size_bytes: u64,
+    pub catalog_sequence: u64,
+    pub catalog_sha256: String,
+    pub catalog_signing_key_id: String,
+    pub catalog_origin: CatalogOrigin,
+    pub installation_source: ModelInstallationSource,
+    pub installed_at_unix_seconds: u64,
+}
+
 pub fn find(name: &str) -> Option<&'static ModelInfo> {
     MODELS
         .iter()
@@ -212,14 +360,52 @@ pub fn cache_dir() -> Result<PathBuf, String> {
 }
 
 pub fn path(model: &ModelInfo) -> Result<PathBuf, String> {
+    path_for_spec(&ModelSpec::legacy(model))
+}
+
+/// Resolve the cache path for a package from the active catalog.
+pub fn path_for_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
+    path_for_spec(&ModelSpec::catalog(model))
+}
+
+fn path_for_spec(model: &ModelSpec<'_>) -> Result<PathBuf, String> {
     Ok(cache_dir()?.join(model.name).join(model.filename))
 }
 
 pub fn verify(model: &ModelInfo) -> Result<PathBuf, String> {
-    verify_at(model, &path(model)?)
+    let model = ModelSpec::legacy(model);
+    verify_spec_at(&model, &path_for_spec(&model)?)
 }
 
+/// Verify an installed catalog package and its authenticated provenance.
+pub fn verify_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
+    let model = ModelSpec::catalog(model);
+    verify_spec_at(&model, &path_for_spec(&model)?)
+}
+
+#[cfg(test)]
 fn verify_at(model: &ModelInfo, destination: &Path) -> Result<PathBuf, String> {
+    verify_bytes_at(&ModelSpec::legacy(model), destination)
+}
+
+fn verify_spec_at(model: &ModelSpec<'_>, destination: &Path) -> Result<PathBuf, String> {
+    verify_bytes_at(model, destination)?;
+    if model.catalog.is_none() {
+        return Ok(destination.to_path_buf());
+    }
+    let (_, prepared) = prepare_provenance(
+        model,
+        destination,
+        ModelInstallationSource::ExistingCacheMigration,
+    )?;
+    let result = verify_bytes_at(model, destination);
+    if result.is_err() {
+        cleanup_prepared_provenance(&prepared);
+    }
+    result
+}
+
+fn verify_bytes_at(model: &ModelSpec<'_>, destination: &Path) -> Result<PathBuf, String> {
     let Some(mut input) = open_existing_regular_file(destination, "installed model")? else {
         return Err(format!("model is not installed: {}", destination.display()));
     };
@@ -233,6 +419,40 @@ fn verify_at(model: &ModelInfo, destination: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(destination.to_path_buf())
+}
+
+/// Read and validate the provenance associated with a legacy manifest model.
+/// Caller-constructed `ModelInfo` values that do not exactly match the embedded
+/// authenticated catalog retain size/SHA verification but have no provenance.
+pub fn provenance(model: &ModelInfo) -> Result<ModelProvenance, String> {
+    let model = ModelSpec::legacy(model);
+    provenance_for_spec(&model, &path_for_spec(&model)?)
+}
+
+/// Read and validate the provenance associated with an active catalog model.
+pub fn catalog_model_provenance(model: &CatalogModel) -> Result<ModelProvenance, String> {
+    let model = ModelSpec::catalog(model);
+    provenance_for_spec(&model, &path_for_spec(&model)?)
+}
+
+fn provenance_for_spec(
+    model: &ModelSpec<'_>,
+    destination: &Path,
+) -> Result<ModelProvenance, String> {
+    if model.catalog.is_none() {
+        return Err(format!(
+            "model {} is not represented by the embedded authenticated catalog; provenance is unavailable",
+            model.name
+        ));
+    }
+    verify_spec_at(model, destination)?;
+    let provenance = ensure_provenance(
+        model,
+        destination,
+        ModelInstallationSource::ExistingCacheMigration,
+    )?;
+    verify_bytes_at(model, destination)?;
+    Ok(provenance)
 }
 
 pub fn install(model: &ModelInfo) -> Result<PathBuf, String> {
@@ -274,7 +494,34 @@ where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
-    install_internal(model, options, false, &mut cancelled, &mut progress)
+    let model = ModelSpec::legacy(model);
+    install_internal(&model, options, false, &mut cancelled, &mut progress)
+}
+
+pub fn install_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
+    let options = ModelDownloadOptions::from_env()?;
+    install_catalog_model_with_options(model, &options)
+}
+
+pub fn install_catalog_model_with_options(
+    model: &CatalogModel,
+    options: &ModelDownloadOptions,
+) -> Result<PathBuf, String> {
+    install_catalog_model_with_options_and_progress(model, options, || false, |_, _| {})
+}
+
+pub fn install_catalog_model_with_options_and_progress<C, P>(
+    model: &CatalogModel,
+    options: &ModelDownloadOptions,
+    mut cancelled: C,
+    mut progress: P,
+) -> Result<PathBuf, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
+    let model = ModelSpec::catalog(model);
+    install_internal(&model, options, false, &mut cancelled, &mut progress)
 }
 
 /// Install a model from a local file after checking the pinned byte length and
@@ -293,12 +540,47 @@ where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
+    let model = ModelSpec::legacy(model);
+    install_spec_from_file_with_progress(&model, source, &mut cancelled, &mut progress)
+}
+
+pub fn install_catalog_model_from_file(
+    model: &CatalogModel,
+    source: impl AsRef<Path>,
+) -> Result<PathBuf, String> {
+    install_catalog_model_from_file_with_progress(model, source, || false, |_, _| {})
+}
+
+pub fn install_catalog_model_from_file_with_progress<C, P>(
+    model: &CatalogModel,
+    source: impl AsRef<Path>,
+    mut cancelled: C,
+    mut progress: P,
+) -> Result<PathBuf, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
+    let model = ModelSpec::catalog(model);
+    install_spec_from_file_with_progress(&model, source, &mut cancelled, &mut progress)
+}
+
+fn install_spec_from_file_with_progress<C, P>(
+    model: &ModelSpec<'_>,
+    source: impl AsRef<Path>,
+    cancelled: &mut C,
+    progress: &mut P,
+) -> Result<PathBuf, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
     let source = source.as_ref();
-    let destination = path(model)?;
+    let destination = path_for_spec(model)?;
     let parent = model_parent(&destination)?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    let lock = acquire_lock(&destination, &mut cancelled)?;
+    let lock = acquire_lock(&destination, cancelled)?;
     let result = (|| {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
@@ -313,14 +595,16 @@ where
         let partial = sidecar(&destination, ".part");
         let metadata = sidecar(&destination, ".part.meta");
         reset_partial(&partial, &metadata)?;
-        publish_open_file(
+        publish_model_open_file(
+            model,
+            ModelInstallationSource::LocalFile,
             source_file,
             source,
             &destination,
             model.size_bytes,
             model.sha256,
-            &mut cancelled,
-            &mut progress,
+            cancelled,
+            progress,
         )?;
         Ok(destination.clone())
     })();
@@ -330,7 +614,15 @@ where
 
 /// Remove an installed model and all interrupted-download state.
 pub fn remove(model: &ModelInfo) -> Result<bool, String> {
-    let destination = path(model)?;
+    remove_spec(&ModelSpec::legacy(model))
+}
+
+pub fn remove_catalog_model(model: &CatalogModel) -> Result<bool, String> {
+    remove_spec(&ModelSpec::catalog(model))
+}
+
+fn remove_spec(model: &ModelSpec<'_>) -> Result<bool, String> {
+    let destination = path_for_spec(model)?;
     let Some(parent) = destination.parent() else {
         return Err("invalid model cache path".into());
     };
@@ -341,7 +633,8 @@ pub fn remove(model: &ModelInfo) -> Result<bool, String> {
     let removed = remove_file_if_present(&destination)?
         | remove_file_if_present(&partial)?
         | remove_file_if_present(&metadata)?
-        | remove_file_if_present(&sidecar(&metadata, ".tmp"))?;
+        | remove_file_if_present(&sidecar(&metadata, ".tmp"))?
+        | remove_provenance_state(&destination)?;
     match std::fs::remove_dir(parent) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -390,11 +683,33 @@ where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
-    install_internal(model, options, true, &mut cancelled, &mut progress)
+    let model = ModelSpec::legacy(model);
+    install_internal(&model, options, true, &mut cancelled, &mut progress)
+}
+
+pub fn update_catalog_model_with_options(
+    model: &CatalogModel,
+    options: &ModelDownloadOptions,
+) -> Result<PathBuf, String> {
+    update_catalog_model_with_options_and_progress(model, options, || false, |_, _| {})
+}
+
+pub fn update_catalog_model_with_options_and_progress<C, P>(
+    model: &CatalogModel,
+    options: &ModelDownloadOptions,
+    mut cancelled: C,
+    mut progress: P,
+) -> Result<PathBuf, String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
+    let model = ModelSpec::catalog(model);
+    install_internal(&model, options, true, &mut cancelled, &mut progress)
 }
 
 fn install_internal<C, P>(
-    model: &ModelInfo,
+    model: &ModelSpec<'_>,
     options: &ModelDownloadOptions,
     force: bool,
     cancelled: &mut C,
@@ -404,7 +719,7 @@ where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
-    let destination = path(model)?;
+    let destination = path_for_spec(model)?;
     let parent = model_parent(&destination)?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
@@ -413,10 +728,11 @@ where
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
         if !force {
-            if let Ok(path) = verify_at(model, &destination) {
+            if let Ok(path) = verify_spec_at(model, &destination) {
                 return Ok(path);
             }
         }
+        let installation_source = installation_source_for_download(model, options);
         let partial = sidecar(&destination, ".part");
         let metadata_path = sidecar(&destination, ".part.meta");
         reject_symlink(&partial)?;
@@ -439,7 +755,9 @@ where
                 drop(partial_file);
                 if valid {
                     let mut ignored_progress = |_, _| {};
-                    publish_file(
+                    publish_model_file(
+                        model,
+                        ModelInstallationSource::CompletedPartial,
                         &partial,
                         &destination,
                         model.size_bytes,
@@ -458,7 +776,7 @@ where
             }
         }
         if options.offline {
-            if let Ok(path) = verify_at(model, &destination) {
+            if let Ok(path) = verify_spec_at(model, &destination) {
                 return Ok(path);
             }
             return Err(format!(
@@ -469,14 +787,15 @@ where
 
         let raw_url = options.source_url.as_deref().unwrap_or(model.url);
         let source = Url::parse(raw_url).map_err(|_| "invalid model source URL".to_string())?;
-        if !matches!(source.scheme(), "http" | "https") {
+        if !matches!(source.scheme(), "http" | "https") || source.host_str().is_none() {
             return Err(
-                "model source URL must use http or https; use --from for local files".into(),
+                "model source URL must be an absolute http or https URL; use --from for local files"
+                    .into(),
             );
         }
         validate_authentication(&source, options.authentication.as_ref())?;
         let source_id = source_identity(raw_url);
-        download(
+        download_spec(
             model,
             options,
             &source,
@@ -487,7 +806,9 @@ where
             progress,
         )?;
         let mut ignored_progress = |_, _| {};
-        publish_file(
+        publish_model_file(
+            model,
+            installation_source,
             &partial,
             &destination,
             model.size_bytes,
@@ -504,8 +825,37 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn download<C, P>(
     model: &ModelInfo,
+    options: &ModelDownloadOptions,
+    source: &Url,
+    source_id: &str,
+    partial: &Path,
+    metadata_path: &Path,
+    cancelled: &mut C,
+    progress: &mut P,
+) -> Result<(), String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
+    let model = ModelSpec::legacy(model);
+    download_spec(
+        &model,
+        options,
+        source,
+        source_id,
+        partial,
+        metadata_path,
+        cancelled,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_spec<C, P>(
+    model: &ModelSpec<'_>,
     options: &ModelDownloadOptions,
     source: &Url,
     source_id: &str,
@@ -689,7 +1039,7 @@ where
             {
                 drop(output);
                 reset_partial(partial, metadata_path)?;
-                return Err("model server sent more bytes than allowed by the manifest".into());
+                return Err("model server sent more bytes than allowed by catalog metadata".into());
             }
             output
                 .write_all(&buffer[..count])
@@ -1244,7 +1594,7 @@ fn validate_partial_response(
         ));
     }
     if start >= expected_size || end >= expected_size {
-        return Err("partial model response exceeds the manifest size".into());
+        return Err("partial model response exceeds the catalog package size".into());
     }
     if total.is_some_and(|total| total != expected_size) {
         return Err(format!(
@@ -1265,7 +1615,7 @@ fn validate_partial_response(
         .and_then(|metadata| metadata.total)
         .is_some_and(|total| total != expected_size)
     {
-        return Err("partial metadata conflicts with the manifest size".into());
+        return Err("partial metadata conflicts with the catalog package size".into());
     }
     if let (Some(old), Some(new)) = (
         metadata.and_then(|meta| meta.etag.as_deref()),
@@ -1326,6 +1676,356 @@ fn handle_range_not_satisfiable(
         return Ok(false);
     }
     Ok(file_matches(partial, expected_size, expected_sha256))
+}
+
+fn installation_source_for_download(
+    model: &ModelSpec<'_>,
+    options: &ModelDownloadOptions,
+) -> ModelInstallationSource {
+    match options.source_url.as_deref() {
+        Some(url) => ModelInstallationSource::AlternateUrl {
+            url: redact_url(url),
+        },
+        None => ModelInstallationSource::CatalogUrl {
+            url: redact_url(model.url),
+        },
+    }
+}
+
+struct PreparedProvenance {
+    path: PathBuf,
+    created: bool,
+}
+
+fn ensure_provenance(
+    model: &ModelSpec<'_>,
+    destination: &Path,
+    installation_source: ModelInstallationSource,
+) -> Result<ModelProvenance, String> {
+    let (provenance, _) = prepare_provenance(model, destination, installation_source)?;
+    Ok(provenance)
+}
+
+fn prepare_provenance(
+    model: &ModelSpec<'_>,
+    destination: &Path,
+    installation_source: ModelInstallationSource,
+) -> Result<(ModelProvenance, PreparedProvenance), String> {
+    let catalog = model.catalog.as_ref().ok_or_else(|| {
+        format!(
+            "model {} is not represented by an authenticated catalog",
+            model.name
+        )
+    })?;
+    let path = provenance_path(model, destination)?;
+    if let Some(provenance) = read_provenance(&path)? {
+        validate_provenance(model, &provenance)?;
+        return Ok((
+            provenance,
+            PreparedProvenance {
+                path,
+                created: false,
+            },
+        ));
+    }
+
+    let directory = provenance_directory(destination)?;
+    reject_symlink(&directory)?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("failed to create {}: {error}", directory.display()))?;
+    reject_symlink(&directory)?;
+    let provenance = ModelProvenance {
+        version: MODEL_PROVENANCE_VERSION,
+        model_name: model.name.to_string(),
+        backend: model.backend.to_string(),
+        filename: model.filename.to_string(),
+        revision: model.revision.to_string(),
+        license: model.license.to_string(),
+        sample_rate: model.sample_rate,
+        artifact_sha256: model.sha256.to_string(),
+        artifact_size_bytes: model.size_bytes,
+        catalog_sequence: catalog.sequence,
+        catalog_sha256: catalog.sha256.clone(),
+        catalog_signing_key_id: catalog.signing_key_id.clone(),
+        catalog_origin: catalog.origin.clone(),
+        installation_source,
+        installed_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())?
+            .as_secs(),
+    };
+    let bytes = serde_json::to_vec_pretty(&provenance)
+        .map_err(|error| format!("failed to encode model provenance: {error}"))?;
+    if bytes.len() as u64 > MAX_MODEL_PROVENANCE_BYTES {
+        return Err("model provenance exceeds the 64 KiB limit".into());
+    }
+    let mut output = AtomicOutput::new(&path)?;
+    output
+        .file_mut()
+        .write_all(&bytes)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    let created = match output.commit(CommitMode::NoClobber) {
+        Ok(()) => true,
+        Err(error) => {
+            if let Some(existing) = read_provenance(&path)? {
+                validate_provenance(model, &existing)?;
+                return Ok((
+                    existing,
+                    PreparedProvenance {
+                        path,
+                        created: false,
+                    },
+                ));
+            }
+            return Err(error);
+        }
+    };
+    let stored = read_provenance(&path)?
+        .ok_or_else(|| format!("model provenance disappeared: {}", path.display()))?;
+    validate_provenance(model, &stored)?;
+    Ok((stored, PreparedProvenance { path, created }))
+}
+
+fn read_provenance(path: &Path) -> Result<Option<ModelProvenance>, String> {
+    let Some(file) = open_existing_regular_file(path, "model provenance")? else {
+        return Ok(None);
+    };
+    let length = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?
+        .len();
+    if length > MAX_MODEL_PROVENANCE_BYTES {
+        return Err(format!(
+            "model provenance exceeds the 64 KiB limit: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_MODEL_PROVENANCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_MODEL_PROVENANCE_BYTES {
+        return Err(format!(
+            "model provenance exceeds the 64 KiB limit: {}",
+            path.display()
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("invalid model provenance {}: {error}", path.display()))
+}
+
+fn validate_provenance(model: &ModelSpec<'_>, provenance: &ModelProvenance) -> Result<(), String> {
+    let catalog = model.catalog.as_ref().ok_or_else(|| {
+        format!(
+            "model {} is not represented by an authenticated catalog",
+            model.name
+        )
+    })?;
+    // Origin is installation-time diagnostic context, not part of the signed
+    // catalog identity. The same catalog may move from local import to HTTPS,
+    // or become embedded in a later binary, without invalidating model bytes.
+    let catalog_origin_is_valid = catalog::catalog_origin_is_safe(&provenance.catalog_origin);
+    let installation_source_is_valid = match &provenance.installation_source {
+        ModelInstallationSource::CatalogUrl { url }
+        | ModelInstallationSource::AlternateUrl { url } => valid_provenance_url(url),
+        ModelInstallationSource::LocalFile
+        | ModelInstallationSource::CompletedPartial
+        | ModelInstallationSource::ExistingCacheMigration => true,
+    };
+    if provenance.version != MODEL_PROVENANCE_VERSION
+        || provenance.model_name != model.name
+        || provenance.backend != model.backend
+        || provenance.filename != model.filename
+        || provenance.revision != model.revision
+        || provenance.license != model.license
+        || provenance.sample_rate != model.sample_rate
+        || provenance.artifact_sha256 != model.sha256
+        || provenance.artifact_size_bytes != model.size_bytes
+        || provenance.catalog_sequence != catalog.sequence
+        || provenance.catalog_sha256 != catalog.sha256
+        || provenance.catalog_signing_key_id != catalog.signing_key_id
+        || provenance.installed_at_unix_seconds > MAX_JSON_SAFE_INTEGER
+        || !catalog_origin_is_valid
+        || !installation_source_is_valid
+    {
+        return Err(format!(
+            "installed model provenance does not match package {}",
+            model.name
+        ));
+    }
+    Ok(())
+}
+
+fn valid_provenance_url(value: &str) -> bool {
+    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
+        return false;
+    }
+    Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+fn provenance_directory(destination: &Path) -> Result<PathBuf, String> {
+    Ok(model_parent(destination)?.join(".provenance"))
+}
+
+fn remove_provenance_state(destination: &Path) -> Result<bool, String> {
+    let directory = provenance_directory(destination)?;
+    reject_symlink(&directory)?;
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "failed to read model provenance directory {}: {error}",
+                directory.display()
+            ))
+        }
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read model provenance directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(|error| {
+            format!(
+                "failed to inspect model provenance {}: {error}",
+                path.display()
+            )
+        })?;
+        if !metadata.is_file() || entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+            return Err(format!(
+                "refusing special entry in model provenance directory: {}",
+                path.display()
+            ));
+        }
+        removed |= remove_file_if_present(&path)?;
+    }
+    match std::fs::remove_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to remove model provenance directory {}: {error}",
+                directory.display()
+            ))
+        }
+    }
+    Ok(removed)
+}
+
+fn provenance_path(model: &ModelSpec<'_>, destination: &Path) -> Result<PathBuf, String> {
+    let catalog = model.catalog.as_ref().ok_or_else(|| {
+        format!(
+            "model {} is not represented by an authenticated catalog",
+            model.name
+        )
+    })?;
+    let directory = provenance_directory(destination)?;
+    reject_symlink(&directory)?;
+    Ok(directory.join(format!("{}.{}.json", model.sha256, catalog.sha256)))
+}
+
+fn cleanup_prepared_provenance(prepared: &PreparedProvenance) {
+    if prepared.created {
+        let _ = remove_file_if_present(&prepared.path);
+        if let Some(parent) = prepared.path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_model_file<C, P>(
+    model: &ModelSpec<'_>,
+    installation_source: ModelInstallationSource,
+    source: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    cancelled: &mut C,
+    progress: &mut P,
+) -> Result<(), String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
+    if model.catalog.is_none() {
+        return publish_file(
+            source,
+            destination,
+            expected_size,
+            expected_sha256,
+            cancelled,
+            progress,
+        );
+    }
+    let (_, prepared) = prepare_provenance(model, destination, installation_source)?;
+    let result = publish_file(
+        source,
+        destination,
+        expected_size,
+        expected_sha256,
+        cancelled,
+        progress,
+    );
+    if result.is_err() {
+        cleanup_prepared_provenance(&prepared);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_model_open_file<C, P>(
+    model: &ModelSpec<'_>,
+    installation_source: ModelInstallationSource,
+    input: File,
+    source: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+    cancelled: &mut C,
+    progress: &mut P,
+) -> Result<(), String>
+where
+    C: FnMut() -> bool,
+    P: FnMut(u64, Option<u64>),
+{
+    if model.catalog.is_none() {
+        return publish_open_file(
+            input,
+            source,
+            destination,
+            expected_size,
+            expected_sha256,
+            cancelled,
+            progress,
+        );
+    }
+    let (_, prepared) = prepare_provenance(model, destination, installation_source)?;
+    let result = publish_open_file(
+        input,
+        source,
+        destination,
+        expected_size,
+        expected_sha256,
+        cancelled,
+        progress,
+    );
+    if result.is_err() {
+        cleanup_prepared_provenance(&prepared);
+    }
+    result
 }
 
 fn publish_file<C, P>(
@@ -1390,7 +2090,7 @@ where
             .ok_or_else(|| "model size overflow while staging".to_string())?;
         if next_copied > expected_size {
             return Err(format!(
-                "model size exceeds the manifest while staging: expected {expected_size} bytes"
+                "model size exceeds catalog metadata while staging: expected {expected_size} bytes"
             ));
         }
         output
@@ -1491,7 +2191,7 @@ fn sha256_open_file_exact(
             .ok_or_else(|| "model size overflow while hashing".to_string())?;
         if read > expected_size {
             return Err(format!(
-                "model size exceeds the manifest while hashing: expected {expected_size} bytes"
+                "model size exceeds catalog metadata while hashing: expected {expected_size} bytes"
             ));
         }
         digest.update(&buffer[..count]);

@@ -263,6 +263,35 @@ jobs:
           retryAttempts: 3
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
+  model-catalog:
+    name: Sign model catalog
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Install Tauri signer
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Sign and upload model catalog
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          asset="$GITHUB_WORKSPACE/denoize-model-catalog-v1.json"
+          cp models/catalog-v1.json "$asset"
+          (
+            cd apps/desktop
+            # The existing updater key is passwordless. The standalone signer
+            # otherwise tries to prompt on a non-interactive Actions runner.
+            npm run tauri -- signer sign --password "" "$asset"
+          )
+          gh release upload "$GITHUB_REF_NAME" \
+            "$asset" "$asset.sig" --clobber
+
   publish:
     name: Publish release
     needs: publish-crate
@@ -275,7 +304,7 @@ jobs:
 
   verify-assets:
     name: Verify release assets
-    needs: [build, desktop-build]
+    needs: [build, desktop-build, model-catalog]
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source

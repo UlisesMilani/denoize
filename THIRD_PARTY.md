@@ -1,5 +1,18 @@
 # Third-party notices
 
+## minisign-verify 0.2.5
+
+denoize uses the unmodified `minisign-verify` implementation by Frank Denis
+to authenticate versioned model catalogs. It is distributed under the MIT
+License and includes cryptographic code derived from rust-crypto under its
+included permissive license notice. The exact corresponding source is
+available at [`jedisct1/rust-minisign-verify` revision
+`3a91d03f86a8462a1af953c2854687d3f953d541`](https://github.com/jedisct1/rust-minisign-verify/tree/3a91d03f86a8462a1af953c2854687d3f953d541),
+and the crates.io checksum is
+`22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e`.
+The complete bundled notice is included at
+[`LICENSES/minisign-verify-0.2.5-MIT.txt`](LICENSES/minisign-verify-0.2.5-MIT.txt).
+
 ## Symphonia 0.6.0
 
 denoize uses the Symphonia media-decoding project, including
