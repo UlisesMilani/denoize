@@ -1,0 +1,18 @@
+{
+  "schema": "denoize-model-catalog-v1",
+  "sequence": 4,
+  "signing_key_id": "557E67D5F983C071",
+  "models": [
+    {
+      "name": "gtcrn-dns3",
+      "backend": "gtcrn",
+      "filename": "gtcrn_simple.onnx",
+      "url": "https://models.example.test/gtcrn_simple.onnx",
+      "revision": "catalog-sequence-4-key-rotation",
+      "sha256": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+      "size_bytes": 535190,
+      "license": "MIT",
+      "sample_rate": 16000
+    }
+  ]
+}

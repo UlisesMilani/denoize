@@ -301,11 +301,20 @@ dpss_nw = 3.0
 
 ### Managed model downloads
 
-Model installs and updates support explicit network policy, authenticated
-mirrors, resumable transfers, and air-gapped local files. Run
-`denoize models --help` for the dedicated command reference.
+Every build contains a versioned model catalog. Remote catalog updates are
+accepted only after detached-minisign verification against a compiled trust
+root, strict schema validation, and monotonic sequence/rollback checks. Model
+installs and updates then use the active catalog's exact size and SHA-256 while
+supporting explicit network policy, authenticated mirrors, resumable transfers,
+and air-gapped local files. Run `denoize models --help` for the dedicated
+command reference.
 
 ```sh
+# Inspect, update, or air-gap import the signed catalog.
+denoize models catalog status
+denoize models catalog update
+denoize models catalog import catalog-v1.json catalog-v1.json.sig
+
 # Offline mode never opens a network connection.
 denoize models install gtcrn-dns3 --offline
 
@@ -328,7 +337,7 @@ denoize models install gtcrn-dns3 --from /media/models/gtcrn_simple.onnx
 ```
 
 The corresponding defaults are `DENOIZE_MODEL_OFFLINE`,
-`DENOIZE_MODEL_URL`, `DENOIZE_MODEL_PROXY`,
+`DENOIZE_MODEL_URL`, `DENOIZE_MODEL_CATALOG_URL`, `DENOIZE_MODEL_PROXY`,
 `DENOIZE_MODEL_BEARER_TOKEN`, `DENOIZE_MODEL_USERNAME`, and
 `DENOIZE_MODEL_PASSWORD`. Standard `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
 and `NO_PROXY` variables (including lowercase variants) are used when no
@@ -340,13 +349,16 @@ Interrupted transfers are retained in a `.part` sidecar and resumed with HTTP
 range requests. Saved `ETag` or `Last-Modified` validators and each
 `Content-Range` are checked before appending; changed objects, malformed range
 responses, or an unverified `416` response cause a clean restart. Every managed
-model candidate must match both the manifest's exact byte length and SHA-256
+model candidate must match both the catalog's exact byte length and SHA-256
 before use: this includes fresh or resumed downloads, alternate `--url`
 sources, `--from` imports, completed partials, and files already in the cache.
 An update keeps the current verified model until its replacement is ready.
-`denoize models info MODEL` reports the pinned length as an unscaled decimal
-`size-bytes` value. This per-model integrity bound is not an aggregate cache
-quota.
+Each installation also receives content-addressed provenance that binds the
+artifact to its catalog sequence, digest, and signing key, and records its
+installation-time catalog origin and source. Existing verified caches are
+migrated lazily; mismatched provenance fails verification. `denoize models info MODEL` reports these fields and the
+pinned length as an unscaled decimal `size-bytes` value. This per-model
+integrity bound is not an aggregate cache quota.
 
 HTTPS model connections, including those tunneled through an HTTP CONNECT
 proxy, use the operating system trust store. CLI Bearer tokens and Basic
@@ -417,11 +429,12 @@ default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
 when selected; managed GTCRN weights are resolved automatically after install.
-The model manager's offline, alternate-source, proxy/direct, authentication,
-and local-file controls are session-only. Bearer tokens and Basic credentials are
-cleared after an operation starts, and none of these download overrides are
-included in saved settings, named presets, or CLI-compatible imports and
-exports.
+The model manager shows signed-catalog identity and installed provenance and
+can update the catalog. Its offline, alternate-source, proxy/direct,
+authentication, and local-file controls are session-only. Bearer tokens and
+Basic credentials are cleared after an operation starts, and none of these
+download overrides are included in saved settings, named presets, or
+CLI-compatible imports and exports.
 Desktop batches accept files or folders, preserve relative paths, run with a
 configurable worker count, continue after individual failures, and can resume
 from the same `.denoize-state` journal used by the CLI in the output directory.

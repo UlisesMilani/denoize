@@ -33,6 +33,12 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```text'
   "$binary" --help
   echo '```'
+  echo
+  echo '## Managed models'
+  echo
+  echo '```text'
+  "$binary" models --help
+  echo '```'
   cat <<'EOF'
 
 ## Batch resume state

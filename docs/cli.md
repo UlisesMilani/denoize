@@ -101,6 +101,48 @@ CONFIGURATION:
     before audio decoding, output staging, or batch worker creation.
 ```
 
+## Managed models
+
+```text
+Manage verified external models.
+
+USAGE:
+    denoize models list
+    denoize models info <MODEL|all>
+    denoize models install <MODEL|all> [DOWNLOAD OPTIONS]
+    denoize models install <MODEL> --from <PATH>
+    denoize models update <MODEL|all> [DOWNLOAD OPTIONS]
+    denoize models verify <MODEL|all>
+    denoize models remove <MODEL|all>
+    denoize models path <MODEL|all>
+    denoize models catalog status
+    denoize models catalog update [DOWNLOAD OPTIONS]
+    denoize models catalog import <CATALOG.json> <CATALOG.json.sig>
+    denoize models cache-dir
+
+DOWNLOAD OPTIONS:
+        --offline                  never access the network; use only verified cached data
+        --proxy <URL>              use this proxy instead of proxy environment variables
+        --no-proxy                 connect directly and ignore proxy environment variables
+        --url <URL>                alternate model URL; catalog update requires HTTPS JSON
+        --bearer-token-env <VAR>   read a bearer token from environment variable VAR
+        --basic-user <USER>        username for HTTP Basic authentication
+        --basic-password-env <VAR> read the Basic password from environment variable VAR
+        --from <PATH>              install one MODEL from a local file (install only)
+
+Bearer tokens and Basic passwords are read from environment variables instead
+of literal secret flags. Basic authentication requires both --basic-user and
+--basic-password-env. Signed --url values and proxy credentials can still be
+visible in process arguments. Alternate sources, origin authentication, and
+--from accept one model, not `all`; --url rejects userinfo credentials.
+
+ENVIRONMENT:
+    DENOIZE_MODEL_OFFLINE, DENOIZE_MODEL_URL, DENOIZE_MODEL_CATALOG_URL,
+    DENOIZE_MODEL_PROXY,
+    DENOIZE_MODEL_BEARER_TOKEN, DENOIZE_MODEL_USERNAME, DENOIZE_MODEL_PASSWORD
+    HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY (and lowercase variants)
+```
+
 ## Batch resume state
 
 CLI and desktop batches share the `.denoize-state` v3 journal in the output

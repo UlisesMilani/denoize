@@ -1033,6 +1033,7 @@ dependencies = [
  "kaldi-native-fbank",
  "libc",
  "lofty",
+ "minisign-verify",
  "mp4",
  "nanomp3",
  "ndarray 0.17.2",

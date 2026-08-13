@@ -1,0 +1,18 @@
+{
+  "schema": "denoize-model-catalog-v1",
+  "sequence": 1,
+  "signing_key_id": "F5AE02E7593C64D9",
+  "models": [
+    {
+      "name": "gtcrn-dns3",
+      "backend": "gtcrn",
+      "filename": "gtcrn_simple.onnx",
+      "url": "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/stream/onnx_models/gtcrn_simple.onnx",
+      "revision": "3862c44808dca492ea5a8a145d2dc2a1028d08c8",
+      "sha256": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+      "size_bytes": 535190,
+      "license": "MIT",
+      "sample_rate": 16000
+    }
+  ]
+}

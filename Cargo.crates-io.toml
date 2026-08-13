@@ -30,6 +30,7 @@ include = [
     "ROADMAP.md",
     "THIRD_PARTY.md",
     "src/**/*.rs",
+    "src/models/testdata/*",
     "examples/**/*.rs",
     "scripts/export-mpsenet.py",
     "scripts/validate-mpsenet.py",
@@ -42,6 +43,7 @@ include = [
     "scripts/generate-cli-docs.sh",
     "docs/cli.md",
     "docs/models.md",
+    "models/*.json",
 ]
 
 [lib]
@@ -74,6 +76,7 @@ toml = "0.8"
 ctrlc = "3.4.5"
 tempfile = "3.27.0"
 sha2 = "0.10.9"
+minisign-verify = "0.2.5"
 base64 = "0.22.1"
 fs2 = "0.4.3"
 percent-encoding = "2.3.2"

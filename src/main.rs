@@ -4225,13 +4225,16 @@ USAGE:
     denoize models verify <MODEL|all>
     denoize models remove <MODEL|all>
     denoize models path <MODEL|all>
+    denoize models catalog status
+    denoize models catalog update [DOWNLOAD OPTIONS]
+    denoize models catalog import <CATALOG.json> <CATALOG.json.sig>
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:
         --offline                  never access the network; use only verified cached data
         --proxy <URL>              use this proxy instead of proxy environment variables
         --no-proxy                 connect directly and ignore proxy environment variables
-        --url <URL>                download one MODEL from an alternate HTTP(S) URL
+        --url <URL>                alternate model URL; catalog update requires HTTPS JSON
         --bearer-token-env <VAR>   read a bearer token from environment variable VAR
         --basic-user <USER>        username for HTTP Basic authentication
         --basic-password-env <VAR> read the Basic password from environment variable VAR
@@ -4244,7 +4247,8 @@ visible in process arguments. Alternate sources, origin authentication, and
 --from accept one model, not `all`; --url rejects userinfo credentials.
 
 ENVIRONMENT:
-    DENOIZE_MODEL_OFFLINE, DENOIZE_MODEL_URL, DENOIZE_MODEL_PROXY,
+    DENOIZE_MODEL_OFFLINE, DENOIZE_MODEL_URL, DENOIZE_MODEL_CATALOG_URL,
+    DENOIZE_MODEL_PROXY,
     DENOIZE_MODEL_BEARER_TOKEN, DENOIZE_MODEL_USERNAME, DENOIZE_MODEL_PASSWORD
     HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY (and lowercase variants)
 "
@@ -4287,7 +4291,7 @@ fn models_option_value(args: &[String], index: &mut usize, flag: &str) -> Result
 fn validate_model_source_url(value: &str) -> Result<(), String> {
     let source = url::Url::parse(value)
         .map_err(|_| "invalid value for --url: expected an HTTP(S) URL".to_string())?;
-    if !matches!(source.scheme(), "http" | "https") {
+    if !matches!(source.scheme(), "http" | "https") || source.host_str().is_none() {
         return Err("invalid value for --url: expected an HTTP(S) URL".into());
     }
     if !source.username().is_empty() || source.password().is_some() {
@@ -4552,6 +4556,46 @@ where
     })
 }
 
+fn model_catalog_download_options_from_environment_with<F>(
+    args: &[String],
+    mut read_environment: F,
+) -> Result<denoize::models::ModelDownloadOptions, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let overrides_offline = args.iter().any(|argument| argument == "--offline");
+    let overrides_source = args.iter().any(|argument| argument == "--url");
+    let overrides_proxy = args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--proxy" | "--no-proxy"));
+    let overrides_authentication = args.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--bearer-token-env" | "--basic-user" | "--basic-password-env"
+        )
+    });
+    denoize::models::ModelDownloadOptions::from_env_with(|name| {
+        let overridden = match name {
+            "DENOIZE_MODEL_OFFLINE" => overrides_offline,
+            "DENOIZE_MODEL_URL" => overrides_source,
+            "DENOIZE_MODEL_PROXY" => overrides_proxy,
+            "DENOIZE_MODEL_BEARER_TOKEN" | "DENOIZE_MODEL_USERNAME" | "DENOIZE_MODEL_PASSWORD" => {
+                overrides_authentication
+            }
+            _ => false,
+        };
+        let environment_name = if name == "DENOIZE_MODEL_URL" {
+            "DENOIZE_MODEL_CATALOG_URL"
+        } else {
+            name
+        };
+        (!overridden)
+            .then(|| read_environment(environment_name))
+            .flatten()
+    })
+}
+
+#[cfg(test)]
 fn model_info_output(model: &denoize::models::ModelInfo, path: &std::path::Path) -> String {
     format!(
         "name: {}\nbackend: {}\nsample-rate: {}\nlicense: {}\nrevision: {}\nsize-bytes: {}\nsha256: {}\nurl: {}\npath: {}\n",
@@ -4567,7 +4611,155 @@ fn model_info_output(model: &denoize::models::ModelInfo, path: &std::path::Path)
     )
 }
 
+fn catalog_origin_output(origin: &denoize::models::CatalogOrigin) -> String {
+    match origin {
+        denoize::models::CatalogOrigin::Embedded => "embedded".into(),
+        denoize::models::CatalogOrigin::Signed { source } if source == "local-import" => {
+            "signed:local-import".into()
+        }
+        denoize::models::CatalogOrigin::Signed { source } => {
+            format!("signed:{}", denoize::models::redact_url(source))
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn installation_source_output(source: &denoize::models::ModelInstallationSource) -> String {
+    match source {
+        denoize::models::ModelInstallationSource::CatalogUrl { url } => {
+            format!("catalog-url:{}", denoize::models::redact_url(url))
+        }
+        denoize::models::ModelInstallationSource::AlternateUrl { url } => {
+            format!("alternate-url:{}", denoize::models::redact_url(url))
+        }
+        denoize::models::ModelInstallationSource::LocalFile => "local-file".into(),
+        denoize::models::ModelInstallationSource::CompletedPartial => "completed-partial".into(),
+        denoize::models::ModelInstallationSource::ExistingCacheMigration => {
+            "existing-cache-migration".into()
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn catalog_model_info_output(
+    model: &denoize::models::CatalogModel,
+    path: &std::path::Path,
+) -> String {
+    let mut output = format!(
+        "name: {}\nbackend: {}\nsample-rate: {}\nlicense: {}\nrevision: {}\nsize-bytes: {}\nsha256: {}\nurl: {}\npath: {}\ncatalog-sequence: {}\ncatalog-sha256: {}\ncatalog-signing-key: {}\ncatalog-origin: {}\n",
+        model.name(),
+        model.backend(),
+        model.sample_rate(),
+        model.license(),
+        model.revision(),
+        model.size_bytes(),
+        model.sha256(),
+        denoize::models::redact_url(model.url()),
+        path.display(),
+        model.catalog_sequence(),
+        model.catalog_sha256(),
+        model.catalog_signing_key_id(),
+        catalog_origin_output(model.catalog_origin()),
+    );
+    match denoize::models::catalog_model_provenance(model) {
+        Ok(provenance) => {
+            output.push_str(&format!(
+                "installed: true\ninstalled-source: {}\ninstalled-at-unix-seconds: {}\ninstalled-catalog-sequence: {}\ninstalled-catalog-sha256: {}\ninstalled-catalog-signing-key: {}\n",
+                installation_source_output(&provenance.installation_source),
+                provenance.installed_at_unix_seconds,
+                provenance.catalog_sequence,
+                provenance.catalog_sha256,
+                provenance.catalog_signing_key_id,
+            ));
+        }
+        Err(_) => output.push_str("installed: false\n"),
+    }
+    output
+}
+
+fn print_catalog_status(status: &denoize::models::CatalogStatus) {
+    println!("sequence: {}", status.sequence);
+    println!("sha256: {}", status.sha256);
+    println!("signing-key: {}", status.signing_key_id);
+    println!("origin: {}", catalog_origin_output(&status.origin));
+    println!("models: {}", status.model_count);
+    println!(
+        "highest-accepted-sequence: {}",
+        status.highest_accepted_sequence
+    );
+    println!("cached-path: {}", status.cached_catalog_path.display());
+}
+
+fn run_model_catalog(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .skip(1)
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        || args.get(1).map(String::as_str) == Some("help")
+    {
+        print!("{}", models_usage());
+        return Ok(());
+    }
+    let command = args.get(1).map(String::as_str).unwrap_or("status");
+    match command {
+        "status" => {
+            if args.len() > 2 {
+                return Err("models catalog status accepts no arguments".into());
+            }
+            print_catalog_status(&denoize::models::catalog_status()?);
+        }
+        "import" => {
+            if args.len() != 4 {
+                return Err(
+                    "models catalog import requires CATALOG.json and CATALOG.json.sig".into(),
+                );
+            }
+            let catalog = denoize::models::import_catalog(&args[2], &args[3])?;
+            print_catalog_status(&denoize::models::catalog_status()?);
+            eprintln!(
+                "verified model catalog sequence {} ({})",
+                catalog.sequence(),
+                catalog.sha256()
+            );
+        }
+        "update" => {
+            let mut options = model_catalog_download_options_from_environment_with(args, |name| {
+                std::env::var(name).ok()
+            })?;
+            let mut synthetic = vec!["update".to_string(), "catalog".to_string()];
+            synthetic.extend_from_slice(&args[2..]);
+            let parsed = parse_models_command(&synthetic, options.clone(), |name| {
+                std::env::var(name).map_err(|error| error.to_string())
+            })?;
+            let ParsedModelsCommand::Run {
+                download_options,
+                source_file,
+                ..
+            } = parsed
+            else {
+                return Err("invalid models catalog update arguments".into());
+            };
+            if source_file.is_some() {
+                return Err("use models catalog import for local catalog files".into());
+            }
+            options = *download_options.expect("catalog update has download options");
+            let catalog = denoize::models::update_catalog(&options)?;
+            print_catalog_status(&denoize::models::catalog_status()?);
+            eprintln!(
+                "verified model catalog sequence {} ({})",
+                catalog.sequence(),
+                catalog.sha256()
+            );
+        }
+        value => return Err(format!("unknown models catalog command: {value}")),
+    }
+    Ok(())
+}
+
 fn run_models(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("catalog") {
+        return run_model_catalog(args);
+    }
     let help_requested = args
         .iter()
         .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
@@ -4588,16 +4780,21 @@ fn run_models(args: &[String]) -> Result<(), String> {
             return Ok(());
         }
         ParsedModelsCommand::List => {
+            let catalog = denoize::models::active_catalog()?;
             println!("NAME\tBACKEND\tRATE\tLICENSE\tSTATUS");
-            for model in denoize::models::MODELS {
-                let status = if denoize::models::verify(model).is_ok() {
+            for model in catalog.models() {
+                let status = if denoize::models::verify_catalog_model(model).is_ok() {
                     "installed"
                 } else {
                     "not-installed"
                 };
                 println!(
                     "{}\t{}\t{}\t{}\t{}",
-                    model.name, model.backend, model.sample_rate, model.license, status
+                    model.name(),
+                    model.backend(),
+                    model.sample_rate(),
+                    model.license(),
+                    status
                 );
             }
             return Ok(());
@@ -4614,23 +4811,25 @@ fn run_models(args: &[String]) -> Result<(), String> {
         } => (command, target, download_options, source_file),
     };
 
+    let catalog = denoize::models::active_catalog()?;
     let models: Vec<_> = if target == "all" {
-        denoize::models::MODELS.iter().collect()
+        catalog.models().iter().collect()
     } else {
-        vec![denoize::models::find(&target)
+        vec![catalog
+            .find(&target)
             .ok_or_else(|| format!("unknown model: {target} (run `denoize models list`)"))?]
     };
     for model in models {
         match command {
             ModelCommand::Info => {
-                let path = denoize::models::path(model)?;
-                print!("{}", model_info_output(model, &path));
+                let path = denoize::models::path_for_catalog_model(model)?;
+                print!("{}", catalog_model_info_output(model, &path));
             }
             ModelCommand::Install => {
                 let installed = if let Some(source) = source_file.as_ref() {
-                    denoize::models::install_from_file(model, source)?
+                    denoize::models::install_catalog_model_from_file(model, source)?
                 } else {
-                    denoize::models::install_with_options(
+                    denoize::models::install_catalog_model_with_options(
                         model,
                         download_options
                             .as_ref()
@@ -4641,7 +4840,7 @@ fn run_models(args: &[String]) -> Result<(), String> {
             }
             ModelCommand::Update => println!(
                 "{}",
-                denoize::models::update_with_options(
+                denoize::models::update_catalog_model_with_options(
                     model,
                     download_options
                         .as_ref()
@@ -4650,18 +4849,24 @@ fn run_models(args: &[String]) -> Result<(), String> {
                 .display()
             ),
             ModelCommand::Verify => {
-                println!("verified {}", denoize::models::verify(model)?.display())
+                println!(
+                    "verified {}",
+                    denoize::models::verify_catalog_model(model)?.display()
+                )
             }
             ModelCommand::Remove => println!(
                 "{} {}",
-                if denoize::models::remove(model)? {
+                if denoize::models::remove_catalog_model(model)? {
                     "removed"
                 } else {
                     "not-installed"
                 },
-                model.name
+                model.name()
             ),
-            ModelCommand::Path => println!("{}", denoize::models::path(model)?.display()),
+            ModelCommand::Path => println!(
+                "{}",
+                denoize::models::path_for_catalog_model(model)?.display()
+            ),
         }
     }
     Ok(())
@@ -4698,6 +4903,16 @@ mod model_command_tests {
     }
 
     #[test]
+    fn local_catalog_origin_has_a_stable_non_url_label() {
+        assert_eq!(
+            catalog_origin_output(&denoize::models::CatalogOrigin::Signed {
+                source: "local-import".into(),
+            }),
+            "signed:local-import"
+        );
+    }
+
+    #[test]
     fn explicit_model_flags_override_invalid_environment_defaults() {
         let args = vec![
             "install".into(),
@@ -4715,6 +4930,42 @@ mod model_command_tests {
                     "DENOIZE_MODEL_OFFLINE" => "not-a-boolean",
                     "DENOIZE_MODEL_URL" => "environment-url",
                     "DENOIZE_MODEL_PROXY" => "environment-proxy",
+                    "DENOIZE_MODEL_BEARER_TOKEN" => "environment-bearer",
+                    "DENOIZE_MODEL_USERNAME" => "environment-user",
+                    "DENOIZE_MODEL_PASSWORD" => "environment-password",
+                    _ => return None,
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        assert!(!options.offline);
+        assert!(options.source_url.is_none());
+        assert!(matches!(
+            options.proxy,
+            denoize::models::ModelProxy::Environment
+        ));
+        assert!(options.authentication.is_none());
+    }
+
+    #[test]
+    fn explicit_catalog_flags_override_invalid_environment_defaults() {
+        let args = vec![
+            "catalog".into(),
+            "update".into(),
+            "--offline".into(),
+            "--url".into(),
+            "https://catalog.example.test/catalog.json".into(),
+            "--no-proxy".into(),
+            "--bearer-token-env".into(),
+            "CATALOG_TOKEN".into(),
+        ];
+        let options = model_catalog_download_options_from_environment_with(&args, |name| {
+            Some(
+                match name {
+                    "DENOIZE_MODEL_OFFLINE" => "not-a-boolean",
+                    "DENOIZE_MODEL_CATALOG_URL" => "not-a-url",
+                    "DENOIZE_MODEL_PROXY" => "not-a-proxy",
                     "DENOIZE_MODEL_BEARER_TOKEN" => "environment-bearer",
                     "DENOIZE_MODEL_USERNAME" => "environment-user",
                     "DENOIZE_MODEL_PASSWORD" => "environment-password",

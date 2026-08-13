@@ -385,6 +385,33 @@ fn model_action_options(
     model_action_options_with_environment(input, |name| std::env::var(name).ok())
 }
 
+fn catalog_action_options(
+    input: Option<ModelActionOptions>,
+) -> Result<ModelDownloadOptions, String> {
+    catalog_action_options_with_environment(input, |name| std::env::var(name).ok())
+}
+
+fn catalog_action_options_with_environment<F>(
+    input: Option<ModelActionOptions>,
+    mut read_environment: F,
+) -> Result<ModelDownloadOptions, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let (options, source) = model_action_options_with_environment(input, |name| {
+        let name = if name == "DENOIZE_MODEL_URL" {
+            "DENOIZE_MODEL_CATALOG_URL"
+        } else {
+            name
+        };
+        read_environment(name)
+    })?;
+    if source.is_some() {
+        return Err("ローカルカタログはCLIの models catalog import で導入してください".into());
+    }
+    Ok(options)
+}
+
 fn model_action_options_with_environment<F>(
     input: Option<ModelActionOptions>,
     mut read_environment: F,
@@ -603,13 +630,30 @@ fn comparison_metric_set(report: &ComparisonReport) -> ComparisonMetricSet {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelRow {
-    name: &'static str,
-    backend: &'static str,
-    license: &'static str,
+    name: String,
+    backend: String,
+    license: String,
     sample_rate: u32,
-    revision: &'static str,
+    revision: String,
     installed: bool,
     path: String,
+    catalog_sequence: u64,
+    catalog_sha256: String,
+    catalog_signing_key: String,
+    provenance_source: Option<String>,
+    installed_at_unix_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCatalogRow {
+    sequence: u64,
+    sha256: String,
+    signing_key: String,
+    origin: String,
+    model_count: usize,
+    highest_accepted_sequence: u64,
+    cached_path: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1428,21 +1472,93 @@ async fn compare_audio(
 
 #[tauri::command]
 fn list_models() -> Result<Vec<ModelRow>, String> {
-    denoize::models::MODELS
+    let catalog = denoize::models::active_catalog()?;
+    catalog
+        .models()
         .iter()
         .map(|model| {
-            let path = denoize::models::path(model)?;
+            let path = denoize::models::path_for_catalog_model(model)?;
+            let provenance = denoize::models::catalog_model_provenance(model).ok();
             Ok(ModelRow {
-                name: model.name,
-                backend: model.backend,
-                license: model.license,
-                sample_rate: model.sample_rate,
-                revision: model.revision,
-                installed: denoize::models::verify(model).is_ok(),
+                name: model.name().to_string(),
+                backend: model.backend().to_string(),
+                license: model.license().to_string(),
+                sample_rate: model.sample_rate(),
+                revision: model.revision().to_string(),
+                installed: provenance.is_some(),
                 path: path.to_string_lossy().into_owned(),
+                catalog_sequence: model.catalog_sequence(),
+                catalog_sha256: model.catalog_sha256().to_string(),
+                catalog_signing_key: model.catalog_signing_key_id().to_string(),
+                provenance_source: provenance
+                    .as_ref()
+                    .map(|provenance| model_installation_source(&provenance.installation_source)),
+                installed_at_unix_seconds: provenance
+                    .map(|provenance| provenance.installed_at_unix_seconds),
             })
         })
         .collect()
+}
+
+fn model_catalog_origin(origin: &denoize::models::CatalogOrigin) -> String {
+    match origin {
+        denoize::models::CatalogOrigin::Embedded => "embedded".into(),
+        denoize::models::CatalogOrigin::Signed { source } if source == "local-import" => {
+            "signed:local-import".into()
+        }
+        denoize::models::CatalogOrigin::Signed { source } => {
+            format!("signed:{}", denoize::models::redact_url(source))
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn model_installation_source(source: &denoize::models::ModelInstallationSource) -> String {
+    match source {
+        denoize::models::ModelInstallationSource::CatalogUrl { url } => {
+            format!("catalog-url:{}", denoize::models::redact_url(url))
+        }
+        denoize::models::ModelInstallationSource::AlternateUrl { url } => {
+            format!("alternate-url:{}", denoize::models::redact_url(url))
+        }
+        denoize::models::ModelInstallationSource::LocalFile => "local-file".into(),
+        denoize::models::ModelInstallationSource::CompletedPartial => "completed-partial".into(),
+        denoize::models::ModelInstallationSource::ExistingCacheMigration => {
+            "existing-cache-migration".into()
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn current_model_catalog_row() -> Result<ModelCatalogRow, String> {
+    let status = denoize::models::catalog_status()?;
+    Ok(ModelCatalogRow {
+        sequence: status.sequence,
+        sha256: status.sha256,
+        signing_key: status.signing_key_id,
+        origin: model_catalog_origin(&status.origin),
+        model_count: status.model_count,
+        highest_accepted_sequence: status.highest_accepted_sequence,
+        cached_path: status.cached_catalog_path.to_string_lossy().into_owned(),
+    })
+}
+
+#[tauri::command]
+fn model_catalog_status() -> Result<ModelCatalogRow, String> {
+    current_model_catalog_row()
+}
+
+#[tauri::command]
+async fn update_model_catalog(
+    options: Option<ModelActionOptions>,
+) -> Result<ModelCatalogRow, String> {
+    let options = catalog_action_options(options)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        denoize::models::update_catalog(&options)?;
+        current_model_catalog_row()
+    })
+    .await
+    .map_err(|error| format!("モデルカタログ更新タスクに失敗しました: {error}"))?
 }
 
 #[tauri::command]
@@ -1453,7 +1569,11 @@ fn model_action(
     action: String,
     options: Option<ModelActionOptions>,
 ) -> Result<u64, String> {
-    let model = denoize::models::find(&name).ok_or_else(|| format!("不明なモデル: {name}"))?;
+    let catalog = denoize::models::active_catalog()?;
+    let model = catalog
+        .find(&name)
+        .cloned()
+        .ok_or_else(|| format!("不明なモデル: {name}"))?;
     if !matches!(action.as_str(), "install" | "update" | "verify" | "remove") {
         return Err(format!("不明な操作: {action}"));
     }
@@ -1487,29 +1607,33 @@ fn model_action(
         };
         let result = match action.as_str() {
             "install" => match source_path {
-                Some(source) => denoize::models::install_from_file_with_progress(
-                    model,
+                Some(source) => denoize::models::install_catalog_model_from_file_with_progress(
+                    &model,
                     source,
                     || cancelled.is_cancelled(),
                     progress,
                 ),
-                None => denoize::models::install_with_options_and_progress(
-                    model,
+                None => denoize::models::install_catalog_model_with_options_and_progress(
+                    &model,
                     &download_options,
                     || cancelled.is_cancelled(),
                     progress,
                 ),
             }
             .map(|path| path.display().to_string()),
-            "update" => denoize::models::update_with_options_and_progress(
-                model,
+            "update" => denoize::models::update_catalog_model_with_options_and_progress(
+                &model,
                 &download_options,
                 || cancelled.is_cancelled(),
                 progress,
             )
             .map(|path| path.display().to_string()),
-            "verify" => denoize::models::verify(model).map(|path| path.display().to_string()),
-            "remove" => denoize::models::remove(model).map(|_| "削除しました".into()),
+            "verify" => {
+                denoize::models::verify_catalog_model(&model).map(|path| path.display().to_string())
+            }
+            "remove" => {
+                denoize::models::remove_catalog_model(&model).map(|_| "削除しました".into())
+            }
             _ => unreachable!(),
         };
         match result {
@@ -2279,6 +2403,8 @@ pub fn run() {
             stop_live,
             compare_audio,
             list_models,
+            model_catalog_status,
+            update_model_catalog,
             model_action,
             prepare_preview,
             load_gui_config,
@@ -3013,6 +3139,27 @@ deterministic = false
             Some(ModelAuthentication::Bearer(ref token)) if token == "environment-token"
         ));
         assert!(source.is_none());
+    }
+
+    #[test]
+    fn catalog_options_use_the_dedicated_catalog_environment_source() {
+        let options = catalog_action_options_with_environment(None, |name| match name {
+            "DENOIZE_MODEL_CATALOG_URL" => Some("https://catalog.example.test/catalog.json".into()),
+            "DENOIZE_MODEL_URL" => Some("https://wrong.example.test/model.onnx".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(
+            options.source_url.as_deref(),
+            Some("https://catalog.example.test/catalog.json")
+        );
+
+        let input = ModelActionOptions {
+            source_path: Some("catalog.json".into()),
+            ..ModelActionOptions::default()
+        };
+        let error = catalog_action_options_with_environment(Some(input), |_| None).unwrap_err();
+        assert!(error.contains("models catalog import"), "{error}");
     }
 
     #[test]
