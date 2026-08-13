@@ -15,12 +15,11 @@ use super::budget::{channel_descriptor_bytes, DecodeBudget};
 use super::pcm::DecodedPcm;
 use super::DecodeLimits;
 
-/// Match the 13-bit ADTS transport ceiling. At 48 kHz/1024 samples this still
-/// admits roughly 3.1 Mbit/s per access unit, far above ordinary AAC-LC, while
-/// placing a finite bound on oxideav-aac's per-byte syntactic-element
-/// amplification. MP4 AAC samples above this conservative interoperability
-/// ceiling are rejected before an access-unit buffer or decoder is entered.
-const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x1fff;
+/// MPEG-4 `bufferSizeDB` is 24 bits. Using the same finite ceiling for MP4 AAC
+/// samples prevents a corrupt `stsz` from requesting an unbounded access-unit
+/// buffer. When a working-set limit is configured, the payload-proportional
+/// decoder allowance below is checked before allocation or decoder entry.
+const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x00ff_ffff;
 const MAX_MP4_BOX_DEPTH: usize = 32;
 const MAX_EMPTY_TRUN_SAMPLES: u64 = 10_000_000;
 const MAX_EDIT_WORKING_BYTES: u128 = 512 * 1024 * 1024;
@@ -3621,17 +3620,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_access_unit_without_allocating_it() {
+    fn enforces_mpeg4_access_unit_size_ceiling_without_allocating_payload() {
         let mut table = TestTable::variable_stco();
-        table.fixed_size = MAX_AAC_ACCESS_UNIT_SIZE;
         table.variable_sizes.clear();
-        validate_table(&table, u64::MAX).expect("8,191-byte AAC access unit remains accepted");
+
+        for accepted_size in [8_192, 64 * 1024, MAX_AAC_ACCESS_UNIT_SIZE] {
+            table.fixed_size = accepted_size;
+            validate_table(&table, u64::MAX).unwrap_or_else(|error| {
+                panic!("{accepted_size}-byte MP4 AAC access unit must be accepted: {error}")
+            });
+        }
 
         table.fixed_size = MAX_AAC_ACCESS_UNIT_SIZE + 1;
-        table.variable_sizes.clear();
         let error = validate_table(&table, u64::MAX).unwrap_err();
         assert!(error.contains("safety limit"), "{error}");
+    }
 
+    #[test]
+    fn checks_large_access_unit_amplification_against_exact_working_budget() {
+        const LARGE_ACCESS_UNIT_SIZE: u32 = 64 * 1024;
+        let amplified = aac_access_unit_decoder_bytes(LARGE_ACCESS_UNIT_SIZE).unwrap();
+
+        let exact =
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(amplified)));
+        exact
+            .check_peak(0, amplified, "M4A large AAC access unit")
+            .expect("the exact payload-proportional working budget must be accepted");
+
+        let one_byte_short = DecodeBudget::new(
+            DecodeLimits::default().with_max_working_set_bytes(Some(amplified - 1)),
+        );
+        let error = one_byte_short
+            .check_peak(0, amplified, "M4A large AAC access unit")
+            .expect_err("the pre-entry budget check must reject before allocation or decode");
+        assert!(error.contains("working-set limit"), "{error}");
+    }
+
+    #[test]
+    fn hostile_access_unit_amplification_remains_bounded() {
         let amplified = aac_access_unit_decoder_bytes(MAX_AAC_ACCESS_UNIT_SIZE).unwrap();
         let budget = DecodeBudget::new(
             DecodeLimits::default().with_max_working_set_bytes(Some(amplified.saturating_sub(1))),

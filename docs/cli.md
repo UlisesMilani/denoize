@@ -112,6 +112,11 @@ untracked, changed, or unsafe existing output is preserved with an error unless
 `--force` can safely replace it; run that forced regeneration once to migrate a
 legacy entry, after which an identical run can skip.
 
+The denoize package version participates in the v3 recipe hash. After a package
+upgrade, `--resume` preserves an existing output and reports `recipeChanged`
+unless `--force` is supplied. Regenerate it once with `--force` to migrate the
+saved recipe; subsequent identical runs skip it normally.
+
 Resumable ONNX-backed batches require a self-contained `.onnx` file. Models
 that declare external tensor sidecars can still be used without `--resume`, but
 are rejected for resume because the v3 model digest cannot represent every
