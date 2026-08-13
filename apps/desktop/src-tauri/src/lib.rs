@@ -8,8 +8,8 @@ use denoize::encode::write_audio_to_file;
 use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode, DownmixMode,
-    EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
+    AacEncoder, AtomicOutput, Backend, BackendOptions, BackendSession, ChannelMode, CommitMode,
+    DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -288,6 +288,7 @@ struct PreparedBatchItem {
     encode: EncodeOptions,
     metadata_policy: MetadataPolicy,
     processing: service::ResolvedProcessingOptions,
+    backend_session: Arc<BackendSession>,
     expectation: ResumeExpectation,
 }
 
@@ -757,6 +758,7 @@ fn start_batch(
                 prepared.encode,
                 prepared.metadata_policy,
                 &prepared.processing,
+                &prepared.backend_session,
                 &control,
             )
             .and_then(|transaction| {
@@ -1772,6 +1774,7 @@ fn preflight_batch_items(
         MetadataPolicy::Drop
     };
     let mut model_fingerprints = HashMap::<(PathBuf, u32), batch_resume::ConsumedModel>::new();
+    let mut backend_sessions = Vec::<(Backend, BackendOptions, Arc<BackendSession>)>::new();
     let mut prepared = Vec::with_capacity(items.len());
     for item in items {
         let input_fingerprint = batch_resume::fingerprint_file(&item.input).map_err(|error| {
@@ -1824,6 +1827,33 @@ fn preflight_batch_items(
             }
             None => None,
         };
+        // Bind the prepared graph to the model bytes already captured by the
+        // resume recipe. The whole-plan source fence below re-hashes the path
+        // after graph preparation and rejects a persistent replacement.
+        let backend_session = if let Some((_, _, session)) =
+            backend_sessions
+                .iter()
+                .find(|(backend, backend_options, _)| {
+                    *backend == processing.backend && backend_options == &processing.backend_options
+                }) {
+            Arc::clone(session)
+        } else {
+            let session = Arc::new(
+                BackendSession::prepare(processing.backend, processing.backend_options.clone())
+                    .map_err(|error| {
+                        format!(
+                            "バッチ入力 {} のバックエンドを準備できません: {error}",
+                            item.input.display()
+                        )
+                    })?,
+            );
+            backend_sessions.push((
+                processing.backend,
+                processing.backend_options.clone(),
+                Arc::clone(&session),
+            ));
+            session
+        };
         let recipe = batch_resume::recipe_digest(
             &processing,
             audio.channels(),
@@ -1848,6 +1878,7 @@ fn preflight_batch_items(
             encode,
             metadata_policy,
             processing,
+            backend_session,
             expectation,
         });
     }
@@ -2076,6 +2107,7 @@ fn stage_batch_output(
     encode: EncodeOptions,
     metadata_policy: MetadataPolicy,
     processing: &service::ResolvedProcessingOptions,
+    backend_session: &BackendSession,
     control: &JobControl,
 ) -> Result<AtomicOutput, String> {
     check_cancelled(control)?;
@@ -2087,7 +2119,7 @@ fn stage_batch_output(
     let mut audio = read_audio(input)?;
     format.validate_config(&audio, &encode)?;
     check_cancelled(control)?;
-    service::process_audio_resolved(&mut audio, processing)?;
+    service::process_audio_resolved_with_session(&mut audio, processing, backend_session)?;
     check_cancelled(control)?;
     if let Some(parent) = output
         .parent()
@@ -2556,6 +2588,7 @@ deterministic = false
             item.prepared.encode,
             item.prepared.metadata_policy,
             &item.prepared.processing,
+            &item.prepared.backend_session,
             &control,
         )?;
         verify_prepared_batch_recipe(&item.prepared)?;
@@ -2851,7 +2884,7 @@ deterministic = false
         let Some(name) = Backend::available_names()
             .iter()
             .copied()
-            .find(|name| !matches!(*name, "classical" | "rnnoise"))
+            .find(|name| !matches!(*name, "classical" | "rnnoise" | "gtcrn"))
         else {
             return;
         };

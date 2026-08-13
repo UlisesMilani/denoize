@@ -7,6 +7,7 @@
 
 use super::OnnxModelConfig;
 use rustfft::{num_complex::Complex32, FftPlanner};
+use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
 
 const MODEL_RATE: u32 = 48_000;
@@ -19,33 +20,77 @@ pub fn process(
     input_sample_rate: u32,
     config: &OnnxModelConfig,
 ) -> Result<Vec<Vec<f64>>, String> {
-    if config.sample_rate != MODEL_RATE {
-        return Err(format!(
-            "BSRNN expects a {MODEL_RATE} Hz model, got {} Hz",
-            config.sample_rate
-        ));
-    }
-    if !config.path.is_file() {
-        return Err(format!(
-            "BSRNN ONNX model does not exist or is not a file: {}",
-            config.path.display()
-        ));
-    }
-    if channels.is_empty() {
-        return Ok(Vec::new());
+    BsrnnModel::load(config)?.process(channels, input_sample_rate)
+}
+
+struct CompiledBsrnnModel {
+    frames: usize,
+    model: Arc<TypedRunnableModel<TypedModel>>,
+}
+
+pub(crate) struct BsrnnModel {
+    template: InferenceModel,
+    compiled: Mutex<Option<CompiledBsrnnModel>>,
+}
+
+impl BsrnnModel {
+    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+        if config.sample_rate != MODEL_RATE {
+            return Err(format!(
+                "BSRNN expects a {MODEL_RATE} Hz model, got {} Hz",
+                config.sample_rate
+            ));
+        }
+        if !config.path.is_file() {
+            return Err(format!(
+                "BSRNN ONNX model does not exist or is not a file: {}",
+                config.path.display()
+            ));
+        }
+        Ok(Self {
+            template: load_template(config)?,
+            compiled: Mutex::new(None),
+        })
     }
 
-    let model_samples =
-        crate::resample::resample(&channels[0], input_sample_rate, MODEL_RATE)?.len();
-    if model_samples == 0 {
-        return Ok(channels.iter().map(|_| Vec::new()).collect());
+    pub(crate) fn process(
+        &self,
+        channels: &[Vec<f64>],
+        input_sample_rate: u32,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model_samples =
+            crate::resample::resample(&channels[0], input_sample_rate, MODEL_RATE)?.len();
+        if model_samples == 0 {
+            return Ok(channels.iter().map(|_| Vec::new()).collect());
+        }
+        let frames = model_samples / HOP_SIZE + 1;
+        let model = self.compiled_model(frames)?;
+        channels
+            .iter()
+            .map(|channel| process_channel(channel, input_sample_rate, frames, &model))
+            .collect()
     }
-    let frames = model_samples / HOP_SIZE + 1;
-    let model = load_model(config, frames)?;
-    channels
-        .iter()
-        .map(|channel| process_channel(channel, input_sample_rate, frames, &model))
-        .collect()
+
+    fn compiled_model(&self, frames: usize) -> Result<Arc<TypedRunnableModel<TypedModel>>, String> {
+        let mut compiled = self
+            .compiled
+            .lock()
+            .map_err(|_| "BSRNN compiled-model cache lock was poisoned".to_string())?;
+        if let Some(cached) = compiled.as_ref() {
+            if cached.frames == frames {
+                return Ok(Arc::clone(&cached.model));
+            }
+        }
+        let model = Arc::new(compile_model(&self.template, frames)?);
+        *compiled = Some(CompiledBsrnnModel {
+            frames,
+            model: Arc::clone(&model),
+        });
+        Ok(model)
+    }
 }
 
 fn process_channel(
@@ -171,12 +216,8 @@ fn istft(spectrum: &[f32], frames: usize, output_length: usize) -> Result<Vec<f3
     Ok(output)
 }
 
-fn load_model(
-    config: &OnnxModelConfig,
-    frames: usize,
-) -> Result<TypedRunnableModel<TypedModel>, String> {
-    let shape = tvec!(1, frames, BINS, 2);
-    let mut model = tract_onnx::onnx()
+fn load_template(config: &OnnxModelConfig) -> Result<InferenceModel, String> {
+    let model = tract_onnx::onnx()
         .model_for_path(&config.path)
         .map_err(|error| model_error("load", error))?;
     if model
@@ -192,6 +233,15 @@ fn load_model(
     {
         return Err("BSRNN ONNX model must have one input and one output".into());
     }
+    Ok(model)
+}
+
+fn compile_model(
+    template: &InferenceModel,
+    frames: usize,
+) -> Result<TypedRunnableModel<TypedModel>, String> {
+    let shape = tvec!(1, frames, BINS, 2);
+    let mut model = template.clone();
     model
         .set_input_fact(0, f32::fact(shape.clone()).into())
         .map_err(|error| model_error("configure input", error))?;

@@ -18,12 +18,22 @@ pub struct GtcrnProcessor {
 #[cfg(feature = "gtcrn")]
 impl GtcrnProcessor {
     pub fn open(path: &std::path::Path, channels: usize) -> Result<Self, String> {
-        if channels == 0 {
-            return Err("stream must have at least one channel".into());
+        if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {
+            return Err(format!(
+                "stream channels must be between 1 and {}",
+                crate::config::MAX_STREAM_CHANNELS
+            ));
         }
-        let mut streams = Vec::with_capacity(channels);
+        let model = crate::backend::gtcrn::GtcrnModel::load(&crate::OnnxModelConfig {
+            path: path.to_path_buf(),
+            sample_rate: crate::backend::gtcrn::SAMPLE_RATE,
+        })?;
+        let mut streams = Vec::new();
+        streams
+            .try_reserve_exact(channels)
+            .map_err(|_| "unable to reserve GTCRN channel streams".to_string())?;
         for _ in 0..channels {
-            streams.push(crate::backend::gtcrn::GtcrnStream::open(path)?);
+            streams.push(model.stream()?);
         }
         Ok(Self { streams })
     }
@@ -131,5 +141,16 @@ mod tests {
             processor.process_block(&[vec![1.0, -1.0]]).unwrap(),
             vec![vec![0.5, -0.5]]
         );
+    }
+
+    #[cfg(feature = "gtcrn")]
+    #[test]
+    fn gtcrn_stream_rejects_channel_bounds_before_opening_the_model() {
+        for channels in [0, crate::config::MAX_STREAM_CHANNELS + 1] {
+            let error = GtcrnProcessor::open(std::path::Path::new("missing.onnx"), channels)
+                .err()
+                .expect("invalid channel count must fail");
+            assert!(error.contains("between 1 and"));
+        }
     }
 }

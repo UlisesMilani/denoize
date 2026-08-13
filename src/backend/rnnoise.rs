@@ -16,7 +16,6 @@ const FRAME: usize = DenoiseState::FRAME_SIZE;
 /// block can legitimately produce zero frames while bounded internal latency
 /// is accumulated. Call [`finish`](Self::finish) to emit the final partial
 /// frame and resampler delay.
-#[cfg(any(feature = "live", test))]
 pub(crate) struct StreamingProcessor {
     channels: usize,
     to_48k: crate::resample::StreamingResampler,
@@ -28,7 +27,6 @@ pub(crate) struct StreamingProcessor {
     finished: bool,
 }
 
-#[cfg(any(feature = "live", test))]
 impl StreamingProcessor {
     pub(crate) fn new(sample_rate: u32, channels: usize) -> Result<Self, String> {
         if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {
@@ -298,7 +296,6 @@ fn process_channel(input: &[f64], sample_rate: u32) -> Result<Vec<f64>, String> 
     Ok(trimmed)
 }
 
-#[cfg(any(feature = "live", test))]
 fn validate_stream_block(input: &[Vec<f64>], channels: usize) -> Result<usize, String> {
     if input.len() != channels {
         return Err(format!(
@@ -313,7 +310,6 @@ fn validate_stream_block(input: &[Vec<f64>], channels: usize) -> Result<usize, S
     Ok(frames)
 }
 
-#[cfg(any(feature = "live", test))]
 fn empty_output(channels: usize, capacity: usize) -> Result<Vec<Vec<f64>>, String> {
     let mut output = Vec::new();
     output
@@ -329,7 +325,6 @@ fn empty_output(channels: usize, capacity: usize) -> Result<Vec<Vec<f64>>, Strin
     Ok(output)
 }
 
-#[cfg(any(feature = "live", test))]
 #[allow(dead_code)]
 fn append_limited(
     destination: &mut [Vec<f64>],
@@ -363,7 +358,6 @@ fn append_limited(
     Ok(())
 }
 
-#[cfg(any(feature = "live", test))]
 fn to_rnnoise_sample(sample: f64) -> f32 {
     (crate::audio::sanitize_sample(sample) as f32) * 32768.0
 }

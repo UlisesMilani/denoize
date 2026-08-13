@@ -3,7 +3,7 @@
 use crate::loudness::LoudnessReport;
 #[cfg(feature = "gtcrn")]
 use crate::OnnxModelConfig;
-use crate::{Audio, Backend, BackendOptions, ConfigError, DenoiserConfig};
+use crate::{Audio, Backend, BackendOptions, BackendSession, ConfigError, DenoiserConfig};
 use std::time::Duration;
 
 /// User-facing backend choice shared by every application frontend.
@@ -271,6 +271,16 @@ pub fn process_audio_resolved(
     audio: &mut Audio,
     options: &ResolvedProcessingOptions,
 ) -> Result<ProcessingResult, String> {
+    let session = BackendSession::prepare(options.backend, options.backend_options.clone())?;
+    process_audio_resolved_with_session(audio, options, &session)
+}
+
+/// Process decoded audio with an already-prepared backend session.
+pub fn process_audio_resolved_with_session(
+    audio: &mut Audio,
+    options: &ResolvedProcessingOptions,
+    session: &BackendSession,
+) -> Result<ProcessingResult, String> {
     if audio.sample_rate != options.denoiser.sample_rate {
         return Err(format!(
             "resolved processing sample rate {} Hz does not match decoded audio rate {} Hz",
@@ -278,12 +288,11 @@ pub fn process_audio_resolved(
         ));
     }
     options.validate_config()?;
-    let (mut working, elapsed) = crate::process_audio_copy_with_backend_config(
-        audio,
-        options.denoiser.clone(),
-        options.backend,
-        &options.backend_options,
-    )?;
+    if session.backend() != options.backend || session.options() != &options.backend_options {
+        return Err("prepared backend session does not match resolved processing options".into());
+    }
+    let (mut working, elapsed) =
+        crate::process_audio_copy_with_backend_session(audio, options.denoiser.clone(), session)?;
     let loudness = options
         .loudness_lufs
         .map(|target| crate::loudness::normalize(&mut working, target, options.true_peak_dbtp))

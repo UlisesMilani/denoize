@@ -77,11 +77,13 @@ pub use audio::{
     write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamInfo, WavStreamReader,
     WavStreamWriter,
 };
+#[cfg(feature = "gtcrn")]
+pub use backend::gtcrn::{GtcrnModel, GtcrnStream};
 #[cfg(feature = "onnx")]
 pub use backend::onnx::{OnnxWaveformContract, OnnxWaveformLayout, OnnxWaveformModel};
 pub use backend::{
-    decode_mid_side, encode_mid_side, Backend, BackendOptions, ChannelMode, OnnxModelConfig,
-    SgmseProfile,
+    decode_mid_side, encode_mid_side, Backend, BackendOptions, BackendSession, ChannelMode,
+    OnnxModelConfig, SgmseProfile, StreamingBackendSession,
 };
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
@@ -251,45 +253,40 @@ pub fn denoise_audio_with_backend_config(
     backend: Backend,
     backend_options: &BackendOptions,
 ) -> Result<std::time::Duration, String> {
-    let (processed, elapsed) =
-        process_audio_copy_with_backend_config(audio, config, backend, backend_options)?;
+    let session = BackendSession::prepare(backend, backend_options.clone())?;
+    denoise_audio_with_backend_session(audio, config, &session)
+}
+
+/// Process decoded audio with a prepared backend graph.
+///
+/// Reuse the same session across files or VAD regions to avoid reparsing and
+/// reoptimizing model weights. Per-call recurrent state remains isolated.
+pub fn denoise_audio_with_backend_session(
+    audio: &mut Audio,
+    config: DenoiserConfig,
+    session: &BackendSession,
+) -> Result<std::time::Duration, String> {
+    let (processed, elapsed) = process_audio_copy_with_backend_session(audio, config, session)?;
     *audio = processed;
     Ok(elapsed)
 }
 
-/// Build a processed replacement without changing the caller's audio. This is
-/// also used by delivery layers that have further fallible work, such as
-/// loudness normalization, before committing the result.
-pub(crate) fn process_audio_copy_with_backend_config(
+pub(crate) fn process_audio_copy_with_backend_session(
     audio: &Audio,
     mut config: DenoiserConfig,
-    backend: Backend,
-    backend_options: &BackendOptions,
+    session: &BackendSession,
 ) -> Result<(Audio, std::time::Duration), String> {
     config.sample_rate = audio.sample_rate;
     config
         .validate_config()
         .map_err(|error| error.to_string())?;
-    backend_options.validate_resolved_resources(backend)?;
     let mut input = audio.try_clone_fallible("denoising input")?;
     input.sanitize_samples();
     let t0 = std::time::Instant::now();
     let channels = if config.vad {
-        process_with_vad(
-            backend,
-            &input.channels,
-            input.sample_rate,
-            &config,
-            backend_options,
-        )?
+        process_with_vad(session, &input.channels, input.sample_rate, &config)?
     } else {
-        backend::process_channels(
-            backend,
-            &input.channels,
-            input.sample_rate,
-            &config,
-            backend_options,
-        )?
+        session.process(&input.channels, input.sample_rate, &config)?
     };
     let mut processed = Audio {
         sample_rate: audio.sample_rate,
@@ -302,7 +299,7 @@ pub(crate) fn process_audio_copy_with_backend_config(
     let elapsed = t0.elapsed();
     eprintln!(
         "denoize: {:?} | {}ch x {} frames ({:.2}s) in {:.2?} ({:.1}x realtime)",
-        backend,
+        session.backend(),
         processed.channels(),
         processed.frames(),
         processed.frames() as f64 / processed.sample_rate as f64,
@@ -314,11 +311,10 @@ pub(crate) fn process_audio_copy_with_backend_config(
 }
 
 fn process_with_vad(
-    backend: Backend,
+    session: &BackendSession,
     channels: &[Vec<f64>],
     sample_rate: u32,
     config: &DenoiserConfig,
-    backend_options: &BackendOptions,
 ) -> Result<Vec<Vec<f64>>, String> {
     let regions = vad::speech_regions(channels, sample_rate);
     let fade_frames = (sample_rate as usize / 50).max(1); // 20 ms
@@ -335,8 +331,7 @@ fn process_with_vad(
                 channel[region.start.min(channel.len())..region.end.min(channel.len())].to_vec()
             })
             .collect();
-        let enhanced =
-            backend::process_channels(backend, &input, sample_rate, config, backend_options)?;
+        let enhanced = session.process(&input, sample_rate, config)?;
         for (channel_index, enhanced_channel) in enhanced.iter().enumerate() {
             let Some(destination) = output.get_mut(channel_index) else {
                 continue;
@@ -367,7 +362,10 @@ fn vad_mix_weight(offset: usize, length: usize, fade_frames: usize) -> f64 {
 
 #[cfg(test)]
 mod vad_mix_tests {
-    use super::{process_with_vad, vad, vad_mix_weight, Backend, BackendOptions, DenoiserConfig};
+    use super::{
+        process_with_vad, vad, vad_mix_weight, Backend, BackendOptions, BackendSession,
+        DenoiserConfig,
+    };
 
     #[test]
     fn fades_vad_region_edges_without_exceeding_unity() {
@@ -406,6 +404,10 @@ mod vad_mix_tests {
         config.sanitized()
     }
 
+    fn test_session() -> BackendSession {
+        BackendSession::prepare(Backend::Classical, BackendOptions::default()).unwrap()
+    }
+
     #[test]
     fn vad_applies_configured_gain_to_non_speech_audio() {
         let sample_rate = 16_000;
@@ -418,11 +420,10 @@ mod vad_mix_tests {
         assert!(vad::speech_regions(std::slice::from_ref(&input), sample_rate).is_empty());
 
         let output = process_with_vad(
-            Backend::Classical,
+            &test_session(),
             std::slice::from_ref(&input),
             sample_rate,
             &test_config(sample_rate),
-            &BackendOptions::default(),
         )
         .unwrap();
 
@@ -465,11 +466,10 @@ mod vad_mix_tests {
         assert!(!regions.is_empty());
 
         let output = process_with_vad(
-            Backend::Classical,
+            &test_session(),
             std::slice::from_ref(&input),
             sample_rate,
             &test_config(sample_rate),
-            &BackendOptions::default(),
         )
         .unwrap();
         assert_eq!(output[0].len(), input.len());

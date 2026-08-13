@@ -21,9 +21,9 @@ use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::AudioInputSession;
 use denoize::{
-    AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode,
-    DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile, StreamingDenoiser,
-    WindowType,
+    AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, BackendSession, ChannelMode,
+    CommitMode, DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
+    StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -75,7 +75,7 @@ struct ProcessResultJson<'a> {
 struct StreamResultJson<'a> {
     input: &'a str,
     output: &'a str,
-    backend: &'static str,
+    backend: &'a str,
     channels: u16,
     frames: usize,
     sample_rate: u32,
@@ -137,6 +137,7 @@ fn process_result_json_line(
 fn stream_result_json_line(
     input: &str,
     output: &str,
+    backend: &str,
     channels: u16,
     frames: usize,
     sample_rate: u32,
@@ -144,7 +145,7 @@ fn stream_result_json_line(
     serialize_json_line(&StreamResultJson {
         input,
         output,
-        backend: "classical",
+        backend,
         channels,
         frames,
         sample_rate,
@@ -205,7 +206,7 @@ fn usage() -> String {
         "\
 denoize {VERSION} — pure-Rust audio denoiser engineered for the world's highest sound quality
 
-Classical DSP + optional AI backends (RNNoise, DeepFilterNet v3, MP-SENet, BSRNN).
+Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
 Output: WAV, FLAC, Ogg Opus, MP3, M4A, AAC.
 
@@ -218,8 +219,8 @@ USAGE:
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
 
 LIVE:
-    Low-latency live processing supports only classical and rnnoise; other
-    backends are rejected before capture or playback starts.
+    Low-latency live processing supports classical, rnnoise, and gtcrn when
+    compiled; other backends are rejected before capture or playback starts.
 
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
@@ -264,7 +265,7 @@ OPTIONS:
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
-        --stream              bounded-memory classical WAV-to-WAV processing
+        --stream              bounded-memory stateful WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --recursive           include subdirectories in batch mode
@@ -290,7 +291,7 @@ BACKENDS (build with --features full for all):
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
     mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
-    gtcrn       Official causal GTCRN for files/library streams (not the live command)
+    gtcrn       Official causal GTCRN for files, --stream, and live processing
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP
@@ -867,6 +868,7 @@ fn preflight_batch_items(
     };
     let mut model_fingerprints =
         std::collections::HashMap::<(std::path::PathBuf, u32), ConsumedModel>::new();
+    let mut backend_sessions = Vec::<(Backend, BackendOptions, Arc<BackendSession>)>::new();
     let mut prepared = Vec::with_capacity(items.len());
     let decode_limits = decode_limits(ov.max_memory_mb)?;
     for item in items {
@@ -971,6 +973,19 @@ fn preflight_batch_items(
             }
             None => None,
         };
+        // Hash the selected model before preparing its graph. The whole-plan
+        // source fence below then re-hashes it after preparation, so a
+        // persistent pathname replacement cannot bind model A's graph to
+        // model B's resume fingerprint.
+        let backend_session =
+            cached_backend_session(&mut backend_sessions, &resolved_processing, ov.report)
+                .map_err(|error| {
+                    format!(
+                        "prepare batch backend {} for {}: {error}",
+                        service::backend_name(resolved_processing.backend),
+                        item.input.display()
+                    )
+                })?;
         let recipe = batch_resume::recipe_digest(
             &resolved_processing,
             audio.channels(),
@@ -999,6 +1014,7 @@ fn preflight_batch_items(
         prepared.push(PreparedBatchItem {
             item: item.clone(),
             resolved_processing,
+            backend_session,
             expectation,
             recipe,
         });
@@ -1011,6 +1027,31 @@ fn preflight_batch_items(
     }
     debug_assert_eq!(prepared.len(), items.len());
     Ok(prepared)
+}
+
+fn cached_backend_session(
+    cache: &mut Vec<(Backend, BackendOptions, Arc<BackendSession>)>,
+    options: &service::ResolvedProcessingOptions,
+    report_only: bool,
+) -> Result<Option<Arc<BackendSession>>, String> {
+    if report_only {
+        return Ok(None);
+    }
+    if let Some((_, _, session)) = cache.iter().find(|(backend, backend_options, _)| {
+        *backend == options.backend && backend_options == &options.backend_options
+    }) {
+        return Ok(Some(Arc::clone(session)));
+    }
+    let session = Arc::new(BackendSession::prepare(
+        options.backend,
+        options.backend_options.clone(),
+    )?);
+    cache.push((
+        options.backend,
+        options.backend_options.clone(),
+        Arc::clone(&session),
+    ));
+    Ok(Some(session))
 }
 
 fn effective_batch_jobs(ov: &Overrides) -> usize {
@@ -1519,6 +1560,7 @@ fn run_one_with_output_format(
         None,
         None,
         None,
+        None,
         true,
     )?;
     let Some(staged) = staged else {
@@ -1554,6 +1596,7 @@ fn process_one_to_staged_output(
     recipe_metadata_policy: Option<MetadataPolicy>,
     expected_input_probe: Option<AudioProbe>,
     expected_input_fingerprint: Option<FileFingerprint>,
+    pre_prepared_backend_session: Option<Arc<BackendSession>>,
     inspect_destination: bool,
 ) -> Result<Option<StagedProcessOutput>, String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
@@ -1667,7 +1710,18 @@ fn process_one_to_staged_output(
         format.validate_config(&audio, &encode_options)?;
     }
 
-    let result = service::process_audio_resolved(&mut audio, &resolved_processing)?;
+    let backend_session = match pre_prepared_backend_session {
+        Some(session) => session,
+        None => Arc::new(BackendSession::prepare(
+            resolved_processing.backend,
+            resolved_processing.backend_options.clone(),
+        )?),
+    };
+    let result = service::process_audio_resolved_with_session(
+        &mut audio,
+        &resolved_processing,
+        &backend_session,
+    )?;
     if let Some(report) = result.loudness {
         if !ov.json {
             eprintln!(
@@ -1742,18 +1796,16 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     if !is_wav(input_path) || !is_wav(output_path) {
         return Err("--stream currently supports WAV-to-WAV paths only".into());
     }
-    if ov.auto_backend
-        || ov
-            .backend
-            .is_some_and(|backend| backend != Backend::Classical)
-    {
-        return Err("--stream currently supports only the classical backend".into());
-    }
-    if ov
-        .channel_mode
-        .is_some_and(|mode| mode != ChannelMode::Independent)
-    {
-        return Err("--stream requires independent channels".into());
+    let backend = if ov.auto_backend {
+        service::select_live_backend()
+    } else {
+        ov.backend.unwrap_or(Backend::Classical)
+    };
+    if !StreamingBackendSession::supports(backend) {
+        return Err(format!(
+            "backend {} does not support --stream",
+            service::backend_name(backend)
+        ));
     }
     let preflight_cfg = build_config(&ov, VALIDATION_SAMPLE_RATE);
     if preflight_cfg.vad {
@@ -1770,8 +1822,9 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let channel_mask = stream_info.channel_mask;
     validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
+    let backend_options = service::resolve_backend_options(backend, build_backend_options(&ov))?;
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
-    let stream_working_set = estimate_stream_memory_bytes_checked(
+    let base_stream_working_set = estimate_stream_memory_bytes_checked(
         spec.channels as usize,
         block_frames,
         cfg.frame_size,
@@ -1779,6 +1832,16 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         cfg.profile_ms,
     )
     .map_err(|error| error.to_string())?;
+    let backend_stream_state = StreamingBackendSession::estimate_additional_bytes(
+        backend,
+        spec.sample_rate,
+        spec.channels as usize,
+        backend_options.channel_mode,
+    )
+    .map_err(|error| error.to_string())?;
+    let stream_working_set = base_stream_working_set
+        .checked_add(backend_stream_state)
+        .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
     ensure_memory_limit(
         stream_working_set,
         ov.max_memory_mb,
@@ -1787,8 +1850,13 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let metadata_limits = retained_metadata_limits(ov.max_memory_mb, stream_working_set)?;
     if ov.report {
         println!(
-            "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : classical\nstream     : enabled ({} frames/block)",
-            spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format, block_frames
+            "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\nstream     : enabled ({} frames/block)",
+            spec.channels,
+            spec.sample_rate,
+            spec.bits_per_sample,
+            spec.sample_format,
+            service::backend_name(backend),
+            block_frames
         );
         return Ok(());
     }
@@ -1796,7 +1864,13 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     // Construct every allocation-sensitive processor before opening the
     // transactional output. Invalid or hostile resource plans therefore leave
     // neither a destination nor a temporary `.part` file behind.
-    let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
+    let mut processor = StreamingBackendSession::new(
+        backend,
+        spec.sample_rate,
+        spec.channels as usize,
+        cfg,
+        backend_options,
+    )?;
     let metadata = if !ov.no_metadata {
         input_session.read_metadata_with_limits(metadata_limits)?
     } else {
@@ -1835,12 +1909,21 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     if ov.json {
         println!(
             "{}",
-            stream_result_json_line(input, output, spec.channels, frames, spec.sample_rate)
+            stream_result_json_line(
+                input,
+                output,
+                service::backend_name(backend),
+                spec.channels,
+                frames,
+                spec.sample_rate,
+            )
         );
     } else {
         eprintln!(
-            "denoize: streaming classical WAV complete: {}ch x {} frames",
-            spec.channels, frames
+            "denoize: streaming {} WAV complete: {}ch x {} frames",
+            service::backend_name(backend),
+            spec.channels,
+            frames
         );
     }
     Ok(())
@@ -1888,6 +1971,7 @@ struct BatchItem {
 struct PreparedBatchItem {
     item: BatchItem,
     resolved_processing: service::ResolvedProcessingOptions,
+    backend_session: Option<Arc<BackendSession>>,
     expectation: ResumeExpectation,
     recipe: Digest,
 }
@@ -2299,6 +2383,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             Some(metadata_policy),
             Some(item.probe),
             Some(planned.prepared.expectation.input_fingerprint()),
+            planned.prepared.backend_session.clone(),
             false,
         ) {
             Ok(staged) => staged,
@@ -2535,6 +2620,7 @@ mod json_output_tests {
         let value = parse_json_line(&stream_result_json_line(
             SPECIAL_INPUT,
             SPECIAL_OUTPUT,
+            "gtcrn",
             2,
             8_193,
             44_100,
@@ -2543,7 +2629,7 @@ mod json_output_tests {
         assert_eq!(value.as_object().unwrap().len(), 7);
         assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
         assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
-        assert_eq!(value["backend"].as_str(), Some("classical"));
+        assert_eq!(value["backend"].as_str(), Some("gtcrn"));
         assert_eq!(value["channels"].as_u64(), Some(2));
         assert_eq!(value["frames"].as_u64(), Some(8_193));
         assert_eq!(value["sample_rate"].as_u64(), Some(44_100));
@@ -2611,6 +2697,29 @@ mod batch_tests {
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
         "4a4a45623b86fe17b0e0b61610b4355c623e30968abc127295ce6040c47c31d4";
+
+    #[test]
+    fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {
+        let options = service::ResolvedProcessingOptions {
+            backend: Backend::Classical,
+            denoiser: DenoiserConfig::default(48_000),
+            backend_options: BackendOptions::default(),
+            loudness_lufs: None,
+            true_peak_dbtp: -1.0,
+        };
+        let mut cache = Vec::new();
+        let first = cached_backend_session(&mut cache, &options, false)
+            .unwrap()
+            .unwrap();
+        let second = cached_backend_session(&mut cache, &options, false)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.len(), 1);
+        assert!(cached_backend_session(&mut cache, &options, true)
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn cancellation_while_waiting_for_publication_fence_never_publishes() {
@@ -3252,6 +3361,13 @@ mod auto_backend_tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+    #[cfg(feature = "gtcrn")]
+    use prost::Message;
+    #[cfg(feature = "gtcrn")]
+    use tract_onnx::pb::{
+        tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
+        OperatorSetIdProto, TensorShapeProto, TypeProto, ValueInfoProto,
+    };
 
     #[test]
     fn parses_stream_option() {
@@ -3363,6 +3479,114 @@ mod streaming_tests {
         assert_eq!(result.channels(), 1);
         assert_eq!(result.frames(), 20_000);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "gtcrn")]
+    #[test]
+    fn streams_gtcrn_wav_through_the_common_session() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let output = root.path().join("output.wav");
+        let model_path = root.path().join("gtcrn.onnx");
+        let mut model_bytes = Vec::new();
+        gtcrn_identity_model().encode(&mut model_bytes).unwrap();
+        std::fs::write(&model_path, model_bytes).unwrap();
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        for frame in 0..1_201 {
+            let sample = ((frame as f64 * 0.031).sin() * 8_000.0) as i16;
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                stream_frames: Some(37),
+                backend: Some(Backend::Gtcrn),
+                onnx_model: Some(model_path.to_string_lossy().into_owned()),
+                onnx_sample_rate: Some(16_000),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let result = read_audio(&output).unwrap();
+        assert_eq!(result.sample_rate, spec.sample_rate);
+        assert_eq!(result.channels(), 1);
+        assert_eq!(result.frames(), 1_201);
+        assert!(result.channels[0].iter().all(|sample| sample.is_finite()));
+    }
+
+    #[cfg(feature = "gtcrn")]
+    fn gtcrn_identity_model() -> ModelProto {
+        let bins = denoize::backend::gtcrn::BINS as i64;
+        let shapes: [(&str, &str, &[i64]); 4] = [
+            ("mixture", "enhanced", &[1, bins, 1, 2]),
+            ("conv", "conv_out", &[2, 1, 16, 16, 33]),
+            ("tra", "tra_out", &[2, 3, 1, 1, 16]),
+            ("inter", "inter_out", &[2, 1, 33, 16]),
+        ];
+        ModelProto {
+            ir_version: 8,
+            opset_import: vec![OperatorSetIdProto {
+                domain: String::new(),
+                version: 13,
+            }],
+            graph: Some(GraphProto {
+                name: "gtcrn-cli-identity".into(),
+                node: shapes
+                    .iter()
+                    .map(|(input, output, _)| NodeProto {
+                        input: vec![(*input).into()],
+                        output: vec![(*output).into()],
+                        name: format!("{input}_identity"),
+                        op_type: "Identity".into(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                input: shapes
+                    .iter()
+                    .map(|(input, _, shape)| gtcrn_value_info(input, shape))
+                    .collect(),
+                output: shapes
+                    .iter()
+                    .map(|(_, output, shape)| gtcrn_value_info(output, shape))
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "gtcrn")]
+    fn gtcrn_value_info(name: &str, shape: &[i64]) -> ValueInfoProto {
+        ValueInfoProto {
+            name: name.into(),
+            r#type: Some(TypeProto {
+                denotation: String::new(),
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: tensor_proto::DataType::Float as i32,
+                    shape: Some(TensorShapeProto {
+                        dim: shape
+                            .iter()
+                            .map(|value| tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimValue(*value)),
+                                denotation: String::new(),
+                            })
+                            .collect(),
+                    }),
+                })),
+            }),
+            doc_string: String::new(),
+        }
     }
 }
 

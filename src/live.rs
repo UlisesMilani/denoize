@@ -9,14 +9,16 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
 
 use crate::audio::Audio;
+#[cfg(test)]
+use crate::config::MAX_STREAM_BLOCK_FRAMES;
 use crate::config::{
     checked_profile_target_samples, checked_resource_add, checked_resource_multiply, ConfigError,
-    MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS, MAX_STREAM_STATE_BYTES,
+    MAX_STREAM_CHANNELS, MAX_STREAM_STATE_BYTES,
 };
 use crate::denoiser::DenoiserConfig;
 use crate::{
     denoise_audio_with_backend_config, Backend, BackendOptions, ChannelMode, ResourcePlan,
-    StreamingDenoiser,
+    StreamingBackendSession,
 };
 
 const MIN_CHUNK_MS: u32 = 10;
@@ -36,10 +38,14 @@ const PLAYBACK_QUEUE_CHUNKS: u64 = 8;
 const RNNOISE_SAMPLE_RATE: u64 = 48_000;
 #[cfg(feature = "rnnoise")]
 const RNNOISE_FRAME_FRAMES: u64 = 480;
-#[cfg(feature = "rnnoise")]
-const RNNOISE_RESAMPLER_CHUNK_FRAMES: u64 = 1_024;
-#[cfg(feature = "rnnoise")]
-const RNNOISE_RESAMPLER_SUB_CHUNKS: u64 = 2;
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+const STREAM_RESAMPLER_CHUNK_FRAMES: u64 = 1_024;
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+const STREAM_RESAMPLER_SUB_CHUNKS: u64 = 2;
+#[cfg(feature = "gtcrn")]
+const GTCRN_SAMPLE_RATE: u64 = crate::backend::gtcrn::SAMPLE_RATE as u64;
+#[cfg(feature = "gtcrn")]
+const GTCRN_HOP_FRAMES: u64 = crate::backend::gtcrn::HOP_SIZE as u64;
 
 static CTRL_C_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 static CTRL_C_SESSION: OnceLock<Mutex<Option<Weak<AtomicBool>>>> = OnceLock::new();
@@ -73,7 +79,14 @@ impl LiveConfig {
         if !backend_is_live_capable(self.backend) {
             return Err(ConfigError::invalid(
                 "backend",
-                "classical or rnnoise for realtime processing",
+                "a compiled backend with stateful realtime support",
+            ));
+        }
+        #[cfg(feature = "gtcrn")]
+        if self.backend == Backend::Gtcrn && self.denoiser.vad {
+            return Err(ConfigError::invalid(
+                "vad",
+                "disabled for the causal GTCRN realtime backend",
             ));
         }
         self.backend_options.validate_config(self.backend)
@@ -84,12 +97,7 @@ impl LiveConfig {
 /// the current live capture worker.
 #[allow(unreachable_patterns)]
 pub fn backend_is_live_capable(backend: Backend) -> bool {
-    match backend {
-        Backend::Classical => true,
-        #[cfg(feature = "rnnoise")]
-        Backend::Rnnoise => true,
-        _ => false,
-    }
+    StreamingBackendSession::supports(backend)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,7 +141,7 @@ fn maximum_ready_burst_frames(
         }
         #[cfg(feature = "rnnoise")]
         Backend::Rnnoise => {
-            let first_src_debt = rnnoise_resampler_output_debt(sample_rate as u64, 48_000)?;
+            let first_src_debt = stream_resampler_output_debt(sample_rate as u64, 48_000)?;
             let model_debt = RNNOISE_FRAME_FRAMES - 1;
             let debt_at_48k =
                 checked_resource_add("live RNNoise ready burst", first_src_debt, model_debt)?;
@@ -144,27 +152,53 @@ fn maximum_ready_burst_frames(
                 RNNOISE_SAMPLE_RATE,
             )?;
             let second_src_debt =
-                rnnoise_resampler_output_debt(RNNOISE_SAMPLE_RATE, sample_rate as u64)?;
+                stream_resampler_output_debt(RNNOISE_SAMPLE_RATE, sample_rate as u64)?;
             let backlog =
                 checked_resource_add("live RNNoise ready burst", upstream_debt, second_src_debt)?;
             checked_resource_add("live RNNoise ready burst", chunk_frames, backlog)
         }
+        #[cfg(feature = "gtcrn")]
+        Backend::Gtcrn => {
+            let first_src_debt =
+                stream_resampler_output_debt(sample_rate as u64, GTCRN_SAMPLE_RATE)?;
+            // A partial input hop and the causal WOLA hop can be retained at
+            // the same time before the first aligned output is available.
+            let model_debt = GTCRN_HOP_FRAMES
+                .checked_mul(2)
+                .and_then(|frames| frames.checked_sub(1))
+                .ok_or(ConfigError::ResourceOverflow {
+                    resource: "live GTCRN ready burst",
+                })?;
+            let debt_at_model_rate =
+                checked_resource_add("live GTCRN ready burst", first_src_debt, model_debt)?;
+            let upstream_debt = checked_ceil_scale(
+                "live GTCRN ready burst",
+                debt_at_model_rate,
+                sample_rate as u64,
+                GTCRN_SAMPLE_RATE,
+            )?;
+            let second_src_debt =
+                stream_resampler_output_debt(GTCRN_SAMPLE_RATE, sample_rate as u64)?;
+            let backlog =
+                checked_resource_add("live GTCRN ready burst", upstream_debt, second_src_debt)?;
+            checked_resource_add("live GTCRN ready burst", chunk_frames, backlog)
+        }
         #[allow(unreachable_patterns)]
         _ => Err(ConfigError::invalid(
             "backend",
-            "classical or rnnoise for realtime processing",
+            "a compiled backend with stateful realtime support",
         )),
     }
 }
 
-#[cfg(feature = "rnnoise")]
-fn rnnoise_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, ConfigError> {
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+fn stream_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, ConfigError> {
     if from_rate == to_rate {
         return Ok(0);
     }
     let gcd = greatest_common_divisor(from_rate, to_rate);
     let minimum_input_chunk = from_rate / gcd;
-    let wanted_subchunk = RNNOISE_RESAMPLER_CHUNK_FRAMES / RNNOISE_RESAMPLER_SUB_CHUNKS;
+    let wanted_subchunk = STREAM_RESAMPLER_CHUNK_FRAMES / STREAM_RESAMPLER_SUB_CHUNKS;
     let fft_chunks = checked_ceil_div(
         "live RNNoise resampler quantum",
         wanted_subchunk,
@@ -177,7 +211,7 @@ fn rnnoise_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, Co
     )?;
     let fft_size_out =
         checked_resource_multiply("live RNNoise resampler quantum", fft_chunks, to_rate / gcd)?;
-    let external_pending = RNNOISE_RESAMPLER_CHUNK_FRAMES - 1;
+    let external_pending = STREAM_RESAMPLER_CHUNK_FRAMES - 1;
     let internal_pending = fft_size_in - 1;
     let held_input = checked_resource_add(
         "live RNNoise resampler quantum",
@@ -197,7 +231,7 @@ fn rnnoise_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, Co
     checked_resource_add("live RNNoise resampler quantum", delayed, 2)
 }
 
-#[cfg(feature = "rnnoise")]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
 fn checked_ceil_scale(
     resource: &'static str,
     value: u64,
@@ -208,7 +242,7 @@ fn checked_ceil_scale(
     checked_ceil_div(resource, product, denominator)
 }
 
-#[cfg(feature = "rnnoise")]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
 fn checked_ceil_div(
     resource: &'static str,
     numerator: u64,
@@ -218,7 +252,7 @@ fn checked_ceil_div(
     Ok(adjusted / denominator)
 }
 
-#[cfg(feature = "rnnoise")]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
 fn greatest_common_divisor(mut lhs: u64, mut rhs: u64) -> u64 {
     while rhs != 0 {
         let remainder = lhs % rhs;
@@ -244,33 +278,12 @@ fn plan_live_buffers(
     let mut denoiser = config.denoiser.clone();
     denoiser.sample_rate = sample_rate;
     denoiser.validate_config()?;
-    #[cfg(feature = "rnnoise")]
-    let rnnoise_resampler_bytes = if config.backend == Backend::Rnnoise {
-        let processor_channels = if input_channels == 2
-            && config.backend_options.channel_mode == ChannelMode::StereoLinked
-        {
-            1
-        } else {
-            input_channels
-        };
-        let mut total = 0u64;
-        for (from_rate, to_rate) in [(sample_rate, 48_000), (48_000, sample_rate)] {
-            let bytes =
-                crate::resample::resampler_plan_bytes(processor_channels, from_rate, to_rate)
-                    .map_err(|_| {
-                        ConfigError::invalid(
-                            "sample_rate",
-                            "a rate with a bounded RNNoise 48 kHz resampler plan",
-                        )
-                    })?;
-            total = checked_resource_add("live RNNoise resamplers", total, bytes)?;
-        }
-        total
-    } else {
-        0
-    };
-    #[cfg(not(feature = "rnnoise"))]
-    let rnnoise_resampler_bytes = 0u64;
+    let backend_additional_bytes = StreamingBackendSession::estimate_additional_bytes(
+        config.backend,
+        sample_rate,
+        input_channels,
+        config.backend_options.channel_mode,
+    )?;
     let processor = ResourcePlan::for_stream(
         input_channels,
         denoiser.frame_size,
@@ -381,7 +394,7 @@ fn plan_live_buffers(
     let required_bytes = checked_resource_add(
         "live working set",
         stream_and_buffers,
-        rnnoise_resampler_bytes,
+        backend_additional_bytes,
     )?;
     if required_bytes > MAX_STREAM_STATE_BYTES {
         return Err(ConfigError::ResourceLimitExceeded {
@@ -462,16 +475,7 @@ struct CompatibilityLiveProcessor {
 }
 
 struct StatefulLiveProcessor {
-    processor: StatefulBackend,
-    channel_mode: ChannelMode,
-    input_channels: usize,
-    linked_original: VecDeque<(f64, f64)>,
-}
-
-enum StatefulBackend {
-    Classical(StreamingDenoiser),
-    #[cfg(feature = "rnnoise")]
-    Rnnoise(Box<crate::backend::RnnoiseStreamingProcessor>),
+    processor: StreamingBackendSession,
 }
 
 impl LiveProcessor {
@@ -501,8 +505,7 @@ impl LiveProcessor {
             .ok_or_else(|| "live capture sequence exhausted".to_string())?;
         let reset_for_gap = sequence != self.next_sequence;
         if reset_for_gap {
-            let replacement = LiveProcessorKind::new(&self.spec, false)?;
-            self.kind = replacement;
+            self.kind.reset()?;
         }
         self.next_sequence = following;
         let mut channels = self.kind.process_block(channels)?;
@@ -540,6 +543,13 @@ impl LiveProcessorKind {
             Self::Compatibility(processor) => processor.process_block(channels),
         }
     }
+
+    fn reset(&mut self) -> Result<(), String> {
+        match self {
+            Self::Stateful(processor) => processor.processor.reset(),
+            Self::Compatibility(_) => Ok(()),
+        }
+    }
 }
 
 impl CompatibilityLiveProcessor {
@@ -563,208 +573,27 @@ impl CompatibilityLiveProcessor {
 
 impl StatefulLiveProcessor {
     fn new(spec: &LiveProcessorSpec) -> Result<Self, String> {
-        let stereo_mode =
-            spec.channels == 2 && spec.backend_options.channel_mode != ChannelMode::Independent;
-        let processor_channels =
-            if stereo_mode && spec.backend_options.channel_mode == ChannelMode::StereoLinked {
-                1
-            } else {
-                spec.channels
-            };
-        let processor = match spec.backend {
-            Backend::Classical => {
-                let mut config = spec.denoiser.clone();
-                // Automatic profiling intentionally buffers up to 1.5 seconds
-                // for offline analysis. A realtime session instead starts the
-                // adaptive estimator immediately so the first live chunk is
-                // emitted after only the normal overlap-add latency.
-                if config.profile_ms == 0.0 {
-                    config.profile_ms = -1.0;
-                }
-                StatefulBackend::Classical(StreamingDenoiser::new(config, processor_channels)?)
-            }
-            #[cfg(feature = "rnnoise")]
-            Backend::Rnnoise => {
-                StatefulBackend::Rnnoise(Box::new(crate::backend::RnnoiseStreamingProcessor::new(
-                    spec.denoiser.sample_rate,
-                    processor_channels,
-                )?))
-            }
-            #[allow(unreachable_patterns)]
-            _ => return Err("selected backend is not live-capable".into()),
-        };
+        let mut config = spec.denoiser.clone();
+        // Automatic profiling intentionally buffers up to 1.5 seconds for
+        // offline analysis. A realtime classical session instead starts the
+        // adaptive estimator immediately so its first chunk sees only the
+        // normal overlap-add latency.
+        if spec.backend == Backend::Classical && config.profile_ms == 0.0 {
+            config.profile_ms = -1.0;
+        }
         Ok(Self {
-            processor,
-            channel_mode: if stereo_mode {
-                spec.backend_options.channel_mode
-            } else {
-                ChannelMode::Independent
-            },
-            input_channels: spec.channels,
-            linked_original: VecDeque::new(),
+            processor: StreamingBackendSession::new(
+                spec.backend,
+                spec.denoiser.sample_rate,
+                spec.channels,
+                config,
+                spec.backend_options.clone(),
+            )?,
         })
     }
 
     fn process_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        self.process_block_with_limit(channels, MAX_STREAM_BLOCK_FRAMES)
-    }
-
-    fn process_block_with_limit(
-        &mut self,
-        channels: &[Vec<f64>],
-        block_limit: usize,
-    ) -> Result<Vec<Vec<f64>>, String> {
-        validate_live_block(channels, self.input_channels)?;
-        if block_limit == 0 {
-            return Err("live processor block limit must be positive".into());
-        }
-        let frames = channels.first().map(Vec::len).unwrap_or(0);
-        if frames <= block_limit {
-            return self.process_bounded_block(channels);
-        }
-
-        let mut output = try_empty_live_channels(self.input_channels)?;
-        let mut position = 0usize;
-        while position < frames {
-            let end = bounded_subblock_end(position, frames, block_limit);
-            let block = try_clone_live_range(channels, position, end)?;
-            let ready = self.process_bounded_block(&block)?;
-            append_live_channels(&mut output, &ready, self.input_channels)?;
-            position = end;
-        }
-        Ok(output)
-    }
-
-    fn process_bounded_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        debug_assert!(channels.first().map(Vec::len).unwrap_or(0) <= MAX_STREAM_BLOCK_FRAMES);
-        match self.channel_mode {
-            ChannelMode::Independent => self.processor.process_block(channels),
-            ChannelMode::StereoLinked => self.process_linked(channels),
-            ChannelMode::MidSide => self.process_mid_side(channels),
-        }
-    }
-
-    fn process_linked(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        let frames = channels[0].len();
-        self.linked_original
-            .try_reserve(frames)
-            .map_err(|_| ConfigError::allocation_failed("live linked alignment").to_string())?;
-        let mut mid = Vec::new();
-        mid.try_reserve_exact(frames)
-            .map_err(|_| ConfigError::allocation_failed("live linked mid channel").to_string())?;
-        for (&left, &right) in channels[0].iter().zip(&channels[1]) {
-            let left = crate::audio::sanitize_sample(left);
-            let right = crate::audio::sanitize_sample(right);
-            mid.push((left + right) * 0.5);
-            self.linked_original.push_back((left, right));
-        }
-        let mut enhanced = self.processor.process_block(&[mid])?;
-        if enhanced.len() != 1 {
-            return Err("linked live processor must return exactly one channel".into());
-        }
-        let enhanced = enhanced.pop().unwrap_or_default();
-        if enhanced.len() > self.linked_original.len() {
-            return Err("linked live processor returned unaligned frames".into());
-        }
-        let mut left = Vec::new();
-        let mut right = Vec::new();
-        left.try_reserve_exact(enhanced.len())
-            .map_err(|_| ConfigError::allocation_failed("live linked output").to_string())?;
-        right
-            .try_reserve_exact(enhanced.len())
-            .map_err(|_| ConfigError::allocation_failed("live linked output").to_string())?;
-        for clean in enhanced {
-            let (original_left, original_right) = self
-                .linked_original
-                .pop_front()
-                .ok_or_else(|| "linked live alignment queue underflow".to_string())?;
-            let original_mid = (original_left + original_right) * 0.5;
-            let correction = clean - original_mid;
-            left.push(crate::audio::sanitize_sample(original_left + correction));
-            right.push(crate::audio::sanitize_sample(original_right + correction));
-        }
-        Ok(vec![left, right])
-    }
-
-    fn process_mid_side(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        let (mid, side) = crate::backend::encode_mid_side(&channels[0], &channels[1])?;
-        let processed = self.processor.process_block(&[mid, side])?;
-        if processed.len() != 2 {
-            return Err("mid-side live processor must return exactly two channels".into());
-        }
-        let (left, right) = crate::backend::decode_mid_side(&processed[0], &processed[1])?;
-        Ok(vec![left, right])
-    }
-}
-
-fn bounded_subblock_end(position: usize, frames: usize, block_limit: usize) -> usize {
-    position.saturating_add(block_limit).min(frames)
-}
-
-fn try_empty_live_channels(channels: usize) -> Result<Vec<Vec<f64>>, String> {
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(channels)
-        .map_err(|_| ConfigError::allocation_failed("live split output channels").to_string())?;
-    for _ in 0..channels {
-        output.push(Vec::new());
-    }
-    Ok(output)
-}
-
-fn try_clone_live_range(
-    channels: &[Vec<f64>],
-    start: usize,
-    end: usize,
-) -> Result<Vec<Vec<f64>>, String> {
-    let frames = end.checked_sub(start).ok_or_else(|| {
-        ConfigError::ResourceOverflow {
-            resource: "live split block",
-        }
-        .to_string()
-    })?;
-    let mut block = Vec::new();
-    block
-        .try_reserve_exact(channels.len())
-        .map_err(|_| ConfigError::allocation_failed("live split channels").to_string())?;
-    for channel in channels {
-        let mut split = Vec::new();
-        split
-            .try_reserve_exact(frames)
-            .map_err(|_| ConfigError::allocation_failed("live split samples").to_string())?;
-        split.extend_from_slice(&channel[start..end]);
-        block.push(split);
-    }
-    Ok(block)
-}
-
-fn append_live_channels(
-    output: &mut [Vec<f64>],
-    block: &[Vec<f64>],
-    expected_channels: usize,
-) -> Result<(), String> {
-    validate_live_block(block, expected_channels)?;
-    if output.len() != expected_channels {
-        return Err("live split output channel count changed".into());
-    }
-    for (output, block) in output.iter_mut().zip(block) {
-        output
-            .try_reserve_exact(block.len())
-            .map_err(|_| ConfigError::allocation_failed("live split output").to_string())?;
-    }
-    for (output, block) in output.iter_mut().zip(block) {
-        output.extend_from_slice(block);
-    }
-    Ok(())
-}
-
-impl StatefulBackend {
-    fn process_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
-        match self {
-            Self::Classical(processor) => processor.process_block(channels),
-            #[cfg(feature = "rnnoise")]
-            Self::Rnnoise(processor) => processor.process_block(channels),
-        }
+        self.processor.process_block(channels)
     }
 }
 
@@ -1373,23 +1202,6 @@ mod tests {
 
     #[test]
     fn oversized_live_blocks_split_at_the_stream_cap_without_changing_output() {
-        assert_eq!(
-            bounded_subblock_end(0, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_BLOCK_FRAMES),
-            MAX_STREAM_BLOCK_FRAMES
-        );
-        assert_eq!(
-            bounded_subblock_end(0, MAX_STREAM_BLOCK_FRAMES + 1, MAX_STREAM_BLOCK_FRAMES),
-            MAX_STREAM_BLOCK_FRAMES
-        );
-        assert_eq!(
-            bounded_subblock_end(
-                MAX_STREAM_BLOCK_FRAMES,
-                MAX_STREAM_BLOCK_FRAMES + 1,
-                MAX_STREAM_BLOCK_FRAMES
-            ),
-            MAX_STREAM_BLOCK_FRAMES + 1
-        );
-
         let input = stereo_signal(1_003);
         for mode in [
             ChannelMode::Independent,
@@ -1406,9 +1218,13 @@ mod tests {
             let mut contiguous = StatefulLiveProcessor::new(&spec).unwrap();
             let mut split = StatefulLiveProcessor::new(&spec).unwrap();
             let expected = contiguous
+                .processor
                 .process_block_with_limit(&input, input[0].len())
                 .unwrap();
-            let actual = split.process_block_with_limit(&input, 37).unwrap();
+            let actual = split
+                .processor
+                .process_block_with_limit(&input, 37)
+                .unwrap();
             assert_eq!(actual, expected, "internal split mismatch for {mode:?}");
         }
     }
@@ -1689,6 +1505,24 @@ mod tests {
                 field: "backend_options.onnx.sample_rate",
                 ..
             })
+        ));
+    }
+
+    #[cfg(feature = "gtcrn")]
+    #[test]
+    fn gtcrn_is_live_capable_but_rejects_chunk_compatibility_vad() {
+        let mut config = config();
+        config.backend = Backend::Gtcrn;
+        config.backend_options.onnx = Some(crate::OnnxModelConfig {
+            path: "model-path-is-not-opened-during-validation.onnx".into(),
+            sample_rate: crate::backend::gtcrn::SAMPLE_RATE,
+        });
+        assert!(backend_is_live_capable(Backend::Gtcrn));
+        assert!(config.validate_config().is_ok());
+        config.denoiser.vad = true;
+        assert!(matches!(
+            config.validate_config(),
+            Err(ConfigError::InvalidValue { field: "vad", .. })
         ));
     }
 
