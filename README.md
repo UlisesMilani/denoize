@@ -50,7 +50,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | AIFF/AIFC | `symphonia` | PCM and supported AIFC codecs |
 | CAF | `symphonia` | PCM and ALAC/other supported CAF codecs |
 | MP3 | `symphonia` + bounded `nanomp3` fallback (Pure Rust) | Xing/Info + LAME gapless trim, ID3v2, no resampling |
-| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | AAC-LC/ALAC decode with MP4 v0/v1 unity-rate edit-list presentation timing |
+| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | AAC-LC/ALAC decode with MP4 v0/v1 unity-rate edit-list timing; MP4 AAC-LC access units above 8,191 bytes are rejected (ALAC is unaffected) |
 | FLAC | `claxon` | Lossless FLAC |
 | Ogg Opus/Vorbis | `opus` + `ogg` / `symphonia` | Mono/stereo; native sample rate decode |
 
@@ -372,21 +372,31 @@ throughput. Noise profiling retains only a bounded leading segment before
 output begins. Stream resource arithmetic is checked from the input header,
 and the processor is constructed before an output or temporary file is staged.
 
-For the normal (decoded, non-streaming) path, `--max-memory MB` performs a
-conservative preflight and decoded-working-set check before processing. FLAC
-and Ogg structure is also checked with finite block, packet, page, stream,
-item, and aggregate metadata limits before a decoder can materialize it—even
-with `--no-metadata`. When tags are preserved, their retained payload budget
-is derived from the memory left after the decoded PCM working set; the same
-limit is enforced again while writing the staged output. The default limits
-remain finite when `--max-memory` is omitted.
+Filesystem inputs are opened once per processing phase as validated regular
+files. Size estimation, probing, decoding, and metadata reads within that
+phase use the same opened filesystem object, so replacing the pathname cannot
+silently mix bytes from two inputs. FIFOs, directories, and device files are
+rejected before an audio parser or output staging step runs.
 
-The limit is per input file/worker; batch jobs can use memory concurrently, so
-lower `--jobs` when enforcing a process-wide budget. Batch probing, decode,
-and metadata validation all finish before the output directory or staging
-files are created. A streaming WAV job stays bounded by its block size and
-denoiser state, and metadata uses a conservative share of the remaining
-budget:
+For the normal (decoded, non-streaming) path, `--max-memory MB` caps requested
+denoize-owned decoded PCM capacities and explicitly accounted codec scratch
+buffers, in addition to the conservative input-size preflight and final
+decoded-working-set check. Internal allocations made inside third-party codec
+libraries can fall outside this enforcement, and allocator capacity rounding
+means the cap is not an allocator-exact process RSS limit. FLAC and Ogg
+structure is also checked with finite block,
+packet, page, stream, item, and aggregate metadata limits before a decoder can
+materialize it—even with `--no-metadata`. When tags are preserved, their
+retained payload budget is derived from the memory left after the decoded PCM
+working set; the same limit is enforced again while writing the staged output.
+The default limits remain finite when `--max-memory` is omitted.
+
+The limit applies per regular-file input/worker; stdin retains its separate
+bounded WAV buffering path. Batch jobs can use memory concurrently, so lower
+`--jobs` when targeting a process-wide ceiling. Batch probing, decode, and
+metadata validation all finish before the output directory or staging files
+are created. A streaming WAV job stays bounded by its block size and denoiser
+state, and metadata uses a conservative share of the remaining budget:
 
 ```sh
 denoize large.mp3 cleaned.wav --max-memory 1024

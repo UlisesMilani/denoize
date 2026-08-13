@@ -7,31 +7,82 @@
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
 
 use mp4::{ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
 use oxideav_aac::decode::{DecodedFrame, StreamDecoder};
 
+use super::budget::{channel_descriptor_bytes, DecodeBudget};
 use super::pcm::DecodedPcm;
+use super::DecodeLimits;
 
-/// `bufferSizeDB` in MPEG-4 systems descriptors is 24 bits. Keeping access
-/// units within that representable range also prevents a corrupt `stsz` from
-/// turning one tiny input into a multi-gigabyte allocation.
-const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x00ff_ffff;
+/// Match the 13-bit ADTS transport ceiling. At 48 kHz/1024 samples this still
+/// admits roughly 3.1 Mbit/s per access unit, far above ordinary AAC-LC, while
+/// placing a finite bound on oxideav-aac's per-byte syntactic-element
+/// amplification. MP4 AAC samples above this conservative interoperability
+/// ceiling are rejected before an access-unit buffer or decoder is entered.
+const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x1fff;
 const MAX_MP4_BOX_DEPTH: usize = 32;
 const MAX_EMPTY_TRUN_SAMPLES: u64 = 10_000_000;
 const MAX_EDIT_WORKING_BYTES: u128 = 512 * 1024 * 1024;
+// `oxideav-aac` keeps at most one decoder state per 4-bit element slot and
+// bounds every transform/QMF dimension to AAC's fixed 1024-line geometry.
+// This allowance covers all 48 possible SCE/LFE/CPE slots, SBR/PS state, and
+// their largest simultaneous frame-local f64 work vectors before we enter the
+// dependency. It is intentionally independent of the declared output layout,
+// because a hostile raw_data_block can carry extra element slots before our
+// returned-geometry check rejects it.
+const AAC_DECODER_INTERNAL_BYTES: u64 = 128 * 1024 * 1024;
+// See the matching ADTS derivation in `aac.rs`: the smallest complete accepted
+// SCE is 29 bits and the largest two-channel per-occurrence live set is bounded
+// below 56 KiB, so 64 KiB/input byte retains over 4x headroom for hostile
+// repeated tags, spectra, returned PCM, and Vec descriptors.
+const AAC_DECODER_BYTES_PER_ACCESS_UNIT_BYTE: u64 = 64 * 1024;
+/// Covers retained box structs, collection buckets, and the parser's buffered
+/// reader for each structurally visited box. Variable-size payload/table
+/// allocations are charged separately below. The deliberately large per-box
+/// allowance also covers the second `TrakBox` copy held by `Mp4Track`.
+const MP4_PARSER_BASE_BYTES: u64 = 64 * 1024;
+const MP4_PARSER_BYTES_PER_BOX: u64 = 2 * 1024;
+// `extract_edit_context` can format an error after reserving its table clones.
+// Charge a small fixed allowance before entering that fallible construction so
+// even malformed edit metadata cannot allocate beyond an exact decode cap.
+const EDIT_CONTEXT_ERROR_BYTES: u64 = 1024;
+const FALLBACK_REASON_BYTES: u64 = 64;
 
 #[derive(Debug)]
 struct ScanBudget {
     empty_trun_samples: u64,
+    parser_retained_bytes: u64,
 }
 
 impl Default for ScanBudget {
     fn default() -> Self {
         Self {
             empty_trun_samples: MAX_EMPTY_TRUN_SAMPLES,
+            parser_retained_bytes: MP4_PARSER_BASE_BYTES,
         }
+    }
+}
+
+impl ScanBudget {
+    fn charge_parser_bytes(&mut self, bytes: u64, context: &str) -> Result<(), String> {
+        self.parser_retained_bytes = self
+            .parser_retained_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| format!("{context} parser allocation byte count overflows"))?;
+        Ok(())
+    }
+
+    fn charge_parser_entries(
+        &mut self,
+        count: u64,
+        bytes_per_entry: u64,
+        context: &str,
+    ) -> Result<(), String> {
+        let bytes = count
+            .checked_mul(bytes_per_entry)
+            .ok_or_else(|| format!("{context} parser allocation byte count overflows"))?;
+        self.charge_parser_bytes(bytes, context)
     }
 }
 
@@ -46,6 +97,7 @@ enum BoxListKind {
     Dref,
     Stbl,
     Stsd,
+    SampleEntry,
     Edts,
     Udta,
     Meta,
@@ -86,16 +138,40 @@ impl RawBoxHeader {
 /// skips media payloads, but proves forward progress, parent containment, and
 /// allocation-count bounds for every box family the M4A path asks `mp4` to
 /// parse.
+#[cfg(test)]
 pub(super) fn validate_mp4_structure<R: Read + Seek>(
     reader: &mut R,
     file_size: u64,
 ) -> Result<(), String> {
+    scan_mp4_structure(reader, file_size).map(|_| ())
+}
+
+/// Validate the raw box graph and reject parser-owned allocations before
+/// `mp4::Mp4Reader` is allowed to materialize them. The returned byte count is
+/// retained by the parsed header throughout native M4A decode.
+pub(super) fn preflight_mp4_parser<R: Read + Seek>(
+    reader: &mut R,
+    file_size: u64,
+    budget: DecodeBudget,
+) -> Result<u64, String> {
+    let scan = scan_mp4_structure(reader, file_size)?;
+    budget.check_peak(0, scan.parser_retained_bytes, "M4A/MP4 header parser")?;
+    Ok(scan.parser_retained_bytes)
+}
+
+fn scan_mp4_structure<R: Read + Seek>(
+    reader: &mut R,
+    file_size: u64,
+) -> Result<ScanBudget, String> {
     if file_size < 8 {
         return Err("file is too short for an MP4 box header".to_string());
     }
-    scan_box_list(reader, 0, file_size, BoxListKind::Top, 0).map(|_| ())
+    let mut budget = ScanBudget::default();
+    scan_box_list_with_budget(reader, 0, file_size, BoxListKind::Top, 0, &mut budget)?;
+    Ok(budget)
 }
 
+#[cfg(test)]
 fn scan_box_list<R: Read + Seek>(
     reader: &mut R,
     start: u64,
@@ -125,7 +201,14 @@ fn scan_box_list_with_budget<R: Read + Seek>(
     let mut cursor = start;
     let mut count = 0u32;
     while cursor < end {
-        let header = read_raw_box_header(reader, cursor, end, kind == BoxListKind::Top)?;
+        let header = read_charged_raw_box_header(
+            reader,
+            cursor,
+            end,
+            kind == BoxListKind::Top,
+            kind,
+            budget,
+        )?;
         validate_raw_box(reader, header, kind, depth, budget)?;
         if header.end <= cursor {
             return Err(format!(
@@ -144,6 +227,26 @@ fn scan_box_list_with_budget<R: Read + Seek>(
         ));
     }
     Ok(count)
+}
+
+/// Read and account one structurally visited box exactly once.
+///
+/// Some container families use manual child scanners to enforce relationships
+/// which the generic list walker cannot express. Routing both paths through
+/// this helper keeps their parser graph and variable allocations under the
+/// same aggregate budget without double-charging generic traversal.
+fn read_charged_raw_box_header<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    parent_end: u64,
+    top_level: bool,
+    parent: BoxListKind,
+    budget: &mut ScanBudget,
+) -> Result<RawBoxHeader, String> {
+    let header = read_raw_box_header(reader, start, parent_end, top_level)?;
+    budget.charge_parser_bytes(MP4_PARSER_BYTES_PER_BOX, "MP4 box graph")?;
+    charge_variable_parser_allocation(reader, header, parent, budget)?;
+    Ok(header)
 }
 
 fn read_raw_box_header<R: Read + Seek>(
@@ -225,6 +328,96 @@ fn read_raw_box_header<R: Read + Seek>(
     })
 }
 
+fn charge_variable_parser_allocation<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    parent: BoxListKind,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    match parent {
+        BoxListKind::Top => match &header.name {
+            b"ftyp" => budget.charge_parser_bytes(header.body_size(), "MP4 ftyp brands"),
+            // `EmsgBox` retains two strings and the remaining message body.
+            b"emsg" => budget.charge_parser_entries(header.body_size(), 2, "MP4 emsg payload"),
+            _ => Ok(()),
+        },
+        BoxListKind::Stbl => match &header.name {
+            // Every track table is retained once in `MoovBox` and cloned once
+            // into `Mp4Track`; charge both copies at their Rust entry sizes.
+            b"stts" | b"ctts" => charge_counted_parser_table(reader, header, 16, budget),
+            b"stsc" => charge_counted_parser_table(reader, header, 24, budget),
+            b"stss" | b"stco" => charge_counted_parser_table(reader, header, 8, budget),
+            b"co64" => charge_counted_parser_table(reader, header, 16, budget),
+            b"stsz" => {
+                require_body_size(header, 12)?;
+                if read_u32_at(reader, header.body_start + 4)? == 0 {
+                    let count = u64::from(read_u32_at(reader, header.body_start + 8)?);
+                    budget.charge_parser_entries(count, 8, "MP4 stsz table")
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        },
+        BoxListKind::Mdia | BoxListKind::Meta if header.name == *b"hdlr" => {
+            // HdlrBox first builds a body-sized byte vector, converts it into
+            // its retained String, and the enclosing TrakBox is cloned into
+            // Mp4Track. Two body sizes cover the retained copies; a third
+            // covers conversion-time overlap before invalid UTF-8 is dropped.
+            budget.charge_parser_entries(header.body_size(), 3, "MP4 handler name")
+        }
+        BoxListKind::Dref if header.name == *b"url " => {
+            budget.charge_parser_entries(header.body_size(), 3, "MP4 data-reference URL")
+        }
+        BoxListKind::Edts if header.name == *b"elst" => {
+            require_body_size(header, 8)?;
+            let count = u64::from(read_u32_at(reader, header.body_start + 4)?);
+            // `mp4::ElstEntry` is cloned with its containing track. Use a
+            // padded 32-byte entry allowance per copy.
+            budget.charge_parser_entries(count, 64, "MP4 edit-list table")
+        }
+        BoxListKind::Traf if header.name == *b"trun" => {
+            require_body_size(header, 8)?;
+            let (_, flags) = read_full_box_header_at(reader, header.body_start)?;
+            let count = u64::from(read_u32_at(reader, header.body_start + 4)?);
+            let fields = u64::from((flags & 0x000100 != 0) as u8)
+                + u64::from((flags & 0x000200 != 0) as u8)
+                + u64::from((flags & 0x000400 != 0) as u8)
+                + u64::from((flags & 0x000800 != 0) as u8);
+            // Moof owns one TrafBox and the selected track clones it.
+            budget.charge_parser_entries(count, fields * 8, "MP4 trun tables")
+        }
+        // An unknown metadata handler retains every child payload. Charging
+        // every non-handler child is conservative for the mdir path and exact
+        // enough for the dependency's Unknown variant. Track metadata is
+        // cloned into `Mp4Track`, hence the factor of two.
+        BoxListKind::Meta if header.name != *b"hdlr" => {
+            budget.charge_parser_entries(header.body_size(), 2, "MP4 metadata payload")
+        }
+        BoxListKind::IlstItem if header.name == *b"data" => {
+            budget.charge_parser_entries(header.body_size(), 2, "MP4 ilst data payload")
+        }
+        // AVC parameter-set payloads are retained as nested vectors and then
+        // cloned with the track. Other supported sample entries retain only
+        // fixed-size configuration fields.
+        BoxListKind::Stsd if header.name == *b"avc1" => {
+            budget.charge_parser_entries(header.body_size(), 2, "MP4 AVC sample entry")
+        }
+        _ => Ok(()),
+    }
+}
+
+fn charge_counted_parser_table<R: Read + Seek>(
+    reader: &mut R,
+    header: RawBoxHeader,
+    retained_bytes_per_entry: u64,
+    budget: &mut ScanBudget,
+) -> Result<(), String> {
+    require_body_size(header, 8)?;
+    let count = u64::from(read_u32_at(reader, header.body_start + 4)?);
+    budget.charge_parser_entries(count, retained_bytes_per_entry, "MP4 counted table")
+}
+
 fn validate_raw_box<R: Read + Seek>(
     reader: &mut R,
     header: RawBoxHeader,
@@ -293,13 +486,14 @@ fn validate_raw_box<R: Read + Seek>(
             _ => Ok(()),
         },
         BoxListKind::Stsd => match &header.name {
-            b"mp4a" => validate_sample_entry(reader, header, 28, SampleEntryKind::Mp4a),
-            b"avc1" => validate_sample_entry(reader, header, 78, SampleEntryKind::Avc),
-            b"hev1" => validate_sample_entry(reader, header, 78, SampleEntryKind::Hevc),
-            b"vp09" => validate_sample_entry(reader, header, 78, SampleEntryKind::Vp9),
+            b"mp4a" => validate_sample_entry(reader, header, 28, SampleEntryKind::Mp4a, budget),
+            b"avc1" => validate_sample_entry(reader, header, 78, SampleEntryKind::Avc, budget),
+            b"hev1" => validate_sample_entry(reader, header, 78, SampleEntryKind::Hevc, budget),
+            b"vp09" => validate_sample_entry(reader, header, 78, SampleEntryKind::Vp9, budget),
             b"tx3g" => require_body_size(header, 38),
             _ => Ok(()),
         },
+        BoxListKind::SampleEntry => Ok(()),
         BoxListKind::Edts => match &header.name {
             b"elst" => validate_elst(reader, header),
             _ => Ok(()),
@@ -376,7 +570,14 @@ fn scan_trak_children<R: Read + Seek>(
     let mut cursor = header.body_start;
     let mut edts_count = 0u32;
     while cursor < header.end {
-        let child = read_raw_box_header(reader, cursor, header.end, false)?;
+        let child = read_charged_raw_box_header(
+            reader,
+            cursor,
+            header.end,
+            false,
+            BoxListKind::Trak,
+            budget,
+        )?;
         if child.name == *b"edts" {
             edts_count = edts_count
                 .checked_add(1)
@@ -420,7 +621,14 @@ fn validate_edts<R: Read + Seek>(
         return Err(format!("MP4 box nesting exceeds {MAX_MP4_BOX_DEPTH}"));
     }
 
-    let child = read_raw_box_header(reader, header.body_start, header.end, false)?;
+    let child = read_charged_raw_box_header(
+        reader,
+        header.body_start,
+        header.end,
+        false,
+        BoxListKind::Edts,
+        budget,
+    )?;
     if child.name != *b"elst" {
         return Err(format!(
             "MP4 edts at byte {} must contain exactly one elst child, found {}",
@@ -489,7 +697,21 @@ fn scan_stsd_entries<R: Read + Seek>(
     let mut cursor = header.body_start + 8;
     let mut actual = 0u32;
     while cursor < header.end {
-        let entry = read_raw_box_header(reader, cursor, header.end, false)?;
+        let entry = if actual == 0 {
+            read_charged_raw_box_header(
+                reader,
+                cursor,
+                header.end,
+                false,
+                BoxListKind::Stsd,
+                budget,
+            )?
+        } else {
+            // `mp4 0.14` seeks over later entries without materializing them.
+            // Validate their physical boundaries without charging retained
+            // parser allocations which the dependency never creates.
+            read_raw_box_header(reader, cursor, header.end, false)?
+        };
         // `mp4 0.14` parses only the first sample entry and then seeks to the
         // end of stsd. Validate every entry's raw boundary and forward
         // progress, but mirror that parser by interpreting only entry #1.
@@ -528,6 +750,7 @@ fn validate_sample_entry<R: Read + Seek>(
     header: RawBoxHeader,
     child_offset: u64,
     kind: SampleEntryKind,
+    budget: &mut ScanBudget,
 ) -> Result<(), String> {
     require_body_size(header, child_offset)?;
     let start = header
@@ -544,7 +767,14 @@ fn validate_sample_entry<R: Read + Seek>(
         };
     }
 
-    let child = read_raw_box_header(reader, start, header.end, false)?;
+    let child = read_charged_raw_box_header(
+        reader,
+        start,
+        header.end,
+        false,
+        BoxListKind::SampleEntry,
+        budget,
+    )?;
     match kind {
         SampleEntryKind::Mp4a if child.name == *b"esds" => validate_esds(reader, child),
         SampleEntryKind::Mp4a => Ok(()),
@@ -641,7 +871,7 @@ fn validate_elst<R: Read + Seek>(reader: &mut R, header: RawBoxHeader) -> Result
             return Err(format!(
                 "unsupported MP4 edit-list version {version} at byte {}",
                 header.start
-            ))
+            ));
         }
     };
     let count = u64::from(read_u32_at(reader, header.body_start + 4)?);
@@ -1115,6 +1345,8 @@ pub(super) enum M4aDecodeError {
     TryOtherCodec {
         reason: String,
         track_edits: Vec<FallbackTrackEdit>,
+        /// Denoize-owned edit metadata kept alive during fallback decode.
+        retained_bytes: u64,
     },
     Fatal(String),
 }
@@ -1335,11 +1567,14 @@ struct ValidatedSampleTable {
     sample_count: u32,
 }
 
-/// Decode M4A/MP4-AAC from path.
-pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
+/// Decode M4A/MP4-AAC from an already-open input.
+pub(super) fn decode_m4a(
+    mut payload_reader: File,
+    limits: DecodeLimits,
+) -> Result<DecodedPcm, M4aDecodeError> {
+    let budget = DecodeBudget::new(limits);
     // Keep the original handle for payload reads. Parsing happens through a
     // clone because each access unit below is read with an absolute seek.
-    let mut payload_reader = File::open(path).map_err(|e| format!("open m4a: {e}"))?;
     let file_size = payload_reader
         .metadata()
         .map_err(|e| format!("stat m4a: {e}"))?
@@ -1347,7 +1582,7 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
     let mut structure_file = payload_reader
         .try_clone()
         .map_err(|e| format!("clone m4a handle for structural validation: {e}"))?;
-    validate_mp4_structure(&mut structure_file, file_size)
+    let parser_retained_bytes = preflight_mp4_parser(&mut structure_file, file_size, budget)
         .map_err(|e| format!("mp4 structure: {e}"))?;
 
     let mut header_file = payload_reader
@@ -1362,10 +1597,22 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
     let track = match select_aac_track(&mp4)? {
         Some(track) => track,
         None => {
-            let track_edits = fallback_track_edits(&mp4)?;
+            let (track_edits, edit_retained_bytes) =
+                fallback_track_edits(&mp4, budget, parser_retained_bytes)?;
+            let retained_bytes = edit_retained_bytes
+                .checked_add(FALLBACK_REASON_BYTES)
+                .ok_or_else(|| "M4A fallback retained byte count overflows".to_string())?;
+            budget.check_peak(
+                0,
+                parser_retained_bytes
+                    .checked_add(retained_bytes)
+                    .ok_or_else(|| "M4A fallback parser byte count overflows".to_string())?,
+                "M4A fallback metadata",
+            )?;
             return Err(M4aDecodeError::TryOtherCodec {
                 reason: "no AAC audio track found in M4A/MP4".into(),
                 track_edits,
+                retained_bytes,
             });
         }
     };
@@ -1379,7 +1626,23 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
 
     let validated = validate_sample_table(track, file_size)
         .map_err(|e| format!("AAC track {} sample table: {e}", track.track_id()))?;
+    let edit_clone_bytes = edit_context_requested_bytes(track)?;
+    budget.check_peak(
+        0,
+        parser_retained_bytes
+            .checked_add(edit_clone_bytes)
+            .ok_or_else(|| "M4A edit metadata byte count overflows".to_string())?,
+        "M4A edit metadata",
+    )?;
     let edit = extract_edit_context(&mp4, track)?;
+    let edit_retained_bytes = edit
+        .as_ref()
+        .map(edit_context_capacity_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let native_retained_bytes = parser_retained_bytes
+        .checked_add(edit_retained_bytes)
+        .ok_or_else(|| "M4A retained metadata byte count overflows".to_string())?;
 
     let profile = track
         .audio_profile()
@@ -1397,6 +1660,11 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
     let chan_conf = channel_config as u8;
     let n_ch = channel_config_to_count(channel_config);
 
+    let decoder_internal_bytes = aac_decoder_retained_bytes(n_ch)?;
+    let decoder_temporary_bytes = native_retained_bytes
+        .checked_add(decoder_internal_bytes)
+        .ok_or_else(|| "M4A/AAC decoder byte count overflows".to_string())?;
+    budget.check_planar_frames(n_ch, 0, decoder_temporary_bytes, "M4A/AAC decode")?;
     let mut decoder = StreamDecoder::new();
     let mut channels = Vec::new();
     channels
@@ -1427,6 +1695,26 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
                 descriptor.index
             )
         })?;
+        let existing_access_unit_bytes = allocation_capacity_bytes::<u8>(
+            access_unit.capacity(),
+            "M4A/AAC retained access-unit buffer",
+        )?;
+        let access_unit_bytes = existing_access_unit_bytes.max(u64::from(descriptor.size));
+        let maximum_frame_bytes = maximum_aac_frame_bytes(n_ch)?;
+        let access_unit_decoder_bytes = aac_access_unit_decoder_bytes(descriptor.size)?;
+        let predecode_temporary = access_unit_bytes
+            .checked_add(maximum_frame_bytes)
+            .and_then(|bytes| bytes.checked_add(native_retained_bytes))
+            .and_then(|bytes| bytes.checked_add(decoder_internal_bytes))
+            .and_then(|bytes| bytes.checked_add(access_unit_decoder_bytes))
+            .ok_or("M4A/AAC temporary byte count overflows")?;
+        budget.check_planar_frames(
+            n_ch,
+            decoded_frames,
+            predecode_temporary,
+            "M4A/AAC packet decode",
+        )?;
+        budget.check_planar_capacities(&channels, predecode_temporary, "M4A/AAC packet decode")?;
         access_unit.clear();
         access_unit.try_reserve_exact(size).map_err(|e| {
             format!(
@@ -1446,12 +1734,25 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
         let frame = decoder
             .decode_raw_data_block(aot, fs_index, sample_rate, chan_conf, 1, &access_unit)
             .map_err(|e| format!("decode AAC sample {}: {e}", descriptor.index))?;
+        let returned_frame_bytes =
+            allocation_capacity_bytes::<i16>(frame.pcm.capacity(), "M4A/AAC frame")?;
+        let live_access_unit_bytes = allocation_capacity_bytes::<u8>(
+            access_unit.capacity(),
+            "M4A/AAC retained access-unit buffer",
+        )?;
         let frame_count = append_decoded_frame(
             &mut channels,
             &frame,
             n_ch,
             sample_rate,
             &mut decoded_frames,
+            budget,
+            live_access_unit_bytes
+                .checked_add(returned_frame_bytes)
+                .and_then(|bytes| bytes.checked_add(native_retained_bytes))
+                .and_then(|bytes| bytes.checked_add(decoder_internal_bytes))
+                .and_then(|bytes| bytes.checked_add(access_unit_decoder_bytes))
+                .ok_or("M4A/AAC temporary byte count overflows")?,
         )
         .map_err(|e| format!("AAC sample {}: {e}", descriptor.index))?;
 
@@ -1490,7 +1791,18 @@ pub(super) fn decode_m4a(path: &Path) -> Result<DecodedPcm, M4aDecodeError> {
         channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(n_ch).mask(),
     };
     if let Some(edit) = &edit {
-        apply_edit_to_decoded(&mut decoded, edit)?;
+        apply_edit_to_decoded_with_budget(
+            &mut decoded,
+            edit,
+            budget,
+            native_retained_bytes
+                .checked_add(allocation_capacity_bytes::<u8>(
+                    access_unit.capacity(),
+                    "M4A/AAC retained access-unit buffer",
+                )?)
+                .and_then(|bytes| bytes.checked_add(decoder_internal_bytes))
+                .ok_or_else(|| "M4A/AAC retained byte count overflows".to_string())?,
+        )?;
     }
     Ok(decoded)
 }
@@ -1520,7 +1832,30 @@ fn select_aac_track<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<Option<&Mp4Tra
 
 fn fallback_track_edits<R: Read + Seek>(
     mp4: &Mp4Reader<R>,
-) -> Result<Vec<FallbackTrackEdit>, String> {
+    budget: DecodeBudget,
+    parser_retained_bytes: u64,
+) -> Result<(Vec<FallbackTrackEdit>, u64), String> {
+    let outer_bytes =
+        allocation_bytes::<FallbackTrackEdit>(mp4.moov.traks.len(), "M4A fallback track metadata")?;
+    let mut planned_bytes = outer_bytes;
+    for trak in &mp4.moov.traks {
+        let Some(track) = mp4.tracks().get(&trak.tkhd.track_id) else {
+            continue;
+        };
+        if track.track_type().ok() == Some(TrackType::Audio) {
+            planned_bytes = planned_bytes
+                .checked_add(edit_context_requested_bytes(track)?)
+                .ok_or("M4A fallback edit metadata byte count overflows")?;
+        }
+    }
+    budget.check_peak(
+        0,
+        parser_retained_bytes
+            .checked_add(planned_bytes)
+            .ok_or("M4A fallback parser byte count overflows")?,
+        "M4A fallback edit metadata",
+    )?;
+
     let mut track_edits = Vec::new();
     track_edits
         .try_reserve_exact(mp4.moov.traks.len())
@@ -1536,7 +1871,60 @@ fn fallback_track_edits<R: Read + Seek>(
             });
         }
     }
-    Ok(track_edits)
+    let retained_bytes = fallback_track_edit_capacity_bytes(&track_edits, track_edits.capacity())?;
+    Ok((track_edits, retained_bytes))
+}
+
+fn edit_context_requested_bytes(track: &Mp4Track) -> Result<u64, String> {
+    let Some(edts) = track.trak.edts.as_ref() else {
+        return Ok(0);
+    };
+    let clone_bytes = match edts.elst.as_ref() {
+        Some(elst) => allocation_bytes::<RawEdit>(elst.entries.len(), "M4A edit-list clone")?
+            .checked_add(allocation_bytes::<RawSttsEntry>(
+                track.stts_len(),
+                "M4A stts clone",
+            )?)
+            .ok_or_else(|| "M4A edit context byte count overflows".to_string())?,
+        None => 0,
+    };
+    clone_bytes
+        .checked_add(EDIT_CONTEXT_ERROR_BYTES)
+        .ok_or_else(|| "M4A edit context byte count overflows".to_string())
+}
+
+fn edit_context_capacity_bytes(context: &EditContext) -> Result<u64, String> {
+    allocation_capacity_bytes::<RawEdit>(
+        context.edit_list.entries.capacity(),
+        "M4A edit-list clone",
+    )?
+    .checked_add(allocation_capacity_bytes::<RawSttsEntry>(
+        context.stts_entries.capacity(),
+        "M4A stts clone",
+    )?)
+    .ok_or_else(|| "M4A retained edit context byte count overflows".to_string())
+}
+
+fn fallback_track_edit_capacity_bytes(
+    track_edits: &[FallbackTrackEdit],
+    outer_capacity: usize,
+) -> Result<u64, String> {
+    let mut bytes = allocation_capacity_bytes::<FallbackTrackEdit>(
+        outer_capacity,
+        "M4A fallback track metadata",
+    )?;
+    for track in track_edits {
+        let nested = match &track.edit {
+            Ok(Some(context)) => edit_context_capacity_bytes(context)?,
+            Err(error) => u64::try_from(error.capacity())
+                .map_err(|_| "M4A fallback edit error capacity does not fit in u64")?,
+            Ok(None) => 0,
+        };
+        bytes = bytes
+            .checked_add(nested)
+            .ok_or("M4A retained fallback edit byte count overflows")?;
+    }
+    Ok(bytes)
 }
 
 fn extract_edit_context<R: Read + Seek>(
@@ -1950,12 +2338,32 @@ struct PlannedEdit {
     copy_frames: usize,
 }
 
+#[cfg(test)]
 fn plan_edits(
     context: &EditContext,
     sample_rate: u32,
     raw_frames: usize,
     channel_count: usize,
 ) -> Result<(Vec<PlannedEdit>, usize), String> {
+    plan_edits_with_budget(
+        context,
+        sample_rate,
+        raw_frames,
+        &vec![Vec::new(); channel_count],
+        DecodeBudget::new(DecodeLimits::default()),
+        0,
+    )
+}
+
+fn plan_edits_with_budget(
+    context: &EditContext,
+    sample_rate: u32,
+    raw_frames: usize,
+    channels: &[Vec<f64>],
+    budget: DecodeBudget,
+    retained_temporary_bytes: u64,
+) -> Result<(Vec<PlannedEdit>, usize), String> {
+    let channel_count = channels.len();
     validate_raw_edit_list(&context.edit_list)?;
     if context.movie_timescale == 0 {
         return Err("M4A edit list has a zero movie timescale".into());
@@ -1983,10 +2391,28 @@ fn plan_edits(
         .checked_mul(u128::from(context.media_timescale))
         .ok_or("M4A edit-list stts movie boundary overflows")?;
 
+    let plan_bytes =
+        allocation_bytes::<PlannedEdit>(context.edit_list.entries.len(), "M4A edit plan")?;
+    let planning_temporary = retained_temporary_bytes
+        .checked_add(plan_bytes)
+        .ok_or("M4A edit planning byte count overflows")?;
+    budget.check_planar_frames(
+        channel_count,
+        raw_frames,
+        planning_temporary,
+        "M4A edit plan",
+    )?;
+    budget.check_planar_capacities(channels, planning_temporary, "M4A edit plan")?;
     let mut planned = Vec::new();
     planned
         .try_reserve_exact(context.edit_list.entries.len())
         .map_err(|error| format!("reserve M4A edit plan: {error}"))?;
+    let actual_plan_bytes =
+        allocation_capacity_bytes::<PlannedEdit>(planned.capacity(), "M4A edit plan")?;
+    let actual_planning_temporary = retained_temporary_bytes
+        .checked_add(actual_plan_bytes)
+        .ok_or("M4A edit planning byte count overflows")?;
+    budget.check_planar_capacities(channels, actual_planning_temporary, "M4A edit plan")?;
     let mut cumulative_duration = 0u128;
     let mut previous_boundary = 0u128;
     let mut output_frames = 0usize;
@@ -2105,10 +2531,27 @@ fn plan_edits(
     Ok((planned, output_frames))
 }
 
+#[cfg(test)]
 fn apply_edit_to_channels(
     channels: &mut Vec<Vec<f64>>,
     sample_rate: u32,
     context: &EditContext,
+) -> Result<(), String> {
+    apply_edit_to_channels_with_budget(
+        channels,
+        sample_rate,
+        context,
+        DecodeBudget::new(DecodeLimits::default()),
+        0,
+    )
+}
+
+fn apply_edit_to_channels_with_budget(
+    channels: &mut Vec<Vec<f64>>,
+    sample_rate: u32,
+    context: &EditContext,
+    budget: DecodeBudget,
+    retained_temporary_bytes: u64,
 ) -> Result<(), String> {
     let raw_frames = channels
         .first()
@@ -2122,7 +2565,19 @@ fn apply_edit_to_channels(
             index + 1
         ));
     }
-    let (planned, output_frames) = plan_edits(context, sample_rate, raw_frames, channels.len())?;
+    let (planned, output_frames) = plan_edits_with_budget(
+        context,
+        sample_rate,
+        raw_frames,
+        channels,
+        budget,
+        retained_temporary_bytes,
+    )?;
+    let plan_bytes = allocation_capacity_bytes::<PlannedEdit>(planned.capacity(), "M4A edit plan")?;
+    let source_temporary = retained_temporary_bytes
+        .checked_add(plan_bytes)
+        .ok_or("M4A edit source byte count overflows")?;
+    budget.check_planar_capacities(channels, source_temporary, "M4A edit source")?;
 
     if planned.len() == 1 {
         let edit = planned[0];
@@ -2143,15 +2598,39 @@ fn apply_edit_to_channels(
         }
     }
 
+    let source_capacity_samples = channels.iter().try_fold(0u64, |total, channel| {
+        let capacity = u64::try_from(channel.capacity())
+            .map_err(|_| "M4A edit source capacity does not fit in u64")?;
+        total
+            .checked_add(capacity)
+            .ok_or("M4A edit source capacity count overflows")
+    })?;
+    let source_descriptor_bytes = channel_descriptor_bytes(channels.len(), "M4A edit source")?;
+    let raw_bytes = source_capacity_samples
+        .checked_mul(std::mem::size_of::<f64>() as u64)
+        .and_then(|bytes| bytes.checked_add(source_descriptor_bytes))
+        .and_then(|bytes| bytes.checked_add(plan_bytes))
+        .and_then(|bytes| bytes.checked_add(retained_temporary_bytes))
+        .ok_or("M4A edit composition byte count overflows")?;
+    budget.check_planar_frames(
+        channels.len(),
+        output_frames,
+        raw_bytes,
+        "M4A edit composition",
+    )?;
     let mut composed = Vec::new();
     composed
         .try_reserve_exact(channels.len())
         .map_err(|error| format!("reserve M4A edited channels: {error}"))?;
-    for source in channels.iter() {
-        let mut output = Vec::new();
-        output
-            .try_reserve_exact(output_frames)
-            .map_err(|error| format!("reserve M4A edited PCM: {error}"))?;
+    composed.resize_with(channels.len(), Vec::new);
+    budget.reserve_planar_frames(
+        &mut composed,
+        output_frames,
+        raw_bytes,
+        "M4A edit composition",
+    )?;
+    budget.check_planar_capacities(&composed, raw_bytes, "M4A edit composition")?;
+    for (source, output) in channels.iter().zip(composed.iter_mut()) {
         for edit in &planned {
             if let Some(source_start) = edit.source_start {
                 output.extend_from_slice(&source[source_start..source_start + edit.copy_frames]);
@@ -2160,17 +2639,24 @@ fn apply_edit_to_channels(
                 output.resize(output.len() + edit.frames, 0.0);
             }
         }
-        composed.push(output);
     }
     std::mem::swap(channels, &mut composed);
     Ok(())
 }
 
-pub(super) fn apply_edit_to_decoded(
+fn apply_edit_to_decoded_with_budget(
     decoded: &mut DecodedPcm,
     context: &EditContext,
+    budget: DecodeBudget,
+    retained_temporary_bytes: u64,
 ) -> Result<(), String> {
-    apply_edit_to_channels(&mut decoded.channels, decoded.sample_rate, context)
+    apply_edit_to_channels_with_budget(
+        &mut decoded.channels,
+        decoded.sample_rate,
+        context,
+        budget,
+        retained_temporary_bytes,
+    )
 }
 
 pub(super) fn fallback_track_has_edit(
@@ -2348,6 +2834,7 @@ pub(super) fn apply_fallback_track_edit(
     decoded: &mut DecodedPcm,
     selected_track_id: u32,
     track_edits: Vec<FallbackTrackEdit>,
+    budget: DecodeBudget,
 ) -> Result<(), String> {
     let selected = track_edits
         .into_iter()
@@ -2356,9 +2843,9 @@ pub(super) fn apply_fallback_track_edit(
             format!(
                 "fallback decoder selected MP4 audio track {selected_track_id}, but its primary track metadata is unavailable"
             )
-        })?;
+    })?;
     if let Some(context) = selected.edit? {
-        apply_edit_to_decoded(decoded, &context)?;
+        apply_edit_to_decoded_with_budget(decoded, &context, budget, 0)?;
     }
     Ok(())
 }
@@ -2397,7 +2884,7 @@ fn validate_table<T: SampleTable + ?Sized>(
     let chunk_count = match table.chunk_offsets_kind() {
         ChunkOffsetsKind::Missing => return Err("missing stco/co64 chunk-offset table".into()),
         ChunkOffsetsKind::Both => {
-            return Err("both stco and co64 are present; exactly one is required".into())
+            return Err("both stco and co64 are present; exactly one is required".into());
         }
         ChunkOffsetsKind::Stco(len) | ChunkOffsetsKind::Co64(len) => len,
     };
@@ -2565,7 +3052,7 @@ where
         ChunkOffsetsKind::Stco(len) | ChunkOffsetsKind::Co64(len) => len,
         ChunkOffsetsKind::Missing => return Err("missing stco/co64 chunk-offset table".into()),
         ChunkOffsetsKind::Both => {
-            return Err("both stco and co64 are present; exactly one is required".into())
+            return Err("both stco and co64 are present; exactly one is required".into());
         }
     };
     let stsz = table.stsz_fields();
@@ -2642,6 +3129,8 @@ fn append_decoded_frame(
     expected_channels: usize,
     expected_sample_rate: u32,
     total_frames: &mut usize,
+    budget: DecodeBudget,
+    temporary_bytes: u64,
 ) -> Result<usize, String> {
     if frame.channels == 0 {
         if frame.pcm.is_empty() {
@@ -2678,11 +3167,7 @@ fn append_decoded_frame(
     let next_total = total_frames
         .checked_add(frame_count)
         .ok_or("decoded M4A frame count overflows")?;
-    for channel in channels.iter_mut() {
-        channel
-            .try_reserve(frame_count)
-            .map_err(|e| format!("reserve decoded M4A PCM: {e}"))?;
-    }
+    budget.reserve_planar_additional(channels, frame_count, temporary_bytes, "M4A/AAC decode")?;
     for samples in frame.pcm.chunks_exact(expected_channels) {
         for (channel, sample) in channels.iter_mut().zip(samples) {
             let value = *sample as f64 / 32768.0;
@@ -2691,6 +3176,37 @@ fn append_decoded_frame(
     }
     *total_frames = next_total;
     Ok(frame_count)
+}
+
+fn maximum_aac_frame_bytes(channels: usize) -> Result<u64, String> {
+    let frames = oxideav_aac::decode::FRAME_LEN
+        .checked_mul(2)
+        .ok_or("M4A/AAC maximum frame count overflows")?;
+    let samples = channels
+        .checked_mul(frames)
+        .ok_or("M4A/AAC maximum sample count overflows")?;
+    allocation_bytes::<i16>(samples, "M4A/AAC maximum decoded frame")
+}
+
+fn aac_decoder_retained_bytes(_declared_channels: usize) -> Result<u64, String> {
+    Ok(AAC_DECODER_INTERNAL_BYTES)
+}
+
+fn aac_access_unit_decoder_bytes(access_unit_bytes: u32) -> Result<u64, String> {
+    u64::from(access_unit_bytes)
+        .checked_mul(AAC_DECODER_BYTES_PER_ACCESS_UNIT_BYTE)
+        .ok_or_else(|| "M4A/AAC access-unit decoder byte count overflows".to_string())
+}
+
+fn allocation_bytes<T>(len: usize, context: &str) -> Result<u64, String> {
+    u64::try_from(len)
+        .ok()
+        .and_then(|len| len.checked_mul(std::mem::size_of::<T>() as u64))
+        .ok_or_else(|| format!("{context} byte count overflows"))
+}
+
+fn allocation_capacity_bytes<T>(capacity: usize, context: &str) -> Result<u64, String> {
+    allocation_bytes::<T>(capacity, context)
 }
 
 #[cfg(test)]
@@ -3107,10 +3623,52 @@ mod tests {
     #[test]
     fn rejects_oversized_access_unit_without_allocating_it() {
         let mut table = TestTable::variable_stco();
+        table.fixed_size = MAX_AAC_ACCESS_UNIT_SIZE;
+        table.variable_sizes.clear();
+        validate_table(&table, u64::MAX).expect("8,191-byte AAC access unit remains accepted");
+
         table.fixed_size = MAX_AAC_ACCESS_UNIT_SIZE + 1;
         table.variable_sizes.clear();
         let error = validate_table(&table, u64::MAX).unwrap_err();
         assert!(error.contains("safety limit"), "{error}");
+
+        let amplified = aac_access_unit_decoder_bytes(MAX_AAC_ACCESS_UNIT_SIZE).unwrap();
+        let budget = DecodeBudget::new(
+            DecodeLimits::default().with_max_working_set_bytes(Some(amplified.saturating_sub(1))),
+        );
+        let error = budget
+            .check_peak(0, amplified, "M4A hostile repeated AAC elements")
+            .expect_err("payload-proportional oxideav work must be rejected before decode");
+        assert!(error.contains("working-set limit"), "{error}");
+    }
+
+    #[test]
+    fn spare_pcm_capacity_is_combined_with_the_next_m4a_access_unit_peak() {
+        const MIB: u64 = 1024 * 1024;
+        let mut channels = vec![Vec::with_capacity(32_768)];
+        channels[0].resize(1_024, 0.0);
+        let logical_bytes = allocation_bytes::<f64>(channels[0].len(), "test M4A length").unwrap()
+            + std::mem::size_of::<Vec<f64>>() as u64;
+        let next_access_unit_temporary = MIB - logical_bytes;
+        let budget =
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(MIB)));
+
+        budget
+            .check_planar_frames(
+                1,
+                channels[0].len(),
+                next_access_unit_temporary,
+                "logical M4A",
+            )
+            .expect("logical frames fit the crafted cap");
+        let error = budget
+            .check_planar_capacities(
+                &channels,
+                next_access_unit_temporary,
+                "M4A/AAC packet decode",
+            )
+            .expect_err("retained spare capacity plus next access unit must be rejected");
+        assert!(error.contains("working-set limit"), "{error}");
     }
 
     #[test]
@@ -3285,6 +3843,99 @@ mod tests {
         let before = unequal.clone();
         assert!(apply_edit_to_channels(&mut unequal, 1, &context).is_err());
         assert_eq!(unequal, before);
+    }
+
+    #[test]
+    fn edit_composition_charges_spare_source_and_plan_capacities() {
+        const MIB: u64 = 1024 * 1024;
+        const RETAINED_TEMPORARY_BYTES: u64 = 2 * MIB;
+        let context = edit_context(vec![raw_edit(1, -1), raw_edit(1, 0)], 1, 1, 0);
+        let mut source = Vec::with_capacity(32_768);
+        source.push(1.0);
+        let channels = vec![source];
+
+        let (planned, output_frames) = plan_edits(&context, 1, 1, 1).unwrap();
+        assert_eq!(output_frames, 2);
+        let plan_bytes =
+            allocation_capacity_bytes::<PlannedEdit>(planned.capacity(), "M4A edit plan test")
+                .unwrap();
+        let source_bytes = channels[0].capacity() as u64 * std::mem::size_of::<f64>() as u64
+            + channel_descriptor_bytes(channels.len(), "M4A edit source test").unwrap();
+        let output_bytes = crate::decode::budget::planar_pcm_bytes(
+            channels.len(),
+            output_frames,
+            "M4A edit output test",
+        )
+        .unwrap()
+            + channel_descriptor_bytes(channels.len(), "M4A edit output test").unwrap();
+        let exact_peak = source_bytes + plan_bytes + output_bytes + RETAINED_TEMPORARY_BYTES;
+
+        let mut exact_channels = channels.clone();
+        // `Clone` may compact capacity; restore the crafted spare source.
+        let additional_capacity = 32_768 - exact_channels[0].capacity();
+        exact_channels[0].reserve_exact(additional_capacity);
+        apply_edit_to_channels_with_budget(
+            &mut exact_channels,
+            1,
+            &context,
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(exact_peak))),
+            RETAINED_TEMPORARY_BYTES,
+        )
+        .expect("exact source, plan, and output capacity boundary");
+
+        let mut tight_channels = Vec::new();
+        tight_channels.push(Vec::with_capacity(32_768));
+        tight_channels[0].push(1.0);
+        let error = apply_edit_to_channels_with_budget(
+            &mut tight_channels,
+            1,
+            &context,
+            DecodeBudget::new(
+                DecodeLimits::default().with_max_working_set_bytes(Some(exact_peak - 1)),
+            ),
+            RETAINED_TEMPORARY_BYTES,
+        )
+        .expect_err("spare source plus live plan and output must exceed the tight cap");
+        assert!(error.contains("working-set limit"), "{error}");
+        assert_eq!(tight_channels[0], vec![1.0]);
+    }
+
+    #[test]
+    fn edit_planning_rejects_spare_source_capacity_before_plan_reserve() {
+        const RETAINED_TEMPORARY_BYTES: u64 = 2 * 1024 * 1024;
+        let context = edit_context(vec![raw_edit(1, -1), raw_edit(1, 0)], 1, 1, 0);
+        let mut source = Vec::with_capacity(32_768);
+        source.push(1.0);
+        let channels = vec![source];
+        let requested_plan_bytes =
+            allocation_bytes::<PlannedEdit>(context.edit_list.entries.len(), "M4A edit plan test")
+                .unwrap();
+        let source_bytes = channels[0].capacity() as u64 * std::mem::size_of::<f64>() as u64
+            + channel_descriptor_bytes(channels.len(), "M4A edit source test").unwrap();
+        let exact_peak = source_bytes + requested_plan_bytes + RETAINED_TEMPORARY_BYTES;
+
+        plan_edits_with_budget(
+            &context,
+            1,
+            1,
+            &channels,
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(exact_peak))),
+            RETAINED_TEMPORARY_BYTES,
+        )
+        .expect("exact source and requested plan boundary");
+        let error = plan_edits_with_budget(
+            &context,
+            1,
+            1,
+            &channels,
+            DecodeBudget::new(
+                DecodeLimits::default().with_max_working_set_bytes(Some(exact_peak - 1)),
+            ),
+            RETAINED_TEMPORARY_BYTES,
+        )
+        .expect_err("spare source plus requested plan must fail before plan reserve");
+        assert!(error.contains("M4A edit plan"), "{error}");
+        assert!(error.contains("working-set limit"), "{error}");
     }
 
     #[test]
@@ -3568,6 +4219,8 @@ mod tests {
             2,
             48_000,
             &mut total,
+            DecodeBudget::new(DecodeLimits::default()),
+            0,
         )
         .unwrap();
         assert_eq!(frames, 0);
@@ -3594,11 +4247,23 @@ mod tests {
             channel_mask: None,
         };
         assert!(fallback_track_has_edit(&edits, 9).unwrap());
-        apply_fallback_track_edit(&mut decoded, 9, edits).unwrap();
+        apply_fallback_track_edit(
+            &mut decoded,
+            9,
+            edits,
+            DecodeBudget::new(DecodeLimits::default()),
+        )
+        .unwrap();
         assert_eq!(decoded.channels, vec![vec![12.0]]);
 
         let before = decoded.channels.clone();
-        let error = apply_fallback_track_edit(&mut decoded, 11, Vec::new()).unwrap_err();
+        let error = apply_fallback_track_edit(
+            &mut decoded,
+            11,
+            Vec::new(),
+            DecodeBudget::new(DecodeLimits::default()),
+        )
+        .unwrap_err();
         assert!(error.contains("metadata is unavailable"), "{error}");
         assert_eq!(decoded.channels, before);
 
@@ -3706,7 +4371,8 @@ mod tests {
         let path = directory.path().join("fatal-edit.m4a");
         std::fs::write(&path, bytes).unwrap();
 
-        let native_error = decode_m4a(&path).unwrap_err();
+        let native_error =
+            decode_m4a(File::open(&path).unwrap(), DecodeLimits::default()).unwrap_err();
         assert!(
             matches!(native_error, M4aDecodeError::Fatal(_)),
             "{native_error}"
@@ -3738,6 +4404,8 @@ mod tests {
             2,
             48_000,
             &mut total_frames,
+            DecodeBudget::new(DecodeLimits::default()),
+            0,
         )
         .unwrap();
         assert_eq!(total_frames, 2);
@@ -3767,9 +4435,16 @@ mod tests {
             },
         ] {
             let before = channels.clone();
-            assert!(
-                append_decoded_frame(&mut channels, &frame, 2, 48_000, &mut total_frames,).is_err()
-            );
+            assert!(append_decoded_frame(
+                &mut channels,
+                &frame,
+                2,
+                48_000,
+                &mut total_frames,
+                DecodeBudget::new(DecodeLimits::default()),
+                0,
+            )
+            .is_err());
             assert_eq!(channels, before);
         }
     }
@@ -3789,7 +4464,7 @@ mod tests {
         bytes.extend_from_slice(b"free");
         std::fs::write(&path, bytes).unwrap();
 
-        let error = decode_m4a(&path).unwrap_err();
+        let error = decode_m4a(File::open(&path).unwrap(), DecodeLimits::default()).unwrap_err();
         assert!(error.contains("zero-sized MP4 box free"), "{error}");
     }
 
@@ -3912,6 +4587,77 @@ mod tests {
             0,
         )
         .expect("unused QuickTime sample entries remain parser-compatible");
+    }
+
+    #[test]
+    fn structural_preflight_charges_manual_elst_children_before_parser_entry() {
+        const ENTRY_COUNT: usize = 4_096;
+        let entries = vec![(1, 0, 1, 0); ENTRY_COUNT];
+        let elst = raw_elst(0, 0, &entries);
+        let edts = raw_box(*b"edts", &elst);
+        let trak = raw_box(*b"trak", &edts);
+        let bytes = raw_box(*b"moov", &trak);
+
+        let scan = scan_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        let expected =
+            MP4_PARSER_BASE_BYTES + 4 * MP4_PARSER_BYTES_PER_BOX + ENTRY_COUNT as u64 * 64;
+        assert_eq!(scan.parser_retained_bytes, expected);
+
+        preflight_mp4_parser(
+            &mut Cursor::new(&bytes),
+            bytes.len() as u64,
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(expected))),
+        )
+        .expect("exact edit-list parser boundary");
+        let error = preflight_mp4_parser(
+            &mut Cursor::new(&bytes),
+            bytes.len() as u64,
+            DecodeBudget::new(
+                DecodeLimits::default().with_max_working_set_bytes(Some(expected - 1)),
+            ),
+        )
+        .expect_err("edit-list parser allocation must be rejected before dependency entry");
+        assert!(error.contains("working-set limit"), "{error}");
+    }
+
+    #[test]
+    fn structural_preflight_charges_manual_avc_sample_children_before_parser_entry() {
+        let mut avcc_body = vec![0; 256 * 1024];
+        avcc_body[0] = 1;
+        let avcc = raw_box(*b"avcC", &avcc_body);
+        let mut avc1_body = vec![0; 78];
+        avc1_body.extend_from_slice(&avcc);
+        let avc1 = raw_box(*b"avc1", &avc1_body);
+        let mut stsd_body = vec![0; 4];
+        stsd_body.extend_from_slice(&1u32.to_be_bytes());
+        stsd_body.extend_from_slice(&avc1);
+        let stsd = raw_box(*b"stsd", &stsd_body);
+        let stbl = raw_box(*b"stbl", &stsd);
+        let minf = raw_box(*b"minf", &stbl);
+        let mdia = raw_box(*b"mdia", &minf);
+        let trak = raw_box(*b"trak", &mdia);
+        let bytes = raw_box(*b"moov", &trak);
+
+        let scan = scan_mp4_structure(&mut Cursor::new(&bytes), bytes.len() as u64).unwrap();
+        let expected =
+            MP4_PARSER_BASE_BYTES + 8 * MP4_PARSER_BYTES_PER_BOX + avc1_body.len() as u64 * 2;
+        assert_eq!(scan.parser_retained_bytes, expected);
+
+        preflight_mp4_parser(
+            &mut Cursor::new(&bytes),
+            bytes.len() as u64,
+            DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(expected))),
+        )
+        .expect("exact AVC parser boundary");
+        let error = preflight_mp4_parser(
+            &mut Cursor::new(&bytes),
+            bytes.len() as u64,
+            DecodeBudget::new(
+                DecodeLimits::default().with_max_working_set_bytes(Some(expected - 1)),
+            ),
+        )
+        .expect_err("AVC parser allocation must be rejected before dependency entry");
+        assert!(error.contains("working-set limit"), "{error}");
     }
 
     #[test]
@@ -4329,7 +5075,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_file() {
-        assert!(decode_m4a(Path::new("/nonexistent/file.m4a")).is_err());
+    fn rejects_empty_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(decode_m4a(File::open(file.path()).unwrap(), DecodeLimits::default(),).is_err());
     }
 }

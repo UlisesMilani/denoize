@@ -38,6 +38,10 @@ fn run_with_stdin(args: &[String], input: &[u8]) -> Output {
 }
 
 fn write_wav(path: &Path, channels: u16, sample_rate: u32) {
+    write_wav_frames(path, channels, sample_rate, 64);
+}
+
+fn write_wav_frames(path: &Path, channels: u16, sample_rate: u32, frames: usize) {
     let spec = hound::WavSpec {
         channels,
         sample_rate,
@@ -45,7 +49,7 @@ fn write_wav(path: &Path, channels: u16, sample_rate: u32) {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(path, spec).unwrap();
-    for _ in 0..64 {
+    for _ in 0..frames {
         for _ in 0..spec.channels {
             writer.write_sample(0_i16).unwrap();
         }
@@ -391,6 +395,36 @@ fn piped_stdin_stops_at_the_checked_memory_limit() {
 }
 
 #[test]
+fn filesystem_decode_capacity_is_capped_before_output_staging() {
+    let root = temp_root("decode-capacity");
+    let input = root.join("input.wav");
+    let output = root.join("output.wav");
+    // The 120-KiB encoded file passes the conservative 8x input-size
+    // preflight under 1 MiB, while its planar f64 processing representation
+    // needs more than 1 MiB. The decode allocator must reject it directly.
+    write_wav_frames(&input, 1, 16_000, 60_000);
+
+    let result = run(&[
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--max-memory".into(),
+        "1".into(),
+        "--no-metadata".into(),
+        "--json".into(),
+    ]);
+
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty(), "error emitted partial JSON");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("WAV decode") && stderr.contains("decode working-set limit"),
+        "unexpected error: {stderr}"
+    );
+    assert_no_staged_output(&root, &output);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn no_metadata_still_rejects_oversized_flac_metadata_before_staging() {
     let root = temp_root("bounded-flac-metadata");
     let input = root.join("input.flac");
@@ -604,6 +638,43 @@ fn batch_metadata_limit_fails_before_creating_the_output_directory() {
         "unexpected error: {stderr}"
     );
     assert!(!output.exists(), "batch preflight created output directory");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn batch_probe_decode_limit_fails_before_creating_the_output_directory() {
+    let root = temp_root("bounded-batch-probe");
+    let input = root.join("input");
+    let output = root.join("output");
+    std::fs::create_dir(&input).unwrap();
+    let mut oversized_m4a = vec![0_u8; 1024 * 1024 + 1];
+    let box_size = u32::try_from(oversized_m4a.len()).unwrap();
+    oversized_m4a[..4].copy_from_slice(&box_size.to_be_bytes());
+    oversized_m4a[4..16].copy_from_slice(b"ftypM4A \0\0\0\0");
+    std::fs::write(input.join("oversized.m4a"), oversized_m4a).unwrap();
+
+    let result = run(&[
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+        "--batch".into(),
+        "--output-format".into(),
+        "wav".into(),
+        "--max-memory".into(),
+        "1".into(),
+        "--no-metadata".into(),
+        "--json".into(),
+    ]);
+
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty(), "error emitted partial JSON");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("probe batch input")
+            && stderr.contains("M4A/MP4")
+            && stderr.contains("decode working-set limit"),
+        "unexpected error: {stderr}"
+    );
+    assert!(!output.exists(), "batch probe created output directory");
     std::fs::remove_dir_all(root).unwrap();
 }
 

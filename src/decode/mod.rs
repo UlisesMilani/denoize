@@ -15,17 +15,96 @@
 //! | AIFF / CAF / Ogg Vorbis / ALAC | `symphonia` |
 
 mod aac;
+mod budget;
 mod m4a;
 mod mp3;
 mod opus;
 mod pcm;
 
+pub(crate) use budget::DecodeBudget;
+pub use budget::DecodeLimits;
 pub use pcm::DecodedPcm;
 
 use std::path::Path;
 
 const FORMAT_SNIFF_BYTES: usize = 4096;
 const ID3V2_HEADER_BYTES: usize = 10;
+const MAX_RF64_SIZE_TABLE_ENTRIES: usize = 65_536;
+// A conservative allowance for the key/value, hash bucket, and allocator
+// bookkeeping retained per RF64 `ds64` table entry.
+const RF64_SIZE_TABLE_ENTRY_BYTES: u64 = 64;
+
+fn rf64_table_working_bytes(
+    retained_entries: usize,
+    incoming_entries: usize,
+    transient_body_bytes: usize,
+    context: &str,
+) -> Result<u64, String> {
+    let total_entries = retained_entries
+        .checked_add(incoming_entries)
+        .ok_or_else(|| format!("{context} size-table entry count overflows"))?;
+    if total_entries > MAX_RF64_SIZE_TABLE_ENTRIES {
+        return Err(format!(
+            "{context} size table exceeds {MAX_RF64_SIZE_TABLE_ENTRIES} entries"
+        ));
+    }
+    u64::try_from(total_entries)
+        .ok()
+        .and_then(|entries| entries.checked_mul(RF64_SIZE_TABLE_ENTRY_BYTES))
+        .and_then(|bytes| bytes.checked_add(u64::try_from(transient_body_bytes).ok()?))
+        .ok_or_else(|| format!("{context} working-set byte count overflows"))
+}
+
+fn read_rf64_ds64_table(
+    reader: &mut impl std::io::Read,
+    body_len: usize,
+    size_table: &mut std::collections::HashMap<[u8; 4], u64>,
+    entries_seen: &mut usize,
+    budget: DecodeBudget,
+    context: &str,
+) -> Result<u64, String> {
+    if body_len < 28 || body_len > 1 << 20 {
+        return Err(format!("{context} ds64 chunk has an invalid size"));
+    }
+    let mut fixed = [0u8; 28];
+    reader
+        .read_exact(&mut fixed)
+        .map_err(|error| format!("read {context} ds64 header: {error}"))?;
+    let data_size = u64::from_le_bytes(fixed[8..16].try_into().expect("fixed ds64 data size"));
+    let table_len = usize::try_from(u32::from_le_bytes(
+        fixed[24..28].try_into().expect("fixed table length"),
+    ))
+    .map_err(|_| format!("{context} ds64 table count is too large"))?;
+    let required = table_len
+        .checked_mul(12)
+        .and_then(|bytes| bytes.checked_add(fixed.len()))
+        .ok_or_else(|| format!("{context} ds64 table size overflows"))?;
+    if required > body_len {
+        return Err(format!("{context} ds64 chunk ends before its table"));
+    }
+    let working_bytes =
+        rf64_table_working_bytes(*entries_seen, table_len, fixed.len() + 12, context)?;
+    budget.check_peak(0, working_bytes, context)?;
+    size_table
+        .try_reserve(table_len)
+        .map_err(|error| format!("reserve {context} size table: {error}"))?;
+    *entries_seen = entries_seen
+        .checked_add(table_len)
+        .ok_or_else(|| format!("{context} size-table entry count overflows"))?;
+    for _ in 0..table_len {
+        let mut entry = [0u8; 12];
+        reader
+            .read_exact(&mut entry)
+            .map_err(|error| format!("read {context} ds64 table: {error}"))?;
+        let mut chunk_id = [0u8; 4];
+        chunk_id.copy_from_slice(&entry[..4]);
+        size_table.insert(
+            chunk_id,
+            u64::from_le_bytes(entry[4..12].try_into().expect("fixed table entry")),
+        );
+    }
+    Ok(data_size)
+}
 
 fn declared_id3v2_payload_offset(header: &[u8]) -> Result<Option<u64>, String> {
     if !header.starts_with(b"ID3") {
@@ -344,12 +423,13 @@ fn detect_file_format_from_file(
 ///
 /// Container detection is content-based. Ogg and ISO BMFF containers are then
 /// demuxed with Symphonia so that `.ogg` is not implicitly treated as Opus and
-/// `.m4a` / `.mp4` is not implicitly treated as AAC.
+/// `.m4a` / `.mp4` is not implicitly treated as AAC. The path must resolve to
+/// a regular file; FIFOs, directories, and device files are rejected.
 pub fn probe_file(path: &Path) -> Result<AudioProbe, String> {
-    probe_file_with_metadata_limits(path, crate::metadata::MetadataLimits::default())
+    probe_file_with_limits(path, DecodeLimits::default())
 }
 
-/// Inspect an audio file while enforcing explicit FLAC/Ogg metadata limits.
+/// Inspect a regular-file audio input with explicit FLAC/Ogg metadata limits.
 ///
 /// The limits are applied before a decoder or demuxer can materialize
 /// container metadata. Other formats retain their existing probe behavior.
@@ -357,10 +437,43 @@ pub fn probe_file_with_metadata_limits(
     path: &Path,
     metadata_limits: crate::metadata::MetadataLimits,
 ) -> Result<AudioProbe, String> {
+    probe_file_with_limits(
+        path,
+        DecodeLimits {
+            metadata: metadata_limits,
+            ..DecodeLimits::default()
+        },
+    )
+}
+
+/// Inspect a regular-file audio input with explicit decode resource limits.
+pub fn probe_file_with_limits(path: &Path, limits: DecodeLimits) -> Result<AudioProbe, String> {
+    let mut session = crate::input::AudioInputSession::open(path)?;
+    probe_file_from_session_with_limits(&mut session, limits)
+}
+
+/// Inspect the regular file held by an existing input session.
+///
+/// The clone used for probing refers to the same opened filesystem object as
+/// later session operations, even if the original pathname is replaced.
+pub fn probe_file_from_session_with_limits(
+    session: &mut crate::input::AudioInputSession,
+    limits: DecodeLimits,
+) -> Result<AudioProbe, String> {
+    let path = session.path().to_path_buf();
+    let source = session.try_clone_rewound("audio probe")?;
+    probe_file_from_file_with_limits(&path, source, limits)
+}
+
+fn probe_file_from_file_with_limits(
+    path: &Path,
+    mut source: std::fs::File,
+    limits: DecodeLimits,
+) -> Result<AudioProbe, String> {
+    let budget = DecodeBudget::new(limits);
+    budget.check_peak(0, FORMAT_SNIFF_BYTES as u64, "audio probe")?;
     // Suppress extension fallback here. A probe must describe the file's
     // contents, not what its name claims the contents are.
-    let mut source = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for format detection: {error}", path.display()))?;
     let format = detect_file_format_from_file(path, false, &mut source)?;
     use std::io::{Seek, SeekFrom};
     source
@@ -368,18 +481,20 @@ pub fn probe_file_with_metadata_limits(
         .map_err(|error| format!("rewind {} after format detection: {error}", path.display()))?;
 
     match format {
-        AudioFormat::Wav | AudioFormat::Rf64 => probe_wave_file_from_file(path, format, source),
+        AudioFormat::Wav | AudioFormat::Rf64 => {
+            probe_wave_file_from_file(path, format, source, budget)
+        }
         AudioFormat::Aiff | AudioFormat::Caf => Ok(single_audio_track(format, AudioCodec::Pcm)),
         AudioFormat::Flac => {
-            crate::metadata::preflight_flac_decode(&mut source, metadata_limits)?;
+            crate::metadata::preflight_flac_decode(&mut source, limits.metadata)?;
             Ok(single_audio_track(format, AudioCodec::Flac))
         }
         AudioFormat::Mp3 => Ok(single_audio_track(format, AudioCodec::Mp3)),
         AudioFormat::AacAdts => Ok(single_audio_track(format, AudioCodec::Aac)),
         AudioFormat::OggOpus | AudioFormat::OggVorbis => {
-            probe_ogg_tracks(path, format, metadata_limits, source)
+            probe_ogg_tracks(path, format, limits.metadata, source)
         }
-        AudioFormat::M4a => probe_mp4_tracks_from_file(path, source),
+        AudioFormat::M4a => probe_mp4_tracks_from_file(path, source, limits),
         AudioFormat::Unknown => Err(format!(
             "could not identify the audio container from the file header ({}); verify that the file is a supported, non-truncated audio file",
             path.display()
@@ -401,6 +516,7 @@ fn probe_wave_file_from_file(
     path: &Path,
     format: AudioFormat,
     mut file: std::fs::File,
+    budget: DecodeBudget,
 ) -> Result<AudioProbe, String> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -419,6 +535,8 @@ fn probe_wave_file_from_file(
     let mut is_broadcast_wave = false;
     let mut rf64_data_size = None;
     let mut rf64_chunk_sizes = std::collections::HashMap::<[u8; 4], u64>::new();
+    let mut rf64_table_entries_seen = 0usize;
+    budget.check_peak(0, 0, "WAVE/RF64 probe")?;
     for _ in 0..4096 {
         let Some(header_end) = offset.checked_add(8) else {
             break;
@@ -462,26 +580,14 @@ fn probe_wave_file_from_file(
             {
                 return Err(format!("RF64 ds64 chunk is truncated ({})", path.display()));
             }
-            let mut body = vec![0u8; usize::try_from(chunk_size).unwrap()];
-            file.read_exact(&mut body)
-                .map_err(|error| format!("read RF64 ds64 chunk {}: {error}", path.display()))?;
-            rf64_data_size = Some(u64::from_le_bytes(body[8..16].try_into().unwrap()));
-            let table_len = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
-            let required = 28usize.saturating_add(table_len.saturating_mul(12));
-            if required > body.len() {
-                return Err(format!(
-                    "RF64 ds64 chunk ends before its table ({})",
-                    path.display()
-                ));
-            }
-            for entry in body[28..required].chunks_exact(12) {
-                let mut chunk_id = [0u8; 4];
-                chunk_id.copy_from_slice(&entry[..4]);
-                rf64_chunk_sizes.insert(
-                    chunk_id,
-                    u64::from_le_bytes(entry[4..12].try_into().unwrap()),
-                );
-            }
+            rf64_data_size = Some(read_rf64_ds64_table(
+                &mut file,
+                usize::try_from(chunk_size).unwrap(),
+                &mut rf64_chunk_sizes,
+                &mut rf64_table_entries_seen,
+                budget,
+                "RF64 probe",
+            )?);
         } else if &header[0..4] == b"fmt " {
             if chunk_size < 16 {
                 return Err(format!("WAVE fmt chunk is truncated ({})", path.display()));
@@ -496,10 +602,10 @@ fn probe_wave_file_from_file(
                     path.display()
                 ));
             }
-            let mut fmt = vec![0u8; read_len];
-            file.read_exact(&mut fmt)
+            let mut fmt = [0u8; 64];
+            file.read_exact(&mut fmt[..read_len])
                 .map_err(|error| format!("read WAVE fmt chunk {}: {error}", path.display()))?;
-            codec = wave_codec_from_fmt(&fmt);
+            codec = wave_codec_from_fmt(&fmt[..read_len]);
             found_fmt = true;
         } else if &header[0..4] == b"bext" {
             is_broadcast_wave = true;
@@ -569,15 +675,23 @@ fn wave_codec_from_fmt(fmt: &[u8]) -> AudioCodec {
     }
 }
 
-fn probe_mp4_tracks_from_file(path: &Path, mut file: std::fs::File) -> Result<AudioProbe, String> {
+fn probe_mp4_tracks_from_file(
+    path: &Path,
+    mut file: std::fs::File,
+    limits: DecodeLimits,
+) -> Result<AudioProbe, String> {
     use std::io::{BufReader, Seek, SeekFrom};
 
     let size = file
         .metadata()
         .map_err(|error| format!("stat {} for MP4 codec probe: {error}", path.display()))?
         .len();
+    let budget = DecodeBudget::new(limits);
+    let mut fallback_file = file
+        .try_clone()
+        .map_err(|error| format!("clone {} for MP4 fallback probe: {error}", path.display()))?;
     let primary = (|| {
-        m4a::validate_mp4_structure(&mut file, size)
+        m4a::preflight_mp4_parser(&mut file, size, budget)
             .map_err(|error| format!("validate M4A/MP4 structure ({}): {error}", path.display()))?;
         file.seek(SeekFrom::Start(0))
             .map_err(|error| format!("rewind {} for MP4 codec probe: {error}", path.display()))?;
@@ -592,7 +706,10 @@ fn probe_mp4_tracks_from_file(path: &Path, mut file: std::fs::File) -> Result<Au
         }
     }
 
-    match probe_container_tracks(path, AudioFormat::M4a) {
+    fallback_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {} for MP4 fallback probe: {error}", path.display()))?;
+    match probe_container_tracks_from_file(path, AudioFormat::M4a, fallback_file) {
         Ok(probe) if probe.codec == AudioCodec::Alac => Ok(probe),
         Ok(mut probe) => {
             // The generic demuxer does not establish that an `mp4a` sample
@@ -816,12 +933,6 @@ fn scan_ogg_bos_codecs(
     Ok(codecs)
 }
 
-fn probe_container_tracks(path: &Path, header_format: AudioFormat) -> Result<AudioProbe, String> {
-    let source = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for codec probe: {error}", path.display()))?;
-    probe_container_tracks_from_file(path, header_format, source)
-}
-
 fn probe_container_tracks_from_file(
     path: &Path,
     header_format: AudioFormat,
@@ -935,12 +1046,14 @@ fn audio_codec_from_symphonia(codec: symphonia::core::codecs::audio::AudioCodecI
     }
 }
 
-/// Decode any supported audio file to high-fidelity planar PCM.
+/// Decode any supported regular audio file to high-fidelity planar PCM.
+///
+/// FIFOs, directories, and device files are rejected.
 pub fn decode_file(path: &Path) -> Result<DecodedPcm, String> {
-    decode_file_with_metadata_limits(path, crate::metadata::MetadataLimits::default())
+    decode_file_with_limits(path, DecodeLimits::default())
 }
 
-/// Decode an audio file while enforcing explicit FLAC/Ogg metadata limits.
+/// Decode a regular-file audio input with explicit FLAC/Ogg metadata limits.
 ///
 /// FLAC and Ogg structures are validated on the same open file handle that is
 /// subsequently passed to the decoder. This prevents oversized metadata from
@@ -950,81 +1063,153 @@ pub fn decode_file_with_metadata_limits(
     path: &Path,
     metadata_limits: crate::metadata::MetadataLimits,
 ) -> Result<DecodedPcm, String> {
+    decode_file_with_limits(
+        path,
+        DecodeLimits {
+            metadata: metadata_limits,
+            ..DecodeLimits::default()
+        },
+    )
+}
+
+/// Decode a regular-file audio input with explicit resource limits.
+pub fn decode_file_with_limits(path: &Path, limits: DecodeLimits) -> Result<DecodedPcm, String> {
+    let mut session = crate::input::AudioInputSession::open(path)?;
+    decode_file_from_session_with_limits(&mut session, limits)
+}
+
+/// Decode the regular file held by an existing input session.
+pub fn decode_file_from_session_with_limits(
+    session: &mut crate::input::AudioInputSession,
+    limits: DecodeLimits,
+) -> Result<DecodedPcm, String> {
+    let path = session.path().to_path_buf();
+    let source = session.try_clone_rewound("audio decode")?;
+    decode_file_from_file_with_limits(&path, source, limits)
+}
+
+/// Detect and decode an already-open input without reopening its pathname.
+pub(crate) fn decode_file_from_file_with_limits(
+    path: &Path,
+    mut source: std::fs::File,
+    limits: DecodeLimits,
+) -> Result<DecodedPcm, String> {
     use std::io::{Seek, SeekFrom};
 
-    // Keep the detected file open through FLAC/Ogg preflight and decode. A
-    // concurrent path replacement therefore cannot swap in a different
-    // container after format detection but before a metadata parser runs.
-    let mut source = std::fs::File::open(path)
-        .map_err(|error| format!("open {} for format detection: {error}", path.display()))?;
+    DecodeBudget::new(limits).check_planar_frames(0, 0, 0, "audio decode")?;
     let fmt = detect_file_format_from_file(path, true, &mut source)?;
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("rewind {} after format detection: {error}", path.display()))?;
-    decode_file_from_detected_file(path, fmt, source, metadata_limits)
+    decode_file_from_detected_file(path, fmt, source, limits)
 }
 
 fn decode_file_from_detected_file(
     path: &Path,
     fmt: AudioFormat,
-    source: std::fs::File,
-    metadata_limits: crate::metadata::MetadataLimits,
+    mut source: std::fs::File,
+    limits: DecodeLimits,
 ) -> Result<DecodedPcm, String> {
     match fmt {
-        AudioFormat::Wav => decode_wav(path),
-        AudioFormat::Rf64 => decode_rf64(path),
-        AudioFormat::Aiff | AudioFormat::Caf => decode_symphonia(path),
-        AudioFormat::OggVorbis => decode_symphonia_ogg(path, source, metadata_limits),
-        AudioFormat::Flac => decode_flac(source, metadata_limits),
-        AudioFormat::OggOpus => opus::decode_ogg_opus_with_limits(source, metadata_limits),
-        AudioFormat::Mp3 => decode_mp3(path),
-        AudioFormat::M4a => match m4a::decode_m4a(path) {
-            Ok(decoded) => Ok(decoded),
-            Err(m4a::M4aDecodeError::Fatal(error)) => {
-                Err(format!("M4A/AAC decode failed: {error}"))
-            }
-            Err(m4a::M4aDecodeError::TryOtherCodec {
-                reason,
-                track_edits,
-            }) => {
-                let (mut decoded, selected_track_id, packet_errors) =
-                    decode_symphonia_with_track_id(path, &track_edits).map_err(
-                        |symphonia_error| {
+        AudioFormat::Wav => {
+            crate::audio::read_wav_from_file_with_limits(source, limits).map(|audio| DecodedPcm {
+                sample_rate: audio.sample_rate,
+                channels: audio.channels,
+                channel_mask: audio.channel_mask,
+            })
+        }
+        AudioFormat::Rf64 => decode_rf64(source, limits),
+        AudioFormat::Aiff | AudioFormat::Caf => {
+            decode_symphonia(path, source, DecodeBudget::new(limits))
+        }
+        AudioFormat::OggVorbis => decode_symphonia_ogg(path, source, limits),
+        AudioFormat::Flac => decode_flac(source, limits),
+        AudioFormat::OggOpus => opus::decode_ogg_opus_with_limits(source, limits),
+        AudioFormat::Mp3 => decode_mp3(path, source, limits),
+        AudioFormat::M4a => {
+            let m4a_source = clone_rewound(&mut source, path, "M4A primary decode")?;
+            match m4a::decode_m4a(m4a_source, limits) {
+                Ok(decoded) => Ok(decoded),
+                Err(m4a::M4aDecodeError::Fatal(error)) => {
+                    Err(format!("M4A/AAC decode failed: {error}"))
+                }
+                Err(m4a::M4aDecodeError::TryOtherCodec {
+                    reason,
+                    track_edits,
+                    retained_bytes,
+                }) => {
+                    let fallback_budget = DecodeBudget::new(limits)
+                        .with_retained_bytes(retained_bytes)
+                        .map_err(|error| format!("M4A fallback metadata: {error}"))?;
+                    let fallback_source = clone_rewound(&mut source, path, "M4A fallback decode")?;
+                    let (mut decoded, selected_track_id, packet_errors) =
+                        decode_symphonia_with_track_id(
+                            path,
+                            fallback_source,
+                            &track_edits,
+                            fallback_budget,
+                        )
+                        .map_err(|symphonia_error| {
                             format!(
                                 "M4A/AAC decode failed: {reason}; ALAC/other decoder: {symphonia_error}"
                             )
-                        },
-                    )?;
-                let edit_active =
-                    m4a::fallback_track_has_edit(&track_edits, selected_track_id).map_err(
-                        |edit_error| {
+                        })?;
+                    let edit_active = m4a::fallback_track_has_edit(
+                        &track_edits,
+                        selected_track_id,
+                    )
+                    .map_err(|edit_error| {
                             format!(
                                 "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
                             )
-                        },
-                    )?;
-                if edit_active {
-                    reject_m4a_fallback_packet_errors(&packet_errors).map_err(|edit_error| {
-                        format!(
-                            "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
-                        )
                     })?;
-                }
-                m4a::apply_fallback_track_edit(&mut decoded, selected_track_id, track_edits)
+                    if edit_active {
+                        reject_m4a_fallback_packet_errors(&packet_errors).map_err(|edit_error| {
+                            format!(
+                                "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
+                            )
+                        })?;
+                    }
+                    m4a::apply_fallback_track_edit(
+                        &mut decoded,
+                        selected_track_id,
+                        track_edits,
+                        fallback_budget,
+                    )
                     .map_err(|edit_error| {
                         format!(
                             "M4A/AAC decode failed: {reason}; ALAC/other edit list: {edit_error}"
                         )
                     })?;
-                Ok(decoded)
+                    Ok(decoded)
+                }
             }
-        },
-        AudioFormat::AacAdts => aac::decode_adts(path),
+        }
+        AudioFormat::AacAdts => aac::decode_adts(source, limits),
         AudioFormat::Unknown => Err(format!(
             "unsupported audio format ({}); supported input: wav, rf64/bwf, aiff, caf, flac, opus/vorbis, mp3, m4a/alac, aac",
             path.display()
         )),
     }
+}
+
+fn clone_rewound(
+    source: &mut std::fs::File,
+    path: &Path,
+    context: &str,
+) -> Result<std::fs::File, String> {
+    use std::io::{Seek, SeekFrom};
+
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {context} {}: {error}", path.display()))?;
+    let mut clone = source
+        .try_clone()
+        .map_err(|error| format!("clone {context} {}: {error}", path.display()))?;
+    clone
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind cloned {context} {}: {error}", path.display()))?;
+    Ok(clone)
 }
 
 /// Decode a container supported by Symphonia into planar `f64` PCM.
@@ -1055,34 +1240,41 @@ impl SymphoniaDecodeOutcome {
     }
 }
 
-fn decode_symphonia(path: &Path) -> Result<DecodedPcm, String> {
-    decode_symphonia_with_report(path)?.into_decoded()
+fn decode_symphonia(
+    path: &Path,
+    source: std::fs::File,
+    budget: DecodeBudget,
+) -> Result<DecodedPcm, String> {
+    decode_symphonia_with_report(path, source, budget)?.into_decoded()
 }
 
 fn decode_symphonia_ogg(
     path: &Path,
     mut source: std::fs::File,
-    metadata_limits: crate::metadata::MetadataLimits,
+    limits: DecodeLimits,
 ) -> Result<DecodedPcm, String> {
     use std::io::{Seek, SeekFrom};
 
-    crate::metadata::preflight_ogg_decode(&mut source, metadata_limits)?;
+    crate::metadata::preflight_ogg_decode(&mut source, limits.metadata)?;
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("rewind Ogg input {}: {error}", path.display()))?;
-    decode_symphonia_with_report_inner(path, None, Some(source))?.into_decoded()
+    decode_symphonia_with_report_inner(path, None, source, DecodeBudget::new(limits))?
+        .into_decoded()
 }
 
 fn decode_symphonia_with_track_id(
     path: &Path,
+    source: std::fs::File,
     track_edits: &[m4a::FallbackTrackEdit],
+    budget: DecodeBudget,
 ) -> Result<(DecodedPcm, u32, RecoverablePacketErrors), String> {
     let SymphoniaDecodeOutcome {
         decoded,
         selected_track_id,
         packet_errors,
         ..
-    } = decode_symphonia_with_report_inner(path, Some(track_edits), None)?;
+    } = decode_symphonia_with_report_inner(path, Some(track_edits), source, budget)?;
     let decoded = decoded.ok_or_else(|| "no audio packets decoded".to_string())?;
     Ok((decoded, selected_track_id, packet_errors))
 }
@@ -1107,14 +1299,19 @@ fn reject_m4a_fallback_packet_errors(errors: &RecoverablePacketErrors) -> Result
     Ok(())
 }
 
-fn decode_symphonia_with_report(path: &Path) -> Result<SymphoniaDecodeOutcome, String> {
-    decode_symphonia_with_report_inner(path, None, None)
+fn decode_symphonia_with_report(
+    path: &Path,
+    source: std::fs::File,
+    budget: DecodeBudget,
+) -> Result<SymphoniaDecodeOutcome, String> {
+    decode_symphonia_with_report_inner(path, None, source, budget)
 }
 
 fn decode_symphonia_with_report_inner(
     path: &Path,
     fallback_track_edits: Option<&[m4a::FallbackTrackEdit]>,
-    source: Option<std::fs::File>,
+    source: std::fs::File,
+    budget: DecodeBudget,
 ) -> Result<SymphoniaDecodeOutcome, String> {
     use symphonia::core::codecs::audio::AudioDecoderOptions;
     use symphonia::core::errors::Error as SymphoniaError;
@@ -1123,10 +1320,6 @@ fn decode_symphonia_with_report_inner(
     use symphonia::core::io::MediaSourceStream;
     use symphonia::core::meta::MetadataOptions;
 
-    let source = match source {
-        Some(source) => source,
-        None => std::fs::File::open(path).map_err(|error| format!("open: {error}"))?,
-    };
     let stream = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
@@ -1165,6 +1358,23 @@ fn decode_symphonia_with_report_inner(
         .as_ref()
         .map(|channels| channels.count())
         .filter(|count| *count > 0);
+    let declared_packet_temporary =
+        match (expected_channel_count, codec_params.max_frames_per_packet) {
+            (Some(channel_count), Some(frames)) => {
+                symphonia_temporary_bytes(channel_count, frames)?
+            }
+            _ => 0,
+        };
+    if let (Some(channel_count), Some(frame_count)) = (expected_channel_count, track.num_frames) {
+        let frame_count = usize::try_from(frame_count)
+            .map_err(|_| "Symphonia track frame count is too large for this platform")?;
+        budget.check_planar_frames(
+            channel_count,
+            frame_count,
+            declared_packet_temporary,
+            "Symphonia decode",
+        )?;
+    }
     let track_id = track.id;
     let mut timeline_verifier = match fallback_track_edits {
         Some(track_edits) => m4a::fallback_timeline_verifier(track_edits, track_id)?,
@@ -1178,6 +1388,14 @@ fn decode_symphonia_with_report_inner(
     let mut packet_errors = RecoverablePacketErrors::default();
 
     loop {
+        // The format reader may allocate its next packet internally. Charge
+        // all currently reserved output capacity and the declared decoder
+        // packet scratch before entering that dependency.
+        budget.check_planar_capacities(
+            &channels,
+            declared_packet_temporary,
+            "Symphonia packet read",
+        )?;
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
@@ -1187,6 +1405,16 @@ fn decode_symphonia_with_report_inner(
             }
             Err(error) => return Err(format!("read packet: {error}")),
         };
+        let packet_data_bytes = u64::try_from(packet.data.len())
+            .map_err(|_| "Symphonia packet byte count does not fit in u64")?;
+        let predecode_temporary = packet_data_bytes
+            .checked_add(declared_packet_temporary)
+            .ok_or_else(|| "Symphonia pre-decode temporary byte count overflows".to_string())?;
+        budget.check_planar_capacities(
+            &channels,
+            predecode_temporary,
+            "Symphonia packet decode",
+        )?;
         if packet.track_id != track_id {
             continue;
         }
@@ -1211,9 +1439,8 @@ fn decode_symphonia_with_report_inner(
         if decoded_frames == 0 {
             packet_errors.empty_decoded_packet = true;
         }
-        let mut planes = Vec::<Vec<f32>>::new();
-        decoded.copy_to_vecs_planar(&mut planes);
-        if planes.is_empty() {
+        let plane_count = decoded.num_planes();
+        if plane_count == 0 {
             packet_errors.empty_decoded_packet = true;
             continue;
         }
@@ -1225,17 +1452,61 @@ fn decode_symphonia_with_report_inner(
             }
         } else {
             sample_rate = Some(rate);
-            channels = vec![Vec::new(); planes.len()];
+            let packet_temporary = symphonia_temporary_bytes(
+                plane_count,
+                u64::try_from(decoded.capacity())
+                    .map_err(|_| "Symphonia packet capacity does not fit in u64")?,
+            )?
+            .checked_add(packet_data_bytes)
+            .ok_or_else(|| "Symphonia packet temporary byte count overflows".to_string())?;
+            budget.check_planar_frames(
+                plane_count,
+                decoded_frames,
+                packet_temporary,
+                "Symphonia decode",
+            )?;
+            channels
+                .try_reserve_exact(plane_count)
+                .map_err(|error| format!("reserve Symphonia channel list: {error}"))?;
+            channels.resize_with(plane_count, Vec::new);
         }
-        if planes.len() != channels.len() {
+        if plane_count != channels.len() {
             return Err("audio channel count changed during decode".into());
         }
-        for (destination, source) in channels.iter_mut().zip(planes) {
-            destination.extend(
-                source
-                    .into_iter()
-                    .map(|sample| crate::audio::sanitize_sample(sample as f64)),
-            );
+
+        // Symphonia owns the current decoded packet. Count its capacity as a
+        // conservative f64-width codec temporary, then reserve every output
+        // plane before extending any of them.
+        let packet_temporary = symphonia_temporary_bytes(
+            plane_count,
+            u64::try_from(decoded.capacity())
+                .map_err(|_| "Symphonia packet capacity does not fit in u64")?,
+        )?
+        .checked_add(packet_data_bytes)
+        .ok_or_else(|| "Symphonia packet temporary byte count overflows".to_string())?;
+        let previous_frames = channels.first().map(Vec::len).unwrap_or(0);
+        let target_frames = budget.reserve_planar_additional(
+            &mut channels,
+            decoded_frames,
+            packet_temporary,
+            "Symphonia decode",
+        )?;
+        for destination in &mut channels {
+            destination.resize(target_frames, 0.0);
+        }
+        let mut destinations = Vec::new();
+        destinations
+            .try_reserve_exact(plane_count)
+            .map_err(|error| format!("reserve Symphonia plane views: {error}"))?;
+        for destination in &mut channels {
+            destinations.push(&mut destination[previous_frames..target_frames]);
+        }
+        decoded.copy_to_slice_planar::<f64, _>(&mut destinations);
+        drop(destinations);
+        for destination in &mut channels {
+            for sample in &mut destination[previous_frames..target_frames] {
+                *sample = crate::audio::sanitize_sample(*sample);
+            }
         }
     }
 
@@ -1257,8 +1528,27 @@ fn decode_symphonia_with_report_inner(
     })
 }
 
-fn decode_mp3(path: &Path) -> Result<DecodedPcm, String> {
-    let attempt = decode_symphonia_with_report(path)?;
+fn symphonia_temporary_bytes(channel_count: usize, frames: u64) -> Result<u64, String> {
+    let channels =
+        u64::try_from(channel_count).map_err(|_| "Symphonia channel count does not fit in u64")?;
+    channels
+        .checked_mul(frames)
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+        .and_then(|sample_bytes| {
+            channels
+                .checked_mul(std::mem::size_of::<&mut [f64]>() as u64)
+                .and_then(|views| sample_bytes.checked_add(views))
+        })
+        .ok_or_else(|| "Symphonia packet temporary byte count overflows".to_string())
+}
+
+fn decode_mp3(
+    path: &Path,
+    mut source: std::fs::File,
+    limits: DecodeLimits,
+) -> Result<DecodedPcm, String> {
+    let primary_source = clone_rewound(&mut source, path, "MP3 primary decode")?;
+    let attempt = decode_symphonia_with_report(path, primary_source, DecodeBudget::new(limits))?;
     if !attempt.packet_errors.invalid_main_data_offset {
         return attempt.into_decoded().map(normalize_mp3_layout);
     }
@@ -1269,7 +1559,11 @@ fn decode_mp3(path: &Path) -> Result<DecodedPcm, String> {
         ));
     }
 
-    let (classified_rate, classified_channels) = match mp3::inspect_timing_metadata(path) {
+    let timing_source = clone_rewound(&mut source, path, "MP3 fallback timing probe")?;
+    let (classified_rate, classified_channels) = match mp3::inspect_timing_metadata(
+        timing_source,
+        limits,
+    ) {
         mp3::TimingMetadata::Absent {
             sample_rate,
             channel_count,
@@ -1298,7 +1592,8 @@ fn decode_mp3(path: &Path) -> Result<DecodedPcm, String> {
     // compatibility decoder accumulates a replacement whole-stream PCM.
     drop(decoded);
 
-    let decoded = mp3::decode_mp3_file_compatibility(path).map_err(|fallback_error| {
+    let fallback_source = clone_rewound(&mut source, path, "MP3 compatibility fallback")?;
+    let decoded = mp3::decode_mp3_file_compatibility(fallback_source, limits).map_err(|fallback_error| {
         format!(
             "MP3 compatibility fallback failed after Symphonia's invalid main-data offset: {fallback_error}"
         )
@@ -1356,11 +1651,11 @@ fn checked_rf64_decoded_bytes(frame_count: usize, channel_count: usize) -> Resul
         .ok_or_else(|| "RF64 decoded byte count overflows".to_string())
 }
 
-fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
+fn decode_rf64(mut file: std::fs::File, limits: DecodeLimits) -> Result<DecodedPcm, String> {
     use std::collections::HashMap;
     use std::io::{Read, Seek, SeekFrom};
 
-    let mut file = std::fs::File::open(path).map_err(|error| format!("open RF64: {error}"))?;
+    let budget = DecodeBudget::new(limits);
     let file_len = file
         .metadata()
         .map_err(|error| format!("stat RF64: {error}"))?
@@ -1377,6 +1672,7 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
 
     let mut data_size_from_ds64 = None;
     let mut extended_chunk_sizes = HashMap::<[u8; 4], u64>::new();
+    let mut extended_table_entries_seen = 0usize;
     let mut format = None;
     let mut data_offset = None;
     let mut data_size = None;
@@ -1444,32 +1740,14 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
             b"ds64" => {
                 let body_len = usize::try_from(u64::from(size32))
                     .map_err(|_| "RF64 ds64 chunk is too large".to_string())?;
-                if body_len < 28 || body_len > 1 << 20 {
-                    return Err("RF64 ds64 chunk has an invalid size".into());
-                }
-                let mut body = vec![0u8; body_len];
-                file.read_exact(&mut body)
-                    .map_err(|error| format!("read RF64 ds64: {error}"))?;
-                data_size_from_ds64 = Some(u64::from_le_bytes(
-                    body[8..16].try_into().expect("fixed ds64 data size"),
-                ));
-                let table_len =
-                    u32::from_le_bytes(body[24..28].try_into().expect("fixed ds64 table length"))
-                        as usize;
-                let required = table_len
-                    .checked_mul(12)
-                    .and_then(|bytes| bytes.checked_add(28))
-                    .ok_or_else(|| "RF64 ds64 table size overflows".to_string())?;
-                if required > body.len() {
-                    return Err("RF64 ds64 chunk ends before its table".into());
-                }
-                for entry in body[28..required].chunks_exact(12) {
-                    let mut chunk_id = [0u8; 4];
-                    chunk_id.copy_from_slice(&entry[..4]);
-                    let size =
-                        u64::from_le_bytes(entry[4..12].try_into().expect("fixed table size"));
-                    extended_chunk_sizes.insert(chunk_id, size);
-                }
+                data_size_from_ds64 = Some(read_rf64_ds64_table(
+                    &mut file,
+                    body_len,
+                    &mut extended_chunk_sizes,
+                    &mut extended_table_entries_seen,
+                    budget,
+                    "RF64 decode",
+                )?);
             }
             b"fmt " => {
                 let body_len = usize::try_from(declared_size)
@@ -1477,7 +1755,17 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
                 if body_len < 16 || body_len > 1 << 20 {
                     return Err("RF64 fmt chunk has an invalid size".into());
                 }
-                let mut body = vec![0u8; body_len];
+                let retained_table_bytes = rf64_table_working_bytes(
+                    extended_table_entries_seen,
+                    0,
+                    body_len,
+                    "RF64 decode",
+                )?;
+                budget.check_peak(0, retained_table_bytes, "RF64 format parse")?;
+                let mut body = Vec::new();
+                body.try_reserve_exact(body_len)
+                    .map_err(|error| format!("reserve RF64 fmt body: {error}"))?;
+                body.resize(body_len, 0);
                 file.read_exact(&mut body)
                     .map_err(|error| format!("read RF64 fmt: {error}"))?;
                 let format_tag =
@@ -1588,23 +1876,24 @@ fn decode_rf64(path: &Path) -> Result<DecodedPcm, String> {
         return Err("RF64 fmt block alignment is invalid".into());
     }
 
+    // Extended sizes are no longer needed once the data and format locations
+    // have been resolved; release the table before allocating whole-stream PCM.
+    drop(extended_chunk_sizes);
     file.seek(SeekFrom::Start(data_offset))
         .map_err(|error| format!("seek RF64 data: {error}"))?;
-    let mut channels = Vec::new();
-    channels
-        .try_reserve_exact(channel_count)
-        .map_err(|_| "unable to reserve RF64 channel list".to_string())?;
-    for _ in 0..channel_count {
-        let mut channel = Vec::new();
-        channel
-            .try_reserve_exact(frame_count)
-            .map_err(|_| "unable to reserve RF64 decoded samples".to_string())?;
-        channels.push(channel);
-    }
     let block_frames = (64 * 1024 / block_align).max(1).min(frame_count.max(1));
     let buffer_len = block_frames
         .checked_mul(block_align)
         .ok_or_else(|| "RF64 decode buffer size overflows".to_string())?;
+    let buffer_bytes =
+        u64::try_from(buffer_len).map_err(|_| "RF64 buffer size does not fit in u64")?;
+    budget.check_planar_frames(channel_count, frame_count, buffer_bytes, "RF64 decode")?;
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(channel_count)
+        .map_err(|_| "unable to reserve RF64 channel list".to_string())?;
+    channels.resize_with(channel_count, Vec::new);
+    budget.reserve_planar_frames(&mut channels, frame_count, buffer_bytes, "RF64 decode")?;
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(buffer_len)
@@ -1666,13 +1955,10 @@ fn read_u32_le(file: &mut impl std::io::Read, context: &str) -> Result<u32, Stri
     Ok(u32::from_le_bytes(bytes))
 }
 
-fn decode_flac(
-    mut source: std::fs::File,
-    metadata_limits: crate::metadata::MetadataLimits,
-) -> Result<DecodedPcm, String> {
+fn decode_flac(mut source: std::fs::File, limits: DecodeLimits) -> Result<DecodedPcm, String> {
     use std::io::{Seek, SeekFrom};
 
-    crate::metadata::preflight_flac_decode(&mut source, metadata_limits)?;
+    crate::metadata::preflight_flac_decode(&mut source, limits.metadata)?;
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| format!("FLAC rewind: {error}"))?;
@@ -1685,8 +1971,42 @@ fn decode_flac(
     let info = reader.streaminfo();
     let channels = info.channels as usize;
     let scale = 1.0 / (1_u64 << (info.bits_per_sample - 1)) as f64;
-    let mut output = vec![Vec::new(); channels];
+    let budget = DecodeBudget::new(limits);
+    let frame_temporary = u64::from(info.max_block_size)
+        .checked_mul(u64::from(info.channels))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<i32>() as u64))
+        .ok_or_else(|| "FLAC frame temporary byte count overflows".to_string())?;
+    let mut output = Vec::new();
+    let planned_frames = info
+        .samples
+        .map(usize::try_from)
+        .transpose()
+        .map_err(|_| "FLAC decoded frame count is too large for this platform")?;
+    budget.check_planar_frames(
+        channels,
+        planned_frames.unwrap_or(0),
+        frame_temporary,
+        "FLAC decode",
+    )?;
+    output
+        .try_reserve_exact(channels)
+        .map_err(|error| format!("reserve FLAC channel list: {error}"))?;
+    output.resize_with(channels, Vec::new);
+    if let Some(frames) = planned_frames {
+        budget.reserve_planar_frames(&mut output, frames, frame_temporary, "FLAC decode")?;
+    }
+    let mut retained_frames = 0usize;
     for (index, sample) in reader.samples().enumerate() {
+        if index % channels == 0 {
+            retained_frames = retained_frames
+                .checked_add(1)
+                .ok_or_else(|| "FLAC decoded frame count overflows".to_string())?;
+            if output[0].capacity() < retained_frames {
+                let retained_before = retained_frames - 1;
+                debug_assert!(output.iter().all(|plane| plane.len() == retained_before));
+                budget.reserve_planar_additional(&mut output, 1, frame_temporary, "FLAC decode")?;
+            }
+        }
         output[index % channels]
             .push(sample.map_err(|e| format!("FLAC decode: {e}"))? as f64 * scale);
     }
@@ -1694,15 +2014,6 @@ fn decode_flac(
         sample_rate: info.sample_rate,
         channels: output,
         channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(channels).mask(),
-    })
-}
-
-fn decode_wav(path: &Path) -> Result<DecodedPcm, String> {
-    let audio = crate::audio::read_wav(path)?;
-    Ok(DecodedPcm {
-        sample_rate: audio.sample_rate,
-        channels: audio.channels,
-        channel_mask: audio.channel_mask,
     })
 }
 
@@ -1755,6 +2066,26 @@ mod tests {
         bytes.extend(vendor_len.to_le_bytes());
         bytes.resize(bytes.len() + vendor_len as usize, b'v');
         bytes.extend(0_u32.to_le_bytes());
+        bytes
+    }
+
+    fn rf64_ds64_only(table_entries: usize) -> Vec<u8> {
+        let body_len = 28usize
+            .checked_add(table_entries.checked_mul(12).unwrap())
+            .unwrap();
+        let mut bytes = b"RF64".to_vec();
+        bytes.extend(u32::MAX.to_le_bytes());
+        bytes.extend(b"WAVE");
+        bytes.extend(b"ds64");
+        bytes.extend(u32::try_from(body_len).unwrap().to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(u32::try_from(table_entries).unwrap().to_le_bytes());
+        for index in 0..table_entries {
+            bytes.extend(b"JUNK");
+            bytes.extend(u64::try_from(index).unwrap().to_le_bytes());
+        }
         bytes
     }
 
@@ -1955,6 +2286,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compressed_flac_silence_is_rejected_from_streaminfo_before_pcm_reserve() {
+        let directory = tempfile::tempdir().expect("create FLAC fixture directory");
+        let path = directory.path().join("compressed-silence.flac");
+        let frames = 100_000usize;
+        let audio = crate::audio::Audio {
+            sample_rate: 48_000,
+            channels: vec![vec![0.0; frames], vec![0.0; frames]],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+        crate::encode::write_audio(&path, &audio, crate::encode::EncodeOptions::default())
+            .expect("encode compressed FLAC silence fixture");
+
+        const CAP_BYTES: u64 = 2 * 1024 * 1024;
+        let encoded_bytes = std::fs::metadata(&path)
+            .expect("stat compressed FLAC fixture")
+            .len();
+        assert!(
+            encoded_bytes < CAP_BYTES,
+            "fixture is not compressed enough"
+        );
+
+        let error = decode_file_with_limits(
+            &path,
+            DecodeLimits::new(crate::metadata::MetadataLimits::default(), Some(CAP_BYTES)),
+        )
+        .expect_err("STREAMINFO geometry must reject decoded PCM beyond the cap");
+        assert!(error.contains("FLAC decode"), "{error}");
+        assert!(error.contains("working-set limit"), "{error}");
+    }
+
+    #[test]
+    fn rf64_ds64_table_is_rejected_before_hostile_reserve() {
+        let entry_count = 20_000;
+        let bytes = rf64_ds64_only(entry_count);
+        let file = tempfile::NamedTempFile::new().expect("create RF64 table fixture");
+        std::fs::write(file.path(), bytes).expect("write RF64 table fixture");
+        let limits = DecodeLimits::new(
+            crate::metadata::MetadataLimits::default(),
+            Some(1024 * 1024),
+        );
+
+        let probe_error = probe_file_with_limits(file.path(), limits)
+            .expect_err("RF64 probe must reject table beyond one-MiB cap");
+        assert!(probe_error.contains("RF64 probe"), "{probe_error}");
+        assert!(probe_error.contains("working-set limit"), "{probe_error}");
+
+        let decode_error = decode_file_with_limits(file.path(), limits)
+            .expect_err("RF64 decode must reject table beyond one-MiB cap");
+        assert!(decode_error.contains("RF64 decode"), "{decode_error}");
+        assert!(decode_error.contains("working-set limit"), "{decode_error}");
+    }
+
+    #[test]
+    fn rf64_ds64_table_has_finite_entry_ceiling() {
+        let error =
+            rf64_table_working_bytes(MAX_RF64_SIZE_TABLE_ENTRIES, 1, 0, "RF64 test").unwrap_err();
+        assert!(error.contains("exceeds"), "{error}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn detected_ogg_handle_survives_path_replacement_before_decode() {
@@ -1976,13 +2369,9 @@ mod tests {
         std::fs::write(&replacement, flac_with_vendor(64)).expect("write replacement FLAC file");
         std::fs::rename(&replacement, &path).expect("atomically replace the path");
 
-        let decoded = decode_file_from_detected_file(
-            &path,
-            format,
-            source,
-            crate::metadata::MetadataLimits::default(),
-        )
-        .expect("decode must continue from the already-open Ogg inode");
+        let decoded =
+            decode_file_from_detected_file(&path, format, source, DecodeLimits::default())
+                .expect("decode must continue from the already-open Ogg inode");
         assert_eq!(decoded.sample_rate, 48_000);
         assert_eq!(decoded.n_channels(), 1);
         assert_eq!(decoded.frames(), 960);

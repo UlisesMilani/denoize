@@ -55,12 +55,14 @@ impl Metadata {
     }
 }
 
-/// Read metadata with finite default resource limits.
+/// Read metadata from a regular-file input with finite default resource limits.
+///
+/// FIFOs, directories, and device files are rejected before parsing.
 pub fn read_extended(input: &Path) -> Result<Option<Metadata>, String> {
     read_extended_with_limits(input, MetadataLimits::default())
 }
 
-/// Read metadata while enforcing caller-selected resource limits.
+/// Read metadata from a regular-file input with caller-selected resource limits.
 ///
 /// FLAC blocks and Ogg pages are inspected with streaming readers before
 /// Lofty is allowed to parse the generic tag. This bounds attacker-controlled
@@ -69,18 +71,30 @@ pub fn read_extended_with_limits(
     input: &Path,
     limits: MetadataLimits,
 ) -> Result<Option<Metadata>, String> {
+    let mut session = crate::input::AudioInputSession::open(input)?;
+    session.read_metadata_with_limits(limits)
+}
+
+/// Read metadata through an already validated regular-file handle.
+///
+/// The caller keeps ownership of the handle and may rewind it for subsequent
+/// probing or decoding. Detection, raw-container validation, and Lofty's
+/// generic parser all use this same open file description.
+pub(crate) fn read_extended_from_file_with_limits(
+    source_file: &mut File,
+    input: &Path,
+    limits: MetadataLimits,
+) -> Result<Option<Metadata>, String> {
     // Keep detection, the raw-container scan, and Lofty's generic read on one
     // open file description. Besides bounding each parser, this prevents a
     // pathname replacement from mixing raw comments from one inode with a
     // generic tag from another.
-    let mut source_file = File::open(input)
-        .map_err(|error| format!("open metadata from {}: {error}", input.display()))?;
-    let container = detect_file_container(&mut source_file)
+    let container = detect_file_container(source_file)
         .map_err(|error| format!("read metadata signature from {}: {error}", input.display()))?;
     let mut raw_budget = MetadataBudget::new(limits);
     let vorbis_comments = match container {
-        RawContainer::Flac => flac::read_file(&mut source_file, &limits, &mut raw_budget)?,
-        RawContainer::Ogg => ogg::read_file(&mut source_file, &limits, &mut raw_budget)?,
+        RawContainer::Flac => flac::read_file(source_file, &limits, &mut raw_budget)?,
+        RawContainer::Ogg => ogg::read_file(source_file, &limits, &mut raw_budget)?,
         RawContainer::Other => None,
     };
 
@@ -97,7 +111,7 @@ pub fn read_extended_with_limits(
     }
 
     configure_lofty(limits);
-    let source = match read_lofty_file(&mut source_file, limits) {
+    let source = match read_lofty_file(source_file, limits) {
         Ok(source) => source,
         // Audio decoding intentionally supports some containers for which
         // Lofty has no tag reader. Treat those as having no generic metadata.
@@ -157,9 +171,12 @@ pub fn write_extended_with_limits(
     validate_metadata(&metadata, limits)?;
 
     let mut transaction = AtomicOutput::new(output)?;
+    // Reject FIFOs, devices, and directories before reading any destination
+    // bytes. Opening the transaction first fixes the canonical destination
+    // parent, while dropping it after a rejection removes only the empty stage.
     let fixed_output = transaction.destination_path().to_path_buf();
-    let mut source = File::open(&fixed_output)
-        .map_err(|error| format!("open output metadata from {}: {error}", output.display()))?;
+    let source_session = crate::input::AudioInputSession::open(&fixed_output)?;
+    let mut source = source_session.into_file_rewound("output metadata source")?;
     io::copy(&mut source, transaction.file_mut())
         .map_err(|error| format!("stage output metadata from {}: {error}", output.display()))?;
     drop(source);
@@ -1533,5 +1550,38 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("aggregate limit"));
         assert_eq!(fs::read(output.path()).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_write_rejects_fifo_without_replacing_or_opening_it_for_io() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("output.fifo");
+        let output_name = CString::new(output.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `output_name` is NUL terminated and names a path in the
+        // private test directory.
+        assert_eq!(unsafe { libc::mkfifo(output_name.as_ptr(), 0o600) }, 0);
+        let before = fs::symlink_metadata(&output).unwrap();
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.set_title("must not be published".into());
+        let error = write_extended(
+            Metadata {
+                tag,
+                vorbis_comments: None,
+            },
+            &output,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not a regular file"), "{error}");
+        let after = fs::symlink_metadata(&output).unwrap();
+        assert!(after.file_type().is_fifo());
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

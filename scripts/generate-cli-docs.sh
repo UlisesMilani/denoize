@@ -57,6 +57,19 @@ decisions; a second denoize batch for that directory fails immediately. Both
 state names (`.denoize-state` and the legacy `.denoize-gui-state`) and the lock
 name are rejected as planned outputs.
 
+Filesystem audio inputs are opened as regular files; FIFOs, directories, and
+device files are rejected before parsing or output staging. Within each
+processing phase, size estimation, probing, decoding, and metadata reads use
+the same opened filesystem object rather than reopening its pathname.
+
+`--max-memory` limits denoize-owned decoded PCM capacity, explicitly accounted
+codec scratch space, and native metadata budgets per input/worker. Some private
+allocations inside third-party codec libraries fall outside this enforcement,
+and allocator capacity rounding means it is not an exact process-RSS ceiling.
+Batch workers can run concurrently; reduce `--jobs` when targeting a
+whole-process memory ceiling. Standard-input WAV uses its separate bounded
+buffering path.
+
 On Unix, the batch output root must be owned by the current user and must not be
 group/world writable. On Windows, use an ACL-capable local filesystem and an
 output root that is not writable by untrusted accounts; newly created state and

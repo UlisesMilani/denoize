@@ -1,24 +1,25 @@
 //! `denoize` command-line interface.
 
 use denoize::audio::{
-    ensure_memory_limit, estimate_audio_working_set_bytes, estimate_file_memory_bytes,
-    estimate_stream_memory_bytes_checked, read_audio, read_audio_with_metadata_limits,
-    read_wav_bytes, write_wav_bytes, write_wav_channel_mask_to_file, WavStreamReader,
-    WavStreamWriter,
+    ensure_memory_limit, estimate_audio_working_set_bytes, estimate_session_memory_bytes,
+    estimate_stream_memory_bytes_checked, inspect_wav_session, read_audio,
+    read_audio_from_session_with_limits, read_wav_bytes_with_limits, write_wav_bytes,
+    write_wav_channel_mask_to_file, WavStreamReader, WavStreamWriter,
 };
 use denoize::batch_resume::{
-    self, BatchSession, ConsumedModel, Digest, MetadataPolicy, ResumeDecision, ResumeExpectation,
-    LEGACY_DESKTOP_STATE_FILE_NAME, LOCK_FILE_NAME, STATE_FILE_NAME,
+    self, BatchSession, ConsumedModel, Digest, FileFingerprint, MetadataPolicy, ResumeDecision,
+    ResumeExpectation, LEGACY_DESKTOP_STATE_FILE_NAME, LOCK_FILE_NAME, STATE_FILE_NAME,
 };
 use denoize::config::{MAX_SAMPLE_RATE, MAX_STREAM_BLOCK_FRAMES};
 use denoize::decode::{
-    probe_file_with_metadata_limits as probe_audio_file_with_metadata_limits, AudioCodec,
-    AudioFormat, AudioProbe,
+    probe_file_from_session_with_limits as probe_audio_session_with_limits, AudioCodec,
+    AudioFormat, AudioProbe, DecodeLimits,
 };
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::metadata::MetadataLimits;
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
+use denoize::AudioInputSession;
 use denoize::{
     AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, ChannelMode, CommitMode,
     DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile, StreamingDenoiser,
@@ -265,7 +266,7 @@ OPTIONS:
         --batch               process files in INPUT directory into OUTPUT directory
         --stream              bounded-memory classical WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
-        --max-memory <MB>     checked working-set and metadata limit in MiB (minimum: 1)
+        --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --recursive           include subdirectories in batch mode
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
@@ -783,10 +784,16 @@ fn metadata_limits_for_available_bytes(available: Option<u64>) -> MetadataLimits
     limits
 }
 
-fn decode_metadata_limits(max_memory_mb: Option<usize>) -> Result<MetadataLimits, String> {
-    Ok(metadata_limits_for_available_bytes(
-        checked_memory_limit_bytes(max_memory_mb)?,
+fn decode_limits(max_memory_mb: Option<usize>) -> Result<DecodeLimits, String> {
+    let max_working_set_bytes = checked_memory_limit_bytes(max_memory_mb)?;
+    Ok(DecodeLimits::new(
+        metadata_limits_for_available_bytes(max_working_set_bytes),
+        max_working_set_bytes,
     ))
+}
+
+fn decode_metadata_limits(max_memory_mb: Option<usize>) -> Result<MetadataLimits, String> {
+    Ok(decode_limits(max_memory_mb)?.metadata)
 }
 
 fn retained_metadata_limits(
@@ -861,23 +868,38 @@ fn preflight_batch_items(
     let mut model_fingerprints =
         std::collections::HashMap::<(std::path::PathBuf, u32), ConsumedModel>::new();
     let mut prepared = Vec::with_capacity(items.len());
-    let decode_limits = decode_metadata_limits(ov.max_memory_mb)?;
+    let decode_limits = decode_limits(ov.max_memory_mb)?;
     for item in items {
-        let input_fingerprint = batch_resume::fingerprint_file(&item.input).map_err(|error| {
+        let mut input_session = AudioInputSession::open(&item.input).map_err(|error| {
             format!(
-                "fingerprint batch input {} during preflight: {error}",
+                "open batch input {} during preflight: {error}",
                 item.input.display()
             )
         })?;
-        let estimate = estimate_file_memory_bytes(&item.input).map_err(|error| {
-            format!(
-                "batch input preflight failed for {}: {error}",
+        let current_probe = probe_audio_session_with_limits(&mut input_session, decode_limits)
+            .map_err(|error| {
+                format!(
+                    "probe batch input {} during preflight: {error}",
+                    item.input.display()
+                )
+            })?;
+        if current_probe != item.probe {
+            return Err(format!(
+                "batch input codec/container changed after planning: {}",
                 item.input.display()
-            )
-        })?;
+            ));
+        }
+        let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)
+            .map_err(|error| {
+                format!(
+                    "fingerprint batch input {} during preflight: {error}",
+                    item.input.display()
+                )
+            })?;
+        let estimate = estimate_session_memory_bytes(&input_session);
         ensure_memory_limit(estimate, ov.max_memory_mb, "batch input preflight")?;
-        let audio =
-            read_audio_with_metadata_limits(&item.input, decode_limits).map_err(|error| {
+        let audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)
+            .map_err(|error| {
                 format!(
                     "decode batch input {} during preflight: {error}",
                     item.input.display()
@@ -891,14 +913,14 @@ fn preflight_batch_items(
         )?;
         if !ov.no_metadata {
             let metadata_limits = retained_metadata_limits(ov.max_memory_mb, decoded_working_set)?;
-            denoize::metadata::read_extended_with_limits(&item.input, metadata_limits).map_err(
-                |error| {
+            input_session
+                .read_metadata_with_limits(metadata_limits)
+                .map_err(|error| {
                     format!(
                         "read batch input metadata {} during preflight: {error}",
                         item.input.display()
                     )
-                },
-            )?;
+                })?;
         }
         item.output_format
             .validate_config(&audio, &options)
@@ -1495,6 +1517,8 @@ fn run_one_with_output_format(
         pre_resolved_backend_options,
         None,
         None,
+        None,
+        None,
         true,
     )?;
     let Some(staged) = staged else {
@@ -1528,6 +1552,8 @@ fn process_one_to_staged_output(
     pre_resolved_backend_options: Option<BackendOptions>,
     pre_resolved_processing: Option<service::ResolvedProcessingOptions>,
     recipe_metadata_policy: Option<MetadataPolicy>,
+    expected_input_probe: Option<AudioProbe>,
+    expected_input_fingerprint: Option<FileFingerprint>,
     inspect_destination: bool,
 ) -> Result<Option<StagedProcessOutput>, String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
@@ -1555,16 +1581,47 @@ fn process_one_to_staged_output(
     if inspect_destination && output_format.is_some() {
         ensure_output_available(output, ov.force)?;
     }
-    if !standard_input {
-        let estimate = estimate_file_memory_bytes(input)?;
+    let mut input_session = if standard_input {
+        None
+    } else {
+        Some(AudioInputSession::open(input)?)
+    };
+    if let (Some(session), Some(expected)) = (&mut input_session, expected_input_probe) {
+        let current = probe_audio_session_with_limits(session, decode_limits(ov.max_memory_mb)?)?;
+        if current != expected {
+            return Err(format!(
+                "input codec/container changed after batch preflight: {}",
+                input.display()
+            ));
+        }
+    }
+    if let (Some(session), Some(expected)) = (&mut input_session, expected_input_fingerprint) {
+        let current = batch_resume::fingerprint_input_session(session)?;
+        if current != expected {
+            return Err(format!(
+                "input bytes changed after batch preflight: {}",
+                input.display()
+            ));
+        }
+    }
+    if let Some(session) = &input_session {
+        let estimate = estimate_session_memory_bytes(session);
         ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
     }
-    let decode_limits = decode_metadata_limits(ov.max_memory_mb)?;
+    let decode_limits = decode_limits(ov.max_memory_mb)?;
     let mut audio = if standard_input {
         let stdin = std::io::stdin();
-        read_wav_bytes(read_stdin_bytes(stdin.lock(), ov.max_memory_mb)?)?
+        read_wav_bytes_with_limits(
+            read_stdin_bytes(stdin.lock(), ov.max_memory_mb)?,
+            decode_limits,
+        )?
     } else {
-        read_audio_with_metadata_limits(input, decode_limits)?
+        read_audio_from_session_with_limits(
+            input_session
+                .as_mut()
+                .expect("filesystem input session was opened"),
+            decode_limits,
+        )?
     };
     let decoded_working_set = estimate_audio_working_set_bytes(&audio);
     ensure_memory_limit(
@@ -1574,7 +1631,10 @@ fn process_one_to_staged_output(
     )?;
     let metadata_limits = retained_metadata_limits(ov.max_memory_mb, decoded_working_set)?;
     let metadata = if !standard_input && !ov.no_metadata {
-        denoize::metadata::read_extended_with_limits(input, metadata_limits)?
+        input_session
+            .as_mut()
+            .expect("filesystem input session was opened")
+            .read_metadata_with_limits(metadata_limits)?
     } else {
         None
     };
@@ -1704,9 +1764,10 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     }
     ensure_output_available(output_path, ov.force)?;
 
-    let mut reader = WavStreamReader::open(input_path)?;
-    let spec = reader.spec();
-    let channel_mask = reader.channel_mask();
+    let mut input_session = AudioInputSession::open(input_path)?;
+    let stream_info = inspect_wav_session(&mut input_session)?;
+    let spec = stream_info.spec;
+    let channel_mask = stream_info.channel_mask;
     validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
@@ -1737,10 +1798,11 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     // neither a destination nor a temporary `.part` file behind.
     let mut processor = StreamingDenoiser::new(cfg, spec.channels as usize)?;
     let metadata = if !ov.no_metadata {
-        denoize::metadata::read_extended_with_limits(input_path, metadata_limits)?
+        input_session.read_metadata_with_limits(metadata_limits)?
     } else {
         None
     };
+    let mut reader = WavStreamReader::from_session(input_session)?;
     let mut transaction = AtomicOutput::new(output_path)?;
     let frames = (|| -> Result<usize, String> {
         let sink = std::io::BufWriter::new(transaction.file_mut());
@@ -1819,6 +1881,7 @@ struct BatchItem {
     destination: std::path::PathBuf,
     destination_relative: std::path::PathBuf,
     output_format: OutputFormat,
+    probe: AudioProbe,
 }
 
 #[derive(Clone)]
@@ -1881,21 +1944,21 @@ fn plan_batch_files(
     files: Vec<std::path::PathBuf>,
     output_extension: Option<&str>,
 ) -> Result<Vec<BatchItem>, String> {
-    plan_batch_files_with_metadata_limits(
+    plan_batch_files_with_limits(
         input_dir,
         output_dir,
         files,
         output_extension,
-        MetadataLimits::default(),
+        DecodeLimits::default(),
     )
 }
 
-fn plan_batch_files_with_metadata_limits(
+fn plan_batch_files_with_limits(
     input_dir: &std::path::Path,
     output_dir: &std::path::Path,
     files: Vec<std::path::PathBuf>,
     output_extension: Option<&str>,
-    metadata_limits: MetadataLimits,
+    decode_limits: DecodeLimits,
 ) -> Result<Vec<BatchItem>, String> {
     let mut items = Vec::with_capacity(files.len());
     for input in files {
@@ -1914,7 +1977,9 @@ fn plan_batch_files_with_metadata_limits(
             destination.set_extension(extension);
         }
 
-        let probe = probe_audio_file_with_metadata_limits(&input, metadata_limits)
+        let mut input_session = AudioInputSession::open(&input)
+            .map_err(|error| format!("open batch input {}: {error}", input.display()))?;
+        let probe = probe_audio_session_with_limits(&mut input_session, decode_limits)
             .map_err(|error| format!("probe batch input {}: {error}", input.display()))?;
         if probe.audio_tracks != 1 {
             return Err(format!(
@@ -1976,6 +2041,7 @@ fn plan_batch_files_with_metadata_limits(
             destination,
             destination_relative,
             output_format,
+            probe,
         });
     }
     validate_batch_destinations(input_dir, &items)?;
@@ -2152,12 +2218,12 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     if files.is_empty() {
         return Err("batch input contains no supported audio files".into());
     }
-    let items = plan_batch_files_with_metadata_limits(
+    let items = plan_batch_files_with_limits(
         input_dir,
         output_dir,
         files,
         output_extension,
-        decode_metadata_limits(ov.max_memory_mb)?,
+        decode_limits(ov.max_memory_mb)?,
     )?;
     let state_path = output_dir.join(STATE_FILE_NAME);
     let legacy_state_path = output_dir.join(LEGACY_DESKTOP_STATE_FILE_NAME);
@@ -2231,6 +2297,8 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             None,
             Some(planned.prepared.resolved_processing.clone()),
             Some(metadata_policy),
+            Some(item.probe),
+            Some(planned.prepared.expectation.input_fingerprint()),
             false,
         ) {
             Ok(staged) => staged,

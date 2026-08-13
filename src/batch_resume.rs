@@ -437,6 +437,19 @@ pub fn fingerprint_file(path: &Path) -> Result<FileFingerprint, String> {
     fingerprint_file_after_hash(path, || Ok(()))
 }
 
+/// Fingerprint the regular file already held by an audio input session.
+///
+/// Unlike [`fingerprint_file`], this intentionally does not reopen the
+/// pathname: the digest remains bound to the same filesystem object that the
+/// caller will use for metadata extraction and decoding.
+pub fn fingerprint_input_session(
+    session: &mut crate::input::AudioInputSession,
+) -> Result<FileFingerprint, String> {
+    let path = session.path().to_path_buf();
+    let mut file = session.try_clone_rewound("input fingerprint")?;
+    fingerprint_open_file(&mut file, &path, false)
+}
+
 fn fingerprint_file_after_hash(
     path: &Path,
     after_hash: impl FnOnce() -> Result<(), String>,
@@ -462,16 +475,7 @@ fn fingerprint_file_after_hash(
 }
 
 fn open_content_file(path: &Path) -> Result<File, String> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    options
-        .open(path)
-        .map_err(|error| format!("open content file {}: {error}", path.display()))
+    crate::input::AudioInputSession::open(path)?.into_file_rewound("content file")
 }
 
 fn fingerprint_open_file(
@@ -2606,6 +2610,26 @@ mod tests {
 
         assert!(error.contains("content path changed while hashing"));
         assert_eq!(std::fs::read(&input).unwrap(), b"other-bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_fingerprint_stays_bound_to_open_inode_after_path_replacement() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.bin");
+        let replacement = directory.path().join("replacement.bin");
+        write(&input, b"old-content");
+        write(&replacement, b"new-content");
+
+        let mut session = crate::input::AudioInputSession::open(&input).unwrap();
+        let old_fingerprint = fingerprint_input_session(&mut session).unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        assert_eq!(
+            fingerprint_input_session(&mut session).unwrap(),
+            old_fingerprint
+        );
+        assert_ne!(fingerprint_file(&input).unwrap(), old_fingerprint);
     }
 
     #[test]
