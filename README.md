@@ -50,7 +50,7 @@ models; spectral models and diffusion samplers require dedicated adapters.
 | AIFF/AIFC | `symphonia` | PCM and supported AIFC codecs |
 | CAF | `symphonia` | PCM and ALAC/other supported CAF codecs |
 | MP3 | `symphonia` + bounded `nanomp3` fallback (Pure Rust) | Xing/Info + LAME gapless trim, ID3v2, no resampling |
-| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | AAC-LC/ALAC decode with MP4 v0/v1 unity-rate edit-list timing; MP4 AAC-LC access units above 8,191 bytes are rejected (ALAC is unaffected) |
+| M4A/AAC/ALAC | `oxideav-aac` + `symphonia` fallback | AAC-LC/ALAC decode with MP4 v0/v1 unity-rate edit-list timing; MP4 AAC-LC uses the 24-bit MPEG-4 buffer/sample safety ceiling and charges payload-proportional decoder work before access-unit allocation when `--max-memory` is set (ALAC is unaffected) |
 | FLAC | `claxon` | Lossless FLAC |
 | Ogg Opus/Vorbis | `opus` + `ogg` / `symphonia` | Mono/stereo; native sample rate decode |
 
@@ -493,9 +493,10 @@ The `GitHub Release` workflow verifies that the tag is on the default branch and
 matches every release version field, runs the full test suite, and builds all
 CLI and desktop targets before publishing the crates.io package. It then checks
 all archives, checksums, signatures, and updater metadata before publishing the
-draft release and generated notes. Installed desktop apps check the signed
-`latest.json` feed on startup; updates are only installed after user
-confirmation. The updater private key is kept in the
+draft release and generated notes. When `docs/releases/vTAG.md` exists, its
+curated notes are prepended to the generated notes. Installed desktop apps
+check the signed `latest.json` feed on startup; updates are only installed
+after user confirmation. The updater private key is kept in the
 `TAURI_SIGNING_PRIVATE_KEY` repository secret. A failed build leaves the release
 as a draft and cannot publish the crate before every target has built.
 
@@ -748,6 +749,11 @@ The resume/force decision is deliberately conservative:
 content, and output content. Symlinks, multiply linked files, directories, and
 special files are never accepted as completed outputs; directories and special
 files remain non-replaceable even with `--force`.
+
+The denoize package version participates in the v3 recipe hash. After a package
+upgrade, `--resume` preserves an existing output and reports `recipeChanged`
+unless `--force` is supplied. Regenerate it once with `--force` to migrate the
+saved recipe; subsequent identical runs skip it normally.
 
 Resumable ONNX-backed batches require a self-contained `.onnx` model. ONNX
 models that declare external tensor sidecars remain usable in ordinary

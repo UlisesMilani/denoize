@@ -83,11 +83,18 @@ jobs:
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "Release $GITHUB_REF_NAME already exists; reusing it."
           else
-            gh release create "$GITHUB_REF_NAME" \
-              --draft \
-              --verify-tag \
-              --generate-notes \
+            release_args=(
+              --draft
+              --verify-tag
+              --generate-notes
               --title "denoize $GITHUB_REF_NAME"
+            )
+            notes_file="docs/releases/${GITHUB_REF_NAME}.md"
+            if [[ -f "$notes_file" ]]; then
+              echo "Prepending curated release notes from $notes_file."
+              release_args+=(--notes-file "$notes_file")
+            fi
+            gh release create "$GITHUB_REF_NAME" "${release_args[@]}"
           fi
 
   build:
