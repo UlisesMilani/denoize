@@ -27,6 +27,7 @@ include = [
     "LICENSE",
     "LICENSES/*.txt",
     "README.md",
+    "ROADMAP.md",
     "THIRD_PARTY.md",
     "src/**/*.rs",
     "examples/**/*.rs",
