@@ -12,7 +12,9 @@
 //! The module-level [`process`] function remains as a one-call convenience
 //! wrapper.
 
+use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
+use crate::AcceleratorRuntime;
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
@@ -74,7 +76,7 @@ impl OnnxWaveformContract {
 
 struct CompiledWaveformModel {
     input_samples: usize,
-    runnable: Arc<TypedRunnableModel<TypedModel>>,
+    runnable: SharedRunnable,
 }
 
 /// A parsed waveform ONNX model that can be reused across inference calls.
@@ -90,12 +92,21 @@ pub struct OnnxWaveformModel {
     config: OnnxModelConfig,
     contract: OnnxWaveformContract,
     template: InferenceModel,
+    runtime: AcceleratorRuntime,
     compiled: Mutex<Option<CompiledWaveformModel>>,
 }
 
 impl OnnxWaveformModel {
     /// Parse and validate a waveform ONNX model.
     pub fn load(config: OnnxModelConfig) -> Result<Self, String> {
+        Self::load_with_accelerator(config, AcceleratorRuntime::Cpu)
+    }
+
+    /// Parse and validate a waveform model for a selected runtime.
+    pub fn load_with_accelerator(
+        config: OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
         config
             .validate_config()
             .map_err(|error| error.to_string())?;
@@ -127,6 +138,7 @@ impl OnnxWaveformModel {
             config,
             contract,
             template,
+            runtime,
             compiled: Mutex::new(None),
         })
     }
@@ -172,7 +184,7 @@ impl OnnxWaveformModel {
         let shape = self.contract.layout.shape(input_samples);
         let model = self.compiled_model(input_samples)?;
         let process_channel = |(model_input, original): (&Vec<f64>, &Vec<f64>)| {
-            let model_output = run_model(model_input, &shape, &model)?;
+            let model_output = run_model(model_input, &shape, model.as_ref())?;
             let mut output = crate::resample::resample(
                 &model_output,
                 self.config.sample_rate,
@@ -197,10 +209,7 @@ impl OnnxWaveformModel {
         }
     }
 
-    fn compiled_model(
-        &self,
-        input_samples: usize,
-    ) -> Result<Arc<TypedRunnableModel<TypedModel>>, String> {
+    fn compiled_model(&self, input_samples: usize) -> Result<SharedRunnable, String> {
         if let Some(required) = self.contract.fixed_input_samples {
             if input_samples != required {
                 return Err(format!(
@@ -237,12 +246,8 @@ impl OnnxWaveformModel {
         model
             .set_output_fact(0, f32::fact(output_shape).into())
             .map_err(tract_error)?;
-        let runnable = Arc::new(
-            model
-                .into_optimized()
-                .and_then(|model| model.into_runnable())
-                .map_err(tract_error)?,
-        );
+        let model = model.into_typed().map_err(tract_error)?;
+        let runnable = super::tract_runtime::prepare(model, self.runtime, "ONNX waveform model")?;
         *compiled = Some(CompiledWaveformModel {
             input_samples,
             runnable: Arc::clone(&runnable),
@@ -384,14 +389,16 @@ fn validate_unit_dimension(
 fn run_model(
     input: &[f64],
     shape: &[usize],
-    runnable: &TypedRunnableModel<TypedModel>,
+    runnable: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f64>, String> {
     let samples: Vec<f32> = input.iter().map(|&sample| sample as f32).collect();
     let tensor = Tensor::from_shape(shape, &samples).map_err(tract_error)?;
     let outputs = runnable
         .run(tvec!(tensor.into_tvalue()))
         .map_err(tract_error)?;
-    let output = outputs[0].to_array_view::<f32>().map_err(tract_error)?;
+    let output = outputs[0]
+        .to_plain_array_view::<f32>()
+        .map_err(tract_error)?;
 
     if output.len() < input.len() {
         return Err(format!(

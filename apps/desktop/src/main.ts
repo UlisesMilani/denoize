@@ -7,21 +7,27 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check } from "@tauri-apps/plugin-updater";
 import "./styles.css";
 
-type BackendInfo = { name: string; externalModel: boolean; managedModel: string | null; sampleRate: number | null };
-type AppInfo = { version: string; backends: BackendInfo[]; formats: string[]; fdkAvailable: boolean };
+type BackendInfo = { name: string; externalModel: boolean; managedModel: string | null; sampleRate: number | null; accelerated: boolean };
+type AcceleratorInfo = {
+  name: string; compiled: boolean; available: boolean; device: string | null;
+  memoryBytes: number | null; computeCapability: string | null; detail: string | null;
+};
+type AppInfo = { version: string; backends: BackendInfo[]; formats: string[]; fdkAvailable: boolean; accelerators: AcceleratorInfo[] };
 type GuiConfig = {
   backend: string; preset: string; mode: string; strength: number; adaptive_noise: boolean; vad: boolean;
   channels: string; downmix: string; loudness_lufs?: number | null; true_peak_dbtp?: number | null;
   preserve_metadata: boolean; force: boolean; mp3_bitrate_kbps: number; m4a_bitrate_kbps: number;
   aac_encoder: string; onnx_model?: string | null; onnx_rate: number; sgmse_profile: string;
-  deterministic: boolean;
+  accelerator: string; deterministic: boolean;
 };
 type JobProgress = {
   jobId: number; kind: string; status: string; message: string; current: number; total: number;
   fraction: number; elapsedSeconds: number; output?: string; error?: string; etaSeconds?: number;
   item?: string; itemStatus?: "completed" | "failed" | "skipped" | "cancelled";
   itemId?: string; resumeReason?: string;
+  accelerator?: AcceleratorSelection | null;
 };
+type AcceleratorSelection = { requested: string; effective: string; fallback: string | null };
 type Comparison = {
   markdown: string; json: string; html: string; noisySnrDb: number; enhancedSnrDb: number; improvementDb: number;
   metrics: {
@@ -95,6 +101,7 @@ type LiveEvent = {
   status: "running" | "stopped" | "failed"; message: string; sampleRate: number;
   inputChannels: number; outputChannels: number; chunkFrames: number;
   inputLevel: number; outputLevel: number; processedChunks: number; droppedChunks: number;
+  accelerator?: AcceleratorSelection | null;
 };
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
@@ -152,6 +159,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                 <label>モード<select id="mode"><option value="speech">音声</option><option value="music">音楽</option><option value="ambient">環境音</option></select></label>
                 <label>プリセット<select id="preset"><option value="hifi">Hi-Fi</option><option value="speech">Speech</option><option value="music">Music</option><option value="gentle">Gentle</option><option value="aggressive">Aggressive</option><option value="restore">Restore</option></select></label>
                 <label>バックエンド<select id="backend"><option value="auto">自動</option></select></label>
+                <label>アクセラレータ<select id="accelerator"><option value="cpu">CPU</option><option value="auto">自動</option></select></label>
               </div>
               <div id="backend-settings" class="backend-settings hidden">
                 <div class="file-row"><div><label>ONNXモデル</label><div id="model-path-display" class="path empty">モデルファイルを選択</div></div><button class="secondary" id="choose-model">選択</button></div>
@@ -270,7 +278,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
-const settingIds = ["mode", "preset", "backend", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
+const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
 type SavedValues = Record<string, string | number | boolean>;
 
 function captureSettings(): SavedValues {
@@ -436,6 +444,7 @@ function options(backend = $<HTMLSelectElement>("#backend").value) {
     onnxModel: onnxModelForBackend(backend),
     onnxSampleRate: onnxRateForBackend(backend),
     sgmseProfile: $<HTMLSelectElement>("#sgmse-profile").value,
+    accelerator: $<HTMLSelectElement>("#accelerator").value,
     deterministic: $<HTMLInputElement>("#deterministic").checked,
   };
 }
@@ -453,18 +462,50 @@ async function init() {
       liveBackend.add(new Option(label, name));
     }
   });
+  const accelerator = $<HTMLSelectElement>("#accelerator");
+  const gpuAvailable = appInfo.accelerators.some(({ name, available }) => name !== "cpu" && available);
+  const gpu = new Option("GPU（Metal → CUDA）", "gpu");
+  gpu.disabled = !gpuAvailable;
+  accelerator.add(gpu);
+  appInfo.accelerators.filter(({ name }) => name !== "cpu").forEach((runtime) => {
+    const capabilities = [
+      runtime.device,
+      runtime.memoryBytes == null ? null : formatDeviceMemory(runtime.memoryBytes),
+      runtime.computeCapability == null ? null : `CC ${runtime.computeCapability}`,
+    ].filter((value): value is string => value != null);
+    const summary = capabilities.length === 0 ? "" : ` — ${capabilities.join(" · ")}`;
+    const option = new Option(`${runtime.name.toUpperCase()}${summary}${runtime.available ? "" : "（利用不可）"}`, runtime.name);
+    option.disabled = !runtime.available;
+    option.title = runtime.detail ?? capabilities.join(" · ");
+    accelerator.add(option);
+  });
   if (appInfo.fdkAvailable) $<HTMLSelectElement>("#aac-encoder").add(new Option("FDK-AAC", "fdk"));
   await loadLiveDevices();
   restoreSettings();
+  updateBackendSettings();
   renderCompareInputs();
   await loadModels();
   window.setTimeout(() => void checkForUpdate(false), 1500);
+}
+
+function formatDeviceMemory(bytes: number): string {
+  const gib = 1024 ** 3;
+  const mib = 1024 ** 2;
+  return bytes >= gib ? `${(bytes / gib).toFixed(1)} GiB` : `${(bytes / mib).toFixed(1)} MiB`;
 }
 
 function updateBackendSettings(useDescriptorRate = false) {
   const selected = $<HTMLSelectElement>("#backend").value;
   const descriptor = appInfo.backends.find(({ name }) => name === selected);
   const needsModel = descriptor?.externalModel ?? false;
+  const accelerator = $<HTMLSelectElement>("#accelerator");
+  for (const option of Array.from(accelerator.options)) {
+    if (["gpu", "metal", "cuda"].includes(option.value)) {
+      const runtime = appInfo.accelerators.find(({ name }) => name === option.value);
+      option.disabled = descriptor?.accelerated !== true || (option.value === "gpu" ? !appInfo.accelerators.some(({ name, available }) => name !== "cpu" && available) : runtime?.available !== true);
+    }
+  }
+  if (accelerator.selectedOptions[0]?.disabled) accelerator.value = "auto";
   $("#backend-settings").classList.toggle("hidden", !needsModel);
   $("#sgmse-profile-field").classList.toggle("hidden", selected !== "sgmse");
   if (useDescriptorRate && descriptor?.sampleRate) $<HTMLInputElement>("#onnx-rate").value = String(descriptor.sampleRate);
@@ -511,7 +552,7 @@ function exportConfig() {
     mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
     aac_encoder: values["aac-encoder"], onnx_model: onnxModelForBackend(backend, String(values["model-path"])),
     onnx_rate: onnxRateForBackend(backend, Number(values["onnx-rate"])), sgmse_profile: values["sgmse-profile"],
-    deterministic: values.deterministic,
+    accelerator: values.accelerator, deterministic: values.deterministic,
   };
 }
 $("#export-config").addEventListener("click", async () => {
@@ -530,7 +571,7 @@ $("#import-config").addEventListener("click", async () => {
       "mp3-bitrate": config.mp3_bitrate_kbps, "aac-bitrate": config.m4a_bitrate_kbps,
       "aac-encoder": config.aac_encoder, "model-path": config.onnx_model ?? "",
       "onnx-rate": config.onnx_rate, "sgmse-profile": config.sgmse_profile,
-      deterministic: config.deterministic,
+      accelerator: config.accelerator, deterministic: config.deterministic,
     };
     applyAndSaveSettings(values); showToast("設定を読み込みました");
   } catch (error) { showToast(errorText(error), true); }
@@ -1120,7 +1161,8 @@ listen<LiveEvent>("live-status", ({ payload }) => {
   $("#live-status").textContent = payload.message;
   $<HTMLElement>("#live-input-level").style.width = `${Math.min(100, payload.inputLevel * 100)}%`;
   $<HTMLElement>("#live-output-level").style.width = `${Math.min(100, payload.outputLevel * 100)}%`;
-  $("#live-meta").textContent = payload.sampleRate ? `${payload.sampleRate.toLocaleString()} Hz · 入力 ${payload.inputChannels}ch / 出力 ${payload.outputChannels}ch · ${payload.chunkFrames} frames` : "開始すると入出力レベルを表示します";
+  const accelerator = payload.accelerator ? ` · ${payload.accelerator.effective.toUpperCase()}${payload.accelerator.fallback ? ` (${payload.accelerator.fallback})` : ""}` : "";
+  $("#live-meta").textContent = payload.sampleRate ? `${payload.sampleRate.toLocaleString()} Hz · 入力 ${payload.inputChannels}ch / 出力 ${payload.outputChannels}ch · ${payload.chunkFrames} frames${accelerator}` : "開始すると入出力レベルを表示します";
   $("#live-counters").textContent = `処理 ${payload.processedChunks} · ドロップ ${payload.droppedChunks}`;
   if (payload.status !== "running") {
     $("#start-live").classList.remove("hidden"); $("#stop-live").classList.add("hidden");
@@ -1169,7 +1211,8 @@ async function beginJob(kind: "file" | "batch", command: "start_process" | "star
 function updateProgress(progress: JobProgress) {
   const percent = Math.round(progress.fraction * 100);
   $("#progress-percent").textContent = `${percent}%`; $("#progress-message").textContent = progress.message;
-  $("#progress-meta").textContent = `${progress.current} / ${progress.total} · ${progress.elapsedSeconds.toFixed(1)}秒${progress.etaSeconds != null ? ` · 残り約${progress.etaSeconds.toFixed(0)}秒` : ""}`;
+  const accelerator = progress.accelerator ? ` · ${progress.accelerator.effective.toUpperCase()}${progress.accelerator.fallback ? ` (${progress.accelerator.fallback})` : ""}` : "";
+  $("#progress-meta").textContent = `${progress.current} / ${progress.total} · ${progress.elapsedSeconds.toFixed(1)}秒${progress.etaSeconds != null ? ` · 残り約${progress.etaSeconds.toFixed(0)}秒` : ""}${accelerator}`;
   $<HTMLElement>("#progress-bar").style.width = `${percent}%`;
   if (progress.kind === "batch") $("#batch-summary").textContent = `${progress.message}  ${progress.current}/${progress.total}`;
 }

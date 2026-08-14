@@ -58,6 +58,30 @@ recipe digest; streaming results and multi-recipe summaries use `null`. Consumer
 must ignore fields added within a schema version. Versioned schemas ship in each
 release and are documented in `docs/json.md`.
 
+`denoize hardware --json` emits the network-free `denoize-hardware-v1`
+capability snapshot. It lists CPU features, compiled Metal/CUDA runtimes, local
+runtime availability, available GPU device names and memory limits, CUDA
+compute capability, and the backends that can use an accelerator. `--pretty`
+emits the same contract indented. File and streaming JSON results include the
+requested and effective accelerator plus an explicit CPU fallback reason.
+
+## Hardware acceleration
+
+CPU remains the compatibility default. `--accelerator auto` selects an
+available Metal or CUDA runtime for supported tract backends and otherwise
+falls back to CPU with a reported reason. `gpu`, `metal`, and `cuda` are strict
+requests. With an explicit backend they fail before input decoding when the
+backend or runtime is unavailable; automatic backend selection must inspect
+the decoded input first. Deterministic processing always uses CPU: `auto` reports a
+deterministic fallback, while a strict GPU request is rejected. The effective
+runtime participates in finite-file batch recipe identity.
+
+CUDA availability requires a compatible driver, CUDA runtime, NVRTC, cuBLAS,
+cuDNN, CUDA and CCCL development headers, and a writable tract kernel cache.
+The first CUDA model preparation may compile cached kernels. Capability
+discovery validates the host prerequisites but does not promise that every
+user-supplied ONNX graph can be transformed for a GPU.
+
 ## Batch resume state
 
 CLI and desktop batches share the `.denoize-state` v3 journal in the output
@@ -92,8 +116,10 @@ the same opened filesystem object rather than reopening its pathname.
 
 `--max-memory` limits denoize-owned decoded PCM capacity, explicitly accounted
 codec scratch space, and native metadata budgets per input/worker. Some private
-allocations inside third-party codec libraries fall outside this enforcement,
-and allocator capacity rounding means it is not an exact process-RSS ceiling.
+allocations inside third-party codec or model runtimes fall outside this
+enforcement, GPU device memory is not charged, and allocator capacity rounding
+means it is not an exact process-RSS ceiling. Use CPU when a GPU-memory ceiling
+cannot be managed externally.
 Batch workers can run concurrently; reduce `--jobs` when targeting a
 whole-process memory ceiling. Standard-input WAV uses its separate bounded
 buffering path.

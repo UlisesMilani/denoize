@@ -3,6 +3,7 @@
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::audio::sanitize_sample;
 use crate::denoiser::DenoiserConfig;
+use crate::{select_accelerator, AcceleratorSelection};
 
 /// A prepared denoising backend that can process multiple independent files.
 ///
@@ -15,6 +16,7 @@ use crate::denoiser::DenoiserConfig;
 pub struct BackendSession {
     backend: Backend,
     options: BackendOptions,
+    accelerator: AcceleratorSelection,
     prepared: PreparedBackend,
 }
 
@@ -24,6 +26,7 @@ impl std::fmt::Debug for BackendSession {
             .debug_struct("BackendSession")
             .field("backend", &self.backend)
             .field("options", &self.options)
+            .field("accelerator", &self.accelerator)
             .finish_non_exhaustive()
     }
 }
@@ -51,7 +54,26 @@ enum PreparedBackend {
 impl BackendSession {
     /// Validate the resolved options and load the selected backend once.
     pub fn prepare(backend: Backend, options: BackendOptions) -> Result<Self, String> {
+        let accelerator = select_accelerator(backend, options.accelerator, options.deterministic)?;
+        Self::prepare_with_accelerator(backend, options, accelerator)
+    }
+
+    /// Load a backend using an already-resolved accelerator selection.
+    ///
+    /// Application services use this entry point so recipe identity, result
+    /// reporting, and model preparation consume the same capability snapshot.
+    pub fn prepare_with_accelerator(
+        backend: Backend,
+        options: BackendOptions,
+        accelerator: AcceleratorSelection,
+    ) -> Result<Self, String> {
         options.validate_resolved_resources(backend)?;
+        crate::hardware::validate_accelerator_selection(
+            backend,
+            options.accelerator,
+            options.deterministic,
+            accelerator,
+        )?;
         let prepared = match backend {
             Backend::Classical => PreparedBackend::Classical,
             #[cfg(feature = "rnnoise")]
@@ -61,35 +83,46 @@ impl BackendSession {
                 PreparedBackend::DeepFilter(super::deepfilter::DeepFilterModel::load()?)
             }
             #[cfg(feature = "onnx")]
-            Backend::Onnx => PreparedBackend::Onnx(super::onnx::OnnxWaveformModel::load(
-                required_model(&options, "ONNX")?.clone(),
-            )?),
+            Backend::Onnx => {
+                PreparedBackend::Onnx(super::onnx::OnnxWaveformModel::load_with_accelerator(
+                    required_model(&options, "ONNX")?.clone(),
+                    accelerator.effective(),
+                )?)
+            }
             #[cfg(feature = "mpsenet")]
             Backend::MpSenet => PreparedBackend::MpSenet(super::mpsenet::MpSenetModel::load(
                 required_model(&options, "MP-SENet")?,
+                accelerator.effective(),
             )?),
             #[cfg(feature = "bsrnn")]
             Backend::Bsrnn => PreparedBackend::Bsrnn(super::bsrnn::BsrnnModel::load(
                 required_model(&options, "BSRNN")?,
+                accelerator.effective(),
             )?),
             #[cfg(feature = "mossformer2")]
             Backend::Mossformer2 => {
                 PreparedBackend::Mossformer2(super::mossformer2::Mossformer2Model::load(
                     required_model(&options, "MossFormer2")?,
+                    accelerator.effective(),
                 )?)
             }
             #[cfg(feature = "sgmse")]
             Backend::Sgmse => PreparedBackend::Sgmse(super::sgmse::SgmseModel::load(
                 required_model(&options, "SGMSE+")?,
+                accelerator.effective(),
             )?),
             #[cfg(feature = "gtcrn")]
-            Backend::Gtcrn => PreparedBackend::Gtcrn(super::gtcrn::GtcrnModel::load(
-                required_model(&options, "GTCRN")?,
-            )?),
+            Backend::Gtcrn => {
+                PreparedBackend::Gtcrn(super::gtcrn::GtcrnModel::load_with_accelerator(
+                    required_model(&options, "GTCRN")?,
+                    accelerator.effective(),
+                )?)
+            }
         };
         Ok(Self {
             backend,
             options,
+            accelerator,
             prepared,
         })
     }
@@ -104,6 +137,12 @@ impl BackendSession {
     #[must_use]
     pub fn options(&self) -> &BackendOptions {
         &self.options
+    }
+
+    /// Return the concrete runtime captured during preparation.
+    #[must_use]
+    pub const fn accelerator(&self) -> AcceleratorSelection {
+        self.accelerator
     }
 
     /// Process finite planar audio while preserving channel count and length.
@@ -270,12 +309,24 @@ mod tests {
 
         let session =
             BackendSession::prepare(Backend::Classical, BackendOptions::default()).unwrap();
+        assert_eq!(session.accelerator(), AcceleratorSelection::default());
         let input = vec![vec![0.1; 1024], vec![-0.1; 1024]];
         let output = session
             .process(&input, 48_000, &DenoiserConfig::default(48_000))
             .unwrap();
         assert_eq!(output.len(), input.len());
         assert!(output.iter().all(|channel| channel.len() == 1024));
+    }
+
+    #[test]
+    fn auto_cpu_only_session_records_the_fallback_once() {
+        let mut options = BackendOptions::default();
+        options.accelerator = crate::AcceleratorPreference::Auto;
+        let session = BackendSession::prepare(Backend::Classical, options).unwrap();
+        assert_eq!(
+            session.accelerator().fallback(),
+            Some(crate::AcceleratorFallback::BackendCpuOnly)
+        );
     }
 
     #[cfg(feature = "onnx")]

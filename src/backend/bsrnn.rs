@@ -5,7 +5,9 @@
 //! centered periodic-Hann 960-point STFT, whole-utterance inference, inverse
 //! STFT, sample-rate conversion, and exact duration restoration.
 
+use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
+use crate::AcceleratorRuntime;
 use rustfft::{num_complex::Complex32, FftPlanner};
 use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
@@ -20,21 +22,25 @@ pub fn process(
     input_sample_rate: u32,
     config: &OnnxModelConfig,
 ) -> Result<Vec<Vec<f64>>, String> {
-    BsrnnModel::load(config)?.process(channels, input_sample_rate)
+    BsrnnModel::load(config, AcceleratorRuntime::Cpu)?.process(channels, input_sample_rate)
 }
 
 struct CompiledBsrnnModel {
     frames: usize,
-    model: Arc<TypedRunnableModel<TypedModel>>,
+    model: SharedRunnable,
 }
 
 pub(crate) struct BsrnnModel {
     template: InferenceModel,
+    runtime: AcceleratorRuntime,
     compiled: Mutex<Option<CompiledBsrnnModel>>,
 }
 
 impl BsrnnModel {
-    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+    pub(crate) fn load(
+        config: &OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
         if config.sample_rate != MODEL_RATE {
             return Err(format!(
                 "BSRNN expects a {MODEL_RATE} Hz model, got {} Hz",
@@ -49,6 +55,7 @@ impl BsrnnModel {
         }
         Ok(Self {
             template: load_template(config)?,
+            runtime,
             compiled: Mutex::new(None),
         })
     }
@@ -70,11 +77,11 @@ impl BsrnnModel {
         let model = self.compiled_model(frames)?;
         channels
             .iter()
-            .map(|channel| process_channel(channel, input_sample_rate, frames, &model))
+            .map(|channel| process_channel(channel, input_sample_rate, frames, model.as_ref()))
             .collect()
     }
 
-    fn compiled_model(&self, frames: usize) -> Result<Arc<TypedRunnableModel<TypedModel>>, String> {
+    fn compiled_model(&self, frames: usize) -> Result<SharedRunnable, String> {
         let mut compiled = self
             .compiled
             .lock()
@@ -84,7 +91,7 @@ impl BsrnnModel {
                 return Ok(Arc::clone(&cached.model));
             }
         }
-        let model = Arc::new(compile_model(&self.template, frames)?);
+        let model = compile_model(&self.template, frames, self.runtime)?;
         *compiled = Some(CompiledBsrnnModel {
             frames,
             model: Arc::clone(&model),
@@ -97,7 +104,7 @@ fn process_channel(
     input: &[f64],
     input_sample_rate: u32,
     expected_frames: usize,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f64>, String> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -239,7 +246,8 @@ fn load_template(config: &OnnxModelConfig) -> Result<InferenceModel, String> {
 fn compile_model(
     template: &InferenceModel,
     frames: usize,
-) -> Result<TypedRunnableModel<TypedModel>, String> {
+    runtime: AcceleratorRuntime,
+) -> Result<SharedRunnable, String> {
     let shape = tvec!(1, frames, BINS, 2);
     let mut model = template.clone();
     model
@@ -248,16 +256,16 @@ fn compile_model(
     model
         .set_output_fact(0, f32::fact(shape).into())
         .map_err(|error| model_error("configure output", error))?;
-    model
-        .into_optimized()
-        .and_then(|model| model.into_runnable())
-        .map_err(|error| model_error("optimize", error))
+    let model = model
+        .into_typed()
+        .map_err(|error| model_error("type", error))?;
+    super::tract_runtime::prepare(model, runtime, "BSRNN model")
 }
 
 fn run_model(
     spectrum: &[f32],
     frames: usize,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f32>, String> {
     let shape = tvec!(1, frames, BINS, 2);
     let tensor = Tensor::from_shape(&shape, spectrum)
@@ -266,7 +274,7 @@ fn run_model(
         .run(tvec!(tensor.into_tvalue()))
         .map_err(|error| model_error("run", error))?;
     let view = outputs[0]
-        .to_array_view::<f32>()
+        .to_plain_array_view::<f32>()
         .map_err(|error| model_error("read output", error))?;
     if view.len() != spectrum.len() {
         return Err(format!(

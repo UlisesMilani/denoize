@@ -45,6 +45,41 @@ every call. The CLI convenience path keeps the same `--onnx-model` contract.
 > feature currently includes RNNoise, generic ONNX, MP-SENet, BSRNN,
 > MossFormer2, SGMSE+, and GTCRN, but not DeepFilterNet.
 
+### Hardware acceleration
+
+CPU inference remains the compatibility default. Full builds register Apple
+Metal on Apple targets and NVIDIA CUDA on Linux/Windows targets for the generic
+ONNX, MP-SENet, BSRNN, MossFormer2, SGMSE+, and GTCRN adapters. Inspect the
+current binary and host without opening a model or using the network:
+
+```sh
+denoize hardware
+denoize hardware --json
+denoize noisy.wav clean.wav -b gtcrn --accelerator auto
+```
+
+`--accelerator auto` uses the stable Metal-then-CUDA preference and reports an
+explicit CPU fallback when the backend is CPU-only, deterministic mode is
+active, or no compiled runtime passes its dependency probe. `gpu`, `metal`, and
+`cuda` are strict requests. With an explicit backend, an unsupported or
+unavailable request fails before input decoding; automatic backend selection
+must inspect the decoded input before it can validate backend compatibility.
+`--deterministic` always executes on CPU; combine it with `cpu` or `auto`.
+File/stream JSON results expose `requested`, `effective`, and `fallback`, and
+the effective runtime is included in batch recipe identity. The capability
+contract is published as
+[`denoize-hardware-v1`](schemas/denoize-hardware-v1.schema.json).
+For an available GPU the report also includes the device name, CUDA compute
+capability when applicable, and the runtime-reported device-memory limit
+(total global memory for CUDA; recommended maximum working set for Metal).
+
+CUDA availability requires a compatible NVIDIA driver plus the CUDA runtime,
+NVRTC, cuBLAS, cuDNN, CUDA development headers, CCCL headers, and a writable
+tract kernel-cache directory. `denoize hardware` reports the first missing
+prerequisite. The first CUDA model preparation can compile and cache kernels;
+the host probe does not claim that every user-supplied ONNX graph is supported
+by a GPU transform, so model preparation errors remain explicit.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -496,8 +531,10 @@ For the normal (decoded, non-streaming) path, `--max-memory MB` caps requested
 denoize-owned decoded PCM capacities and explicitly accounted codec scratch
 buffers, in addition to the conservative input-size preflight and final
 decoded-working-set check. Internal allocations made inside third-party codec
-libraries can fall outside this enforcement, and allocator capacity rounding
-means the cap is not an allocator-exact process RSS limit. FLAC and Ogg
+or model runtimes can fall outside this enforcement, GPU device memory is not
+charged, and allocator capacity rounding means the cap is not an allocator-exact
+process RSS limit. Use the CPU runtime when a GPU-memory ceiling cannot be
+managed externally. FLAC and Ogg
 structure is also checked with finite block,
 packet, page, stream, item, and aggregate metadata limits before a decoder can
 materialize it—even with `--no-metadata`. When tags are preserved, their
@@ -833,6 +870,7 @@ ceilings to -20..0 dBTP.
 
 ```toml
 backend = "auto"
+accelerator = "cpu" # cpu|auto|gpu|metal|cuda
 preset = "hifi"
 mode = "speech"
 strength = 0.45

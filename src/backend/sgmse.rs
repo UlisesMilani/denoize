@@ -5,7 +5,9 @@
 //! official 16 kHz complex-STFT frontend and the quality-oriented 30-step
 //! OUVE predictor/corrector sampler without a Python runtime.
 
+use super::tract_runtime::SharedRunnable;
 use super::{OnnxModelConfig, SgmseProfile};
+use crate::AcceleratorRuntime;
 use rustfft::{num_complex::Complex32, FftPlanner};
 use std::sync::{Arc, Mutex};
 use tract_onnx::prelude::*;
@@ -30,21 +32,30 @@ pub fn process(
     profile: SgmseProfile,
     seed: Option<u64>,
 ) -> Result<Vec<Vec<f64>>, String> {
-    SgmseModel::load(config)?.process(channels, input_sample_rate, profile, seed)
+    SgmseModel::load(config, AcceleratorRuntime::Cpu)?.process(
+        channels,
+        input_sample_rate,
+        profile,
+        seed,
+    )
 }
 
 struct CompiledSgmseModel {
     frames: usize,
-    model: Arc<TypedRunnableModel<TypedModel>>,
+    model: SharedRunnable,
 }
 
 pub(crate) struct SgmseModel {
     template: InferenceModel,
+    runtime: AcceleratorRuntime,
     compiled: Mutex<Option<CompiledSgmseModel>>,
 }
 
 impl SgmseModel {
-    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+    pub(crate) fn load(
+        config: &OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
         if config.sample_rate != MODEL_RATE {
             return Err(format!(
                 "SGMSE+ expects a {MODEL_RATE} Hz model, got {} Hz",
@@ -59,6 +70,7 @@ impl SgmseModel {
         }
         Ok(Self {
             template: load_template(config)?,
+            runtime,
             compiled: Mutex::new(None),
         })
     }
@@ -90,13 +102,13 @@ impl SgmseModel {
                     frames,
                     seed.unwrap_or(DEFAULT_SEED).wrapping_add(index as u64),
                     profile.steps(),
-                    &model,
+                    model.as_ref(),
                 )
             })
             .collect()
     }
 
-    fn compiled_model(&self, frames: usize) -> Result<Arc<TypedRunnableModel<TypedModel>>, String> {
+    fn compiled_model(&self, frames: usize) -> Result<SharedRunnable, String> {
         let mut compiled = self
             .compiled
             .lock()
@@ -106,7 +118,7 @@ impl SgmseModel {
                 return Ok(Arc::clone(&cached.model));
             }
         }
-        let model = Arc::new(compile_model(&self.template, frames)?);
+        let model = compile_model(&self.template, frames, self.runtime)?;
         *compiled = Some(CompiledSgmseModel {
             frames,
             model: Arc::clone(&model),
@@ -121,7 +133,7 @@ fn process_channel(
     expected_frames: usize,
     seed: u64,
     steps: usize,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f64>, String> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -353,7 +365,8 @@ fn load_template(config: &OnnxModelConfig) -> Result<InferenceModel, String> {
 fn compile_model(
     template: &InferenceModel,
     frames: usize,
-) -> Result<TypedRunnableModel<TypedModel>, String> {
+    runtime: AcceleratorRuntime,
+) -> Result<SharedRunnable, String> {
     let mut model = template.clone();
     model
         .set_input_fact(0, f32::fact(tvec!(1, 4, BINS, frames)).into())
@@ -364,10 +377,10 @@ fn compile_model(
     model
         .set_output_fact(0, f32::fact(tvec!(1, 2, BINS, frames)).into())
         .map_err(|error| model_error("configure score", error))?;
-    model
-        .into_optimized()
-        .and_then(|model| model.into_runnable())
-        .map_err(|error| model_error("optimize", error))
+    let model = model
+        .into_typed()
+        .map_err(|error| model_error("type", error))?;
+    super::tract_runtime::prepare(model, runtime, "SGMSE+ model")
 }
 
 fn run_score_model(
@@ -375,7 +388,7 @@ fn run_score_model(
     noisy: &[Complex32],
     frames: usize,
     time: f32,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<Complex32>, String> {
     let plane = BINS * frames;
     let mut features = vec![0.0f32; 4 * plane];
@@ -396,7 +409,7 @@ fn run_score_model(
         ))
         .map_err(|error| model_error("run", error))?;
     let view = outputs[0]
-        .to_array_view::<f32>()
+        .to_plain_array_view::<f32>()
         .map_err(|error| model_error("read score", error))?;
     if view.len() != 2 * plane {
         return Err(format!(

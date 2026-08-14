@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::config::{ConfigError, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS};
-use crate::{DenoiserConfig, StreamingDenoiser};
+use crate::{select_accelerator, AcceleratorSelection, DenoiserConfig, StreamingDenoiser};
 
 #[cfg(feature = "rnnoise")]
 const RNNOISE_STATE_ALLOWANCE_PER_CHANNEL: u64 = 2 * 1024 * 1024;
@@ -17,6 +17,7 @@ const RNNOISE_STATE_ALLOWANCE_PER_CHANNEL: u64 = 2 * 1024 * 1024;
 /// construction and never reopen it while processing or resetting the stream.
 pub struct StreamingBackendSession {
     backend: Backend,
+    accelerator: AcceleratorSelection,
     input_channels: usize,
     processor_channels: usize,
     channel_mode: ChannelMode,
@@ -54,8 +55,36 @@ impl StreamingBackendSession {
         backend: Backend,
         sample_rate: u32,
         channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+    ) -> Result<Self, String> {
+        let accelerator = select_accelerator(
+            backend,
+            backend_options.accelerator,
+            backend_options.deterministic,
+        )?;
+        Self::new_with_accelerator(
+            backend,
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            accelerator,
+        )
+    }
+
+    /// Construct a stream using an already-resolved accelerator snapshot.
+    ///
+    /// This keeps capability reporting, recipe identity, and model preparation
+    /// bound to the same decision when a frontend preflights the runtime before
+    /// opening an input or audio device.
+    pub fn new_with_accelerator(
+        backend: Backend,
+        sample_rate: u32,
+        channels: usize,
         mut denoiser: DenoiserConfig,
         backend_options: BackendOptions,
+        accelerator: AcceleratorSelection,
     ) -> Result<Self, String> {
         if channels == 0 || channels > MAX_STREAM_CHANNELS {
             return Err(format!(
@@ -70,6 +99,12 @@ impl StreamingBackendSession {
             .validate_config()
             .map_err(|error| error.to_string())?;
         backend_options.validate_resolved_resources(backend)?;
+        crate::hardware::validate_accelerator_selection(
+            backend,
+            backend_options.accelerator,
+            backend_options.deterministic,
+            accelerator,
+        )?;
         let stereo_mode = channels == 2 && backend_options.channel_mode != ChannelMode::Independent;
         let processor_channels =
             if stereo_mode && backend_options.channel_mode == ChannelMode::StereoLinked {
@@ -84,9 +119,11 @@ impl StreamingBackendSession {
             processor_channels,
             &denoiser,
             &backend_options,
+            accelerator,
         )?;
         Ok(Self {
             backend,
+            accelerator,
             input_channels: channels,
             processor_channels,
             channel_mode: if stereo_mode {
@@ -103,6 +140,11 @@ impl StreamingBackendSession {
 
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    #[must_use]
+    pub const fn accelerator(&self) -> AcceleratorSelection {
+        self.accelerator
     }
 
     /// Conservative backend-specific state beyond the classical stream and
@@ -219,8 +261,9 @@ impl StreamingBackendSession {
         channels: usize,
         denoiser: &DenoiserConfig,
         backend_options: &BackendOptions,
+        accelerator: AcceleratorSelection,
     ) -> Result<StreamingBackend, String> {
-        let _ = (sample_rate, backend_options);
+        let _ = (sample_rate, backend_options, accelerator);
         match backend {
             Backend::Classical => Ok(StreamingBackend::Classical(StreamingDenoiser::new(
                 denoiser.clone(),
@@ -237,7 +280,12 @@ impl StreamingBackendSession {
                     .as_ref()
                     .ok_or_else(|| "GTCRN streaming requires the managed ONNX model".to_string())?;
                 Ok(StreamingBackend::Gtcrn(Box::new(
-                    super::gtcrn::StreamingProcessor::new(model, sample_rate, channels)?,
+                    super::gtcrn::StreamingProcessor::new_with_accelerator(
+                        model,
+                        sample_rate,
+                        channels,
+                        accelerator.effective(),
+                    )?,
                 )))
             }
             #[allow(unreachable_patterns)]

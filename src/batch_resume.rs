@@ -843,6 +843,17 @@ pub fn recipe_digest(
     #[cfg(not(feature = "sgmse"))]
     let _ = SgmseProfile::default();
 
+    if crate::backend_supports_acceleration(resolved.backend) {
+        hasher.u8(
+            43,
+            match resolved.accelerator.effective() {
+                crate::AcceleratorRuntime::Cpu => 1,
+                crate::AcceleratorRuntime::Metal => 2,
+                crate::AcceleratorRuntime::Cuda => 3,
+            },
+        );
+    }
+
     if let Some(target) = resolved.loudness_lufs {
         hasher.bool(50, true);
         hasher.f64(51, target)?;
@@ -2569,6 +2580,7 @@ mod tests {
             backend: Backend::Classical,
             denoiser: DenoiserConfig::default(48_000).sanitized(),
             backend_options: BackendOptions::default(),
+            accelerator: crate::AcceleratorSelection::default(),
             loudness_lufs: None,
             true_peak_dbtp: -1.0,
         }
@@ -3118,6 +3130,51 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn accelerated_runtime_is_part_of_the_effective_recipe() {
+        let directory = tempdir().unwrap();
+        let model = directory.path().join("model.onnx");
+        write(&model, b"recipe-only-model-bytes");
+        let fingerprint = fingerprint_file(&model).unwrap();
+        let mut resolved = resolved();
+        resolved.backend = Backend::Onnx;
+        resolved.backend_options.onnx = Some(crate::OnnxModelConfig {
+            path: model,
+            sample_rate: 16_000,
+        });
+
+        let digest = |runtime, preference| {
+            let mut resolved = resolved.clone();
+            resolved.backend_options.accelerator = preference;
+            resolved.accelerator = crate::hardware::test_selection(preference, runtime);
+            recipe_digest(
+                &resolved,
+                1,
+                OutputFormat::Wav,
+                EncodeOptions::default(),
+                MetadataPolicy::Preserve,
+                Some((&fingerprint, 16_000)),
+            )
+            .unwrap()
+        };
+        let cpu = digest(
+            crate::AcceleratorRuntime::Cpu,
+            crate::AcceleratorPreference::Cpu,
+        );
+        let metal = digest(
+            crate::AcceleratorRuntime::Metal,
+            crate::AcceleratorPreference::Metal,
+        );
+        let cuda = digest(
+            crate::AcceleratorRuntime::Cuda,
+            crate::AcceleratorPreference::Cuda,
+        );
+        assert_ne!(cpu, metal);
+        assert_ne!(cpu, cuda);
+        assert_ne!(metal, cuda);
     }
 
     #[cfg(feature = "rnnoise")]

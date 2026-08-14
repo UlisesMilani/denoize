@@ -22,9 +22,9 @@ use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::AudioInputSession;
 use denoize::{
-    AacEncoder, Algorithm, AtomicOutput, Backend, BackendOptions, BackendSession, ChannelMode,
-    CommitMode, DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
-    StreamingBackendSession, WindowType,
+    AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm, AtomicOutput, Backend,
+    BackendOptions, BackendSession, ChannelMode, CommitMode, DownmixMode, EncodeOptions,
+    OnnxModelConfig, OutputFormat, SgmseProfile, StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -72,6 +72,13 @@ struct RecipeJson {
 }
 
 #[derive(Serialize)]
+struct AcceleratorJson {
+    requested: &'static str,
+    effective: &'static str,
+    fallback: Option<&'static str>,
+}
+
+#[derive(Serialize)]
 struct ProcessResultJson<'a> {
     schema: &'static str,
     schema_version: u32,
@@ -81,6 +88,7 @@ struct ProcessResultJson<'a> {
     input: &'a str,
     output: &'a str,
     backend: &'a str,
+    accelerator: AcceleratorJson,
     channels: usize,
     frames: usize,
     sample_rate: u32,
@@ -97,6 +105,7 @@ struct StreamResultJson<'a> {
     input: &'a str,
     output: &'a str,
     backend: &'a str,
+    accelerator: AcceleratorJson,
     channels: u16,
     frames: usize,
     sample_rate: u32,
@@ -144,6 +153,28 @@ fn recipe_json(digest: Option<Digest>) -> RecipeJson {
     }
 }
 
+fn accelerator_json(selection: AcceleratorSelection) -> AcceleratorJson {
+    AcceleratorJson {
+        requested: selection.requested().name(),
+        effective: selection.effective().name(),
+        fallback: selection.fallback().map(|fallback| fallback.name()),
+    }
+}
+
+fn accelerator_description(selection: AcceleratorSelection) -> String {
+    let mut description = format!(
+        "{} -> {}",
+        selection.requested().name(),
+        selection.effective().name()
+    );
+    if let Some(fallback) = selection.fallback() {
+        description.push_str(" (");
+        description.push_str(fallback.name());
+        description.push(')');
+    }
+    description
+}
+
 fn round_to_three_decimals(value: f64) -> f64 {
     format!("{value:.3}")
         .parse()
@@ -154,6 +185,7 @@ fn process_result_json_line(
     input: &str,
     output: &str,
     backend: &str,
+    accelerator: AcceleratorSelection,
     channels: usize,
     frames: usize,
     sample_rate: u32,
@@ -169,6 +201,7 @@ fn process_result_json_line(
         input,
         output,
         backend,
+        accelerator: accelerator_json(accelerator),
         channels,
         frames,
         sample_rate,
@@ -180,6 +213,7 @@ fn stream_result_json_line(
     input: &str,
     output: &str,
     backend: &str,
+    accelerator: AcceleratorSelection,
     channels: u16,
     frames: usize,
     sample_rate: u32,
@@ -193,6 +227,7 @@ fn stream_result_json_line(
         input,
         output,
         backend,
+        accelerator: accelerator_json(accelerator),
         channels,
         frames,
         sample_rate,
@@ -268,6 +303,7 @@ USAGE:
     denoize <INPUT> <OUTPUT.wav|flac|opus|ogg|mp3|m4a|aac> [OPTIONS]
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
+    denoize hardware [--json|--pretty]
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
@@ -316,6 +352,7 @@ OPTIONS:
         --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
+        --accelerator <NAME>  cpu|auto|gpu|metal|cuda (default: cpu)
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
@@ -401,6 +438,7 @@ struct Overrides {
     onnx_sample_rate: Option<u32>,
     channel_mode: Option<ChannelMode>,
     sgmse_profile: Option<SgmseProfile>,
+    accelerator: Option<AcceleratorPreference>,
     deterministic: bool,
     seed: Option<u64>,
     batch: bool,
@@ -449,6 +487,7 @@ struct FileConfig {
     onnx_rate: Option<u32>,
     channels: Option<String>,
     sgmse_profile: Option<String>,
+    accelerator: Option<String>,
     downmix: Option<String>,
     deterministic: bool,
     seed: Option<u64>,
@@ -539,6 +578,13 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
         ov.sgmse_profile = Some(SgmseProfile::parse(&profile).ok_or_else(|| {
             format!(
                 "unknown SGMSE profile in config: {profile} (expected fast, balanced, or quality)"
+            )
+        })?);
+    }
+    if let Some(accelerator) = config.accelerator {
+        ov.accelerator = Some(AcceleratorPreference::parse(&accelerator).ok_or_else(|| {
+            format!(
+                "unknown accelerator in config: {accelerator} (expected cpu, auto, gpu, metal, or cuda)"
             )
         })?);
     }
@@ -736,6 +782,16 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
                     )
                 })?);
             }
+            "--accelerator" => {
+                let accelerator: String = parse_value(args, &mut i, a)?;
+                ov.accelerator = Some(AcceleratorPreference::parse(&accelerator).ok_or_else(
+                    || {
+                        format!(
+                            "unknown accelerator: {accelerator} (expected cpu, auto, gpu, metal, or cuda)"
+                        )
+                    },
+                )?);
+            }
             "--deterministic" => ov.deterministic = true,
             "--seed" => {
                 ov.seed = Some(parse_value(args, &mut i, a)?);
@@ -922,7 +978,12 @@ fn preflight_batch_items(
     };
     let mut model_fingerprints =
         std::collections::HashMap::<(std::path::PathBuf, u32), ConsumedModel>::new();
-    let mut backend_sessions = Vec::<(Backend, BackendOptions, Arc<BackendSession>)>::new();
+    let mut backend_sessions = Vec::<(
+        Backend,
+        BackendOptions,
+        AcceleratorSelection,
+        Arc<BackendSession>,
+    )>::new();
     let mut prepared = Vec::with_capacity(items.len());
     let decode_limits = decode_limits(ov.max_memory_mb)?;
     for item in items {
@@ -1084,25 +1145,38 @@ fn preflight_batch_items(
 }
 
 fn cached_backend_session(
-    cache: &mut Vec<(Backend, BackendOptions, Arc<BackendSession>)>,
+    cache: &mut Vec<(
+        Backend,
+        BackendOptions,
+        AcceleratorSelection,
+        Arc<BackendSession>,
+    )>,
     options: &service::ResolvedProcessingOptions,
     report_only: bool,
 ) -> Result<Option<Arc<BackendSession>>, String> {
     if report_only {
         return Ok(None);
     }
-    if let Some((_, _, session)) = cache.iter().find(|(backend, backend_options, _)| {
-        *backend == options.backend && backend_options == &options.backend_options
-    }) {
+    if let Some((_, _, _, session)) =
+        cache
+            .iter()
+            .find(|(backend, backend_options, accelerator, _)| {
+                *backend == options.backend
+                    && backend_options == &options.backend_options
+                    && *accelerator == options.accelerator
+            })
+    {
         return Ok(Some(Arc::clone(session)));
     }
-    let session = Arc::new(BackendSession::prepare(
+    let session = Arc::new(BackendSession::prepare_with_accelerator(
         options.backend,
         options.backend_options.clone(),
+        options.accelerator,
     )?);
     cache.push((
         options.backend,
         options.backend_options.clone(),
+        options.accelerator,
         Arc::clone(&session),
     ));
     Ok(Some(session))
@@ -1126,6 +1200,7 @@ fn build_backend_options(ov: &Overrides) -> BackendOptions {
         channel_mode: ov.channel_mode.unwrap_or_default(),
         sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
         deterministic: ov.deterministic,
+        accelerator: ov.accelerator.unwrap_or_default(),
         seed: ov.seed,
     }
 }
@@ -1158,7 +1233,9 @@ fn resolve_explicit_backend_options(ov: &Overrides) -> Result<Option<BackendOpti
         return Ok(None);
     }
     let backend = ov.backend.unwrap_or(Backend::Classical);
-    service::resolve_backend_options(backend, build_backend_options(ov)).map(Some)
+    let options = service::resolve_backend_options(backend, build_backend_options(ov))?;
+    denoize::select_accelerator(backend, options.accelerator, options.deterministic)?;
+    Ok(Some(options))
 }
 
 fn validate_effective_options(ov: &Overrides, sample_rate: u32) -> Result<(), String> {
@@ -1350,6 +1427,7 @@ fn print_report(
     audio: &denoize::Audio,
     cfg: &DenoiserConfig,
     backend: Backend,
+    accelerator: AcceleratorSelection,
 ) {
     let hop = (cfg.frame_size as f64 * (1.0 - cfg.overlap)).round() as usize;
     let g_min_db = -20.0 - 25.0 * cfg.strength;
@@ -1385,6 +1463,7 @@ fn print_report(
         println!("pan        : {positions}");
     }
     println!("backend    : {backend:?}");
+    println!("accelerator: {}", accelerator_description(accelerator));
     println!("algorithm  : {:?}", cfg.algorithm);
     println!(
         "strength   : {:.2}  (gain floor ~{:.0} dB)",
@@ -1423,6 +1502,9 @@ fn print_report(
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("hardware") {
+        return run_hardware(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("live") {
         return run_live(&args[1..]);
     }
@@ -1446,6 +1528,96 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_streaming_wav(&input, &output, ov);
     }
     run_one(&input, &output, ov)
+}
+
+fn run_hardware(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        println!("USAGE:\n    denoize hardware [--json|--pretty]");
+        return Ok(());
+    }
+    let mode = match args {
+        [] => None,
+        [flag] if flag == "--json" => Some(false),
+        [flag] if flag == "--pretty" => Some(true),
+        _ => return Err("hardware accepts only --json or --pretty".into()),
+    };
+    let report = denoize::hardware_capabilities();
+    if let Some(pretty) = mode {
+        let json = if pretty {
+            report.to_pretty_json()?
+        } else {
+            report.to_json()?
+        };
+        println!("{json}");
+        return Ok(());
+    }
+    println!(
+        "host: {} {} ({} logical CPUs)",
+        report.os(),
+        report.architecture(),
+        report.logical_cpus()
+    );
+    println!(
+        "cpu-features: {}",
+        if report.cpu_features().is_empty() {
+            "none".into()
+        } else {
+            report.cpu_features().join(",")
+        }
+    );
+    for runtime in report.runtimes() {
+        let status = if runtime.available() {
+            "available"
+        } else if runtime.compiled() {
+            "unavailable"
+        } else {
+            "not-compiled"
+        };
+        let mut details = Vec::new();
+        if let Some(device) = runtime.device() {
+            details.push(device.to_string());
+        }
+        if let Some(memory_bytes) = runtime.memory_bytes() {
+            details.push(format_device_memory(memory_bytes));
+        }
+        if let Some(compute_capability) = runtime.compute_capability() {
+            details.push(format!("compute capability {compute_capability}"));
+        }
+        if let Some(detail) = runtime.detail() {
+            details.push(detail.to_string());
+        }
+        if details.is_empty() {
+            println!("runtime {}: {status}", runtime.runtime().name());
+        } else {
+            println!(
+                "runtime {}: {status} ({})",
+                runtime.runtime().name(),
+                details.join(", ")
+            );
+        }
+    }
+    println!("accelerated-backends:");
+    for backend in report
+        .backends()
+        .iter()
+        .filter(|backend| backend.accelerated())
+    {
+        println!("  {}", backend.backend());
+    }
+    Ok(())
+}
+
+fn format_device_memory(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB device memory", bytes as f64 / GIB)
+    } else {
+        format!("{:.1} MiB device memory", bytes as f64 / MIB)
+    }
 }
 
 #[cfg(feature = "live")]
@@ -1585,6 +1757,7 @@ struct StagedProcessOutput {
     transaction: AtomicOutput,
     effective_recipe: Option<Digest>,
     backend: Backend,
+    accelerator: AcceleratorSelection,
     channels: usize,
     frames: usize,
     sample_rate: u32,
@@ -1635,6 +1808,7 @@ fn run_one_with_output_format(
                 input.as_ref(),
                 output.as_ref(),
                 service::backend_name(staged.backend),
+                staged.accelerator,
                 staged.channels,
                 staged.frames,
                 staged.sample_rate,
@@ -1760,9 +1934,21 @@ fn process_one_to_staged_output(
             service::backend_name(backend)
         );
     }
+    if !ov.json && resolved_processing.accelerator.requested() != AcceleratorPreference::Cpu {
+        eprintln!(
+            "denoize: accelerator {}",
+            accelerator_description(resolved_processing.accelerator)
+        );
+    }
 
     if ov.report {
-        print_report(input, &audio, &resolved_processing.denoiser, backend);
+        print_report(
+            input,
+            &audio,
+            &resolved_processing.denoiser,
+            backend,
+            resolved_processing.accelerator,
+        );
         return Ok(None);
     }
 
@@ -1772,9 +1958,10 @@ fn process_one_to_staged_output(
 
     let backend_session = match pre_prepared_backend_session {
         Some(session) => session,
-        None => Arc::new(BackendSession::prepare(
+        None => Arc::new(BackendSession::prepare_with_accelerator(
             resolved_processing.backend,
             resolved_processing.backend_options.clone(),
+            resolved_processing.accelerator,
         )?),
     };
     let result = service::process_audio_resolved_with_session(
@@ -1832,6 +2019,7 @@ fn process_one_to_staged_output(
             transaction,
             effective_recipe,
             backend: result.backend,
+            accelerator: result.accelerator,
             channels: audio.channels(),
             frames: audio.frames(),
             sample_rate: audio.sample_rate,
@@ -1874,6 +2062,12 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     if ov.loudness_lufs.is_some() || ov.true_peak_dbtp.is_some() {
         return Err("--stream does not support loudness normalization".into());
     }
+    let backend_options = service::resolve_backend_options(backend, build_backend_options(&ov))?;
+    let accelerator = denoize::select_accelerator(
+        backend,
+        backend_options.accelerator,
+        backend_options.deterministic,
+    )?;
     ensure_output_available(output_path, ov.force)?;
 
     let mut input_session = AudioInputSession::open(input_path)?;
@@ -1882,7 +2076,6 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let channel_mask = stream_info.channel_mask;
     validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
-    let backend_options = service::resolve_backend_options(backend, build_backend_options(&ov))?;
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
     let base_stream_working_set = estimate_stream_memory_bytes_checked(
         spec.channels as usize,
@@ -1910,12 +2103,13 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let metadata_limits = retained_metadata_limits(ov.max_memory_mb, stream_working_set)?;
     if ov.report {
         println!(
-            "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\nstream     : enabled ({} frames/block)",
+            "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\naccelerator: {}\nstream     : enabled ({} frames/block)",
             spec.channels,
             spec.sample_rate,
             spec.bits_per_sample,
             spec.sample_format,
             service::backend_name(backend),
+            accelerator_description(accelerator),
             block_frames
         );
         return Ok(());
@@ -1924,13 +2118,15 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     // Construct every allocation-sensitive processor before opening the
     // transactional output. Invalid or hostile resource plans therefore leave
     // neither a destination nor a temporary `.part` file behind.
-    let mut processor = StreamingBackendSession::new(
+    let mut processor = StreamingBackendSession::new_with_accelerator(
         backend,
         spec.sample_rate,
         spec.channels as usize,
         cfg,
         backend_options,
+        accelerator,
     )?;
+    debug_assert_eq!(processor.accelerator(), accelerator);
     let metadata = if !ov.no_metadata {
         input_session.read_metadata_with_limits(metadata_limits)?
     } else {
@@ -1973,12 +2169,19 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                 input,
                 output,
                 service::backend_name(backend),
+                accelerator,
                 spec.channels,
                 frames,
                 spec.sample_rate,
             )
         );
     } else {
+        if accelerator.requested() != AcceleratorPreference::Cpu {
+            eprintln!(
+                "denoize: accelerator {}",
+                accelerator_description(accelerator)
+            );
+        }
         eprintln!(
             "denoize: streaming {} WAV complete: {}ch x {} frames",
             service::backend_name(backend),
@@ -2668,6 +2871,7 @@ mod json_output_tests {
             SPECIAL_INPUT,
             SPECIAL_OUTPUT,
             "classical",
+            AcceleratorSelection::default(),
             2,
             48_001,
             48_000,
@@ -2675,7 +2879,7 @@ mod json_output_tests {
             Some(Digest::from_bytes([7; 32])),
         ));
 
-        assert_eq!(value.as_object().unwrap().len(), 12);
+        assert_eq!(value.as_object().unwrap().len(), 13);
         assert_eq!(value["schema"], CLI_JSON_SCHEMA);
         assert_eq!(value["schema_version"], CLI_JSON_SCHEMA_VERSION);
         assert_eq!(value["event"], "result");
@@ -2690,6 +2894,9 @@ mod json_output_tests {
         assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
         assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
         assert_eq!(value["backend"].as_str(), Some("classical"));
+        assert_eq!(value["accelerator"]["requested"], "cpu");
+        assert_eq!(value["accelerator"]["effective"], "cpu");
+        assert!(value["accelerator"]["fallback"].is_null());
         assert_eq!(value["channels"].as_u64(), Some(2));
         assert_eq!(value["frames"].as_u64(), Some(48_001));
         assert_eq!(value["sample_rate"].as_u64(), Some(48_000));
@@ -2702,12 +2909,13 @@ mod json_output_tests {
             SPECIAL_INPUT,
             SPECIAL_OUTPUT,
             "gtcrn",
+            AcceleratorSelection::default(),
             2,
             8_193,
             44_100,
         ));
 
-        assert_eq!(value.as_object().unwrap().len(), 12);
+        assert_eq!(value.as_object().unwrap().len(), 13);
         assert_eq!(value["schema"], CLI_JSON_SCHEMA);
         assert_eq!(value["schema_version"], CLI_JSON_SCHEMA_VERSION);
         assert_eq!(value["event"], "result");
@@ -2797,6 +3005,7 @@ mod batch_tests {
             backend: Backend::Classical,
             denoiser: DenoiserConfig::default(48_000),
             backend_options: BackendOptions::default(),
+            accelerator: denoize::AcceleratorSelection::default(),
             loudness_lufs: None,
             true_peak_dbtp: -1.0,
         };
@@ -3723,6 +3932,7 @@ adaptive_noise = true
 vad = true
 preserve_metadata = false
 downmix = "stereo"
+accelerator = "auto"
 deterministic = true
 seed = 12345
 stream_frames = 4096
@@ -3734,6 +3944,7 @@ chunk_ms = 100
         .unwrap();
         assert!(options.auto_backend);
         assert!(options.deterministic);
+        assert_eq!(options.accelerator, Some(AcceleratorPreference::Auto));
         assert_eq!(options.seed, Some(12345));
         assert_eq!(options.downmix, Some(DownmixMode::Stereo));
         assert_eq!(options.preset, Some(Preset::HiFi));
@@ -3771,6 +3982,7 @@ aac_encoder = "oxide"
 onnx_model = "model.onnx"
 onnx_rate = 48000
 sgmse_profile = "quality"
+accelerator = "auto"
 deterministic = true
 "#,
             "desktop.toml",
@@ -3795,6 +4007,7 @@ deterministic = true
         assert_eq!(options.onnx_model.as_deref(), Some("model.onnx"));
         assert_eq!(options.onnx_sample_rate, Some(48_000));
         assert_eq!(options.sgmse_profile, Some(SgmseProfile::Quality));
+        assert_eq!(options.accelerator, Some(AcceleratorPreference::Auto));
         assert!(options.deterministic);
     }
 
@@ -3825,6 +4038,9 @@ vad = false
 
         let error = parse_config("quality = \"impossible\"", "desktop.toml").unwrap_err();
         assert!(error.contains("unknown quality in config: impossible"));
+
+        let error = parse_config("accelerator = \"vulkan\"", "desktop.toml").unwrap_err();
+        assert!(error.contains("unknown accelerator in config: vulkan"));
     }
 
     #[test]
@@ -4027,6 +4243,7 @@ chunk_ms = 2001
     #[test]
     fn rejects_unknown_cli_quality_and_normalizes_legacy_aliases() {
         assert!(cli_error(&["--quality", "impossible"]).contains("unknown quality"));
+        assert!(cli_error(&["--accelerator", "vulkan"]).contains("unknown accelerator"));
         let (_, _, options) = parse_args(&[
             "input.wav".into(),
             "output.wav".into(),

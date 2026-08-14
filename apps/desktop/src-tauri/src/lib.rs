@@ -8,8 +8,9 @@ use denoize::encode::write_audio_to_file;
 use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, AtomicOutput, Backend, BackendOptions, BackendSession, ChannelMode, CommitMode,
-    DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat, SgmseProfile,
+    AacEncoder, AcceleratorPreference, AtomicOutput, Backend, BackendOptions, BackendSession,
+    ChannelMode, CommitMode, DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat,
+    SgmseProfile,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,10 @@ const MAX_LOUDNESS_LUFS: f64 = 0.0;
 const MIN_TRUE_PEAK_DBTP: f64 = -20.0;
 const MAX_TRUE_PEAK_DBTP: f64 = 0.0;
 const DEFAULT_MODEL_SAMPLE_RATE_HZ: u32 = 16_000;
+
+fn default_accelerator() -> String {
+    "cpu".into()
+}
 
 #[derive(Default)]
 struct AppState {
@@ -94,6 +99,8 @@ struct ProcessOptions {
     onnx_model: Option<String>,
     onnx_sample_rate: u32,
     sgmse_profile: String,
+    #[serde(default = "default_accelerator")]
+    accelerator: String,
     #[serde(default)]
     deterministic: bool,
     #[serde(default)]
@@ -124,6 +131,8 @@ struct GuiConfig {
     onnx_model: Option<String>,
     onnx_rate: u32,
     sgmse_profile: String,
+    #[serde(default = "default_accelerator")]
+    accelerator: String,
     deterministic: bool,
 }
 
@@ -153,6 +162,7 @@ struct GuiConfigPatch {
     onnx_model: Option<String>,
     onnx_rate: Option<u32>,
     sgmse_profile: Option<String>,
+    accelerator: Option<String>,
     deterministic: Option<bool>,
 }
 
@@ -177,6 +187,7 @@ impl GuiConfig {
             onnx_model: self.onnx_model.clone(),
             onnx_sample_rate: self.onnx_rate,
             sgmse_profile: self.sgmse_profile.clone(),
+            accelerator: self.accelerator.clone(),
             deterministic: self.deterministic,
             seed: None,
         }
@@ -247,6 +258,7 @@ impl GuiConfigPatch {
         }
         replace_present!(onnx_rate);
         replace_present!(sgmse_profile);
+        replace_present!(accelerator);
         replace_present!(deterministic);
         current.normalized()
     }
@@ -330,6 +342,23 @@ struct LiveEvent {
     output_level: f32,
     processed_chunks: u64,
     dropped_chunks: u64,
+    accelerator: Option<AcceleratorResult>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceleratorResult {
+    requested: &'static str,
+    effective: &'static str,
+    fallback: Option<&'static str>,
+}
+
+fn accelerator_result(selection: denoize::AcceleratorSelection) -> AcceleratorResult {
+    AcceleratorResult {
+        requested: selection.requested().name(),
+        effective: selection.effective().name(),
+        fallback: selection.fallback().map(|fallback| fallback.name()),
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -350,6 +379,13 @@ struct JobProgress {
     item_status: Option<&'static str>,
     item_id: Option<String>,
     resume_reason: Option<&'static str>,
+    accelerator: Option<AcceleratorResult>,
+}
+
+#[derive(Debug)]
+struct ProcessFileResult {
+    output: String,
+    accelerator: denoize::AcceleratorSelection,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -506,6 +542,7 @@ struct AppInfo {
     backends: Vec<BackendInfo>,
     formats: Vec<&'static str>,
     fdk_available: bool,
+    accelerators: Vec<AcceleratorInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -515,6 +552,19 @@ struct BackendInfo {
     external_model: bool,
     managed_model: Option<&'static str>,
     sample_rate: Option<u32>,
+    accelerated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceleratorInfo {
+    name: &'static str,
+    compiled: bool,
+    available: bool,
+    device: Option<String>,
+    memory_bytes: Option<u64>,
+    compute_capability: Option<String>,
+    detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -769,6 +819,7 @@ struct DropSelection {
 
 #[tauri::command]
 fn app_info() -> AppInfo {
+    let hardware = denoize::hardware_capabilities();
     AppInfo {
         version: env!("CARGO_PKG_VERSION"),
         backends: Backend::available_names()
@@ -783,10 +834,24 @@ fn app_info() -> AppInfo {
                     "onnx" | "mpsenet" | "sgmse" | "gtcrn" => Some(16_000),
                     _ => None,
                 },
+                accelerated: denoize::backend_supports_acceleration(backend),
             })
             .collect(),
         formats: vec!["wav", "flac", "opus", "mp3", "m4a", "aac"],
         fdk_available: cfg!(feature = "fdk-aac-encoder"),
+        accelerators: hardware
+            .runtimes()
+            .iter()
+            .map(|runtime| AcceleratorInfo {
+                name: runtime.runtime().name(),
+                compiled: runtime.compiled(),
+                available: runtime.available(),
+                device: runtime.device().map(str::to_owned),
+                memory_bytes: runtime.memory_bytes(),
+                compute_capability: runtime.compute_capability().map(str::to_owned),
+                detail: runtime.detail().map(str::to_owned),
+            })
+            .collect(),
     }
 }
 
@@ -819,7 +884,7 @@ fn start_process(
             );
         });
         match result {
-            Ok(output) => emit_progress(
+            Ok(result) => emit_progress_with_accelerator(
                 &app,
                 job_id,
                 "file",
@@ -828,8 +893,9 @@ fn start_process(
                 4,
                 4,
                 started,
-                Some(output),
+                Some(result.output),
                 None,
+                Some(result.accelerator),
             ),
             Err(error) if error == "cancelled" => emit_progress(
                 &app,
@@ -925,6 +991,7 @@ fn start_batch(
                 total,
                 started,
                 outcome.error(),
+                batch_item.prepared.processing.accelerator,
             );
             outcome
         };
@@ -1435,7 +1502,17 @@ fn start_live(
     request: LiveRequest,
 ) -> Result<(), String> {
     let backend = validate_live_request(&request)?;
-    let backend_options = resolve_gui_backend_options(backend, &request.options)?;
+    let backend_options = parsed_backend_options_for(backend, &request.options)?;
+    let denoiser = processing_config(&request.options, 48_000)?;
+    let prepared = denoize::live::PreparedLiveConfig::new(denoize::live::LiveConfig {
+        input_device: request.input_device,
+        output_device: request.output_device,
+        chunk_ms: request.chunk_ms,
+        backend,
+        backend_options,
+        denoiser,
+    })?;
+    let accelerator = prepared.accelerator();
     if !state
         .jobs
         .lock()
@@ -1444,7 +1521,6 @@ fn start_live(
     {
         return Err("ファイル処理の完了後に開始してください".into());
     }
-    let denoiser = processing_config(&request.options, 48_000)?;
     let running = Arc::new(AtomicBool::new(true));
     {
         let mut live = state
@@ -1458,15 +1534,7 @@ fn start_live(
     }
     let live_state = Arc::clone(&state.live);
     std::thread::spawn(move || {
-        let config = denoize::live::LiveConfig {
-            input_device: request.input_device,
-            output_device: request.output_device,
-            chunk_ms: request.chunk_ms,
-            backend,
-            backend_options,
-            denoiser,
-        };
-        let result = denoize::live::run_with_status(config, running, |status| {
+        let result = denoize::live::run_prepared_with_status(prepared, running, |status| {
             let _ = app.emit(
                 "live-status",
                 LiveEvent {
@@ -1480,6 +1548,7 @@ fn start_live(
                     output_level: status.output_level,
                     processed_chunks: status.processed_chunks,
                     dropped_chunks: status.dropped_chunks,
+                    accelerator: Some(accelerator_result(status.accelerator)),
                 },
             );
         });
@@ -1500,6 +1569,7 @@ fn start_live(
                 output_level: 0.0,
                 processed_chunks: 0,
                 dropped_chunks: 0,
+                accelerator: Some(accelerator_result(accelerator)),
             },
         );
         if let Ok(mut live) = live_state.lock() {
@@ -2245,7 +2315,12 @@ fn preflight_batch_items(
         MetadataPolicy::Drop
     };
     let mut model_fingerprints = HashMap::<(PathBuf, u32), batch_resume::ConsumedModel>::new();
-    let mut backend_sessions = Vec::<(Backend, BackendOptions, Arc<BackendSession>)>::new();
+    let mut backend_sessions = Vec::<(
+        Backend,
+        BackendOptions,
+        denoize::AcceleratorSelection,
+        Arc<BackendSession>,
+    )>::new();
     let mut prepared = Vec::with_capacity(items.len());
     for item in items {
         let input_fingerprint = batch_resume::fingerprint_file(&item.input).map_err(|error| {
@@ -2301,26 +2376,33 @@ fn preflight_batch_items(
         // Bind the prepared graph to the model bytes already captured by the
         // resume recipe. The whole-plan source fence below re-hashes the path
         // after graph preparation and rejects a persistent replacement.
-        let backend_session = if let Some((_, _, session)) =
+        let backend_session = if let Some((_, _, _, session)) =
             backend_sessions
                 .iter()
-                .find(|(backend, backend_options, _)| {
-                    *backend == processing.backend && backend_options == &processing.backend_options
+                .find(|(backend, backend_options, accelerator, _)| {
+                    *backend == processing.backend
+                        && backend_options == &processing.backend_options
+                        && *accelerator == processing.accelerator
                 }) {
             Arc::clone(session)
         } else {
             let session = Arc::new(
-                BackendSession::prepare(processing.backend, processing.backend_options.clone())
-                    .map_err(|error| {
-                        format!(
-                            "バッチ入力 {} のバックエンドを準備できません: {error}",
-                            item.input.display()
-                        )
-                    })?,
+                BackendSession::prepare_with_accelerator(
+                    processing.backend,
+                    processing.backend_options.clone(),
+                    processing.accelerator,
+                )
+                .map_err(|error| {
+                    format!(
+                        "バッチ入力 {} のバックエンドを準備できません: {error}",
+                        item.input.display()
+                    )
+                })?,
             );
             backend_sessions.push((
                 processing.backend,
                 processing.backend_options.clone(),
+                processing.accelerator,
                 Arc::clone(&session),
             ));
             session
@@ -2424,6 +2506,8 @@ fn parsed_backend_options(options: &ProcessOptions) -> Result<BackendOptions, St
             .ok_or_else(|| format!("不明なチャンネルモード: {}", options.channel_mode))?,
         sgmse_profile: SgmseProfile::parse(&options.sgmse_profile)
             .ok_or_else(|| format!("不明なSGMSEプロファイル: {}", options.sgmse_profile))?,
+        accelerator: AcceleratorPreference::parse(&options.accelerator)
+            .ok_or_else(|| format!("不明なアクセラレータ: {}", options.accelerator))?,
         deterministic: options.deterministic,
         seed: options.seed,
     })
@@ -2459,7 +2543,12 @@ fn resolve_gui_backend_options(
 
 fn preflight_explicit_backend_resources(options: &ProcessOptions) -> Result<(), String> {
     if let Some(backend) = configured_backend(&options.backend)? {
-        resolve_gui_backend_options(backend, options)?;
+        let backend_options = resolve_gui_backend_options(backend, options)?;
+        denoize::select_accelerator(
+            backend,
+            backend_options.accelerator,
+            backend_options.deterministic,
+        )?;
     }
     Ok(())
 }
@@ -2529,7 +2618,7 @@ fn process_file(
     request: &ProcessRequest,
     control: &JobControl,
     progress: impl Fn(usize, &'static str),
-) -> Result<String, String> {
+) -> Result<ProcessFileResult, String> {
     check_cancelled(control)?;
     let input = Path::new(&request.input);
     let output = Path::new(&request.output);
@@ -2546,7 +2635,7 @@ fn process_file(
     check_cancelled(control)?;
     let processing = validated_processing_options(&request.options, &audio)?;
     progress(2, "ラウドネスと出力を準備しています");
-    service::process_audio(&mut audio, processing)?;
+    let processing_result = service::process_audio(&mut audio, processing)?;
     check_cancelled(control)?;
     progress(3, "ファイルを書き出しています");
     if let Some(parent) = output
@@ -2568,7 +2657,10 @@ fn process_file(
         CommitMode::NoClobber
     };
     control.commit(transaction, commit_mode)?;
-    Ok(output.to_string_lossy().into_owned())
+    Ok(ProcessFileResult {
+        output: output.to_string_lossy().into_owned(),
+        accelerator: processing_result.accelerator,
+    })
 }
 
 fn stage_batch_output(
@@ -2669,6 +2761,25 @@ fn emit_progress(
     output: Option<String>,
     error: Option<String>,
 ) {
+    emit_progress_with_accelerator(
+        app, job_id, kind, status, message, current, total, started, output, error, None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_progress_with_accelerator(
+    app: &AppHandle,
+    job_id: u64,
+    kind: &'static str,
+    status: &'static str,
+    message: &str,
+    current: usize,
+    total: usize,
+    started: Instant,
+    output: Option<String>,
+    error: Option<String>,
+    accelerator: Option<denoize::AcceleratorSelection>,
+) {
     let _ = app.emit(
         "job-progress",
         JobProgress {
@@ -2687,6 +2798,7 @@ fn emit_progress(
             item_status: None,
             item_id: None,
             resume_reason: None,
+            accelerator: accelerator.map(accelerator_result),
         },
     );
 }
@@ -2702,6 +2814,7 @@ fn emit_batch_item(
     total: usize,
     started: Instant,
     error: Option<String>,
+    accelerator: denoize::AcceleratorSelection,
 ) {
     let elapsed = started.elapsed().as_secs_f64();
     let eta =
@@ -2729,6 +2842,7 @@ fn emit_batch_item(
             item_status: Some(item_status),
             item_id: Some(item.item_id.as_hex()),
             resume_reason: resume_reason.map(batch_resume::ResumeReason::as_str),
+            accelerator: Some(accelerator_result(accelerator)),
         },
     );
 }
@@ -2940,6 +3054,7 @@ mod tests {
             onnx_model: None,
             onnx_sample_rate: 16_000,
             sgmse_profile: "balanced".into(),
+            accelerator: "cpu".into(),
             deterministic: false,
             seed: None,
         }
@@ -2965,6 +3080,7 @@ mod tests {
             onnx_model: None,
             onnx_rate: 16_000,
             sgmse_profile: "balanced".into(),
+            accelerator: "cpu".into(),
             deterministic: false,
         }
     }
@@ -3156,6 +3272,15 @@ deterministic = false
     #[test]
     fn app_info_reports_named_backend_model_rates() {
         let info = app_info();
+        assert_eq!(info.accelerators.len(), 3);
+        assert_eq!(info.accelerators[0].name, "cpu");
+        assert!(info.accelerators[0].compiled);
+        assert!(info.accelerators[0].available);
+        assert!(info.accelerators[0].device.is_none());
+        assert!(info.accelerators[0].memory_bytes.is_none());
+        assert!(info.accelerators[0].compute_capability.is_none());
+        assert_eq!(info.accelerators[1].name, "metal");
+        assert_eq!(info.accelerators[2].name, "cuda");
         for (name, expected_rate) in [
             ("mpsenet", 16_000),
             ("sgmse", 16_000),
@@ -3344,6 +3469,7 @@ deterministic = false
             |process| process.downmix = "missing".into(),
             |process| process.aac_encoder = "missing".into(),
             |process| process.sgmse_profile = "missing".into(),
+            |process| process.accelerator = "missing".into(),
         ];
         for mutate in mutations {
             let mut process = options();

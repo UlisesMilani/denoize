@@ -3,7 +3,10 @@
 use crate::loudness::LoudnessReport;
 #[cfg(feature = "gtcrn")]
 use crate::OnnxModelConfig;
-use crate::{Audio, Backend, BackendOptions, BackendSession, ConfigError, DenoiserConfig};
+use crate::{
+    select_accelerator, AcceleratorSelection, Audio, Backend, BackendOptions, BackendSession,
+    ConfigError, DenoiserConfig,
+};
 use std::time::Duration;
 
 /// User-facing backend choice shared by every application frontend.
@@ -35,6 +38,7 @@ pub struct ResolvedProcessingOptions {
     pub backend: Backend,
     pub denoiser: DenoiserConfig,
     pub backend_options: BackendOptions,
+    pub accelerator: AcceleratorSelection,
     pub loudness_lufs: Option<f64>,
     pub true_peak_dbtp: f64,
 }
@@ -47,6 +51,12 @@ impl ResolvedProcessingOptions {
             .map_err(|error| error.to_string())?;
         self.backend_options
             .validate_resolved_resources(self.backend)?;
+        crate::hardware::validate_accelerator_selection(
+            self.backend,
+            self.backend_options.accelerator,
+            self.backend_options.deterministic,
+            self.accelerator,
+        )?;
         if let Some(target) = self.loudness_lufs {
             validate_finite_range(
                 "loudness_lufs",
@@ -132,6 +142,7 @@ fn validate_finite_range(
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessingResult {
     pub backend: Backend,
+    pub accelerator: AcceleratorSelection,
     pub elapsed: Duration,
     pub loudness: Option<LoudnessReport>,
 }
@@ -262,10 +273,16 @@ pub fn resolve_processing_options(
         .map_err(|error| error.to_string())?;
     let denoiser = denoiser.sanitized();
     let backend_options = resolve_backend_options(backend, options.backend_options)?;
+    let accelerator = select_accelerator(
+        backend,
+        backend_options.accelerator,
+        backend_options.deterministic,
+    )?;
     Ok(ResolvedProcessingOptions {
         backend,
         denoiser,
         backend_options,
+        accelerator,
         loudness_lufs: options.loudness_lufs,
         true_peak_dbtp: options.true_peak_dbtp,
     })
@@ -276,7 +293,11 @@ pub fn process_audio_resolved(
     audio: &mut Audio,
     options: &ResolvedProcessingOptions,
 ) -> Result<ProcessingResult, String> {
-    let session = BackendSession::prepare(options.backend, options.backend_options.clone())?;
+    let session = BackendSession::prepare_with_accelerator(
+        options.backend,
+        options.backend_options.clone(),
+        options.accelerator,
+    )?;
     process_audio_resolved_with_session(audio, options, &session)
 }
 
@@ -296,6 +317,9 @@ pub fn process_audio_resolved_with_session(
     if session.backend() != options.backend || session.options() != &options.backend_options {
         return Err("prepared backend session does not match resolved processing options".into());
     }
+    if session.accelerator() != options.accelerator {
+        return Err("prepared backend session does not match resolved accelerator".into());
+    }
     let (mut working, elapsed) =
         crate::process_audio_copy_with_backend_session(audio, options.denoiser.clone(), session)?;
     let loudness = options
@@ -305,6 +329,7 @@ pub fn process_audio_resolved_with_session(
     *audio = working;
     Ok(ProcessingResult {
         backend: options.backend,
+        accelerator: options.accelerator,
         elapsed,
         loudness,
     })

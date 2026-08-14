@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes two versioned JSON contracts for local automation. Their
+denoize publishes three versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -8,6 +8,9 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   recipe-ABI snapshot.
 - [`denoize-cli-output-v1.schema.json`](../schemas/denoize-cli-output-v1.schema.json)
   describes single-file results, streaming results, and batch NDJSON events.
+- [`denoize-hardware-v1.schema.json`](../schemas/denoize-hardware-v1.schema.json)
+  describes a network-free snapshot of CPU features, compiled accelerator
+  runtimes, runtime availability, and backend accelerator support.
 
 Within a schema version, required field names, field types, digest encoding, and
 documented enum/string values are stable. A future release may add fields, so
@@ -80,3 +83,44 @@ JSON is printed only after a normal output has committed. Preflight, decode,
 processing, encoding, or publication failure therefore cannot emit a successful
 result document. Batch failure after execution can still produce complete
 progress and summary NDJSON records describing the failed partition.
+
+New file and streaming results also contain the exact accelerator decision as
+an additive v1 field. The schema keeps it optional so archived v0.53 v1
+documents remain valid:
+
+```json
+{
+  "accelerator": {
+    "requested": "auto",
+    "effective": "cpu",
+    "fallback": "no-available-gpu"
+  }
+}
+```
+
+`requested` is one of `cpu`, `auto`, `gpu`, `metal`, or `cuda`; `effective` is
+the concrete `cpu`, `metal`, or `cuda` runtime. `fallback` is `null` unless an
+`auto` request deliberately selected CPU because deterministic mode was active,
+the backend is CPU-only, or no GPU runtime passed its local availability probe.
+The effective runtime participates in finite-file recipe identity.
+
+## Hardware capability snapshot
+
+```sh
+# Compact, network-free host report.
+denoize hardware --json > denoize-hardware.json
+
+# The same denoize-hardware-v1 document, indented.
+denoize hardware --pretty
+```
+
+The report always lists CPU first, followed by Metal and CUDA. `compiled`
+states whether that runtime exists in this binary for the current target;
+`available` additionally requires its local dependency probe to pass. A failed
+probe is described in `detail` without opening a model or contacting a network.
+An available GPU reports its `device` name and `memory_bytes` limit: CUDA uses
+total global memory, while Metal uses the device's recommended maximum working
+set. CUDA also reports its `compute_capability`; fields that do not apply are
+`null`.
+Backend entries distinguish adapters that can be prepared through a tract GPU
+runtime from CPU-only implementations.
