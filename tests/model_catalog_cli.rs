@@ -18,7 +18,7 @@ fn embedded_catalog_status_list_and_info_are_visible() {
         String::from_utf8_lossy(&status.stderr)
     );
     let status = String::from_utf8(status.stdout).unwrap();
-    assert!(status.contains("sequence: 1\n"), "{status}");
+    assert!(status.contains("sequence: 2\n"), "{status}");
     assert!(
         status.contains("signing-key: F5AE02E7593C64D9\n"),
         "{status}"
@@ -47,13 +47,21 @@ fn embedded_catalog_status_list_and_info_are_visible() {
         String::from_utf8_lossy(&info.stderr)
     );
     let info = String::from_utf8(info.stdout).unwrap();
-    assert!(info.contains("catalog-sequence: 1\n"), "{info}");
+    assert!(info.contains("catalog-sequence: 2\n"), "{info}");
     assert!(
         info.contains("catalog-signing-key: F5AE02E7593C64D9\n"),
         "{info}"
     );
     assert!(
-        info.contains("catalog-expires-at-unix-seconds: legacy-none\n"),
+        info.contains("catalog-expires-at-unix-seconds: 1802217600\n"),
+        "{info}"
+    );
+    assert!(
+        info.contains("bundle-license: gtcrn-dns3-MIT.txt"),
+        "{info}"
+    );
+    assert!(
+        info.contains("bundle-provenance: gtcrn-dns3.json"),
         "{info}"
     );
     assert!(info.contains("catalog-trust-root-version: 1\n"), "{info}");
@@ -75,7 +83,28 @@ fn offline_catalog_update_never_requires_network() {
     );
     assert!(String::from_utf8(output.stdout)
         .unwrap()
-        .contains("sequence: 1\n"));
+        .contains("sequence: 2\n"));
+    assert!(!directory.path().join(".catalog").exists());
+}
+
+#[test]
+fn first_embedded_catalog_acquisition_persists_the_sequence_floor() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let output = run(&cache, &["models", "install", "gtcrn", "--offline"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("offline"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cache.join(".catalog/state.json")).unwrap()).unwrap();
+    assert_eq!(state["highest_sequence"], 2);
+    assert_eq!(
+        state["catalog_sha256"],
+        "9508b6d99af30f73e8a783e606fe9934ff41cefcf4268aca4b9e0ec5d66ff6eb"
+    );
 }
 
 #[test]

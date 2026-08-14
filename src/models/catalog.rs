@@ -32,11 +32,18 @@ const MAX_ENVELOPE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 const MAX_MODELS: usize = 256;
 const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_BUNDLE_METADATA_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_JSON_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
 const DEFAULT_CATALOG_URL: &str =
     "https://github.com/penguin425/denoize/releases/latest/download/denoize-model-catalog-v1.json";
 const LOCAL_IMPORT_SOURCE: &str = "local-import";
+#[cfg(not(test))]
 const EMBEDDED_CATALOG: &[u8] = include_bytes!("../../models/catalog-v1.json");
+// The detached-signature fixtures exercise sequences 2-4 from the original
+// sequence-1 production catalog. Keep that historical anchor test-only while
+// separately validating the current production document below.
+#[cfg(test)]
+const EMBEDDED_CATALOG: &[u8] = include_bytes!("testdata/catalog-seq1.json");
 
 /// Where the active catalog obtained its authenticated contents.
 #[non_exhaustive]
@@ -102,7 +109,51 @@ pub struct CatalogModel {
     pub(crate) size_bytes: u64,
     pub(crate) license: String,
     pub(crate) sample_rate: u32,
+    pub(crate) offline_bundle: Option<CatalogBundleMetadata>,
     pub(crate) catalog: CatalogIdentity,
+}
+
+/// One non-executable file authenticated by the signed catalog for inclusion
+/// in an offline model bundle.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogBundleFile {
+    filename: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+impl CatalogBundleFile {
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+}
+
+/// License and upstream-provenance files authenticated for one offline model
+/// bundle entry.
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogBundleMetadata {
+    license: CatalogBundleFile,
+    provenance: CatalogBundleFile,
+}
+
+impl CatalogBundleMetadata {
+    pub fn license(&self) -> &CatalogBundleFile {
+        &self.license
+    }
+
+    pub fn provenance(&self) -> &CatalogBundleFile {
+        &self.provenance
+    }
 }
 
 impl CatalogModel {
@@ -140,6 +191,12 @@ impl CatalogModel {
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Authenticated non-executable files required to package this model for
+    /// a closed-network installation.
+    pub fn offline_bundle(&self) -> Option<&CatalogBundleMetadata> {
+        self.offline_bundle.as_ref()
     }
 
     pub fn catalog_sequence(&self) -> u64 {
@@ -273,6 +330,23 @@ struct CatalogModelDocument {
     size_bytes: u64,
     license: String,
     sample_rate: u32,
+    #[serde(default)]
+    offline_bundle: Option<CatalogBundleMetadataDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBundleMetadataDocument {
+    license: CatalogBundleFileDocument,
+    provenance: CatalogBundleFileDocument,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBundleFileDocument {
+    filename: String,
+    sha256: String,
+    size_bytes: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -293,6 +367,12 @@ struct SignedCatalogEnvelope {
     catalog_base64: String,
     signature: String,
     source: String,
+}
+
+pub(super) struct VerifiedBundleCatalog {
+    pub catalog: ModelCatalog,
+    pub trust_root_version: u64,
+    pub trust_root_sha256: String,
 }
 
 const fn legacy_trust_root_version() -> u64 {
@@ -336,14 +416,7 @@ pub fn active_catalog() -> Result<ModelCatalog, String> {
             drop(lock);
             result
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let embedded = embedded_catalog();
-            if embedded.sequence() > 1 {
-                promote_embedded_catalog(embedded)
-            } else {
-                Ok(embedded)
-            }
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(embedded_catalog()),
         Err(error) => Err(format!(
             "failed to inspect model catalog directory {}: {error}",
             directory.display()
@@ -364,7 +437,6 @@ fn load_active_catalog_locked(
         .as_ref()
         .is_some_and(|state| state.highest_sequence < embedded.sequence())
     {
-        write_catalog_state(&embedded)?;
         return Ok(embedded);
     }
     if state
@@ -376,9 +448,6 @@ fn load_active_catalog_locked(
     let envelope = load_envelope()?;
     match (state, envelope) {
         (None, None) => {
-            if embedded.sequence() > 1 {
-                write_catalog_state(&embedded)?;
-            }
             Ok(embedded)
         }
         (Some(state), None) => Err(format!(
@@ -441,6 +510,7 @@ fn load_active_catalog_locked(
     }
 }
 
+#[cfg(test)]
 pub(super) fn promote_embedded_catalog(embedded: ModelCatalog) -> Result<ModelCatalog, String> {
     ensure_catalog_directory()?;
     let lock_destination = catalog_directory()?.join("catalog.json");
@@ -448,7 +518,11 @@ pub(super) fn promote_embedded_catalog(embedded: ModelCatalog) -> Result<ModelCa
     let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
     let result = (|| {
         let root = trust::load_active_trust_root_locked()?;
-        load_active_catalog_locked(embedded, &root)
+        let active = load_active_catalog_locked(embedded.clone(), &root)?;
+        if active == embedded && embedded.sequence() > 1 {
+            write_catalog_state(&embedded)?;
+        }
+        Ok(active)
     })();
     drop(lock);
     result
@@ -535,7 +609,7 @@ fn activate_signed_catalog(
     let lock_destination = catalog_directory()?.join("catalog.json");
     let mut never_cancelled = || false;
     let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
-    let result = (|| {
+    let result: Result<Option<ModelCatalog>, String> = (|| {
         let root = trust::load_active_trust_root_locked()?;
         let now = trust::effective_now_and_record_locked(&root)?;
         trust::require_fresh_root(&root, now)?;
@@ -549,48 +623,15 @@ fn activate_signed_catalog(
             CatalogVerificationMode::Current { now },
         )?;
         let embedded = embedded_catalog();
-        if catalog.sequence() < embedded.sequence() {
-            return Err(format!(
-                "refusing model catalog sequence {} older than embedded sequence {}",
-                catalog.sequence(),
-                embedded.sequence()
-            ));
-        }
-        if catalog.sequence() == embedded.sequence()
-            && (catalog.sha256() != embedded.sha256()
-                || catalog.signing_key_id() != embedded.signing_key_id())
-        {
-            return Err(format!(
-                "refusing different model catalog content at embedded sequence {}",
-                embedded.sequence()
-            ));
-        }
+        validate_catalog_candidate_floor(&catalog, &embedded)?;
         if catalog.sequence() == embedded.sequence() {
             // The signature was still authenticated above, but persisting an
-            // envelope identical to immutable embedded bytes adds no authority
-            // or rollback protection. Prefer the build's trusted copy.
+            // envelope identical to immutable embedded bytes adds no
+            // authority. Persist only its rollback floor and prefer the
+            // build's trusted copy.
+            write_catalog_state(&embedded)?;
             return Ok(Some(embedded));
         }
-        if let Some(state) = load_state()? {
-            validate_state(&state)?;
-            if catalog.sequence() < state.highest_sequence {
-                return Err(format!(
-                    "refusing model catalog rollback from sequence {} to {}",
-                    state.highest_sequence,
-                    catalog.sequence()
-                ));
-            }
-            if catalog.sequence() == state.highest_sequence
-                && (catalog.sha256() != state.catalog_sha256
-                    || catalog.signing_key_id() != state.signing_key_id)
-            {
-                return Err(format!(
-                    "refusing different model catalog content at already accepted sequence {}",
-                    state.highest_sequence
-                ));
-            }
-        }
-
         // Persist the rollback floor first. A crash between these commits can
         // require a retry, but can never make an older signed catalog active.
         write_catalog_state(&catalog)?;
@@ -612,6 +653,101 @@ fn activate_signed_catalog(
         Some(embedded) => Ok(embedded),
         None => active_catalog(),
     }
+}
+
+pub(super) fn activate_bundle_catalog(
+    catalog_bytes: &[u8],
+    signature: &[u8],
+) -> Result<ModelCatalog, String> {
+    activate_signed_catalog(catalog_bytes, signature, LOCAL_IMPORT_SOURCE)
+}
+
+/// Verify a detached catalog against the currently active trust root without
+/// advancing either rollback or trusted-time state. Bundle import performs all
+/// payload validation under this read-only authority before it commits state.
+pub(super) fn verify_bundle_catalog(
+    catalog_bytes: &[u8],
+    signature: &[u8],
+) -> Result<VerifiedBundleCatalog, String> {
+    validate_catalog_storage_path()?;
+    let directory = catalog_directory()?;
+    let verify = |root: &trust::ActiveTrustRoot| {
+        let now = trust::effective_now_locked(root)?;
+        trust::require_fresh_root(root, now)?;
+        let catalog = verify_signed_catalog_with_root(
+            catalog_bytes,
+            signature,
+            CatalogOrigin::Signed {
+                source: LOCAL_IMPORT_SOURCE.to_string(),
+            },
+            root,
+            CatalogVerificationMode::Current { now },
+        )?;
+        validate_catalog_candidate_floor(&catalog, &embedded_catalog())?;
+        Ok(VerifiedBundleCatalog {
+            catalog,
+            trust_root_version: root.version(),
+            trust_root_sha256: root.sha256().to_string(),
+        })
+    };
+    match std::fs::symlink_metadata(&directory) {
+        Ok(_) => {
+            let lock_destination = directory.join("catalog.json");
+            let mut never_cancelled = || false;
+            let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
+            let result = verify(&trust::load_active_trust_root_locked()?);
+            drop(lock);
+            result
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            verify(&trust::embedded_trust_root())
+        }
+        Err(error) => Err(format!(
+            "failed to inspect model catalog directory {}: {error}",
+            directory.display()
+        )),
+    }
+}
+
+fn validate_catalog_candidate_floor(
+    catalog: &ModelCatalog,
+    embedded: &ModelCatalog,
+) -> Result<(), String> {
+    if catalog.sequence() < embedded.sequence() {
+        return Err(format!(
+            "refusing model catalog sequence {} older than embedded sequence {}",
+            catalog.sequence(),
+            embedded.sequence()
+        ));
+    }
+    if catalog.sequence() == embedded.sequence()
+        && (catalog.sha256() != embedded.sha256()
+            || catalog.signing_key_id() != embedded.signing_key_id())
+    {
+        return Err(format!(
+            "refusing different model catalog content at embedded sequence {}",
+            embedded.sequence()
+        ));
+    }
+    if let Some(state) = load_state()? {
+        if catalog.sequence() < state.highest_sequence {
+            return Err(format!(
+                "refusing model catalog rollback from sequence {} to {}",
+                state.highest_sequence,
+                catalog.sequence()
+            ));
+        }
+        if catalog.sequence() == state.highest_sequence
+            && (catalog.sha256() != state.catalog_sha256
+                || catalog.signing_key_id() != state.signing_key_id)
+        {
+            return Err(format!(
+                "refusing different model catalog content at already accepted sequence {}",
+                state.highest_sequence
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_signed_catalog_with_root(
@@ -820,6 +956,33 @@ fn validate_document(
                 model.name
             ));
         }
+        let offline_bundle = model
+            .offline_bundle
+            .map(|metadata| {
+                Ok::<CatalogBundleMetadata, String>(CatalogBundleMetadata {
+                    license: validate_catalog_bundle_file(
+                        &model.name,
+                        "license",
+                        metadata.license,
+                    )?,
+                    provenance: validate_catalog_bundle_file(
+                        &model.name,
+                        "provenance",
+                        metadata.provenance,
+                    )?,
+                })
+            })
+            .transpose()?;
+        if offline_bundle.as_ref().is_some_and(|metadata| {
+            metadata.license.filename == model.filename
+                || metadata.provenance.filename == model.filename
+                || metadata.license.filename == metadata.provenance.filename
+        }) {
+            return Err(format!(
+                "model {} offline bundle component filenames must be distinct",
+                model.name
+            ));
+        }
         let url = Url::parse(&model.url)
             .map_err(|_| format!("model {} has an invalid URL", model.name))?;
         if url.scheme() != "https"
@@ -843,10 +1006,41 @@ fn validate_document(
             size_bytes: model.size_bytes,
             license: model.license,
             sample_rate: model.sample_rate,
+            offline_bundle,
             catalog: identity.clone(),
         });
     }
     Ok(ModelCatalog { identity, models })
+}
+
+fn validate_catalog_bundle_file(
+    model_name: &str,
+    description: &str,
+    file: CatalogBundleFileDocument,
+) -> Result<CatalogBundleFile, String> {
+    validate_filename(&file.filename).map_err(|error| {
+        format!("model {model_name} has an invalid offline {description} filename: {error}")
+    })?;
+    if file.sha256.len() != 64
+        || !file
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(format!(
+            "model {model_name} offline {description} has an invalid lowercase SHA-256"
+        ));
+    }
+    if file.size_bytes == 0 || file.size_bytes > MAX_BUNDLE_METADATA_FILE_BYTES {
+        return Err(format!(
+            "model {model_name} offline {description} size must be between 1 byte and {MAX_BUNDLE_METADATA_FILE_BYTES} bytes"
+        ));
+    }
+    Ok(CatalogBundleFile {
+        filename: file.filename,
+        sha256: file.sha256,
+        size_bytes: file.size_bytes,
+    })
 }
 
 fn validate_catalog_validity(
@@ -1162,14 +1356,18 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), String> 
 }
 
 fn write_catalog_state(catalog: &ModelCatalog) -> Result<(), String> {
+    write_catalog_identity_state(catalog.identity())
+}
+
+fn write_catalog_identity_state(identity: &CatalogIdentity) -> Result<(), String> {
     write_json_atomic(
         &state_path()?,
         &CatalogState {
             version: CATALOG_STATE_VERSION,
-            highest_sequence: catalog.sequence(),
-            catalog_sha256: catalog.sha256().to_string(),
-            signing_key_id: catalog.signing_key_id().to_string(),
-            trust_root_version: catalog.trust_root_version(),
+            highest_sequence: identity.sequence,
+            catalog_sha256: identity.sha256.clone(),
+            signing_key_id: identity.signing_key_id.clone(),
+            trust_root_version: identity.trust_root_version,
         },
     )
 }
@@ -1187,7 +1385,26 @@ pub(crate) fn require_catalog_acquisition(identity: &CatalogIdentity) -> Result<
     let result = (|| {
         let root = trust::load_active_trust_root_locked()?;
         let now = trust::effective_now_and_record_locked(&root)?;
-        validate_acquisition_authority(identity, &root, now, load_state()?.as_ref())
+        let state = load_state()?;
+        let advance_embedded_floor = matches!(identity.origin, CatalogOrigin::Embedded)
+            && identity.sequence > 1
+            && state
+                .as_ref()
+                .is_none_or(|state| state.highest_sequence < identity.sequence);
+        validate_acquisition_authority(
+            identity,
+            &root,
+            now,
+            if advance_embedded_floor {
+                None
+            } else {
+                state.as_ref()
+            },
+        )?;
+        if advance_embedded_floor {
+            write_catalog_identity_state(identity)?;
+        }
+        Ok(())
     })();
     drop(lock);
     result
@@ -1204,11 +1421,22 @@ fn catalog_acquisition_allowed(catalog: &ModelCatalog) -> Result<bool, String> {
             let result = (|| {
                 let root = trust::load_active_trust_root_locked()?;
                 let now = trust::effective_now_locked(&root)?;
+                let state = load_state()?;
+                let advance_embedded_floor =
+                    matches!(catalog.identity().origin, CatalogOrigin::Embedded)
+                        && catalog.sequence() > 1
+                        && state
+                            .as_ref()
+                            .is_none_or(|state| state.highest_sequence < catalog.sequence());
                 Ok(validate_acquisition_authority(
                     catalog.identity(),
                     &root,
                     now,
-                    load_state()?.as_ref(),
+                    if advance_embedded_floor {
+                        None
+                    } else {
+                        state.as_ref()
+                    },
                 )
                 .is_ok())
             })();
@@ -1391,6 +1619,32 @@ mod tests {
             .sha256()
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn production_catalog_sequence_two_authenticates_offline_bundle_evidence() {
+        let catalog = parse_catalog(
+            include_bytes!("../../models/catalog-v1.json"),
+            CatalogOrigin::Embedded,
+        )
+        .unwrap();
+        assert_eq!(catalog.sequence(), 2);
+        assert_eq!(catalog.issued_at_unix_seconds(), Some(1_786_665_600));
+        assert_eq!(catalog.expires_at_unix_seconds(), Some(1_802_217_600));
+        let model = catalog.find("gtcrn-dns3").unwrap();
+        let bundle = model.offline_bundle().unwrap();
+        assert_eq!(bundle.license().filename(), "gtcrn-dns3-MIT.txt");
+        assert_eq!(bundle.license().size_bytes(), 1_069);
+        assert_eq!(
+            bundle.license().sha256(),
+            "c467165e5860b4a7494ef4a6e2788e4115d95b5b8989bb5f86287089adddf794"
+        );
+        assert_eq!(bundle.provenance().filename(), "gtcrn-dns3.json");
+        assert_eq!(bundle.provenance().size_bytes(), 749);
+        assert_eq!(
+            bundle.provenance().sha256(),
+            "af0b088d7a32abb626750e753d1d19bdffe86d0a5cd06651ef0ef9ad0a291c41"
+        );
     }
 
     #[test]
@@ -1612,6 +1866,20 @@ mod tests {
             .replace("\"sequence\": 2", "\"sequence\": 18446744073709551615");
         let error = parse_catalog(unsafe_sequence.as_bytes(), CatalogOrigin::Embedded).unwrap_err();
         assert!(error.contains("sequence must be between"), "{error}");
+
+        let mut colliding_bundle: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../models/catalog-v1.json")).unwrap();
+        let artifact_filename = colliding_bundle["models"][0]["filename"].clone();
+        colliding_bundle["models"][0]["offline_bundle"]["license"]["filename"] = artifact_filename;
+        let error = parse_catalog(
+            &serde_json::to_vec(&colliding_bundle).unwrap(),
+            CatalogOrigin::Embedded,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("component filenames must be distinct"),
+            "{error}"
+        );
     }
 
     #[test]

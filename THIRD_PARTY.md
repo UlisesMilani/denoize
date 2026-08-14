@@ -1,5 +1,16 @@
 # Third-party notices
 
+## GTCRN DNS3 model
+
+The signed offline model release bundle contains the official causal GTCRN
+speech-enhancement graph from [`Xiaobin-Rong/gtcrn`](https://github.com/Xiaobin-Rong/gtcrn)
+revision `3862c44808dca492ea5a8a145d2dc2a1028d08c8`. The upstream project and
+model are authored by Rong Xiaobin and distributed under the MIT License. The
+bundle authenticates the exact model, license, and source-provenance bytes
+against the signed denoize model catalog. The complete upstream notice is
+included at
+[`models/licenses/gtcrn-dns3-MIT.txt`](models/licenses/gtcrn-dns3-MIT.txt).
+
 ## minisign-verify 0.2.5
 
 denoize uses the unmodified `minisign-verify` implementation by Frank Denis

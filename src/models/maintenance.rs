@@ -424,6 +424,12 @@ fn basic_provenance_is_managed(provenance: &ModelProvenance, directory_name: &st
             ModelInstallationSource::LocalFile
             | ModelInstallationSource::CompletedPartial
             | ModelInstallationSource::ExistingCacheMigration => true,
+            ModelInstallationSource::OfflineBundle { bundle_sha256 } => {
+                bundle_sha256.len() == 64
+                    && bundle_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            }
         }
 }
 
