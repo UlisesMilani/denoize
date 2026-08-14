@@ -658,6 +658,52 @@ struct ModelCatalogRow {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ModelCacheIssueRow {
+    kind: String,
+    path: String,
+    model: Option<String>,
+    detail: String,
+    prunable: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCacheHealthRow {
+    name: String,
+    path: String,
+    status: String,
+    issues: Vec<ModelCacheIssueRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelCacheReportRow {
+    cache_dir: String,
+    catalog_sequence: u64,
+    catalog_sha256: String,
+    clean: bool,
+    models: Vec<ModelCacheHealthRow>,
+    issues: Vec<ModelCacheIssueRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelLibraryRow {
+    models: Vec<ModelRow>,
+    health: ModelCacheReportRow,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelPruneReportRow {
+    dry_run: bool,
+    would_remove: Vec<String>,
+    removed: Vec<String>,
+    retained: Vec<ModelCacheIssueRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewData {
     source: String,
     playable_path: String,
@@ -1471,21 +1517,28 @@ async fn compare_audio(
 }
 
 #[tauri::command]
-fn list_models() -> Result<Vec<ModelRow>, String> {
+fn list_models() -> Result<ModelLibraryRow, String> {
     let catalog = denoize::models::active_catalog()?;
-    catalog
+    let health = denoize::models::doctor_model_cache_for_catalog(&catalog)?;
+    let models = catalog
         .models()
         .iter()
         .map(|model| {
             let path = denoize::models::path_for_catalog_model(model)?;
-            let provenance = denoize::models::catalog_model_provenance(model).ok();
+            let cache_model = health
+                .models
+                .iter()
+                .find(|candidate| candidate.name == model.name())
+                .ok_or_else(|| format!("モデル診断結果がありません: {}", model.name()))?;
+            let installed = cache_model.status == denoize::models::ModelCacheModelStatus::Healthy;
+            let provenance = cache_model.provenance.as_ref();
             Ok(ModelRow {
                 name: model.name().to_string(),
                 backend: model.backend().to_string(),
                 license: model.license().to_string(),
                 sample_rate: model.sample_rate(),
                 revision: model.revision().to_string(),
-                installed: provenance.is_some(),
+                installed,
                 path: path.to_string_lossy().into_owned(),
                 catalog_sequence: model.catalog_sequence(),
                 catalog_sha256: model.catalog_sha256().to_string(),
@@ -1497,7 +1550,11 @@ fn list_models() -> Result<Vec<ModelRow>, String> {
                     .map(|provenance| provenance.installed_at_unix_seconds),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(ModelLibraryRow {
+        models,
+        health: model_cache_report_row(health),
+    })
 }
 
 fn model_catalog_origin(origin: &denoize::models::CatalogOrigin) -> String {
@@ -1527,6 +1584,73 @@ fn model_installation_source(source: &denoize::models::ModelInstallationSource) 
             "existing-cache-migration".into()
         }
         _ => "unknown".into(),
+    }
+}
+
+fn model_cache_status(status: denoize::models::ModelCacheModelStatus) -> String {
+    match status {
+        denoize::models::ModelCacheModelStatus::Missing => "missing",
+        denoize::models::ModelCacheModelStatus::Healthy => "healthy",
+        denoize::models::ModelCacheModelStatus::Corrupt => "corrupt",
+        denoize::models::ModelCacheModelStatus::ProvenanceMissing => "provenance-missing",
+        denoize::models::ModelCacheModelStatus::ProvenanceInvalid => "provenance-invalid",
+        denoize::models::ModelCacheModelStatus::Unsafe => "unsafe",
+        _ => "unknown",
+    }
+    .into()
+}
+
+fn model_cache_issue_kind(kind: denoize::models::ModelCacheIssueKind) -> String {
+    match kind {
+        denoize::models::ModelCacheIssueKind::MissingArtifact => "missing-artifact",
+        denoize::models::ModelCacheIssueKind::CorruptArtifact => "corrupt-artifact",
+        denoize::models::ModelCacheIssueKind::MissingProvenance => "missing-provenance",
+        denoize::models::ModelCacheIssueKind::InvalidProvenance => "invalid-provenance",
+        denoize::models::ModelCacheIssueKind::IncompleteDownload => "incomplete-download",
+        denoize::models::ModelCacheIssueKind::StaleDownloadState => "stale-download-state",
+        denoize::models::ModelCacheIssueKind::OrphanedEntry => "orphaned-entry",
+        denoize::models::ModelCacheIssueKind::UnsafeEntry => "unsafe-entry",
+        _ => "unknown",
+    }
+    .into()
+}
+
+fn model_cache_issue_row(issue: denoize::models::ModelCacheIssue) -> ModelCacheIssueRow {
+    ModelCacheIssueRow {
+        kind: model_cache_issue_kind(issue.kind),
+        path: issue.path.to_string_lossy().into_owned(),
+        model: issue.model,
+        detail: issue.detail,
+        prunable: issue.prunable,
+    }
+}
+
+fn model_cache_report_row(report: denoize::models::ModelCacheReport) -> ModelCacheReportRow {
+    let clean = report.is_clean();
+    ModelCacheReportRow {
+        cache_dir: report.cache_dir.to_string_lossy().into_owned(),
+        catalog_sequence: report.catalog_sequence,
+        catalog_sha256: report.catalog_sha256,
+        clean,
+        models: report
+            .models
+            .into_iter()
+            .map(|model| ModelCacheHealthRow {
+                name: model.name,
+                path: model.path.to_string_lossy().into_owned(),
+                status: model_cache_status(model.status),
+                issues: model
+                    .issues
+                    .into_iter()
+                    .map(model_cache_issue_row)
+                    .collect(),
+            })
+            .collect(),
+        issues: report
+            .issues
+            .into_iter()
+            .map(model_cache_issue_row)
+            .collect(),
     }
 }
 
@@ -1562,6 +1686,42 @@ async fn update_model_catalog(
 }
 
 #[tauri::command]
+async fn model_cache_doctor() -> Result<ModelCacheReportRow, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        denoize::models::doctor_model_cache().map(model_cache_report_row)
+    })
+    .await
+    .map_err(|error| format!("モデルキャッシュ診断タスクに失敗しました: {error}"))?
+}
+
+#[tauri::command]
+async fn prune_model_cache(dry_run: bool) -> Result<ModelPruneReportRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = denoize::models::prune_model_cache(dry_run)?;
+        Ok(ModelPruneReportRow {
+            dry_run: report.dry_run,
+            would_remove: report
+                .would_remove
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            removed: report
+                .removed
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            retained: report
+                .retained
+                .into_iter()
+                .map(model_cache_issue_row)
+                .collect(),
+        })
+    })
+    .await
+    .map_err(|error| format!("モデルキャッシュ整理タスクに失敗しました: {error}"))?
+}
+
+#[tauri::command]
 fn model_action(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -1574,15 +1734,19 @@ fn model_action(
         .find(&name)
         .cloned()
         .ok_or_else(|| format!("不明なモデル: {name}"))?;
-    if !matches!(action.as_str(), "install" | "update" | "verify" | "remove") {
+    if !matches!(
+        action.as_str(),
+        "install" | "update" | "verify" | "repair" | "remove"
+    ) {
         return Err(format!("不明な操作: {action}"));
     }
-    let (download_options, source_path) = if matches!(action.as_str(), "install" | "update") {
-        model_action_options(options)?
-    } else {
-        (ModelDownloadOptions::default(), None)
-    };
-    if source_path.is_some() && action == "update" {
+    let (download_options, source_path) =
+        if matches!(action.as_str(), "install" | "update" | "repair") {
+            model_action_options(options)?
+        } else {
+            (ModelDownloadOptions::default(), None)
+        };
+    if source_path.is_some() && action != "install" {
         return Err("ローカルファイルは導入操作でのみ使用できます".into());
     }
     let (job_id, cancelled) = register_job(&state)?;
@@ -1631,6 +1795,24 @@ fn model_action(
             "verify" => {
                 denoize::models::verify_catalog_model(&model).map(|path| path.display().to_string())
             }
+            "repair" => denoize::models::repair_catalog_model_with_options_and_progress(
+                &model,
+                &download_options,
+                || cancelled.is_cancelled(),
+                progress,
+            )
+            .map(|outcome| match outcome {
+                denoize::models::ModelRepairOutcome::AlreadyHealthy => {
+                    "正常なため修復は不要です".into()
+                }
+                denoize::models::ModelRepairOutcome::ProvenanceRebuilt => {
+                    "provenanceを再構築しました".into()
+                }
+                denoize::models::ModelRepairOutcome::ArtifactInstalled => {
+                    "モデルを再取得して修復しました".into()
+                }
+                _ => "モデルを修復しました".into(),
+            }),
             "remove" => {
                 denoize::models::remove_catalog_model(&model).map(|_| "削除しました".into())
             }
@@ -2405,6 +2587,8 @@ pub fn run() {
             list_models,
             model_catalog_status,
             update_model_catalog,
+            model_cache_doctor,
+            prune_model_cache,
             model_action,
             prepare_preview,
             load_gui_config,
@@ -3222,6 +3406,22 @@ deterministic = false
         assert_eq!(
             model_action_options(Some(input)).unwrap_err(),
             "プロキシURLと直接接続は同時に指定できません"
+        );
+    }
+
+    #[test]
+    fn model_cache_health_labels_are_stable() {
+        assert_eq!(
+            model_cache_status(denoize::models::ModelCacheModelStatus::ProvenanceInvalid),
+            "provenance-invalid"
+        );
+        assert_eq!(
+            model_cache_issue_kind(denoize::models::ModelCacheIssueKind::InvalidProvenance),
+            "invalid-provenance"
+        );
+        assert_eq!(
+            model_cache_issue_kind(denoize::models::ModelCacheIssueKind::OrphanedEntry),
+            "orphaned-entry"
         );
     }
 

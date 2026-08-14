@@ -315,6 +315,13 @@ denoize models catalog status
 denoize models catalog update
 denoize models catalog import catalog-v1.json catalog-v1.json.sig
 
+# Diagnose the whole cache without changing model data. Repair known packages,
+# then preview and apply removal of stale denoize-owned state.
+denoize models doctor
+denoize models repair all
+denoize models prune --dry-run
+denoize models prune
+
 # Offline mode never opens a network connection.
 denoize models install gtcrn-dns3 --offline
 
@@ -359,6 +366,24 @@ installation-time catalog origin and source. Existing verified caches are
 migrated lazily; mismatched provenance fails verification. `denoize models info MODEL` reports these fields and the
 pinned length as an unscaled decimal `size-bytes` value. This per-model
 integrity bound is not an aggregate cache quota.
+
+`models doctor` inventories every active-catalog package plus cache sidecars
+and orphan entries without changing artifacts, provenance, or download state.
+An optional package that was never installed is reported as `missing` but does
+not make a fresh cache unhealthy. Corrupt bytes, missing or mismatched
+provenance, incomplete/stale downloads, unsafe entries, and catalog-orphaned
+packages are reported separately. `models verify MODEL|all` remains the strict
+package verification command.
+
+`models repair MODEL|all` rebuilds provenance locally when verified bytes are
+already present; otherwise it uses the same offline, source, proxy, and
+authentication policy as install/update. Replacement bytes are staged and
+verified before the old artifact is atomically replaced. `models prune
+--dry-run` lists exact removable paths. Applying `models prune` deletes stale
+sidecars, superseded provenance, and old package directories only when their
+content-addressed provenance, artifact digest/size, and directory layout all
+match denoize-managed state. Unknown data and symlinks, devices, or other
+special entries are reported and retained.
 
 HTTPS model connections, including those tunneled through an HTTP CONNECT
 proxy, use the operating system trust store. CLI Bearer tokens and Basic

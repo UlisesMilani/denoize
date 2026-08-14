@@ -179,6 +179,52 @@ or mismatched provenance fails verification instead of silently being replaced.
 `models remove` removes interrupted state and every provenance record for that
 package.
 
+## Cache health, repair, and pruning
+
+Use the read-only doctor before automated or manual maintenance:
+
+```sh
+denoize models doctor
+denoize models verify all
+```
+
+The report distinguishes `healthy`, optional `missing`, `corrupt`,
+`provenance-missing`, `provenance-invalid`, and `unsafe` package states. It
+also reports resumable incomplete downloads, stale sidecars, superseded
+provenance, catalog-orphaned packages, and unknown cache entries. A fresh cache
+with optional models absent is clean. Doctor does not create or rewrite model
+artifacts, provenance, or download sidecars. Resolving the active catalog keeps
+its normal authenticated promotion and cooperative-lock behavior.
+
+Repair one package or all active packages:
+
+```sh
+denoize models repair gtcrn
+denoize models repair all --offline
+```
+
+Verified artifact bytes with missing or invalid provenance are repaired
+locally. Missing or corrupt artifacts are reacquired with the install/update
+network policy; `--offline` therefore succeeds only when no download is
+needed. A failed, cancelled, or integrity-invalid replacement leaves the old
+artifact untouched.
+
+Pruning is separate from repair and supports an exact preview:
+
+```sh
+denoize models prune --dry-run
+denoize models prune
+```
+
+Prune removes regular stale sidecars and superseded provenance under an active
+package. A whole inactive package directory is removable only when bounded
+provenance, the artifact digest/size, and the complete directory layout match
+denoize-managed state.
+Unproven files/directories and every symlink, device, FIFO, or other special
+entry are retained and reported. Per-package locks prevent prune from racing a
+download, publish, repair, or remove operation. The desktop model manager
+exposes the same diagnosis, per-model repair, preview, and apply operations.
+
 The desktop model manager displays the active catalog sequence, signing key,
 origin, and per-model provenance, and can authenticate and activate the latest
 catalog. It exposes equivalent offline, source, proxy, direct, authentication,

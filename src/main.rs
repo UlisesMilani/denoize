@@ -4223,6 +4223,9 @@ USAGE:
     denoize models install <MODEL> --from <PATH>
     denoize models update <MODEL|all> [DOWNLOAD OPTIONS]
     denoize models verify <MODEL|all>
+    denoize models doctor
+    denoize models repair <MODEL|all> [DOWNLOAD OPTIONS]
+    denoize models prune [--dry-run]
     denoize models remove <MODEL|all>
     denoize models path <MODEL|all>
     denoize models catalog status
@@ -4260,6 +4263,7 @@ enum ModelCommand {
     Install,
     Update,
     Verify,
+    Repair,
     Remove,
     Path,
 }
@@ -4269,6 +4273,10 @@ enum ParsedModelsCommand {
     Help,
     List,
     CacheDir,
+    Doctor,
+    Prune {
+        dry_run: bool,
+    },
     Run {
         command: ModelCommand,
         target: String,
@@ -4353,11 +4361,28 @@ where
         });
     }
 
+    if command_name == "doctor" {
+        if args.len() > 1 {
+            return Err("models doctor accepts no arguments".into());
+        }
+        return Ok(ParsedModelsCommand::Doctor);
+    }
+
+    if command_name == "prune" {
+        let dry_run = match args.get(1).map(String::as_str) {
+            None => false,
+            Some("--dry-run") if args.len() == 2 => true,
+            Some(value) => return Err(format!("unknown models prune option: {value}")),
+        };
+        return Ok(ParsedModelsCommand::Prune { dry_run });
+    }
+
     let command = match command_name {
         "info" => ModelCommand::Info,
         "install" => ModelCommand::Install,
         "update" => ModelCommand::Update,
         "verify" => ModelCommand::Verify,
+        "repair" => ModelCommand::Repair,
         "remove" => ModelCommand::Remove,
         "path" => ModelCommand::Path,
         _ => return Err(format!("unknown models command: {command_name}")),
@@ -4368,7 +4393,10 @@ where
         .ok_or_else(|| format!("models {command_name} requires MODEL|all"))?
         .clone();
 
-    if !matches!(command, ModelCommand::Install | ModelCommand::Update) {
+    if !matches!(
+        command,
+        ModelCommand::Install | ModelCommand::Update | ModelCommand::Repair
+    ) {
         if args.len() > 2 {
             return Err(format!(
                 "models {command_name} does not accept options or extra arguments"
@@ -4756,6 +4784,80 @@ fn run_model_catalog(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn model_cache_status_output(status: denoize::models::ModelCacheModelStatus) -> &'static str {
+    match status {
+        denoize::models::ModelCacheModelStatus::Missing => "missing",
+        denoize::models::ModelCacheModelStatus::Healthy => "healthy",
+        denoize::models::ModelCacheModelStatus::Corrupt => "corrupt",
+        denoize::models::ModelCacheModelStatus::ProvenanceMissing => "provenance-missing",
+        denoize::models::ModelCacheModelStatus::ProvenanceInvalid => "provenance-invalid",
+        denoize::models::ModelCacheModelStatus::Unsafe => "unsafe",
+        _ => "unknown",
+    }
+}
+
+fn model_cache_issue_output(kind: denoize::models::ModelCacheIssueKind) -> &'static str {
+    match kind {
+        denoize::models::ModelCacheIssueKind::MissingArtifact => "missing-artifact",
+        denoize::models::ModelCacheIssueKind::CorruptArtifact => "corrupt-artifact",
+        denoize::models::ModelCacheIssueKind::MissingProvenance => "missing-provenance",
+        denoize::models::ModelCacheIssueKind::InvalidProvenance => "invalid-provenance",
+        denoize::models::ModelCacheIssueKind::IncompleteDownload => "incomplete-download",
+        denoize::models::ModelCacheIssueKind::StaleDownloadState => "stale-download-state",
+        denoize::models::ModelCacheIssueKind::OrphanedEntry => "orphaned-entry",
+        denoize::models::ModelCacheIssueKind::UnsafeEntry => "unsafe-entry",
+        _ => "unknown",
+    }
+}
+
+fn print_model_cache_issue(issue: &denoize::models::ModelCacheIssue) {
+    println!(
+        "issue: {}\t{}\t{}{}",
+        model_cache_issue_output(issue.kind),
+        issue.path.display(),
+        issue.detail,
+        if issue.prunable { "\tprunable" } else { "" }
+    );
+}
+
+fn print_model_cache_report(report: &denoize::models::ModelCacheReport) {
+    println!("cache: {}", report.cache_dir.display());
+    println!("catalog-sequence: {}", report.catalog_sequence);
+    println!("catalog-sha256: {}", report.catalog_sha256);
+    println!("NAME\tSTATUS\tPATH");
+    for model in &report.models {
+        println!(
+            "{}\t{}\t{}",
+            model.name,
+            model_cache_status_output(model.status),
+            model.path.display()
+        );
+        for issue in &model.issues {
+            if issue.kind != denoize::models::ModelCacheIssueKind::MissingArtifact {
+                print_model_cache_issue(issue);
+            }
+        }
+    }
+    for issue in &report.issues {
+        print_model_cache_issue(issue);
+    }
+    let healthy = report
+        .models
+        .iter()
+        .filter(|model| model.status == denoize::models::ModelCacheModelStatus::Healthy)
+        .count();
+    let missing = report
+        .models
+        .iter()
+        .filter(|model| model.status == denoize::models::ModelCacheModelStatus::Missing)
+        .count();
+    println!(
+        "doctor-summary: {healthy} healthy, {missing} missing, {} attention, {} cache issues",
+        report.models.len() - healthy - missing,
+        report.issues.len()
+    );
+}
+
 fn run_models(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("catalog") {
         return run_model_catalog(args);
@@ -4764,7 +4866,10 @@ fn run_models(args: &[String]) -> Result<(), String> {
         .iter()
         .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
         || args.first().map(String::as_str) == Some("help");
-    let download_command = matches!(args.first().map(String::as_str), Some("install" | "update"));
+    let download_command = matches!(
+        args.first().map(String::as_str),
+        Some("install" | "update" | "repair")
+    );
     let download_options = if download_command && !help_requested {
         model_download_options_from_environment_with(args, |name| std::env::var(name).ok())?
     } else {
@@ -4801,6 +4906,36 @@ fn run_models(args: &[String]) -> Result<(), String> {
         }
         ParsedModelsCommand::CacheDir => {
             println!("{}", denoize::models::cache_dir()?.display());
+            return Ok(());
+        }
+        ParsedModelsCommand::Doctor => {
+            let report = denoize::models::doctor_model_cache()?;
+            print_model_cache_report(&report);
+            if !report.is_clean() {
+                return Err(
+                    "model cache needs attention; run `denoize models repair all` and `denoize models prune --dry-run`"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        ParsedModelsCommand::Prune { dry_run } => {
+            let report = denoize::models::prune_model_cache(dry_run)?;
+            for path in &report.would_remove {
+                println!("would-remove {}", path.display());
+            }
+            for path in &report.removed {
+                println!("removed {}", path.display());
+            }
+            for issue in &report.retained {
+                eprintln!("retained {}: {}", issue.path.display(), issue.detail);
+            }
+            println!(
+                "prune-summary: {} removed, {} would-remove, {} retained",
+                report.removed.len(),
+                report.would_remove.len(),
+                report.retained.len()
+            );
             return Ok(());
         }
         ParsedModelsCommand::Run {
@@ -4853,6 +4988,21 @@ fn run_models(args: &[String]) -> Result<(), String> {
                     "verified {}",
                     denoize::models::verify_catalog_model(model)?.display()
                 )
+            }
+            ModelCommand::Repair => {
+                let outcome = denoize::models::repair_catalog_model_with_options(
+                    model,
+                    download_options
+                        .as_ref()
+                        .expect("download options exist for repair"),
+                )?;
+                let action = match outcome {
+                    denoize::models::ModelRepairOutcome::AlreadyHealthy => "healthy",
+                    denoize::models::ModelRepairOutcome::ProvenanceRebuilt => "provenance-rebuilt",
+                    denoize::models::ModelRepairOutcome::ArtifactInstalled => "artifact-installed",
+                    _ => "repaired",
+                };
+                println!("{action} {}", model.name());
             }
             ModelCommand::Remove => println!(
                 "{} {}",

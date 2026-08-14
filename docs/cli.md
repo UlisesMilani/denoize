@@ -113,6 +113,9 @@ USAGE:
     denoize models install <MODEL> --from <PATH>
     denoize models update <MODEL|all> [DOWNLOAD OPTIONS]
     denoize models verify <MODEL|all>
+    denoize models doctor
+    denoize models repair <MODEL|all> [DOWNLOAD OPTIONS]
+    denoize models prune [--dry-run]
     denoize models remove <MODEL|all>
     denoize models path <MODEL|all>
     denoize models catalog status
