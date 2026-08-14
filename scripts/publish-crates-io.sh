@@ -58,4 +58,15 @@ if [[ "$is_dry_run" == true ]]; then
     echo "dry-run package contains desktop or node_modules files" >&2
     exit 1
   fi
+  for required in \
+    "denoize-${package_version}/src/automation.rs" \
+    "denoize-${package_version}/docs/json.md" \
+    "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json"
+  do
+    if ! tar -tf "$package_archive" | grep -Fx "$required" >/dev/null; then
+      echo "dry-run package is missing $required" >&2
+      exit 1
+    fi
+  done
 fi

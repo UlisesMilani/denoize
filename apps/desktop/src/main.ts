@@ -250,7 +250,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <div id="model-bundle-details" class="field-hint hidden"></div>
           <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルも署名カタログ固定のSHA-256で検証されます。ローカルモデル導入時、共有ネットワーク欄はモデル本体には使われず、カタログ更新にだけ使用できます。</p>
         </article>
-        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="model-doctor">診断</button><button class="secondary" id="model-prune-preview">整理確認</button><button class="secondary" id="model-prune">整理実行</button><button class="secondary" id="recover-model-trust-root">信頼ルート復旧</button><button class="secondary" id="reset-model-trust-time">信頼時刻リセット</button><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p id="model-health-status" class="section-copy">モデルキャッシュを診断しています。</p><p class="section-copy">外部モデルは版管理された信頼ルート、カタログ署名、期限、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。期限切れや失効後も検証済みモデルは利用できますが、新規取得は停止します。信頼ルート復旧は破損した同世代のキャッシュだけを、このアプリに埋め込まれたルートへ戻します。信頼時刻リセットは、誤った未来時刻を修正した後にだけ使用します。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
+        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="model-doctor">診断</button><button class="secondary" id="export-model-json">JSONを書出</button><button class="secondary" id="model-prune-preview">整理確認</button><button class="secondary" id="model-prune">整理実行</button><button class="secondary" id="recover-model-trust-root">信頼ルート復旧</button><button class="secondary" id="reset-model-trust-time">信頼時刻リセット</button><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p id="model-health-status" class="section-copy">モデルキャッシュを診断しています。</p><p class="section-copy">外部モデルは版管理された信頼ルート、カタログ署名、期限、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。期限切れや失効後も検証済みモデルは利用できますが、新規取得は停止します。信頼ルート復旧は破損した同世代のキャッシュだけを、このアプリに埋め込まれたルートへ戻します。信頼時刻リセットは、誤った未来時刻を修正した後にだけ使用します。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
       </section>
       <div id="toast" role="status"></div>
       <div id="drop-overlay"><strong>ここにドロップ</strong><span>音声ファイルまたはフォルダ</span></div>
@@ -904,6 +904,22 @@ async function loadModels() {
 }
 $("#refresh-models").addEventListener("click", () => void loadModels());
 $("#model-doctor").addEventListener("click", () => void loadModels());
+$("#export-model-json").addEventListener("click", async () => {
+  setModelUiBusy(true);
+  try {
+    const path = await save({
+      defaultPath: "denoize-automation.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) return;
+    await invoke("save_automation_snapshot", { path });
+    showToast("モデル自動化JSONを書き出しました");
+  } catch (error) {
+    showToast(errorText(error), true);
+  } finally {
+    setModelUiBusy(false);
+  }
+});
 
 async function runModelPrune(dryRun: boolean) {
   try {
@@ -976,6 +992,7 @@ function setModelUiBusy(busy: boolean) {
   document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.disabled = busy);
   $<HTMLButtonElement>("#refresh-models").disabled = busy;
   $<HTMLButtonElement>("#model-doctor").disabled = busy;
+  $<HTMLButtonElement>("#export-model-json").disabled = busy;
   $<HTMLButtonElement>("#model-prune-preview").disabled = busy;
   $<HTMLButtonElement>("#model-prune").disabled = busy;
   $<HTMLButtonElement>("#update-model-catalog").disabled = busy;

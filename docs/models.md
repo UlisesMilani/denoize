@@ -54,6 +54,16 @@ installed provenance when present. Bundle-enabled entries also show the signed
 license and source-provenance filenames, exact sizes, and digests. The byte
 counts are not rounded or scaled.
 
+For automation, `denoize models snapshot --json` emits one compact
+`denoize-automation-v1` document; `--pretty` emits the same fields indented. It
+combines catalog and trust-root identity, acquisition policy, recipe ABI, cache
+health, expected artifact and bundle metadata, and validated installation
+provenance. Capture is local-only and generation checked: a concurrent catalog
+or trust change fails before stdout is written rather than producing a mixed
+snapshot. URLs are credential/query/fragment redacted. The desktop model library
+exports this identical document. See [Stable JSON automation contracts](json.md)
+for compatibility guarantees and release schema locations.
+
 ## Signed offline bundles
 
 Each GitHub release publishes `denoize-models-<tag>.dmb` and a matching

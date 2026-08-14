@@ -8,7 +8,8 @@ use denoize::audio::{
 };
 use denoize::batch_resume::{
     self, BatchSession, ConsumedModel, Digest, FileFingerprint, MetadataPolicy, ResumeDecision,
-    ResumeExpectation, LEGACY_DESKTOP_STATE_FILE_NAME, LOCK_FILE_NAME, STATE_FILE_NAME,
+    ResumeExpectation, LEGACY_DESKTOP_STATE_FILE_NAME, LOCK_FILE_NAME, RECIPE_DOMAIN,
+    RECIPE_OUTPUT_ABI_VERSION, RECIPE_VERSION, STATE_FILE_NAME,
 };
 use denoize::config::{MAX_SAMPLE_RATE, MAX_STREAM_BLOCK_FRAMES};
 use denoize::decode::{
@@ -42,6 +43,8 @@ const INPUT_MEMORY_EXPANSION_FACTOR: u64 = 8;
 const METADATA_REPRESENTATION_EXPANSION_FACTOR: u64 = 16;
 const METADATA_DESCRIPTOR_BYTES: u64 = 256;
 const STDIN_READ_CHUNK_BYTES: usize = 64 * 1024;
+const CLI_JSON_SCHEMA: &str = "denoize-cli-output-v1";
+const CLI_JSON_SCHEMA_VERSION: u32 = 1;
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -61,7 +64,20 @@ fn with_batch_publication_fence<T>(
 }
 
 #[derive(Serialize)]
+struct RecipeJson {
+    domain: &'static str,
+    version: u32,
+    output_abi_version: u32,
+    digest: Option<String>,
+}
+
+#[derive(Serialize)]
 struct ProcessResultJson<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    event: &'static str,
+    mode: &'static str,
+    recipe: RecipeJson,
     input: &'a str,
     output: &'a str,
     backend: &'a str,
@@ -73,6 +89,11 @@ struct ProcessResultJson<'a> {
 
 #[derive(Serialize)]
 struct StreamResultJson<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    event: &'static str,
+    mode: &'static str,
+    recipe: RecipeJson,
     input: &'a str,
     output: &'a str,
     backend: &'a str,
@@ -86,6 +107,9 @@ struct StreamResultJson<'a> {
 #[serde(tag = "event", rename_all = "lowercase")]
 enum BatchJson<'a> {
     Progress {
+        schema: &'static str,
+        schema_version: u32,
+        recipe: RecipeJson,
         status: &'a str,
         completed: usize,
         total: usize,
@@ -94,6 +118,9 @@ enum BatchJson<'a> {
         input: &'a str,
     },
     Summary {
+        schema: &'static str,
+        schema_version: u32,
+        recipe: RecipeJson,
         total: usize,
         succeeded: usize,
         skipped: usize,
@@ -106,6 +133,15 @@ enum BatchJson<'a> {
 
 fn serialize_json_line<T: Serialize + ?Sized>(payload: &T) -> String {
     serde_json::to_string(payload).expect("fixed CLI JSON payload must serialize")
+}
+
+fn recipe_json(digest: Option<Digest>) -> RecipeJson {
+    RecipeJson {
+        domain: RECIPE_DOMAIN,
+        version: RECIPE_VERSION,
+        output_abi_version: RECIPE_OUTPUT_ABI_VERSION,
+        digest: digest.map(|value| value.as_hex()),
+    }
 }
 
 fn round_to_three_decimals(value: f64) -> f64 {
@@ -122,8 +158,14 @@ fn process_result_json_line(
     frames: usize,
     sample_rate: u32,
     elapsed_ms: f64,
+    recipe: Option<Digest>,
 ) -> String {
     serialize_json_line(&ProcessResultJson {
+        schema: CLI_JSON_SCHEMA,
+        schema_version: CLI_JSON_SCHEMA_VERSION,
+        event: "result",
+        mode: "file",
+        recipe: recipe_json(recipe),
         input,
         output,
         backend,
@@ -143,6 +185,11 @@ fn stream_result_json_line(
     sample_rate: u32,
 ) -> String {
     serialize_json_line(&StreamResultJson {
+        schema: CLI_JSON_SCHEMA,
+        schema_version: CLI_JSON_SCHEMA_VERSION,
+        event: "result",
+        mode: "stream",
+        recipe: recipe_json(None),
         input,
         output,
         backend,
@@ -160,8 +207,12 @@ fn batch_progress_json_line(
     elapsed_seconds: f64,
     eta_seconds: f64,
     input: &str,
+    recipe: Digest,
 ) -> String {
     serialize_json_line(&BatchJson::Progress {
+        schema: CLI_JSON_SCHEMA,
+        schema_version: CLI_JSON_SCHEMA_VERSION,
+        recipe: recipe_json(Some(recipe)),
         status,
         completed,
         total,
@@ -181,6 +232,9 @@ fn batch_summary_json_line(
     output: &str,
 ) -> String {
     serialize_json_line(&BatchJson::Summary {
+        schema: CLI_JSON_SCHEMA,
+        schema_version: CLI_JSON_SCHEMA_VERSION,
+        recipe: recipe_json(None),
         total,
         succeeded,
         skipped,
@@ -1550,6 +1604,11 @@ fn run_one_with_output_format(
         CommitMode::NoClobber
     };
     let json = ov.json;
+    let recipe_metadata_policy = json.then_some(if ov.no_metadata {
+        MetadataPolicy::Drop
+    } else {
+        MetadataPolicy::Preserve
+    });
     let staged = process_one_to_staged_output(
         input,
         output,
@@ -1557,7 +1616,7 @@ fn run_one_with_output_format(
         planned_output_format,
         pre_resolved_backend_options,
         None,
-        None,
+        recipe_metadata_policy,
         None,
         None,
         None,
@@ -1580,6 +1639,7 @@ fn run_one_with_output_format(
                 staged.frames,
                 staged.sample_rate,
                 staged.elapsed_ms,
+                staged.effective_recipe,
             )
         );
     }
@@ -2350,7 +2410,15 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     let process_item = |planned: &PlannedBatchItem| -> BatchFileOutcome {
         let item = &planned.prepared.item;
         let finish = |outcome, status| {
-            report_batch_progress(&finished, items.len(), started, &item.input, status, ov);
+            report_batch_progress(
+                &finished,
+                items.len(),
+                started,
+                &item.input,
+                status,
+                planned.prepared.recipe,
+                ov,
+            );
             outcome
         };
         let commit_mode = match planned.decision {
@@ -2485,6 +2553,7 @@ fn report_batch_progress(
     started: Instant,
     path: &std::path::Path,
     status: &str,
+    recipe: Digest,
     ov: &Overrides,
 ) {
     let count = finished.fetch_add(1, Ordering::Relaxed) + 1;
@@ -2498,7 +2567,7 @@ fn report_batch_progress(
         let input = path.to_string_lossy();
         println!(
             "{}",
-            batch_progress_json_line(status, count, total, elapsed, eta, input.as_ref())
+            batch_progress_json_line(status, count, total, elapsed, eta, input.as_ref(), recipe,)
         );
     } else if !ov.no_progress {
         eprintln!(
@@ -2603,9 +2672,21 @@ mod json_output_tests {
             48_001,
             48_000,
             1.2345,
+            Some(Digest::from_bytes([7; 32])),
         ));
 
-        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value.as_object().unwrap().len(), 12);
+        assert_eq!(value["schema"], CLI_JSON_SCHEMA);
+        assert_eq!(value["schema_version"], CLI_JSON_SCHEMA_VERSION);
+        assert_eq!(value["event"], "result");
+        assert_eq!(value["mode"], "file");
+        assert_eq!(value["recipe"]["domain"], RECIPE_DOMAIN);
+        assert_eq!(value["recipe"]["version"], RECIPE_VERSION);
+        assert_eq!(
+            value["recipe"]["output_abi_version"],
+            RECIPE_OUTPUT_ABI_VERSION
+        );
+        assert_eq!(value["recipe"]["digest"], "07".repeat(32));
         assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
         assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
         assert_eq!(value["backend"].as_str(), Some("classical"));
@@ -2626,7 +2707,12 @@ mod json_output_tests {
             44_100,
         ));
 
-        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value.as_object().unwrap().len(), 12);
+        assert_eq!(value["schema"], CLI_JSON_SCHEMA);
+        assert_eq!(value["schema_version"], CLI_JSON_SCHEMA_VERSION);
+        assert_eq!(value["event"], "result");
+        assert_eq!(value["mode"], "stream");
+        assert!(value["recipe"]["digest"].is_null());
         assert_eq!(value["input"].as_str(), Some(SPECIAL_INPUT));
         assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
         assert_eq!(value["backend"].as_str(), Some("gtcrn"));
@@ -2645,10 +2731,14 @@ mod json_output_tests {
             1.23456,
             0.45678,
             SPECIAL_INPUT,
+            Digest::from_bytes([9; 32]),
         ));
 
-        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value.as_object().unwrap().len(), 10);
+        assert_eq!(value["schema"], CLI_JSON_SCHEMA);
+        assert_eq!(value["schema_version"], CLI_JSON_SCHEMA_VERSION);
         assert_eq!(value["event"].as_str(), Some("progress"));
+        assert_eq!(value["recipe"]["digest"], "09".repeat(32));
         assert_eq!(value["status"].as_str(), Some("completed"));
         assert_eq!(value["completed"].as_u64(), Some(3));
         assert_eq!(value["total"].as_u64(), Some(5));
@@ -2669,8 +2759,11 @@ mod json_output_tests {
             SPECIAL_OUTPUT,
         ));
 
-        assert_eq!(value.as_object().unwrap().len(), 8);
+        assert_eq!(value.as_object().unwrap().len(), 11);
+        assert_eq!(value["schema"], CLI_JSON_SCHEMA);
+        assert_eq!(value["schema_version"], CLI_JSON_SCHEMA_VERSION);
         assert_eq!(value["event"].as_str(), Some("summary"));
+        assert!(value["recipe"]["digest"].is_null());
         assert_eq!(value["total"].as_u64(), Some(8));
         assert_eq!(value["succeeded"].as_u64(), Some(4));
         assert_eq!(value["skipped"].as_u64(), Some(2));
@@ -4238,6 +4331,7 @@ USAGE:
     denoize models bundle inspect <BUNDLE.dmb>
     denoize models bundle import <BUNDLE.dmb>
     denoize models bundle create <OUTPUT.dmb> <CATALOG.json> <CATALOG.json.sig> <TRUST-ROOT.json> <COMPONENTS-DIR>
+    denoize models snapshot [--json] [--pretty]
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:
@@ -4281,6 +4375,9 @@ enum ParsedModelsCommand {
     List,
     CacheDir,
     Doctor,
+    Snapshot {
+        pretty: bool,
+    },
     Prune {
         dry_run: bool,
     },
@@ -4373,6 +4470,22 @@ where
             return Err("models doctor accepts no arguments".into());
         }
         return Ok(ParsedModelsCommand::Doctor);
+    }
+
+    if command_name == "snapshot" {
+        let mut pretty = false;
+        let mut json_seen = false;
+        for option in &args[1..] {
+            match option.as_str() {
+                "--pretty" if !pretty => pretty = true,
+                "--json" if !json_seen => json_seen = true,
+                "--pretty" | "--json" => {
+                    return Err(format!("models snapshot option repeated: {option}"))
+                }
+                value => return Err(format!("unknown models snapshot option: {value}")),
+            }
+        }
+        return Ok(ParsedModelsCommand::Snapshot { pretty });
     }
 
     if command_name == "prune" {
@@ -5165,6 +5278,18 @@ fn run_models(args: &[String]) -> Result<(), String> {
             }
             return Ok(());
         }
+        ParsedModelsCommand::Snapshot { pretty } => {
+            let snapshot = denoize::automation::capture_automation_snapshot()?;
+            let mut json = if pretty {
+                snapshot.to_pretty_json()?
+            } else {
+                snapshot.to_json()?
+            };
+            json.push('\n');
+            std::io::Write::write_all(&mut std::io::stdout().lock(), json.as_bytes())
+                .map_err(|error| format!("write automation snapshot: {error}"))?;
+            return Ok(());
+        }
         ParsedModelsCommand::Prune { dry_run } => {
             let report = denoize::models::prune_model_cache(dry_run)?;
             for path in &report.would_remove {
@@ -5673,9 +5798,43 @@ mod model_command_tests {
             "bundle inspect",
             "bundle import",
             "bundle create",
+            "models snapshot",
         ] {
             assert!(models_usage().contains(flag));
         }
+    }
+
+    #[test]
+    fn parses_snapshot_format_without_reading_download_secrets() {
+        let compact = parse_models_command(
+            &["snapshot".into(), "--json".into()],
+            denoize::models::ModelDownloadOptions::default(),
+            |_| panic!("snapshot must not read a secret"),
+        )
+        .unwrap();
+        assert!(matches!(
+            compact,
+            ParsedModelsCommand::Snapshot { pretty: false }
+        ));
+
+        let pretty = parse_models_command(
+            &["snapshot".into(), "--pretty".into()],
+            denoize::models::ModelDownloadOptions::default(),
+            |_| panic!("snapshot must not read a secret"),
+        )
+        .unwrap();
+        assert!(matches!(
+            pretty,
+            ParsedModelsCommand::Snapshot { pretty: true }
+        ));
+
+        let error = parse_models_command(
+            &["snapshot".into(), "--pretty".into(), "--pretty".into()],
+            denoize::models::ModelDownloadOptions::default(),
+            missing_secret,
+        )
+        .unwrap_err();
+        assert!(error.contains("option repeated"));
     }
 
     #[test]

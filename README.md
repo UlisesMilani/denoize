@@ -336,6 +336,7 @@ denoize models bundle import denoize-models-v0.52.0.dmb
 # Diagnose the whole cache without changing model data. Repair known packages,
 # then preview and apply removal of stale denoize-owned state.
 denoize models doctor
+denoize models snapshot --pretty
 denoize models repair all
 denoize models prune --dry-run
 denoize models prune
@@ -445,6 +446,16 @@ content-addressed provenance, artifact digest/size, and directory layout all
 match denoize-managed state. Unknown data and symlinks, devices, or other
 special entries are reported and retained.
 
+`models snapshot [--json] [--pretty]` emits the stable
+`denoize-automation-v1` document without network access. It binds the active
+catalog and trust root to cache health, every expected model identity, validated
+installation provenance, and the processing recipe ABI in one
+generation-checked snapshot. Normal `--json` processing and batch NDJSON records use
+`denoize-cli-output-v1` and expose each finite-file recipe digest. The desktop
+model library exports the same automation snapshot atomically. See the
+[stable JSON contract](docs/json.md) and its versioned schemas for field and
+compatibility rules.
+
 HTTPS model connections, including those tunneled through an HTTP CONNECT
 proxy, use the operating system trust store. CLI Bearer tokens and Basic
 passwords are accepted through environment variables, and diagnostics redact
@@ -515,7 +526,8 @@ FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
 when selected; managed GTCRN weights are resolved automatically after install.
 The model manager shows signed-catalog identity and installed provenance and
-can update the catalog. Its offline, alternate-source, proxy/direct,
+can update the catalog or atomically export the stable automation JSON. Its
+offline, alternate-source, proxy/direct,
 authentication, and local-file controls are session-only. Bearer tokens and
 Basic credentials are cleared after an operation starts, and none of these
 download overrides are included in saved settings, named presets, or
@@ -574,7 +586,8 @@ exact embedded model catalog, its detached signature, the exact embedded model
 trust-root document, and `denoize-models-<tag>.dmb` plus its checksum. The signed
 bundle contains the catalog models, upstream licenses, and provenance for
 closed-network installation; the standalone catalog/root assets remain
-available for independent audit and recovery tooling.
+available for independent audit and recovery tooling. Releases also publish the
+versioned automation and CLI-output JSON Schemas used by monitoring clients.
 
 ## Install with Cargo
 

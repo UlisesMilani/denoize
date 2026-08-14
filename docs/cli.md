@@ -128,6 +128,7 @@ USAGE:
     denoize models bundle inspect <BUNDLE.dmb>
     denoize models bundle import <BUNDLE.dmb>
     denoize models bundle create <OUTPUT.dmb> <CATALOG.json> <CATALOG.json.sig> <TRUST-ROOT.json> <COMPONENTS-DIR>
+    denoize models snapshot [--json] [--pretty]
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:
@@ -152,6 +153,23 @@ ENVIRONMENT:
     DENOIZE_MODEL_BEARER_TOKEN, DENOIZE_MODEL_USERNAME, DENOIZE_MODEL_PASSWORD
     HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY (and lowercase variants)
 ```
+
+## Stable JSON automation
+
+`denoize models snapshot --json` emits one compact, network-free
+`denoize-automation-v1` document covering the active catalog and trust root,
+cache health, expected model identities, validated installation provenance, and
+the processing recipe ABI. `--pretty` emits the same contract indented. Capture
+is assembled before stdout publication and fails without partial JSON if the
+catalog or trust generation changes. URLs are credential/query/fragment
+redacted. The desktop model library exports the identical document atomically.
+
+Normal file-processing `--json` results and batch NDJSON records use
+`denoize-cli-output-v1`. Every record names the recipe domain/version/output ABI.
+A finite-file result and each batch progress event include the exact resolved
+recipe digest; streaming results and multi-recipe summaries use `null`. Consumers
+must ignore fields added within a schema version. Versioned schemas ship in each
+release and are documented in `docs/json.md`.
 
 ## Batch resume state
 
