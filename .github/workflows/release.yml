@@ -287,9 +287,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          asset="$GITHUB_WORKSPACE/denoize-model-catalog-v1.json"
-          trust_asset="$GITHUB_WORKSPACE/denoize-model-trust-root-v1.json"
-          bundle="$GITHUB_WORKSPACE/denoize-models-${GITHUB_REF_NAME}.dmb"
+          # GitHub-hosted runners can attach extended ACLs to /home. Keep every
+          # generated model asset under a private /tmp directory so the bundle's
+          # atomic-output checks retain their strict ancestor policy.
+          asset_dir="$(mktemp -d /tmp/denoize-release.XXXXXX)"
+          asset="$asset_dir/denoize-model-catalog-v1.json"
+          trust_asset="$asset_dir/denoize-model-trust-root-v1.json"
+          bundle="$asset_dir/denoize-models-${GITHUB_REF_NAME}.dmb"
           bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
           cp models/trust-root-v1.json "$trust_asset"
