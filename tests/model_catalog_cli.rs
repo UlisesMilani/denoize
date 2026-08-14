@@ -117,3 +117,104 @@ fn untrusted_catalog_import_does_not_create_rollback_state() {
         .contains("untrusted signing key"));
     assert!(!directory.path().join(".catalog/state.json").exists());
 }
+
+#[test]
+fn model_doctor_treats_a_fresh_optional_cache_as_clean() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+
+    let output = run(&cache, &["models", "doctor"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("gtcrn-dns3\tmissing\t"), "{stdout}");
+    assert!(
+        stdout.contains("doctor-summary: 0 healthy, 1 missing, 0 attention, 0 cache issues"),
+        "{stdout}"
+    );
+    assert!(!cache.exists(), "doctor unexpectedly created the cache");
+}
+
+#[test]
+fn model_doctor_reports_unknown_data_and_prune_retains_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let unknown = cache.join("personal-files");
+    std::fs::create_dir_all(&unknown).unwrap();
+    std::fs::write(unknown.join("keep.txt"), b"not denoize state").unwrap();
+
+    let doctor = run(&cache, &["models", "doctor"]);
+    assert!(!doctor.status.success());
+    let stdout = String::from_utf8(doctor.stdout).unwrap();
+    assert!(stdout.contains("orphaned-entry"), "{stdout}");
+    assert!(unknown.join("keep.txt").exists());
+
+    let prune = run(&cache, &["models", "prune"]);
+    assert!(
+        prune.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prune.stderr)
+    );
+    assert!(unknown.join("keep.txt").exists());
+    assert!(String::from_utf8(prune.stderr)
+        .unwrap()
+        .contains("ownership is not proven"));
+}
+
+#[test]
+fn model_prune_dry_run_and_apply_match_for_stale_known_sidecars() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let model_dir = cache.join("gtcrn-dns3");
+    let partial = model_dir.join("gtcrn_simple.onnx.part");
+    let metadata = model_dir.join("gtcrn_simple.onnx.part.meta");
+    std::fs::create_dir_all(&model_dir).unwrap();
+    std::fs::write(&partial, b"stale partial").unwrap();
+    std::fs::write(&metadata, b"invalid metadata").unwrap();
+
+    let preview = run(&cache, &["models", "prune", "--dry-run"]);
+    assert!(preview.status.success());
+    let preview = String::from_utf8(preview.stdout).unwrap();
+    assert!(preview.contains(&format!("would-remove {}", partial.display())));
+    assert!(preview.contains(&format!("would-remove {}", metadata.display())));
+    assert!(partial.exists() && metadata.exists());
+
+    let applied = run(&cache, &["models", "prune"]);
+    assert!(applied.status.success());
+    let applied = String::from_utf8(applied.stdout).unwrap();
+    assert!(applied.contains(&format!("removed {}", partial.display())));
+    assert!(applied.contains(&format!("removed {}", metadata.display())));
+    assert!(!partial.exists() && !metadata.exists());
+}
+
+#[test]
+fn offline_model_repair_preserves_corrupt_artifact_on_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let artifact = cache.join("gtcrn-dns3/gtcrn_simple.onnx");
+    std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    std::fs::write(&artifact, b"corrupt but preserved").unwrap();
+
+    let output = run(&cache, &["models", "repair", "gtcrn", "--offline"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .contains("offline mode: no verified model is available"));
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"corrupt but preserved");
+}
+
+#[test]
+fn model_help_documents_maintenance_commands() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = run(directory.path(), &["models", "--help"]);
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("denoize models doctor"), "{help}");
+    assert!(help.contains("denoize models repair <MODEL|all>"), "{help}");
+    assert!(help.contains("denoize models prune [--dry-run]"), "{help}");
+}

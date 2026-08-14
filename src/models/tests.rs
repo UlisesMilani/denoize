@@ -165,6 +165,30 @@ fn test_catalog_model(bytes: &[u8]) -> CatalogModel {
     }
 }
 
+fn maintenance_catalog(name: &str, filename: &str, bytes: &[u8]) -> ModelCatalog {
+    let document = serde_json::json!({
+        "schema": "denoize-model-catalog-v1",
+        "sequence": 1,
+        "signing_key_id": "F5AE02E7593C64D9",
+        "models": [{
+            "name": name,
+            "backend": name,
+            "filename": filename,
+            "url": format!("https://models.example.test/{filename}"),
+            "revision": "maintenance-test-revision",
+            "sha256": test_sha256(bytes),
+            "size_bytes": bytes.len(),
+            "license": "MIT",
+            "sample_rate": 16_000
+        }]
+    });
+    catalog::parse_catalog(
+        &serde_json::to_vec(&document).unwrap(),
+        CatalogOrigin::Embedded,
+    )
+    .unwrap()
+}
+
 fn direct_options() -> ModelDownloadOptions {
     ModelDownloadOptions {
         proxy: ModelProxy::Disabled,
@@ -2398,4 +2422,291 @@ fn proxy_urls_validate_ports_and_normalize_scheme_and_credentials() {
     assert_eq!(authorization.as_deref(), Some("Basic dXNlcjpwQHNz"));
     assert!(normalize_proxy_url("http://proxy.example:8080/path").is_err());
     assert!(normalize_proxy_url("http://[::1]:8080").is_err());
+}
+
+#[test]
+fn model_doctor_is_read_only_for_a_fresh_cache() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let catalog = maintenance_catalog("maintenance-model", "model.onnx", b"model bytes");
+
+    let report = maintenance::doctor_catalog(&catalog).unwrap();
+
+    assert!(report.is_clean(), "{report:#?}");
+    assert_eq!(report.models.len(), 1);
+    assert_eq!(report.models[0].status, ModelCacheModelStatus::Missing);
+    assert_eq!(
+        report.models[0].issues[0].kind,
+        ModelCacheIssueKind::MissingArtifact
+    );
+    assert!(!cache.exists(), "doctor must not create the cache");
+}
+
+#[test]
+fn model_doctor_reports_and_repairs_provenance_without_network() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let bytes = b"authenticated model bytes";
+    let catalog = maintenance_catalog("maintenance-model", "model.onnx", bytes);
+    let model = &catalog.models()[0];
+    let source = directory.path().join("source.onnx");
+    std::fs::write(&source, bytes).unwrap();
+    let installed = install_catalog_model_from_file(model, &source).unwrap();
+    let provenance = provenance_path(&ModelSpec::catalog(model), &installed).unwrap();
+    std::fs::remove_file(&provenance).unwrap();
+
+    let report = maintenance::doctor_catalog(&catalog).unwrap();
+    assert_eq!(
+        report.models[0].status,
+        ModelCacheModelStatus::ProvenanceMissing
+    );
+    assert!(!provenance.exists(), "doctor must not migrate provenance");
+
+    let options = ModelDownloadOptions {
+        offline: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        repair_catalog_model_with_options(model, &options).unwrap(),
+        ModelRepairOutcome::ProvenanceRebuilt
+    );
+    assert_eq!(
+        maintenance::doctor_catalog(&catalog).unwrap().models[0].status,
+        ModelCacheModelStatus::Healthy
+    );
+
+    std::fs::write(&provenance, b"{}").unwrap();
+    assert_eq!(
+        maintenance::doctor_catalog(&catalog).unwrap().models[0].status,
+        ModelCacheModelStatus::ProvenanceInvalid
+    );
+    assert_eq!(
+        repair_catalog_model_with_options(model, &options).unwrap(),
+        ModelRepairOutcome::ProvenanceRebuilt
+    );
+    assert_eq!(
+        maintenance::doctor_catalog(&catalog).unwrap().models[0].status,
+        ModelCacheModelStatus::Healthy
+    );
+}
+
+#[test]
+fn model_repair_atomically_replaces_corrupt_artifact() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let bytes = b"replacement model bytes";
+    let catalog = maintenance_catalog("maintenance-model", "model.onnx", bytes);
+    let model = &catalog.models()[0];
+    let destination = path_for_catalog_model(model).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, b"corrupt").unwrap();
+    let (source_url, server) = spawn_test_server(1, move |_, _| TestResponse::ok(bytes));
+    let mut options = direct_options();
+    options.source_url = Some(source_url);
+
+    assert_eq!(
+        repair_catalog_model_with_options(model, &options).unwrap(),
+        ModelRepairOutcome::ArtifactInstalled
+    );
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert_eq!(server.join().unwrap().len(), 1);
+    assert_eq!(
+        maintenance::doctor_catalog(&catalog).unwrap().models[0].status,
+        ModelCacheModelStatus::Healthy
+    );
+}
+
+#[test]
+fn model_repair_cancellation_preserves_the_existing_artifact() {
+    use std::cell::Cell;
+
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let bytes = vec![b'm'; 256 * 1024];
+    let catalog = maintenance_catalog("maintenance-model", "model.onnx", &bytes);
+    let model = &catalog.models()[0];
+    let destination = path_for_catalog_model(model).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, b"corrupt but preserved").unwrap();
+    let response_bytes = bytes.clone();
+    let (source_url, server) =
+        spawn_test_server(1, move |_, _| TestResponse::ok(response_bytes.clone()));
+    let mut options = direct_options();
+    options.source_url = Some(source_url);
+    let cancelled = Cell::new(false);
+
+    let error = repair_catalog_model_with_options_and_progress(
+        model,
+        &options,
+        || cancelled.get(),
+        |downloaded, _| {
+            if downloaded > 0 {
+                cancelled.set(true);
+            }
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error, "cancelled");
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"corrupt but preserved"
+    );
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[test]
+fn model_prune_previews_then_removes_only_owned_stale_state() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let bytes = b"installed model bytes";
+    let catalog = maintenance_catalog("maintenance-model", "model.onnx", bytes);
+    let model = &catalog.models()[0];
+    let source = directory.path().join("source.onnx");
+    std::fs::write(&source, bytes).unwrap();
+    let destination = install_catalog_model_from_file(model, &source).unwrap();
+    let partial = sidecar(&destination, ".part");
+    let metadata = sidecar(&destination, ".part.meta");
+    let temporary = sidecar(&metadata, ".tmp");
+    let unknown = destination.parent().unwrap().join("personal-notes.txt");
+    let current_provenance = provenance_path(&ModelSpec::catalog(model), &destination).unwrap();
+    let mut superseded = read_provenance(&current_provenance).unwrap().unwrap();
+    superseded.catalog_sha256 = "b".repeat(64);
+    let superseded_path = current_provenance.parent().unwrap().join(format!(
+        "{}.{}.json",
+        model.sha256(),
+        superseded.catalog_sha256
+    ));
+    std::fs::write(&superseded_path, serde_json::to_vec(&superseded).unwrap()).unwrap();
+    for path in [&partial, &metadata, &temporary, &unknown] {
+        std::fs::write(path, b"stale").unwrap();
+    }
+
+    let report = maintenance::doctor_catalog(&catalog).unwrap();
+    assert!(!report.is_clean());
+    assert!(report.models[0]
+        .issues
+        .iter()
+        .any(|issue| issue.kind == ModelCacheIssueKind::StaleDownloadState));
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.path == unknown && !issue.prunable));
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.path == superseded_path && issue.prunable));
+
+    let preview = maintenance::prune_catalog(&catalog, true).unwrap();
+    assert_eq!(preview.would_remove.len(), 4);
+    for path in [&partial, &metadata, &temporary, &superseded_path, &unknown] {
+        assert!(path.exists(), "dry-run removed {}", path.display());
+    }
+
+    let applied = maintenance::prune_catalog(&catalog, false).unwrap();
+    assert_eq!(applied.removed.len(), 4);
+    for path in [&partial, &metadata, &temporary, &superseded_path] {
+        assert!(!path.exists(), "prune retained {}", path.display());
+    }
+    assert!(unknown.exists(), "prune removed unknown user data");
+    assert!(applied.retained.iter().any(|issue| issue.path == unknown));
+    assert!(!applied
+        .retained
+        .iter()
+        .any(|issue| issue.path == superseded_path));
+    assert_eq!(
+        maintenance::doctor_catalog(&catalog).unwrap().models[0].status,
+        ModelCacheModelStatus::Healthy
+    );
+}
+
+#[test]
+fn model_prune_removes_provenance_owned_orphan_but_retains_unknown_data() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let orphan_bytes = b"orphaned model bytes";
+    let orphan_catalog = maintenance_catalog("old-model", "old.onnx", orphan_bytes);
+    let orphan_model = &orphan_catalog.models()[0];
+    let source = directory.path().join("old.onnx");
+    std::fs::write(&source, orphan_bytes).unwrap();
+    let orphan_destination = install_catalog_model_from_file(orphan_model, &source).unwrap();
+    let orphan_directory = orphan_destination.parent().unwrap().to_path_buf();
+    let guarded_bytes = b"guarded orphaned model bytes";
+    let guarded_catalog = maintenance_catalog("guarded-model", "guarded.onnx", guarded_bytes);
+    let guarded_source = directory.path().join("guarded.onnx");
+    std::fs::write(&guarded_source, guarded_bytes).unwrap();
+    let guarded_destination =
+        install_catalog_model_from_file(&guarded_catalog.models()[0], &guarded_source).unwrap();
+    let guarded_directory = guarded_destination.parent().unwrap().to_path_buf();
+    std::fs::write(
+        guarded_directory.join(".provenance/keep.txt"),
+        b"unknown user data",
+    )
+    .unwrap();
+    let active_catalog = maintenance_catalog("new-model", "new.onnx", b"new model");
+    let unknown = cache.join("personal-files");
+    std::fs::create_dir_all(&unknown).unwrap();
+    std::fs::write(unknown.join("keep.txt"), b"user data").unwrap();
+
+    let report = maintenance::doctor_catalog(&active_catalog).unwrap();
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.path == orphan_directory && issue.prunable));
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.path == unknown && !issue.prunable));
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.path == guarded_directory && !issue.prunable));
+
+    let pruned = maintenance::prune_catalog(&active_catalog, false).unwrap();
+    assert!(pruned.removed.contains(&orphan_directory));
+    assert!(!orphan_directory.exists());
+    assert!(guarded_destination.exists());
+    assert!(guarded_directory.join(".provenance/keep.txt").exists());
+    assert!(unknown.join("keep.txt").exists());
+    assert!(pruned.retained.iter().any(|issue| issue.path == unknown));
+    assert!(pruned
+        .retained
+        .iter()
+        .any(|issue| issue.path == guarded_directory));
+}
+
+#[cfg(unix)]
+#[test]
+fn model_doctor_and_prune_never_follow_package_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let _model_dir = ModelDirGuard::set(&cache);
+    let catalog = maintenance_catalog("maintenance-model", "model.onnx", b"model bytes");
+    let outside = directory.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("model.onnx"), b"model bytes").unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+    symlink(&outside, cache.join("maintenance-model")).unwrap();
+
+    let report = maintenance::doctor_catalog(&catalog).unwrap();
+    assert_eq!(report.models[0].status, ModelCacheModelStatus::Unsafe);
+    let pruned = maintenance::prune_catalog(&catalog, false).unwrap();
+    assert!(pruned.removed.is_empty());
+    assert!(outside.join("model.onnx").exists());
+    assert!(cache.join("maintenance-model").is_symlink());
 }

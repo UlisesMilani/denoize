@@ -1,10 +1,17 @@
 //! Signed external-model catalog, verified local cache, and installation provenance.
 
 mod catalog;
+mod maintenance;
 
 pub use catalog::{
     active_catalog, catalog_status, embedded_catalog, import_catalog, update_catalog, CatalogModel,
     CatalogOrigin, CatalogStatus, ModelCatalog,
+};
+pub use maintenance::{
+    doctor_model_cache, doctor_model_cache_for_catalog, prune_model_cache,
+    repair_catalog_model_with_options, repair_catalog_model_with_options_and_progress,
+    ModelCacheIssue, ModelCacheIssueKind, ModelCacheModel, ModelCacheModelStatus, ModelCacheReport,
+    ModelPruneReport, ModelRepairOutcome,
 };
 
 use self::catalog::CatalogIdentity;

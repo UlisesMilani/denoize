@@ -46,6 +46,20 @@ type ModelCatalogRow = {
   sequence: number; sha256: string; signingKey: string; origin: string;
   modelCount: number; highestAcceptedSequence: number; cachedPath: string;
 };
+type ModelCacheIssueRow = {
+  kind: string; path: string; model: string | null; detail: string; prunable: boolean;
+};
+type ModelCacheHealthRow = {
+  name: string; path: string; status: string; issues: ModelCacheIssueRow[];
+};
+type ModelCacheReportRow = {
+  cacheDir: string; catalogSequence: number; catalogSha256: string; clean: boolean;
+  models: ModelCacheHealthRow[]; issues: ModelCacheIssueRow[];
+};
+type ModelLibraryRow = { models: ModelRow[]; health: ModelCacheReportRow };
+type ModelPruneReportRow = {
+  dryRun: boolean; wouldRemove: string[]; removed: string[]; retained: ModelCacheIssueRow[];
+};
 type ModelProgress = {
   jobId: number; name: string; status: "running" | "completed" | "failed" | "cancelled";
   message: string; downloaded: number; total: number | null; fraction: number | null;
@@ -212,7 +226,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <input id="model-local-path" type="hidden">
           <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルも署名カタログ固定のSHA-256で検証されます。ローカルモデル導入時、共有ネットワーク欄はモデル本体には使われず、カタログ更新にだけ使用できます。</p>
         </article>
-        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p class="section-copy">外部モデルはカタログ署名、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。中断したダウンロードは次回の導入・更新で再開されます。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
+        <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="model-doctor">診断</button><button class="secondary" id="model-prune-preview">整理確認</button><button class="secondary" id="model-prune">整理実行</button><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p id="model-health-status" class="section-copy">モデルキャッシュを診断しています。</p><p class="section-copy">外部モデルはカタログ署名、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。診断はread-only、修復は検証後に原子的置換、整理はdenoize所有を証明できる古い状態だけを削除します。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
       </section>
       <div id="toast" role="status"></div>
       <div id="drop-overlay"><strong>ここにドロップ</strong><span>音声ファイルまたはフォルダ</span></div>
@@ -744,21 +758,41 @@ updateModelLocalPolicy();
 
 async function loadModels() {
   try {
-    const [models, catalog] = await Promise.all([
-      invoke<ModelRow[]>("list_models"),
+    const [library, catalog] = await Promise.all([
+      invoke<ModelLibraryRow>("list_models"),
       invoke<ModelCatalogRow>("model_catalog_status"),
     ]);
+    const { models, health } = library;
     $("#model-catalog-status").textContent = `カタログ sequence ${catalog.sequence}（rollback floor ${catalog.highestAcceptedSequence}）· ${catalog.sha256.slice(0, 16)}… · 鍵 ${catalog.signingKey} · ${catalog.modelCount}件 · ${catalog.origin}`;
+    const healthByName = new Map(health.models.map((model) => [model.name, model]));
+    const attention = health.models.filter((model) => !["healthy", "missing"].includes(model.status));
+    const stale = health.models.reduce((count, model) => count + model.issues.filter((issue) => issue.kind === "stale-download-state").length, 0);
+    $("#model-health-status").textContent = health.clean
+      ? `キャッシュ正常 · ${health.cacheDir}`
+      : `要確認: モデル ${attention.length}件 · キャッシュ項目 ${health.issues.length}件 · stale ${stale}件 · ${health.cacheDir}`;
+    const healthLabels: Record<string, string> = {
+      healthy: "検証済み", missing: "未導入", corrupt: "破損",
+      "provenance-missing": "来歴なし", "provenance-invalid": "来歴不整合", unsafe: "危険な状態",
+    };
     $("#model-list").innerHTML = models.map((model) => {
+      const modelHealth = healthByName.get(model.name);
+      const healthStatus = modelHealth?.status ?? (model.installed ? "healthy" : "missing");
+      const needsRepair = !["healthy", "missing"].includes(healthStatus);
       const installedAt = model.installedAtUnixSeconds === null
         ? ""
         : ` · installed ${new Date(model.installedAtUnixSeconds * 1000).toLocaleString()}`;
-      return `<div class="model-row" data-model-row="${model.name}"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${model.installed ? "installed" : ""}">${model.installed ? "インストール済み" : "未導入"}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small><small>catalog #${model.catalogSequence} · ${escapeHtml(model.catalogSha256.slice(0, 16))}… · key ${escapeHtml(model.catalogSigningKey)}${model.provenanceSource ? ` · ${escapeHtml(model.provenanceSource)}` : ""}${escapeHtml(installedAt)}</small><div class="model-progress hidden"><div><i></i></div><span></span></div></div><div class="model-actions">${model.installed ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>` : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`}<button class="remove hidden" data-cancel-model>中断</button></div></div>`;
+      const issueText = modelHealth?.issues.filter((issue) => issue.kind !== "missing-artifact").map((issue) => issue.detail).join(" · ") ?? "";
+      const actions = needsRepair
+        ? `<button class="install" data-model="${model.name}" data-action="repair">修復</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>`
+        : model.installed
+          ? `<button data-model="${model.name}" data-action="verify">検証</button><button data-model="${model.name}" data-action="update">更新</button><button class="remove" data-model="${model.name}" data-action="remove">削除</button>`
+          : `<button class="install" data-model="${model.name}" data-action="install">導入</button>`;
+      return `<div class="model-row" data-model-row="${model.name}"><div class="model-icon">AI</div><div class="model-info"><div><b>${escapeHtml(model.name)}</b><span class="pill ${healthStatus === "healthy" ? "installed" : ""}">${escapeHtml(healthLabels[healthStatus] ?? healthStatus)}</span></div><p>${escapeHtml(model.backend)} · ${model.sampleRate.toLocaleString()} Hz · ${escapeHtml(model.license)}</p><small>${escapeHtml(model.path)}</small><small>catalog #${model.catalogSequence} · ${escapeHtml(model.catalogSha256.slice(0, 16))}… · key ${escapeHtml(model.catalogSigningKey)}${model.provenanceSource ? ` · ${escapeHtml(model.provenanceSource)}` : ""}${escapeHtml(installedAt)}</small>${issueText ? `<small>${escapeHtml(issueText)}</small>` : ""}<div class="model-progress hidden"><div><i></i></div><span></span></div></div><div class="model-actions">${actions}<button class="remove hidden" data-cancel-model>中断</button></div></div>`;
     }).join("");
     document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.addEventListener("click", async () => {
       try {
         const action = button.dataset.action!;
-        const usesDownloadOptions = action === "install" || action === "update";
+        const usesDownloadOptions = action === "install" || action === "update" || action === "repair";
         await beginModelJob(
           button.dataset.model!,
           action,
@@ -776,6 +810,29 @@ async function loadModels() {
   } catch (error) { $("#model-list").textContent = errorText(error); }
 }
 $("#refresh-models").addEventListener("click", () => void loadModels());
+$("#model-doctor").addEventListener("click", () => void loadModels());
+
+async function runModelPrune(dryRun: boolean) {
+  try {
+    if (!dryRun && !window.confirm("denoize所有を検証できたstale／孤児モデル状態を削除します。続行しますか？")) return;
+    setModelUiBusy(true);
+    const report = await invoke<ModelPruneReportRow>("prune_model_cache", { dryRun });
+    if (dryRun) {
+      $("#model-health-status").textContent = `整理確認: ${report.wouldRemove.length}件を削除可能、${report.retained.length}件は安全のため保持`;
+      showToast(`整理確認: ${report.wouldRemove.length}件を削除可能です`);
+    } else {
+      showToast(`${report.removed.length}件の古いモデル状態を整理しました`);
+      await loadModels();
+    }
+  } catch (error) {
+    showToast(errorText(error), true);
+  } finally {
+    setModelUiBusy(false);
+  }
+}
+
+$("#model-prune-preview").addEventListener("click", () => void runModelPrune(true));
+$("#model-prune").addEventListener("click", () => void runModelPrune(false));
 $("#update-model-catalog").addEventListener("click", async () => {
   try {
     setModelUiBusy(true);
@@ -796,6 +853,9 @@ $("#update-model-catalog").addEventListener("click", async () => {
 function setModelUiBusy(busy: boolean) {
   document.querySelectorAll<HTMLButtonElement>("[data-model]").forEach((button) => button.disabled = busy);
   $<HTMLButtonElement>("#refresh-models").disabled = busy;
+  $<HTMLButtonElement>("#model-doctor").disabled = busy;
+  $<HTMLButtonElement>("#model-prune-preview").disabled = busy;
+  $<HTMLButtonElement>("#model-prune").disabled = busy;
   $<HTMLButtonElement>("#update-model-catalog").disabled = busy;
 }
 
