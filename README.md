@@ -328,6 +328,11 @@ denoize models catalog trust recover
 # Only after correcting an accidental future system-clock jump:
 denoize models catalog trust reset-time-floor
 
+# Verify and import one release bundle without opening a network connection.
+sha256sum --check denoize-models-v0.52.0.dmb.sha256
+denoize models bundle inspect denoize-models-v0.52.0.dmb
+denoize models bundle import denoize-models-v0.52.0.dmb
+
 # Diagnose the whole cache without changing model data. Repair known packages,
 # then preview and apply removal of stale denoize-owned state.
 denoize models doctor
@@ -379,6 +384,24 @@ installation-time catalog origin and source. Existing verified caches are
 migrated lazily; mismatched provenance fails verification. `denoize models info MODEL` reports these fields and the
 pinned length as an unscaled decimal `size-bytes` value. This per-model
 integrity bound is not an aggregate cache quota.
+
+Official releases additionally provide a signed offline `.dmb` bundle for
+closed networks. Its bounded, length-delimited format carries the exact catalog,
+detached signature, trust root, every catalog model, upstream license text, and
+source-provenance JSON. The manifest contains no extraction paths and the format
+has no compression layer. `models bundle inspect` authenticates every byte
+without changing catalog or cache state; `models bundle import` performs the
+same full preflight before activating the catalog and atomically installing any
+missing model. Both commands accept only a regular file and perform no network
+I/O. A model installed this way records the bundle SHA-256 in local installation
+provenance.
+
+Catalog expiry and rollback rules still apply offline. The import may advance
+the monotonic catalog floor before a later storage error; it rolls back model
+artifacts created by that invocation, and retrying the same authenticated bundle
+is safe. Existing valid models are retained. See the
+[managed-model guide](docs/models.md#signed-offline-bundles) for the operator
+layout used by `models bundle create` and the complete transaction contract.
 
 Catalog sequence 1 is a compatibility exception because it predates signed
 timestamps. The embedded v1 trust policy requires every later sequence to carry
@@ -547,8 +570,11 @@ prebuilt `full`-feature binaries for:
 - Windows x86-64
 
 Every archive has a matching `.sha256` checksum file. Releases also publish the
-exact embedded model catalog, its detached signature, and the exact embedded
-model trust-root document for independent audit and recovery tooling.
+exact embedded model catalog, its detached signature, the exact embedded model
+trust-root document, and `denoize-models-<tag>.dmb` plus its checksum. The signed
+bundle contains the catalog models, upstream licenses, and provenance for
+closed-network installation; the standalone catalog/root assets remain
+available for independent audit and recovery tooling.
 
 ## Install with Cargo
 

@@ -1,12 +1,18 @@
 //! Signed external-model catalog, verified local cache, and installation provenance.
 
+mod bundle;
 mod catalog;
 mod maintenance;
 
+pub use bundle::{
+    build_offline_bundle, import_offline_bundle, import_offline_bundle_if_sha256,
+    inspect_offline_bundle, OfflineBundleImportReport, OfflineBundleInfo, OfflineBundleModelInfo,
+};
 pub use catalog::{
     active_catalog, catalog_status, embedded_catalog, import_catalog, import_trust_root,
     recover_embedded_trust_root, reset_trust_time_floor, trust_root_status, update_catalog,
-    CatalogModel, CatalogOrigin, CatalogStatus, ModelCatalog, TrustRootOrigin, TrustRootStatus,
+    CatalogBundleFile, CatalogBundleMetadata, CatalogModel, CatalogOrigin, CatalogStatus,
+    ModelCatalog, TrustRootOrigin, TrustRootStatus,
 };
 pub use maintenance::{
     doctor_model_cache, doctor_model_cache_for_catalog, prune_model_cache,
@@ -282,6 +288,10 @@ pub enum ModelInstallationSource {
     /// A checksum-valid completed `.part` created by an earlier invocation.
     CompletedPartial,
     ExistingCacheMigration,
+    /// Installed from a fully authenticated closed-network bundle.
+    OfflineBundle {
+        bundle_sha256: String,
+    },
 }
 
 impl<'de> Deserialize<'de> for ModelInstallationSource {
@@ -294,19 +304,44 @@ impl<'de> Deserialize<'de> for ModelInstallationSource {
         struct Wire {
             kind: String,
             url: Option<String>,
+            bundle_sha256: Option<String>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        match (wire.kind.as_str(), wire.url) {
-            ("catalog-url", Some(url)) => Ok(Self::CatalogUrl { url }),
-            ("alternate-url", Some(url)) => Ok(Self::AlternateUrl { url }),
-            ("local-file", None) => Ok(Self::LocalFile),
-            ("completed-partial", None) => Ok(Self::CompletedPartial),
-            ("existing-cache-migration", None) => Ok(Self::ExistingCacheMigration),
-            ("catalog-url" | "alternate-url", None) => Err(serde::de::Error::missing_field("url")),
-            ("local-file" | "completed-partial" | "existing-cache-migration", Some(_)) => Err(
-                serde::de::Error::custom("this installation source must not contain url"),
-            ),
+        match (wire.kind.as_str(), wire.url, wire.bundle_sha256) {
+            ("catalog-url", Some(url), None) => Ok(Self::CatalogUrl { url }),
+            ("alternate-url", Some(url), None) => Ok(Self::AlternateUrl { url }),
+            ("local-file", None, None) => Ok(Self::LocalFile),
+            ("completed-partial", None, None) => Ok(Self::CompletedPartial),
+            ("existing-cache-migration", None, None) => Ok(Self::ExistingCacheMigration),
+            ("offline-bundle", None, Some(bundle_sha256)) => {
+                if bundle_sha256.len() != 64
+                    || !bundle_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                {
+                    return Err(serde::de::Error::custom(
+                        "offline bundle SHA-256 must be 64 lowercase hexadecimal characters",
+                    ));
+                }
+                Ok(Self::OfflineBundle { bundle_sha256 })
+            }
+            ("catalog-url" | "alternate-url", None, None) => {
+                Err(serde::de::Error::missing_field("url"))
+            }
+            ("offline-bundle", None, None) => Err(serde::de::Error::missing_field("bundle_sha256")),
+            (
+                "catalog-url"
+                | "alternate-url"
+                | "local-file"
+                | "completed-partial"
+                | "existing-cache-migration"
+                | "offline-bundle",
+                _,
+                _,
+            ) => Err(serde::de::Error::custom(
+                "installation source contains fields that do not match its kind",
+            )),
             _ => Err(serde::de::Error::unknown_variant(
                 &wire.kind,
                 &[
@@ -315,6 +350,7 @@ impl<'de> Deserialize<'de> for ModelInstallationSource {
                     "local-file",
                     "completed-partial",
                     "existing-cache-migration",
+                    "offline-bundle",
                 ],
             )),
         }
@@ -397,6 +433,7 @@ fn verify_at(model: &ModelInfo, destination: &Path) -> Result<PathBuf, String> {
 }
 
 fn verify_spec_at(model: &ModelSpec<'_>, destination: &Path) -> Result<PathBuf, String> {
+    validate_model_storage_path(destination)?;
     verify_bytes_at(model, destination)?;
     if model.catalog.is_none() {
         return Ok(destination.to_path_buf());
@@ -549,7 +586,14 @@ where
     P: FnMut(u64, Option<u64>),
 {
     let model = ModelSpec::legacy(model);
-    install_spec_from_file_with_progress(&model, source, &mut cancelled, &mut progress)
+    install_spec_from_file_with_progress(
+        &model,
+        source,
+        ModelInstallationSource::LocalFile,
+        true,
+        &mut cancelled,
+        &mut progress,
+    )
 }
 
 pub fn install_catalog_model_from_file(
@@ -570,12 +614,21 @@ where
     P: FnMut(u64, Option<u64>),
 {
     let model = ModelSpec::catalog(model);
-    install_spec_from_file_with_progress(&model, source, &mut cancelled, &mut progress)
+    install_spec_from_file_with_progress(
+        &model,
+        source,
+        ModelInstallationSource::LocalFile,
+        true,
+        &mut cancelled,
+        &mut progress,
+    )
 }
 
 fn install_spec_from_file_with_progress<C, P>(
     model: &ModelSpec<'_>,
     source: impl AsRef<Path>,
+    installation_source: ModelInstallationSource,
+    require_active_authority: bool,
     cancelled: &mut C,
     progress: &mut P,
 ) -> Result<PathBuf, String>
@@ -583,18 +636,17 @@ where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
-    if let Some(identity) = model.catalog.as_ref() {
-        catalog::require_catalog_acquisition(identity)?;
+    if require_active_authority {
+        if let Some(identity) = model.catalog.as_ref() {
+            catalog::require_catalog_acquisition(identity)?;
+        }
     }
     let source = source.as_ref();
     let destination = path_for_spec(model)?;
-    let parent = model_parent(&destination)?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    ensure_model_parent(&destination)?;
     let lock = acquire_lock(&destination, cancelled)?;
     let result = (|| {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        ensure_model_parent(&destination)?;
         let mut source_file = open_local_model(source)?;
         let actual = sha256_open_file_exact(&mut source_file, source, model.size_bytes)?;
         if actual != model.sha256 {
@@ -608,7 +660,7 @@ where
         reset_partial(&partial, &metadata)?;
         publish_model_open_file(
             model,
-            ModelInstallationSource::LocalFile,
+            installation_source,
             source_file,
             source,
             &destination,
@@ -623,6 +675,47 @@ where
     result
 }
 
+pub(super) fn install_catalog_model_from_bundle(
+    model: &CatalogModel,
+    source: impl AsRef<Path>,
+    bundle_sha256: &str,
+) -> Result<PathBuf, String> {
+    let model = ModelSpec::catalog(model);
+    let mut never_cancelled = || false;
+    let mut no_progress = |_, _| {};
+    install_spec_from_file_with_progress(
+        &model,
+        source,
+        ModelInstallationSource::OfflineBundle {
+            bundle_sha256: bundle_sha256.to_string(),
+        },
+        true,
+        &mut never_cancelled,
+        &mut no_progress,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn install_catalog_model_from_verified_bundle_for_test(
+    model: &CatalogModel,
+    source: impl AsRef<Path>,
+    bundle_sha256: &str,
+) -> Result<PathBuf, String> {
+    let model = ModelSpec::catalog(model);
+    let mut never_cancelled = || false;
+    let mut no_progress = |_, _| {};
+    install_spec_from_file_with_progress(
+        &model,
+        source,
+        ModelInstallationSource::OfflineBundle {
+            bundle_sha256: bundle_sha256.to_string(),
+        },
+        false,
+        &mut never_cancelled,
+        &mut no_progress,
+    )
+}
+
 /// Remove an installed model and all interrupted-download state.
 pub fn remove(model: &ModelInfo) -> Result<bool, String> {
     remove_spec(&ModelSpec::legacy(model))
@@ -634,11 +727,13 @@ pub fn remove_catalog_model(model: &CatalogModel) -> Result<bool, String> {
 
 fn remove_spec(model: &ModelSpec<'_>) -> Result<bool, String> {
     let destination = path_for_spec(model)?;
+    validate_model_storage_path(&destination)?;
     let Some(parent) = destination.parent() else {
         return Err("invalid model cache path".into());
     };
     let mut never_cancelled = || false;
     let lock = acquire_lock(&destination, &mut never_cancelled)?;
+    validate_model_storage_path(&destination)?;
     let partial = sidecar(&destination, ".part");
     let metadata = sidecar(&destination, ".part.meta");
     let removed = remove_file_if_present(&destination)?
@@ -739,13 +834,10 @@ where
     if let Some(identity) = model.catalog.as_ref() {
         catalog::require_catalog_acquisition(identity)?;
     }
-    let parent = model_parent(&destination)?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    ensure_model_parent(&destination)?;
     let lock = acquire_lock(&destination, cancelled)?;
     let result = (|| {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+        ensure_model_parent(&destination)?;
         if !force {
             if let Ok(path) = verify_spec_at(model, &destination) {
                 return Ok(path);
@@ -1851,6 +1943,12 @@ fn validate_provenance(model: &ModelSpec<'_>, provenance: &ModelProvenance) -> R
         ModelInstallationSource::LocalFile
         | ModelInstallationSource::CompletedPartial
         | ModelInstallationSource::ExistingCacheMigration => true,
+        ModelInstallationSource::OfflineBundle { bundle_sha256 } => {
+            bundle_sha256.len() == 64
+                && bundle_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        }
     };
     if provenance.version != MODEL_PROVENANCE_VERSION
         || provenance.model_name != model.name
@@ -2353,6 +2451,63 @@ fn model_parent(destination: &Path) -> Result<&Path, String> {
     destination
         .parent()
         .ok_or_else(|| "invalid model cache path".to_string())
+}
+
+pub(super) fn validate_model_storage_path(destination: &Path) -> Result<(), String> {
+    let parent = model_parent(destination)?;
+    let cache = parent
+        .parent()
+        .ok_or_else(|| "invalid model cache path".to_string())?;
+    validate_model_directory(cache, "model cache")?;
+    validate_model_directory(parent, "model package directory")?;
+    Ok(())
+}
+
+fn ensure_model_parent(destination: &Path) -> Result<&Path, String> {
+    let parent = model_parent(destination)?;
+    let cache = parent
+        .parent()
+        .ok_or_else(|| "invalid model cache path".to_string())?;
+    reject_symlink(cache)?;
+    std::fs::create_dir_all(cache)
+        .map_err(|error| format!("failed to create {}: {error}", cache.display()))?;
+    require_model_directory(cache, "model cache")?;
+    reject_symlink(parent)?;
+    match std::fs::create_dir(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!("failed to create {}: {error}", parent.display()));
+        }
+    }
+    require_model_directory(parent, "model package directory")?;
+    Ok(parent)
+}
+
+fn validate_model_directory(path: &Path, description: &str) -> Result<(), String> {
+    reject_symlink(path)?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "{description} is not a directory: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to inspect {}: {error}", path.display())),
+    }
+}
+
+fn require_model_directory(path: &Path, description: &str) -> Result<(), String> {
+    reject_symlink(path)?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!(
+            "{description} is not a directory: {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), String> {

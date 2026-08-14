@@ -4235,6 +4235,9 @@ USAGE:
     denoize models catalog trust import <TRUST-ROOT.json> <SIGNATURES.json>
     denoize models catalog trust recover
     denoize models catalog trust reset-time-floor
+    denoize models bundle inspect <BUNDLE.dmb>
+    denoize models bundle import <BUNDLE.dmb>
+    denoize models bundle create <OUTPUT.dmb> <CATALOG.json> <CATALOG.json.sig> <TRUST-ROOT.json> <COMPONENTS-DIR>
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:
@@ -4669,6 +4672,9 @@ fn installation_source_output(source: &denoize::models::ModelInstallationSource)
         denoize::models::ModelInstallationSource::ExistingCacheMigration => {
             "existing-cache-migration".into()
         }
+        denoize::models::ModelInstallationSource::OfflineBundle { bundle_sha256 } => {
+            format!("offline-bundle:{bundle_sha256}")
+        }
         _ => "unknown".into(),
     }
 }
@@ -4700,6 +4706,17 @@ fn catalog_model_info_output(
         model.catalog_trust_root_version(),
         catalog_origin_output(model.catalog_origin()),
     );
+    if let Some(bundle) = model.offline_bundle() {
+        output.push_str(&format!(
+            "bundle-license: {}\t{}\t{}\nbundle-provenance: {}\t{}\t{}\n",
+            bundle.license().filename(),
+            bundle.license().size_bytes(),
+            bundle.license().sha256(),
+            bundle.provenance().filename(),
+            bundle.provenance().size_bytes(),
+            bundle.provenance().sha256(),
+        ));
+    }
     match denoize::models::catalog_model_provenance(model) {
         Ok(provenance) => {
             output.push_str(&format!(
@@ -4797,6 +4814,100 @@ fn print_trust_root_status(status: &denoize::models::TrustRootStatus) {
         "cached-chain-path: {}",
         status.cached_trust_chain_path.display()
     );
+}
+
+fn print_offline_bundle_info(info: &denoize::models::OfflineBundleInfo) {
+    println!("format-version: {}", info.format_version);
+    println!("bundle-sha256: {}", info.bundle_sha256);
+    println!("size-bytes: {}", info.size_bytes);
+    println!("catalog-sequence: {}", info.catalog_sequence);
+    println!("catalog-sha256: {}", info.catalog_sha256);
+    println!("catalog-signing-key: {}", info.catalog_signing_key_id);
+    println!(
+        "catalog-issued-at-unix-seconds: {}",
+        info.catalog_issued_at_unix_seconds
+            .map_or_else(|| "unrecorded".into(), |value| value.to_string())
+    );
+    println!(
+        "catalog-expires-at-unix-seconds: {}",
+        info.catalog_expires_at_unix_seconds
+            .map_or_else(|| "unrecorded".into(), |value| value.to_string())
+    );
+    println!("trust-root-version: {}", info.trust_root_version);
+    println!("trust-root-sha256: {}", info.trust_root_sha256);
+    println!("models: {}", info.models.len());
+    for model in &info.models {
+        println!(
+            "model: {}\t{}\t{}\t{}\t{}",
+            model.name,
+            model.backend,
+            model.artifact_filename,
+            model.artifact_size_bytes,
+            model.artifact_sha256
+        );
+        println!(
+            "license: {}\t{}\t{}\t{}",
+            model.name, model.license_filename, model.license_size_bytes, model.license_sha256
+        );
+        println!(
+            "provenance: {}\t{}\t{}\t{}",
+            model.name,
+            model.provenance_filename,
+            model.provenance_size_bytes,
+            model.provenance_sha256
+        );
+    }
+}
+
+fn run_model_bundle(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .skip(1)
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        || args.get(1).map(String::as_str) == Some("help")
+    {
+        print!("{}", models_usage());
+        return Ok(());
+    }
+    match args.get(1).map(String::as_str).unwrap_or("inspect") {
+        "inspect" => {
+            if args.len() != 3 {
+                return Err("models bundle inspect requires BUNDLE.dmb".into());
+            }
+            print_offline_bundle_info(&denoize::models::inspect_offline_bundle(&args[2])?);
+        }
+        "import" => {
+            if args.len() != 3 {
+                return Err("models bundle import requires BUNDLE.dmb".into());
+            }
+            let report = denoize::models::import_offline_bundle(&args[2])?;
+            print_offline_bundle_info(&report.bundle);
+            for path in &report.installed {
+                println!("installed: {}", path.display());
+            }
+            for path in &report.already_present {
+                println!("already-present: {}", path.display());
+            }
+        }
+        "create" => {
+            if args.len() != 7 {
+                return Err(
+                    "models bundle create requires OUTPUT.dmb CATALOG.json CATALOG.json.sig TRUST-ROOT.json COMPONENTS-DIR"
+                        .into(),
+                );
+            }
+            let info = denoize::models::build_offline_bundle(
+                &args[2], &args[3], &args[4], &args[5], &args[6],
+            )?;
+            print_offline_bundle_info(&info);
+            eprintln!(
+                "created authenticated offline bundle {} ({})",
+                args[2], info.bundle_sha256
+            );
+        }
+        value => return Err(format!("unknown models bundle command: {value}")),
+    }
+    Ok(())
 }
 
 fn run_model_catalog_trust(args: &[String]) -> Result<(), String> {
@@ -4993,6 +5104,9 @@ fn print_model_cache_report(report: &denoize::models::ModelCacheReport) {
 fn run_models(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("catalog") {
         return run_model_catalog(args);
+    }
+    if args.first().map(String::as_str) == Some("bundle") {
+        return run_model_bundle(args);
     }
     let help_requested = args
         .iter()
@@ -5556,8 +5670,38 @@ mod model_command_tests {
             "--basic-user",
             "--basic-password-env",
             "--from",
+            "bundle inspect",
+            "bundle import",
+            "bundle create",
         ] {
             assert!(models_usage().contains(flag));
+        }
+    }
+
+    #[test]
+    fn model_bundle_commands_reject_bad_arity_before_file_io() {
+        let cases = [
+            (
+                vec!["bundle".into(), "inspect".into()],
+                "models bundle inspect requires BUNDLE.dmb",
+            ),
+            (
+                vec![
+                    "bundle".into(),
+                    "import".into(),
+                    "a.dmb".into(),
+                    "extra".into(),
+                ],
+                "models bundle import requires BUNDLE.dmb",
+            ),
+            (
+                vec!["bundle".into(), "create".into(), "output.dmb".into()],
+                "models bundle create requires OUTPUT.dmb",
+            ),
+        ];
+        for (args, expected) in cases {
+            let error = run_models(&args).unwrap_err();
+            assert!(error.contains(expected), "{error}");
         }
     }
 }

@@ -264,18 +264,24 @@ jobs:
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
   model-catalog:
-    name: Sign model catalog and trust root
+    name: Sign catalog and build offline model bundle
     needs: prepare
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v6
 
+      - name: Select stable Rust
+        shell: bash
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
       - name: Install Tauri signer
         working-directory: apps/desktop
         run: npm ci
 
-      - name: Sign and upload model catalog and trust root
+      - name: Sign catalog, build bundle, and upload model assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -283,6 +289,8 @@ jobs:
         run: |
           asset="$GITHUB_WORKSPACE/denoize-model-catalog-v1.json"
           trust_asset="$GITHUB_WORKSPACE/denoize-model-trust-root-v1.json"
+          bundle="$GITHUB_WORKSPACE/denoize-models-${GITHUB_REF_NAME}.dmb"
+          bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
           cp models/trust-root-v1.json "$trust_asset"
           (
@@ -291,8 +299,11 @@ jobs:
             # otherwise tries to prompt on a non-interactive Actions runner.
             npm run tauri -- signer sign --password "" "$asset"
           )
+          bash scripts/build-offline-model-bundle.sh \
+            "$bundle" "$bundle_checksum" "$asset" "$asset.sig" "$trust_asset"
           gh release upload "$GITHUB_REF_NAME" \
-            "$asset" "$asset.sig" "$trust_asset" --clobber
+            "$asset" "$asset.sig" "$trust_asset" \
+            "$bundle" "$bundle_checksum" --clobber
 
   publish:
     name: Publish release

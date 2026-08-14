@@ -65,7 +65,7 @@ jobs:
         run: bash scripts/publish-crates-io.sh --test
 
       - name: Check release scripts
-        run: bash -n scripts/generate-cli-docs.sh scripts/publish-crates-io.sh scripts/verify-release-assets.sh scripts/verify-release-version.sh
+        run: bash -n scripts/build-offline-model-bundle.sh scripts/generate-cli-docs.sh scripts/publish-crates-io.sh scripts/verify-release-assets.sh scripts/verify-release-version.sh
 
   cli-docs:
     name: CLI documentation

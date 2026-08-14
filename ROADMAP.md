@@ -21,15 +21,18 @@ atomicity, documentation, and release assets are covered by automated tests.
 | 1 | Signed, sequence-monotonic model catalog; exact artifact size/SHA-256; content-addressed installation provenance | Implemented |
 | 2 | `models doctor`, `verify`, `repair`, and `prune` for corrupt, missing, stale, and orphaned cache state | Implemented |
 | 3 | Signing-key rotation, explicit revocation, expiry policy, and emergency trust-root recovery | Implemented |
-| 4 | Signed offline bundles containing catalog, signature, models, licenses, and provenance for closed networks | Planned |
+| 4 | Signed offline bundles containing catalog, signature, models, licenses, and provenance for closed networks | Implemented |
 | 5 | Stable JSON output for catalog/model health, provenance, recipe identity, and automation | Planned |
 | 6 | Hardware capability discovery, explicit accelerator selection, and deterministic CPU fallback | Planned |
 | 7 | Process-level resource controls, worker admission based on memory, and stronger isolation of third-party codec/model allocations | Planned |
 | 8 | Input-aware quality/model recommendation with reproducible calibration evidence | Planned |
+| 9 | Reproducible releases with per-artifact SBOMs, signed build provenance, and offline verification for binaries, crates, and converted models | Planned |
 
 Stages 2–5 extend the authenticated distribution system without weakening its
 rollback or provenance guarantees. Stages 6–8 are runtime improvements and
-must retain a portable CPU path and deterministic validation fixtures.
+must retain a portable CPU path and deterministic validation fixtures. Stage 9
+extends authentication from downloaded model bytes to the release and model
+conversion processes that produced every distributed artifact.
 
 ## Investigation status
 

@@ -125,6 +125,9 @@ USAGE:
     denoize models catalog trust import <TRUST-ROOT.json> <SIGNATURES.json>
     denoize models catalog trust recover
     denoize models catalog trust reset-time-floor
+    denoize models bundle inspect <BUNDLE.dmb>
+    denoize models bundle import <BUNDLE.dmb>
+    denoize models bundle create <OUTPUT.dmb> <CATALOG.json> <CATALOG.json.sig> <TRUST-ROOT.json> <COMPONENTS-DIR>
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:

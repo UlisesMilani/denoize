@@ -37,6 +37,14 @@ fn run_with_stdin(args: &[String], input: &[u8]) -> Output {
     child.wait_with_output().unwrap()
 }
 
+fn run_with_model_dir(args: &[String], model_dir: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_denoize"))
+        .args(args)
+        .env("DENOIZE_MODEL_DIR", model_dir)
+        .output()
+        .unwrap()
+}
+
 fn write_wav(path: &Path, channels: u16, sample_rate: u32) {
     write_wav_frames(path, channels, sample_rate, 64);
 }
@@ -868,5 +876,38 @@ fn batch_backend_resource_precedes_input_directory_scan() {
         "batch input I/O ran before backend resource validation: {stderr}"
     );
     assert!(!output.exists(), "batch preflight created output directory");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn invalid_offline_bundle_cli_inputs_leave_the_model_cache_absent() {
+    let root = temp_root("invalid-model-bundle");
+    let bundle = root.join("invalid.dmb");
+    let cache = root.join("model-cache");
+    std::fs::write(&bundle, b"not a denoize model bundle").unwrap();
+
+    for command in ["inspect", "import"] {
+        let result = run_with_model_dir(
+            &[
+                "models".into(),
+                "bundle".into(),
+                command.into(),
+                bundle.to_string_lossy().into_owned(),
+            ],
+            &cache,
+        );
+        assert!(!result.status.success());
+        assert!(
+            result.stdout.is_empty(),
+            "invalid bundle emitted partial output"
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("offline model bundle") || stderr.contains("offline bundle"),
+            "unexpected {command} error: {stderr}"
+        );
+        assert!(!cache.exists(), "invalid {command} mutated the model cache");
+    }
+
     std::fs::remove_dir_all(root).unwrap();
 }

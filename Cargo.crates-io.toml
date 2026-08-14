@@ -43,9 +43,12 @@ include = [
     "/scripts/export-sgmse.py",
     "/scripts/validate-sgmse.py",
     "/scripts/generate-cli-docs.sh",
+    "/scripts/build-offline-model-bundle.sh",
     "/docs/cli.md",
     "/docs/models.md",
     "/models/*.json",
+    "/models/licenses/*.txt",
+    "/models/provenance/*.json",
 ]
 
 [lib]

@@ -161,6 +161,7 @@ fn test_catalog_model(bytes: &[u8]) -> CatalogModel {
         size_bytes: bytes.len() as u64,
         license: "MIT".into(),
         sample_rate: 16_000,
+        offline_bundle: None,
         catalog: catalog.identity().clone(),
     }
 }
@@ -2874,4 +2875,349 @@ fn model_doctor_and_prune_never_follow_package_symlink() {
     assert!(pruned.removed.is_empty());
     assert!(outside.join("model.onnx").exists());
     assert!(cache.join("maintenance-model").is_symlink());
+}
+
+struct OfflineBundleFixture {
+    bundle: PathBuf,
+    catalog: PathBuf,
+    signature: PathBuf,
+    trust_root: PathBuf,
+    components: PathBuf,
+    model_bytes: Vec<u8>,
+    trust_root_sha256: String,
+}
+
+fn offline_bundle_fixture(directory: &Path) -> OfflineBundleFixture {
+    let model_bytes = b"deterministic offline model fixture".to_vec();
+    let license_bytes = b"fixture license text\n";
+    let model_url = "https://models.example.test/fixture.onnx";
+    let revision = "offline-fixture-v1";
+    let model_sha256 = test_sha256(&model_bytes);
+    let license_sha256 = test_sha256(license_bytes);
+    let mut provenance_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": "denoize-model-source-provenance-v1",
+        "model_name": "offline-fixture",
+        "upstream_repository": "https://models.example.test/fixture",
+        "upstream_revision": revision,
+        "artifact": {
+            "url": model_url,
+            "sha256": model_sha256,
+            "size_bytes": model_bytes.len()
+        },
+        "license": {
+            "spdx": "MIT",
+            "url": "https://models.example.test/fixture/LICENSE",
+            "sha256": license_sha256,
+            "size_bytes": license_bytes.len()
+        }
+    }))
+    .unwrap();
+    provenance_bytes.push(b'\n');
+    let provenance_sha256 = test_sha256(&provenance_bytes);
+    let catalog_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema": "denoize-model-catalog-v1",
+        "sequence": 1,
+        "signing_key_id": "F5AE02E7593C64D9",
+        "models": [{
+            "name": "offline-fixture",
+            "backend": "offline-fixture",
+            "filename": "fixture.onnx",
+            "url": model_url,
+            "revision": revision,
+            "sha256": model_sha256,
+            "size_bytes": model_bytes.len(),
+            "license": "MIT",
+            "sample_rate": 16000,
+            "offline_bundle": {
+                "license": {
+                    "filename": "LICENSE.txt",
+                    "sha256": license_sha256,
+                    "size_bytes": license_bytes.len()
+                },
+                "provenance": {
+                    "filename": "provenance.json",
+                    "sha256": provenance_sha256,
+                    "size_bytes": provenance_bytes.len()
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let catalog = directory.join("catalog.json");
+    let signature = directory.join("catalog.json.sig");
+    let trust_root = directory.join("trust-root.json");
+    let components = directory.join("components");
+    let component = components.join("offline-fixture");
+    std::fs::create_dir_all(&component).unwrap();
+    std::fs::write(&catalog, catalog_bytes).unwrap();
+    std::fs::write(&signature, b"test-only detached signature").unwrap();
+    let trust_root_bytes = include_bytes!("../../models/trust-root-v1.json");
+    std::fs::write(&trust_root, trust_root_bytes).unwrap();
+    std::fs::write(component.join("fixture.onnx"), &model_bytes).unwrap();
+    std::fs::write(component.join("LICENSE.txt"), license_bytes).unwrap();
+    std::fs::write(component.join("provenance.json"), provenance_bytes).unwrap();
+    OfflineBundleFixture {
+        bundle: directory.join("models.dmb"),
+        catalog,
+        signature,
+        trust_root,
+        components,
+        model_bytes,
+        trust_root_sha256: test_sha256(trust_root_bytes).to_string(),
+    }
+}
+
+fn build_offline_bundle_fixture(
+    fixture: &OfflineBundleFixture,
+    output: &Path,
+) -> OfflineBundleInfo {
+    bundle::build_offline_bundle_for_test(
+        output,
+        &fixture.catalog,
+        &fixture.signature,
+        &fixture.trust_root,
+        &fixture.components,
+    )
+    .unwrap()
+}
+
+#[test]
+fn offline_bundle_is_deterministic_and_authenticates_all_components() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    let first = build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let second_path = directory.path().join("models-second.dmb");
+    let second = build_offline_bundle_fixture(&fixture, &second_path);
+
+    assert_eq!(
+        std::fs::read(&fixture.bundle).unwrap(),
+        std::fs::read(second_path).unwrap()
+    );
+    assert_eq!(first, second);
+    assert_eq!(first.models.len(), 1);
+    assert_eq!(first.catalog_issued_at_unix_seconds, None);
+    assert_eq!(first.catalog_expires_at_unix_seconds, None);
+    assert_eq!(first.models[0].name, "offline-fixture");
+    assert_eq!(
+        first.models[0].artifact_size_bytes,
+        fixture.model_bytes.len() as u64
+    );
+    assert_eq!(first.trust_root_sha256, fixture.trust_root_sha256);
+    let inspected =
+        bundle::inspect_offline_bundle_for_test(&fixture.bundle, &fixture.trust_root_sha256)
+            .unwrap();
+    assert_eq!(inspected, first);
+}
+
+#[test]
+fn offline_bundle_rejects_tampering_and_trailing_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let original = std::fs::read(&fixture.bundle).unwrap();
+
+    let tampered_path = directory.path().join("tampered.dmb");
+    let mut tampered = original.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    std::fs::write(&tampered_path, tampered).unwrap();
+    let error = bundle::inspect_offline_bundle_for_test(&tampered_path, &fixture.trust_root_sha256)
+        .unwrap_err();
+    assert!(error.contains("checksum mismatch"), "{error}");
+
+    let trailing_path = directory.path().join("trailing.dmb");
+    let mut trailing = original;
+    trailing.push(0);
+    std::fs::write(&trailing_path, trailing).unwrap();
+    let error = bundle::inspect_offline_bundle_for_test(&trailing_path, &fixture.trust_root_sha256)
+        .unwrap_err();
+    assert!(error.contains("length mismatch"), "{error}");
+}
+
+#[test]
+fn offline_bundle_builder_rejects_mismatched_license_before_output_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    std::fs::write(
+        fixture.components.join("offline-fixture/LICENSE.txt"),
+        b"tampered license\n",
+    )
+    .unwrap();
+    let error = bundle::build_offline_bundle_for_test(
+        &fixture.bundle,
+        &fixture.catalog,
+        &fixture.signature,
+        &fixture.trust_root,
+        &fixture.components,
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("size mismatch") || error.contains("checksum mismatch"),
+        "{error}"
+    );
+    assert!(!fixture.bundle.exists());
+}
+
+#[test]
+fn offline_bundle_builder_rejects_signed_but_inconsistent_provenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    let provenance_path = fixture.components.join("offline-fixture/provenance.json");
+    let mut provenance: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&provenance_path).unwrap()).unwrap();
+    provenance["upstream_revision"] = "different-revision".into();
+    let mut provenance_bytes = serde_json::to_vec_pretty(&provenance).unwrap();
+    provenance_bytes.push(b'\n');
+    std::fs::write(&provenance_path, &provenance_bytes).unwrap();
+
+    // The test verifier treats this catalog as signed, so matching the new
+    // digest proves semantic cross-checking is independent of byte integrity.
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.catalog).unwrap()).unwrap();
+    catalog["models"][0]["offline_bundle"]["provenance"]["sha256"] =
+        test_sha256(&provenance_bytes).into();
+    catalog["models"][0]["offline_bundle"]["provenance"]["size_bytes"] =
+        provenance_bytes.len().into();
+    std::fs::write(
+        &fixture.catalog,
+        serde_json::to_vec_pretty(&catalog).unwrap(),
+    )
+    .unwrap();
+
+    let error = bundle::build_offline_bundle_for_test(
+        &fixture.bundle,
+        &fixture.catalog,
+        &fixture.signature,
+        &fixture.trust_root,
+        &fixture.components,
+    )
+    .unwrap_err();
+    assert!(error.contains("provenance does not match"), "{error}");
+    assert!(!fixture.bundle.exists());
+}
+
+#[test]
+fn public_offline_bundle_import_fails_closed_before_cache_mutation() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let cache = directory.path().join("model-cache");
+    let _model_dir = ModelDirGuard::set(&cache);
+
+    let error = import_offline_bundle(&fixture.bundle).unwrap_err();
+    assert!(error.contains("signature"), "{error}");
+    assert!(!cache.exists());
+}
+
+#[test]
+fn offline_bundle_import_installs_without_network_and_is_idempotent() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    let info = build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let cache = directory.path().join("model-cache");
+    let _model_dir = ModelDirGuard::set(&cache);
+
+    let report =
+        bundle::import_offline_bundle_for_test(&fixture.bundle, &fixture.trust_root_sha256)
+            .unwrap();
+    assert_eq!(report.installed.len(), 1);
+    assert!(report.already_present.is_empty());
+    assert_eq!(
+        std::fs::read(&report.installed[0]).unwrap(),
+        fixture.model_bytes
+    );
+    let catalog_bytes = std::fs::read(&fixture.catalog).unwrap();
+    let catalog = catalog::parse_catalog(
+        &catalog_bytes,
+        CatalogOrigin::Signed {
+            source: "local-import".into(),
+        },
+    )
+    .unwrap();
+    let provenance = catalog_model_provenance(&catalog.models()[0]).unwrap();
+    assert!(matches!(
+        provenance.installation_source,
+        ModelInstallationSource::OfflineBundle { ref bundle_sha256 }
+            if bundle_sha256 == &info.bundle_sha256
+    ));
+
+    let repeated =
+        bundle::import_offline_bundle_for_test(&fixture.bundle, &fixture.trust_root_sha256)
+            .unwrap();
+    assert!(repeated.installed.is_empty());
+    assert_eq!(repeated.already_present.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn offline_bundle_import_never_follows_a_symlinked_model_directory() {
+    use std::os::unix::fs::symlink;
+
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let cache = directory.path().join("model-cache");
+    let outside = directory.path().join("outside");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, cache.join("offline-fixture")).unwrap();
+    let _model_dir = ModelDirGuard::set(&cache);
+
+    let error = bundle::import_offline_bundle_for_test(&fixture.bundle, &fixture.trust_root_sha256)
+        .unwrap_err();
+    assert!(error.contains("symbolic link for model state"), "{error}");
+    assert!(cache.join("offline-fixture").is_symlink());
+    assert!(!outside.join("fixture.onnx").exists());
+    assert!(!outside.join(".provenance").exists());
+}
+
+#[test]
+fn tampered_offline_bundle_leaves_model_cache_absent() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let mut bytes = std::fs::read(&fixture.bundle).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&fixture.bundle, bytes).unwrap();
+    let cache = directory.path().join("model-cache");
+    let _model_dir = ModelDirGuard::set(&cache);
+
+    let error = bundle::import_offline_bundle_for_test(&fixture.bundle, &fixture.trust_root_sha256)
+        .unwrap_err();
+    assert!(error.contains("checksum mismatch"), "{error}");
+    assert!(!cache.exists());
+}
+
+#[test]
+fn expected_bundle_digest_binds_inspection_to_import_without_cache_mutation() {
+    let _serial = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = offline_bundle_fixture(directory.path());
+    build_offline_bundle_fixture(&fixture, &fixture.bundle);
+    let cache = directory.path().join("model-cache");
+    let _model_dir = ModelDirGuard::set(&cache);
+
+    let error = bundle::import_offline_bundle_for_test_if_sha256(
+        &fixture.bundle,
+        &fixture.trust_root_sha256,
+        &"0".repeat(64),
+    )
+    .unwrap_err();
+    assert!(error.contains("changed after inspection"), "{error}");
+    assert!(!cache.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn offline_bundle_rejects_fifo_without_waiting_for_a_writer() {
+    let directory = tempfile::tempdir().unwrap();
+    let fifo = directory.path().join("models.dmb");
+    create_fifo(&fifo);
+    let started = Instant::now();
+    let error = inspect_offline_bundle(&fifo).unwrap_err();
+    assert!(started.elapsed().as_secs() < 1);
+    assert!(error.contains("regular file"), "{error}");
 }

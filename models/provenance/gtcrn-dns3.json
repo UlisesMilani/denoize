@@ -1,0 +1,17 @@
+{
+  "schema": "denoize-model-source-provenance-v1",
+  "model_name": "gtcrn-dns3",
+  "upstream_repository": "https://github.com/Xiaobin-Rong/gtcrn",
+  "upstream_revision": "3862c44808dca492ea5a8a145d2dc2a1028d08c8",
+  "artifact": {
+    "url": "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/stream/onnx_models/gtcrn_simple.onnx",
+    "sha256": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+    "size_bytes": 535190
+  },
+  "license": {
+    "spdx": "MIT",
+    "url": "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/LICENSE",
+    "sha256": "c467165e5860b4a7494ef4a6e2788e4115d95b5b8989bb5f86287089adddf794",
+    "size_bytes": 1069
+  }
+}

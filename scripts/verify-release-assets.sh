@@ -52,6 +52,8 @@ expected_assets=(
   "denoize-model-catalog-v1.json"
   "denoize-model-catalog-v1.json.sig"
   "denoize-model-trust-root-v1.json"
+  "denoize-models-${tag}.dmb"
+  "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
 
@@ -113,6 +115,7 @@ gh release download "$tag" \
   --pattern '*.sig' \
   --pattern '*.zip' \
   --pattern '*.sha256' \
+  --pattern '*.dmb' \
   --pattern 'denoize-model-catalog-v1.json' \
   --pattern 'denoize-model-trust-root-v1.json' \
   --pattern 'latest.json' \
@@ -141,6 +144,16 @@ DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
   models catalog import \
   "$tmp_dir/denoize-model-catalog-v1.json" \
   "$tmp_dir/denoize-model-catalog-v1.json.sig" >/dev/null
+
+DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
+  cargo run --locked --no-default-features --bin denoize -- \
+  models bundle inspect "$tmp_dir/denoize-models-${tag}.dmb" >/dev/null
+DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
+  cargo run --locked --no-default-features --bin denoize -- \
+  models bundle import "$tmp_dir/denoize-models-${tag}.dmb" >/dev/null
+DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
+  cargo run --locked --no-default-features --bin denoize -- \
+  models verify all >/dev/null
 
 archive_contains() {
   local archive="$1"

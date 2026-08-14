@@ -711,6 +711,46 @@ struct ModelPruneReportRow {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct OfflineBundleModelRow {
+    name: String,
+    backend: String,
+    artifact_filename: String,
+    artifact_sha256: String,
+    artifact_size_bytes: u64,
+    license_filename: String,
+    license_sha256: String,
+    license_size_bytes: u64,
+    provenance_filename: String,
+    provenance_sha256: String,
+    provenance_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineBundleRow {
+    format_version: u32,
+    bundle_sha256: String,
+    size_bytes: u64,
+    catalog_sequence: u64,
+    catalog_sha256: String,
+    catalog_signing_key_id: String,
+    catalog_issued_at_unix_seconds: Option<u64>,
+    catalog_expires_at_unix_seconds: Option<u64>,
+    trust_root_version: u64,
+    trust_root_sha256: String,
+    models: Vec<OfflineBundleModelRow>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineBundleImportRow {
+    bundle: OfflineBundleRow,
+    installed: Vec<String>,
+    already_present: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewData {
     source: String,
     playable_path: String,
@@ -1590,6 +1630,9 @@ fn model_installation_source(source: &denoize::models::ModelInstallationSource) 
         denoize::models::ModelInstallationSource::ExistingCacheMigration => {
             "existing-cache-migration".into()
         }
+        denoize::models::ModelInstallationSource::OfflineBundle { bundle_sha256 } => {
+            format!("offline-bundle:{bundle_sha256}")
+        }
         _ => "unknown".into(),
     }
 }
@@ -1681,6 +1724,38 @@ fn current_model_catalog_row() -> Result<ModelCatalogRow, String> {
     })
 }
 
+fn offline_bundle_row(info: denoize::models::OfflineBundleInfo) -> OfflineBundleRow {
+    OfflineBundleRow {
+        format_version: info.format_version,
+        bundle_sha256: info.bundle_sha256,
+        size_bytes: info.size_bytes,
+        catalog_sequence: info.catalog_sequence,
+        catalog_sha256: info.catalog_sha256,
+        catalog_signing_key_id: info.catalog_signing_key_id,
+        catalog_issued_at_unix_seconds: info.catalog_issued_at_unix_seconds,
+        catalog_expires_at_unix_seconds: info.catalog_expires_at_unix_seconds,
+        trust_root_version: info.trust_root_version,
+        trust_root_sha256: info.trust_root_sha256,
+        models: info
+            .models
+            .into_iter()
+            .map(|model| OfflineBundleModelRow {
+                name: model.name,
+                backend: model.backend,
+                artifact_filename: model.artifact_filename,
+                artifact_sha256: model.artifact_sha256,
+                artifact_size_bytes: model.artifact_size_bytes,
+                license_filename: model.license_filename,
+                license_sha256: model.license_sha256,
+                license_size_bytes: model.license_size_bytes,
+                provenance_filename: model.provenance_filename,
+                provenance_sha256: model.provenance_sha256,
+                provenance_size_bytes: model.provenance_size_bytes,
+            })
+            .collect(),
+    }
+}
+
 #[tauri::command]
 fn model_catalog_status() -> Result<ModelCatalogRow, String> {
     current_model_catalog_row()
@@ -1697,6 +1772,41 @@ async fn update_model_catalog(
     })
     .await
     .map_err(|error| format!("モデルカタログ更新タスクに失敗しました: {error}"))?
+}
+
+#[tauri::command]
+async fn inspect_model_bundle(path: String) -> Result<OfflineBundleRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        denoize::models::inspect_offline_bundle(path).map(offline_bundle_row)
+    })
+    .await
+    .map_err(|error| format!("オフラインモデルバンドル検証タスクに失敗しました: {error}"))?
+}
+
+#[tauri::command]
+async fn import_model_bundle(
+    path: String,
+    expected_bundle_sha256: String,
+) -> Result<OfflineBundleImportRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let report =
+            denoize::models::import_offline_bundle_if_sha256(path, &expected_bundle_sha256)?;
+        Ok(OfflineBundleImportRow {
+            bundle: offline_bundle_row(report.bundle),
+            installed: report
+                .installed
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            already_present: report
+                .already_present
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+        })
+    })
+    .await
+    .map_err(|error| format!("オフラインモデルバンドル導入タスクに失敗しました: {error}"))?
 }
 
 #[tauri::command]
@@ -2621,6 +2731,8 @@ pub fn run() {
             list_models,
             model_catalog_status,
             update_model_catalog,
+            inspect_model_bundle,
+            import_model_bundle,
             recover_model_trust_root,
             reset_model_trust_time_floor,
             model_cache_doctor,
@@ -2695,6 +2807,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn desktop_offline_bundle_commands_fail_closed_on_invalid_inputs() {
+        let directory = TestDirectory::create("invalid-offline-bundle");
+        let missing = directory.join("missing.dmb");
+        let inspect_error = tauri::async_runtime::block_on(inspect_model_bundle(
+            missing.to_string_lossy().into_owned(),
+        ))
+        .unwrap_err();
+        assert!(inspect_error.contains("file not found"), "{inspect_error}");
+
+        let import_error = tauri::async_runtime::block_on(import_model_bundle(
+            missing.to_string_lossy().into_owned(),
+            "not-a-sha256".into(),
+        ))
+        .unwrap_err();
+        assert!(
+            import_error.contains("expected offline bundle SHA-256"),
+            "{import_error}"
+        );
     }
 
     fn write_test_wav(path: &Path) {

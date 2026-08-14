@@ -1,9 +1,7 @@
 {
   "schema": "denoize-model-catalog-v1",
-  "sequence": 2,
+  "sequence": 1,
   "signing_key_id": "F5AE02E7593C64D9",
-  "issued_at_unix_seconds": 1786665600,
-  "expires_at_unix_seconds": 1802217600,
   "models": [
     {
       "name": "gtcrn-dns3",
@@ -14,19 +12,7 @@
       "sha256": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
       "size_bytes": 535190,
       "license": "MIT",
-      "sample_rate": 16000,
-      "offline_bundle": {
-        "license": {
-          "filename": "gtcrn-dns3-MIT.txt",
-          "sha256": "c467165e5860b4a7494ef4a6e2788e4115d95b5b8989bb5f86287089adddf794",
-          "size_bytes": 1069
-        },
-        "provenance": {
-          "filename": "gtcrn-dns3.json",
-          "sha256": "af0b088d7a32abb626750e753d1d19bdffe86d0a5cd06651ef0ef9ad0a291c41",
-          "size_bytes": 749
-        }
-      }
+      "sample_rate": 16000
     }
   ]
 }

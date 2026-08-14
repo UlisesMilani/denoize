@@ -73,6 +73,21 @@ type ModelActionOptions = {
   bearerToken: string | null; basicUsername: string | null; basicPassword: string | null;
   sourcePath: string | null;
 };
+type OfflineBundleModelRow = {
+  name: string; backend: string; artifactFilename: string; artifactSha256: string;
+  artifactSizeBytes: number; licenseFilename: string; licenseSha256: string;
+  licenseSizeBytes: number; provenanceFilename: string; provenanceSha256: string;
+  provenanceSizeBytes: number;
+};
+type OfflineBundleRow = {
+  formatVersion: number; bundleSha256: string; sizeBytes: number; catalogSequence: number;
+  catalogSha256: string; catalogSigningKeyId: string; trustRootVersion: number;
+  catalogIssuedAtUnixSeconds: number | null; catalogExpiresAtUnixSeconds: number | null;
+  trustRootSha256: string; models: OfflineBundleModelRow[];
+};
+type OfflineBundleImportRow = {
+  bundle: OfflineBundleRow; installed: string[]; alreadyPresent: string[];
+};
 type PreviewData = { source: string; playablePath: string; durationSeconds: number; rmsDb: number; waveform: number[] };
 type DropSelection = { audioFiles: string[]; directories: string[]; ignored: string[] };
 type LiveDevices = { inputs: string[]; outputs: string[] };
@@ -92,6 +107,7 @@ let activeModelJob: number | null = null;
 let activeModelName: string | null = null;
 let pendingModelName: string | null = null;
 let pendingModelEvents: ModelProgress[] = [];
+let selectedModelBundle: OfflineBundleRow | null = null;
 const previews: { input?: PreviewData; output?: PreviewData } = {};
 let activePreview: "input" | "output" = "input";
 
@@ -228,6 +244,10 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           </div>
           <div class="file-row model-local-file"><div><label>ローカルモデル（導入時に使用）</label><div id="model-local-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="clear-model-local" disabled>解除</button><button class="secondary" id="choose-model-local">選択</button></div></div>
           <input id="model-local-path" type="hidden">
+          <div class="file-row model-local-file"><div><label>署名付きオフラインバンドル</label><div id="model-bundle-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="clear-model-bundle" disabled>解除</button><button class="secondary" id="choose-model-bundle">選択・検証</button><button class="install" id="import-model-bundle" disabled>一括導入</button></div></div>
+          <input id="model-bundle-path" type="hidden">
+          <p id="model-bundle-status" class="field-hint">閉域向けバンドルはカタログ署名、信頼ルート、モデル、ライセンス、来歴の全バイトを導入前に検証します。</p>
+          <div id="model-bundle-details" class="field-hint hidden"></div>
           <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルも署名カタログ固定のSHA-256で検証されます。ローカルモデル導入時、共有ネットワーク欄はモデル本体には使われず、カタログ更新にだけ使用できます。</p>
         </article>
         <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="model-doctor">診断</button><button class="secondary" id="model-prune-preview">整理確認</button><button class="secondary" id="model-prune">整理実行</button><button class="secondary" id="recover-model-trust-root">信頼ルート復旧</button><button class="secondary" id="reset-model-trust-time">信頼時刻リセット</button><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p id="model-health-status" class="section-copy">モデルキャッシュを診断しています。</p><p class="section-copy">外部モデルは版管理された信頼ルート、カタログ署名、期限、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。期限切れや失効後も検証済みモデルは利用できますが、新規取得は停止します。信頼ルート復旧は破損した同世代のキャッシュだけを、このアプリに埋め込まれたルートへ戻します。信頼時刻リセットは、誤った未来時刻を修正した後にだけ使用します。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
@@ -760,6 +780,68 @@ $("#clear-model-local").addEventListener("click", () => {
 });
 updateModelLocalPolicy();
 
+function clearSelectedModelBundle() {
+  selectedModelBundle = null;
+  setPath("#model-bundle-path", "#model-bundle-display", null);
+  $<HTMLButtonElement>("#clear-model-bundle").disabled = true;
+  $<HTMLButtonElement>("#import-model-bundle").disabled = true;
+  $("#model-bundle-status").textContent = "閉域向けバンドルはカタログ署名、信頼ルート、モデル、ライセンス、来歴の全バイトを導入前に検証します。";
+  $("#model-bundle-details").replaceChildren();
+  $("#model-bundle-details").classList.add("hidden");
+}
+
+$("#choose-model-bundle").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize model bundle", extensions: ["dmb"] }] });
+  if (typeof path !== "string") return;
+  try {
+    setModelUiBusy(true);
+    const bundle = await invoke<OfflineBundleRow>("inspect_model_bundle", { path });
+    selectedModelBundle = bundle;
+    setPath("#model-bundle-path", "#model-bundle-display", path);
+    $<HTMLButtonElement>("#clear-model-bundle").disabled = false;
+    $<HTMLButtonElement>("#import-model-bundle").disabled = false;
+    const names = bundle.models.map((model) => model.name).join(", ");
+    const expiry = bundle.catalogExpiresAtUnixSeconds === null
+      ? "期限記録なし"
+      : `期限 ${new Date(bundle.catalogExpiresAtUnixSeconds * 1000).toLocaleString()}`;
+    $("#model-bundle-status").textContent = `検証済み · catalog #${bundle.catalogSequence} · ${expiry} · trust root v${bundle.trustRootVersion} · ${bundle.models.length}件 (${names}) · SHA-256 ${bundle.bundleSha256.slice(0, 16)}…`;
+    $("#model-bundle-details").innerHTML = bundle.models.map((model) =>
+      `<div><b>${escapeHtml(model.name)}</b> · ${escapeHtml(model.backend)}<br>` +
+      `model ${escapeHtml(model.artifactFilename)} · ${model.artifactSizeBytes.toLocaleString()} bytes · ${escapeHtml(model.artifactSha256.slice(0, 16))}…<br>` +
+      `license ${escapeHtml(model.licenseFilename)} · ${escapeHtml(model.licenseSha256.slice(0, 16))}…<br>` +
+      `provenance ${escapeHtml(model.provenanceFilename)} · ${escapeHtml(model.provenanceSha256.slice(0, 16))}…</div>`
+    ).join("");
+    $("#model-bundle-details").classList.remove("hidden");
+    showToast("署名付きオフラインバンドルを検証しました");
+  } catch (error) {
+    clearSelectedModelBundle();
+    showToast(errorText(error), true);
+  } finally {
+    setModelUiBusy(false);
+  }
+});
+
+$("#clear-model-bundle").addEventListener("click", clearSelectedModelBundle);
+
+$("#import-model-bundle").addEventListener("click", async () => {
+  const path = $<HTMLInputElement>("#model-bundle-path").value;
+  const bundle = selectedModelBundle;
+  if (!path || !bundle) return;
+  if (!window.confirm(`署名検証済みのモデル ${bundle.models.length}件をローカルキャッシュへ導入します。続行しますか？`)) return;
+  try {
+    setModelUiBusy(true);
+    const report = await invoke<OfflineBundleImportRow>("import_model_bundle", {
+      path, expectedBundleSha256: bundle.bundleSha256,
+    });
+    showToast(`オフラインバンドルを導入しました（新規 ${report.installed.length}件、既存 ${report.alreadyPresent.length}件）`);
+    await loadModels();
+  } catch (error) {
+    showToast(errorText(error), true);
+  } finally {
+    setModelUiBusy(false);
+  }
+});
+
 async function loadModels() {
   try {
     const [library, catalog] = await Promise.all([
@@ -899,6 +981,9 @@ function setModelUiBusy(busy: boolean) {
   $<HTMLButtonElement>("#update-model-catalog").disabled = busy;
   $<HTMLButtonElement>("#recover-model-trust-root").disabled = busy;
   $<HTMLButtonElement>("#reset-model-trust-time").disabled = busy;
+  $<HTMLButtonElement>("#choose-model-bundle").disabled = busy;
+  $<HTMLButtonElement>("#clear-model-bundle").disabled = busy || selectedModelBundle === null;
+  $<HTMLButtonElement>("#import-model-bundle").disabled = busy || selectedModelBundle === null;
 }
 
 function showModelJobRow(name: string) {

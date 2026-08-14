@@ -50,7 +50,71 @@ denoize models install gtcrn-dns3 --from /media/models/gtcrn_simple.onnx
 
 `denoize models info MODEL` prints the catalog's exact length as a decimal
 `size-bytes` field alongside `sha256`, catalog sequence/digest/signing key, and
-installed provenance when present. The byte count is not rounded or scaled.
+installed provenance when present. Bundle-enabled entries also show the signed
+license and source-provenance filenames, exact sizes, and digests. The byte
+counts are not rounded or scaled.
+
+## Signed offline bundles
+
+Each GitHub release publishes `denoize-models-<tag>.dmb` and a matching
+`.dmb.sha256` file. Transfer both to the closed network, verify the transport
+checksum, authenticate all contents without changing local state, and then
+import:
+
+```sh
+sha256sum --check denoize-models-v0.52.0.dmb.sha256
+denoize models bundle inspect denoize-models-v0.52.0.dmb
+denoize models bundle import denoize-models-v0.52.0.dmb
+denoize models verify all
+```
+
+The checksum detects transfer damage; it is not the authority. The `.dmb`
+contains the exact catalog JSON, detached signature, trust-root JSON, model
+artifacts, upstream license texts, and source-provenance JSON. denoize verifies
+the catalog signature with its active trust root, requires the bundled root to
+match that authority byte-for-byte by SHA-256, cross-checks every model,
+license, and provenance record against the signed catalog, and hashes every
+payload. Source-provenance JSON must use
+`denoize-model-source-provenance-v1` and agree with the signed model revision,
+URL, artifact size/digest, license identifier, and license size/digest.
+
+The format is `denoize-model-bundle-v1`: a fixed magic value, a bounded JSON
+manifest length, and length-delimited payloads in manifest order. Bundle data
+does not choose filesystem extraction paths, and no decompressor runs. The
+manifest, catalog, signatures, trust root, per-model payloads, and metadata each
+have explicit size/count limits. Inputs must be seekable regular files; FIFOs,
+directories, devices, malformed lengths, duplicate models, trailing bytes, and
+unknown manifest fields are rejected.
+
+`inspect` is read-only. `import` performs that complete validation and stages
+every artifact before changing persistent catalog or model state. It then
+activates the signed catalog and publishes only missing models through the
+normal per-model atomic installer. Existing matching models are kept. If a
+later storage operation fails, models created by that invocation are removed
+in reverse order; the monotonic catalog rollback floor can remain advanced, so
+retry the same or a newer authenticated bundle. Validation failures never
+create the model cache. Neither command opens a network connection.
+
+Catalog and trust-root validity still applies on a closed network: an expired,
+revoked, not-yet-valid, rolled-back, or equivocating catalog is rejected. The
+`inspect` output includes catalog issue/expiry times, catalog and trust-root
+identity, the full bundle digest, and each carried artifact/license/provenance
+digest. An imported model records `offline-bundle` plus that bundle digest as
+its installation source.
+
+Release automation builds official bundles. Operators producing an equivalent
+private bundle can use the public builder after signing a trusted catalog:
+
+```text
+denoize models bundle create OUTPUT.dmb CATALOG.json CATALOG.json.sig \
+  TRUST-ROOT.json COMPONENTS-DIR
+```
+
+For every catalog model, `COMPONENTS-DIR` must contain
+`<model>/<artifact filename>`, `<model>/<license filename>`, and
+`<model>/<provenance filename>`. All names, sizes, digests, provenance fields,
+the signature, and trust root are checked before the atomically replaced output
+is committed. The same inputs produce identical bundle bytes.
 
 ## Catalog trust, rotation, expiry, and rollback safety
 
@@ -283,7 +347,9 @@ exposes the same diagnosis, per-model repair, preview, and apply operations.
 
 The desktop model manager displays the active catalog sequence, signing key,
 trust-root version/digest, acquisition status, origin, and per-model provenance,
-and can authenticate and activate the latest catalog. It exposes separate,
+and can authenticate and activate the latest catalog. It can select and inspect
+one `.dmb` file, display its catalog expiry, trust-root identity, model list and
+bundle digest, and import it after explicit confirmation. It exposes separate,
 confirmed embedded-root recovery and corrected-clock time-reset actions plus
 equivalent offline, source, proxy, direct, authentication, and local-file
 controls. They are session-only and are excluded from saved
