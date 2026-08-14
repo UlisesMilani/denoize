@@ -41,6 +41,23 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```'
   cat <<'EOF'
 
+## Stable JSON automation
+
+`denoize models snapshot --json` emits one compact, network-free
+`denoize-automation-v1` document covering the active catalog and trust root,
+cache health, expected model identities, validated installation provenance, and
+the processing recipe ABI. `--pretty` emits the same contract indented. Capture
+is assembled before stdout publication and fails without partial JSON if the
+catalog or trust generation changes. URLs are credential/query/fragment
+redacted. The desktop model library exports the identical document atomically.
+
+Normal file-processing `--json` results and batch NDJSON records use
+`denoize-cli-output-v1`. Every record names the recipe domain/version/output ABI.
+A finite-file result and each batch progress event include the exact resolved
+recipe digest; streaming results and multi-recipe summaries use `null`. Consumers
+must ignore fields added within a schema version. Versioned schemas ship in each
+release and are documented in `docs/json.md`.
+
 ## Batch resume state
 
 CLI and desktop batches share the `.denoize-state` v3 journal in the output

@@ -293,10 +293,14 @@ jobs:
           asset_dir="$(mktemp -d /tmp/denoize-release.XXXXXX)"
           asset="$asset_dir/denoize-model-catalog-v1.json"
           trust_asset="$asset_dir/denoize-model-trust-root-v1.json"
+          automation_schema="$asset_dir/denoize-automation-v1.schema.json"
+          cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
           bundle="$asset_dir/denoize-models-${GITHUB_REF_NAME}.dmb"
           bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
           cp models/trust-root-v1.json "$trust_asset"
+          cp schemas/denoize-automation-v1.schema.json "$automation_schema"
+          cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -307,6 +311,7 @@ jobs:
             "$bundle" "$bundle_checksum" "$asset" "$asset.sig" "$trust_asset"
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
+            "$automation_schema" "$cli_schema" \
             "$bundle" "$bundle_checksum" --clobber
 
   publish:

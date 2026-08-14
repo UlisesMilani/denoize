@@ -36,6 +36,7 @@
 
 pub mod atomic_output;
 pub mod audio;
+pub mod automation;
 pub mod backend;
 #[doc(hidden)]
 pub mod batch_resume;

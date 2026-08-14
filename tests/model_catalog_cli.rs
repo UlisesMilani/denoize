@@ -8,6 +8,81 @@ fn run(cache: &std::path::Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn run_offline_snapshot(cache: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_denoize"))
+        .env("DENOIZE_MODEL_DIR", cache)
+        .env("DENOIZE_MODEL_OFFLINE", "1")
+        .env(
+            "DENOIZE_MODEL_CATALOG_URL",
+            "https://127.0.0.1:9/unreachable",
+        )
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn automation_snapshot_is_complete_stable_and_network_free() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("models");
+    let output = run_offline_snapshot(&cache, &["models", "snapshot", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "snapshot must be one JSON document"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["schema"], "denoize-automation-v1");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["denoize_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        value["recipe_identity"]["domain"],
+        "denoize-batch-recipe-v3"
+    );
+    assert_eq!(value["recipe_identity"]["version"], 3);
+    assert_eq!(value["catalog"]["sequence"], 2);
+    assert_eq!(value["catalog"]["model_count"], 1);
+    assert_eq!(value["trust_root"]["version"], 1);
+    assert_eq!(value["cache"]["clean"], true);
+    assert_eq!(value["cache"]["missing_models"], 1);
+    assert_eq!(value["models"][0]["name"], "gtcrn-dns3");
+    assert_eq!(value["models"][0]["status"], "missing");
+    assert!(value["models"][0]["provenance"].is_null());
+    assert_eq!(
+        value["models"][0]["artifact_sha256"],
+        "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+    );
+
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../schemas/denoize-automation-v1.schema.json")).unwrap();
+    assert_eq!(schema["properties"]["schema"]["const"], value["schema"]);
+    assert_eq!(
+        schema["properties"]["schema_version"]["const"],
+        value["schema_version"]
+    );
+}
+
+#[test]
+fn automation_snapshot_failure_emits_no_partial_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache_file = directory.path().join("not-a-directory");
+    std::fs::write(&cache_file, b"sentinel").unwrap();
+
+    let output = run_offline_snapshot(&cache_file, &["models", "snapshot", "--pretty"]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read(&cache_file).unwrap(), b"sentinel");
+}
+
 #[test]
 fn embedded_catalog_status_list_and_info_are_visible() {
     let directory = tempfile::tempdir().unwrap();
@@ -313,4 +388,8 @@ fn model_help_documents_maintenance_commands() {
     assert!(help.contains("denoize models doctor"), "{help}");
     assert!(help.contains("denoize models repair <MODEL|all>"), "{help}");
     assert!(help.contains("denoize models prune [--dry-run]"), "{help}");
+    assert!(
+        help.contains("denoize models snapshot [--json] [--pretty]"),
+        "{help}"
+    );
 }

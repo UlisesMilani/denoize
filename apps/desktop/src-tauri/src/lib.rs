@@ -1838,6 +1838,27 @@ async fn model_cache_doctor() -> Result<ModelCacheReportRow, String> {
     .map_err(|error| format!("モデルキャッシュ診断タスクに失敗しました: {error}"))?
 }
 
+fn write_automation_json(path: &Path, json: &str) -> Result<(), String> {
+    let mut transaction = AtomicOutput::new(path)?;
+    std::io::Write::write_all(transaction.file_mut(), json.as_bytes())
+        .map_err(|error| format!("自動化JSONを書き込めません: {error}"))?;
+    transaction.commit(CommitMode::Replace)
+}
+
+fn write_automation_snapshot(path: &Path) -> Result<(), String> {
+    let snapshot = denoize::automation::capture_automation_snapshot()?;
+    let mut json = snapshot.to_pretty_json()?;
+    json.push('\n');
+    write_automation_json(path, &json)
+}
+
+#[tauri::command]
+async fn save_automation_snapshot(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_automation_snapshot(Path::new(&path)))
+        .await
+        .map_err(|error| format!("自動化JSONの書出タスクに失敗しました: {error}"))?
+}
+
 #[tauri::command]
 async fn prune_model_cache(dry_run: bool) -> Result<ModelPruneReportRow, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2736,6 +2757,7 @@ pub fn run() {
             recover_model_trust_root,
             reset_model_trust_time_floor,
             model_cache_doctor,
+            save_automation_snapshot,
             prune_model_cache,
             model_action,
             prepare_preview,
@@ -2807,6 +2829,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn desktop_automation_json_export_is_one_atomic_replacement() {
+        let directory = TestDirectory::create("automation-json");
+        let output = directory.join("denoize-automation.json");
+        std::fs::write(&output, b"old contents").unwrap();
+        let json = "{\"schema\":\"denoize-automation-v1\",\"schema_version\":1}\n";
+
+        write_automation_json(&output, json).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), json);
+        directory.assert_no_staged_outputs();
     }
 
     #[test]

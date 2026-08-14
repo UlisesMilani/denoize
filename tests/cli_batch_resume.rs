@@ -116,7 +116,12 @@ fn summary(output: &Output) -> Value {
 }
 
 fn assert_summary_counts(summary: &Value, succeeded: u64, skipped: u64, failed: u64) {
+    assert_eq!(summary["schema"], "denoize-cli-output-v1");
+    assert_eq!(summary["schema_version"], 1);
     assert_eq!(summary["event"], "summary");
+    assert_eq!(summary["recipe"]["domain"], "denoize-batch-recipe-v3");
+    assert_eq!(summary["recipe"]["version"], 3);
+    assert!(summary["recipe"]["digest"].is_null());
     assert_eq!(summary["total"], 1);
     assert_eq!(summary["succeeded"], succeeded);
     assert_eq!(summary["skipped"], skipped);
@@ -148,6 +153,16 @@ fn resumed_batch_reports_skipped_file_exclusively() {
     write_silent_wav(&input.join("sample.wav"));
 
     let first = run_batch(&input, &output);
+    let progress = std::str::from_utf8(&first.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|value| value["event"] == "progress")
+        .unwrap();
+    assert_eq!(progress["schema"], "denoize-cli-output-v1");
+    assert_eq!(progress["schema_version"], 1);
+    assert_eq!(progress["recipe"]["domain"], "denoize-batch-recipe-v3");
+    assert_eq!(progress["recipe"]["digest"].as_str().unwrap().len(), 64);
     assert_summary_counts(&summary(&first), 1, 0, 0);
 
     let resumed = run_batch(&input, &output);

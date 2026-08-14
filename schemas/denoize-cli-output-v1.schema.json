@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-cli-output-v1.schema.json",
+  "title": "denoize CLI JSON and NDJSON output v1",
+  "oneOf": [
+    { "$ref": "#/$defs/fileResult" },
+    { "$ref": "#/$defs/streamResult" },
+    { "$ref": "#/$defs/batchProgress" },
+    { "$ref": "#/$defs/batchSummary" }
+  ],
+  "$defs": {
+    "recipe": {
+      "type": "object",
+      "required": ["domain", "version", "output_abi_version", "digest"],
+      "properties": {
+        "domain": { "const": "denoize-batch-recipe-v3" },
+        "version": { "const": 3 },
+        "output_abi_version": { "type": "integer", "minimum": 1 },
+        "digest": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "common": {
+      "type": "object",
+      "required": ["schema", "schema_version", "event", "recipe"],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "type": "string" },
+        "recipe": { "$ref": "#/$defs/recipe" }
+      }
+    },
+    "fileResult": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "mode",
+            "input",
+            "output",
+            "backend",
+            "channels",
+            "frames",
+            "sample_rate",
+            "elapsed_ms"
+          ],
+          "properties": {
+            "event": { "const": "result" },
+            "mode": { "const": "file" },
+            "input": { "type": "string" },
+            "output": { "type": "string" },
+            "backend": { "type": "string" },
+            "channels": { "type": "integer", "minimum": 1 },
+            "frames": { "type": "integer", "minimum": 0 },
+            "sample_rate": { "type": "integer", "minimum": 1 },
+            "elapsed_ms": { "type": "number", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "streamResult": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "mode",
+            "input",
+            "output",
+            "backend",
+            "channels",
+            "frames",
+            "sample_rate",
+            "stream"
+          ],
+          "properties": {
+            "event": { "const": "result" },
+            "mode": { "const": "stream" },
+            "input": { "type": "string" },
+            "output": { "type": "string" },
+            "backend": { "type": "string" },
+            "channels": { "type": "integer", "minimum": 1 },
+            "frames": { "type": "integer", "minimum": 0 },
+            "sample_rate": { "type": "integer", "minimum": 1 },
+            "stream": { "const": true }
+          }
+        }
+      ]
+    },
+    "batchProgress": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "status",
+            "completed",
+            "total",
+            "elapsed_seconds",
+            "eta_seconds",
+            "input"
+          ],
+          "properties": {
+            "event": { "const": "progress" },
+            "status": { "enum": ["completed", "skipped", "failed", "cancelled"] },
+            "completed": { "type": "integer", "minimum": 0 },
+            "total": { "type": "integer", "minimum": 1 },
+            "elapsed_seconds": { "type": "number", "minimum": 0 },
+            "eta_seconds": { "type": "number", "minimum": 0 },
+            "input": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "batchSummary": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "required": [
+            "event",
+            "total",
+            "succeeded",
+            "skipped",
+            "failed",
+            "cancelled_count",
+            "cancelled",
+            "output"
+          ],
+          "properties": {
+            "event": { "const": "summary" },
+            "total": { "type": "integer", "minimum": 0 },
+            "succeeded": { "type": "integer", "minimum": 0 },
+            "skipped": { "type": "integer", "minimum": 0 },
+            "failed": { "type": "integer", "minimum": 0 },
+            "cancelled_count": { "type": "integer", "minimum": 0 },
+            "cancelled": { "type": "boolean" },
+            "output": { "type": "string" }
+          }
+        }
+      ]
+    }
+  }
+}

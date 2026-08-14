@@ -278,6 +278,30 @@ fn force_replaces_an_existing_destination() {
 }
 
 #[test]
+fn file_json_result_exposes_a_stable_recipe_identity_after_commit() {
+    let directory = TestDirectory::create();
+    let input = directory.join("input.wav");
+    let output = directory.join("output.wav");
+    write_test_wav(&input);
+
+    let result = run(&input, &output, &["--json", "--no-metadata"]);
+
+    assert_success(&result);
+    assert_valid_wav(&output);
+    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(value["schema"], "denoize-cli-output-v1");
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["event"], "result");
+    assert_eq!(value["mode"], "file");
+    assert_eq!(value["recipe"]["domain"], "denoize-batch-recipe-v3");
+    assert_eq!(value["recipe"]["version"], 3);
+    let digest = value["recipe"]["digest"].as_str().unwrap();
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    directory.assert_no_staged_outputs();
+}
+
+#[test]
 fn streaming_force_replaces_an_existing_destination() {
     let directory = TestDirectory::create();
     let input = directory.join("input.wav");

@@ -52,6 +52,8 @@ expected_assets=(
   "denoize-model-catalog-v1.json"
   "denoize-model-catalog-v1.json.sig"
   "denoize-model-trust-root-v1.json"
+  "denoize-automation-v1.schema.json"
+  "denoize-cli-output-v1.schema.json"
   "denoize-models-${tag}.dmb"
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
@@ -118,6 +120,8 @@ gh release download "$tag" \
   --pattern '*.dmb' \
   --pattern 'denoize-model-catalog-v1.json' \
   --pattern 'denoize-model-trust-root-v1.json' \
+  --pattern 'denoize-automation-v1.schema.json' \
+  --pattern 'denoize-cli-output-v1.schema.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -139,6 +143,15 @@ if ! cmp -s models/trust-root-v1.json "$tmp_dir/denoize-model-trust-root-v1.json
   exit 1
 fi
 
+for schema in denoize-automation-v1.schema.json denoize-cli-output-v1.schema.json; do
+  if ! cmp -s "schemas/$schema" "$tmp_dir/$schema"; then
+    echo "release JSON Schema differs from tagged schemas/$schema" >&2
+    exit 1
+  fi
+  jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
+    "$tmp_dir/$schema" >/dev/null
+done
+
 DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
   cargo run --locked --no-default-features --bin denoize -- \
   models catalog import \
@@ -154,6 +167,17 @@ DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
 DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
   cargo run --locked --no-default-features --bin denoize -- \
   models verify all >/dev/null
+DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \
+  DENOIZE_MODEL_OFFLINE=1 \
+  cargo run --locked --no-default-features --bin denoize -- \
+  models snapshot --json |
+  jq -e '
+    .schema == "denoize-automation-v1" and
+    .schema_version == 1 and
+    .cache.clean == true and
+    ([.models[].status] | all(. == "healthy")) and
+    .recipe_identity.domain == "denoize-batch-recipe-v3"
+  ' >/dev/null
 
 archive_contains() {
   local archive="$1"

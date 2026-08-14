@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-automation-v1.schema.json",
+  "title": "denoize automation snapshot v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "recipe_identity",
+    "catalog",
+    "trust_root",
+    "cache",
+    "models"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-automation-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1 },
+    "recipe_identity": { "$ref": "#/$defs/recipeIdentity" },
+    "catalog": { "$ref": "#/$defs/catalog" },
+    "trust_root": { "$ref": "#/$defs/trustRoot" },
+    "cache": { "$ref": "#/$defs/cache" },
+    "models": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/model" }
+    }
+  },
+  "$defs": {
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableTimestamp": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonNegativeInteger" },
+        { "type": "null" }
+      ]
+    },
+    "recipeIdentity": {
+      "type": "object",
+      "required": ["domain", "version", "output_abi_version", "package_version"],
+      "properties": {
+        "domain": { "const": "denoize-batch-recipe-v3" },
+        "version": { "const": 3 },
+        "output_abi_version": { "type": "integer", "minimum": 1 },
+        "package_version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "sha256",
+        "signing_key_id",
+        "origin",
+        "model_count",
+        "highest_accepted_sequence",
+        "cached_catalog_path",
+        "issued_at_unix_seconds",
+        "expires_at_unix_seconds",
+        "trust_root_version",
+        "trust_root_sha256",
+        "trust_root_expires_at_unix_seconds",
+        "trust_root_highest_observed_unix_seconds",
+        "acquisition_allowed"
+      ],
+      "properties": {
+        "sequence": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "signing_key_id": { "type": "string", "minLength": 1 },
+        "origin": { "type": "string", "minLength": 1 },
+        "model_count": { "$ref": "#/$defs/nonNegativeInteger" },
+        "highest_accepted_sequence": { "$ref": "#/$defs/nonNegativeInteger" },
+        "cached_catalog_path": { "type": "string" },
+        "issued_at_unix_seconds": { "$ref": "#/$defs/nullableTimestamp" },
+        "expires_at_unix_seconds": { "$ref": "#/$defs/nullableTimestamp" },
+        "trust_root_version": { "$ref": "#/$defs/nonNegativeInteger" },
+        "trust_root_sha256": { "$ref": "#/$defs/sha256" },
+        "trust_root_expires_at_unix_seconds": { "$ref": "#/$defs/nonNegativeInteger" },
+        "trust_root_highest_observed_unix_seconds": { "$ref": "#/$defs/nullableTimestamp" },
+        "acquisition_allowed": { "type": "boolean" }
+      }
+    },
+    "trustRoot": {
+      "type": "object",
+      "required": [
+        "version",
+        "sha256",
+        "issued_at_unix_seconds",
+        "expires_at_unix_seconds",
+        "expired",
+        "signature_threshold",
+        "root_key_ids",
+        "catalog_signing_key_ids",
+        "origin",
+        "highest_accepted_version",
+        "highest_observed_unix_seconds",
+        "cached_trust_chain_path"
+      ],
+      "properties": {
+        "version": { "$ref": "#/$defs/nonNegativeInteger" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "issued_at_unix_seconds": { "$ref": "#/$defs/nonNegativeInteger" },
+        "expires_at_unix_seconds": { "$ref": "#/$defs/nonNegativeInteger" },
+        "expired": { "type": "boolean" },
+        "signature_threshold": { "$ref": "#/$defs/nonNegativeInteger" },
+        "root_key_ids": { "type": "array", "items": { "type": "string" } },
+        "catalog_signing_key_ids": { "type": "array", "items": { "type": "string" } },
+        "origin": { "type": "string", "minLength": 1 },
+        "highest_accepted_version": { "$ref": "#/$defs/nonNegativeInteger" },
+        "highest_observed_unix_seconds": { "$ref": "#/$defs/nullableTimestamp" },
+        "cached_trust_chain_path": { "type": "string" }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "required": ["kind", "path", "model", "detail", "prunable"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "missing-artifact",
+            "corrupt-artifact",
+            "missing-provenance",
+            "invalid-provenance",
+            "incomplete-download",
+            "stale-download-state",
+            "orphaned-entry",
+            "unsafe-entry"
+          ]
+        },
+        "path": { "type": "string" },
+        "model": { "type": ["string", "null"] },
+        "detail": { "type": "string" },
+        "prunable": { "type": "boolean" }
+      }
+    },
+    "cache": {
+      "type": "object",
+      "required": [
+        "path",
+        "clean",
+        "healthy_models",
+        "missing_models",
+        "attention_models",
+        "issues"
+      ],
+      "properties": {
+        "path": { "type": "string" },
+        "clean": { "type": "boolean" },
+        "healthy_models": { "$ref": "#/$defs/nonNegativeInteger" },
+        "missing_models": { "$ref": "#/$defs/nonNegativeInteger" },
+        "attention_models": { "$ref": "#/$defs/nonNegativeInteger" },
+        "issues": { "type": "array", "items": { "$ref": "#/$defs/issue" } }
+      }
+    },
+    "bundleFile": {
+      "type": "object",
+      "required": ["filename", "sha256", "size_bytes"],
+      "properties": {
+        "filename": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "size_bytes": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "bundleMetadata": {
+      "type": "object",
+      "required": ["license", "provenance"],
+      "properties": {
+        "license": { "$ref": "#/$defs/bundleFile" },
+        "provenance": { "$ref": "#/$defs/bundleFile" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "version",
+        "model_name",
+        "backend",
+        "filename",
+        "revision",
+        "license",
+        "sample_rate",
+        "artifact_sha256",
+        "artifact_size_bytes",
+        "catalog_sequence",
+        "catalog_sha256",
+        "catalog_signing_key_id",
+        "catalog_origin",
+        "installation_source",
+        "installed_at_unix_seconds"
+      ],
+      "properties": {
+        "version": { "$ref": "#/$defs/nonNegativeInteger" },
+        "model_name": { "type": "string" },
+        "backend": { "type": "string" },
+        "filename": { "type": "string" },
+        "revision": { "type": "string" },
+        "license": { "type": "string" },
+        "sample_rate": { "$ref": "#/$defs/nonNegativeInteger" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_size_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "catalog_sequence": { "$ref": "#/$defs/nonNegativeInteger" },
+        "catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "catalog_signing_key_id": { "type": "string" },
+        "catalog_origin": { "type": "string" },
+        "installation_source": { "type": "string" },
+        "installed_at_unix_seconds": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": [
+        "name",
+        "backend",
+        "filename",
+        "url",
+        "revision",
+        "license",
+        "sample_rate",
+        "artifact_sha256",
+        "artifact_size_bytes",
+        "path",
+        "catalog_sequence",
+        "catalog_sha256",
+        "catalog_signing_key_id",
+        "catalog_issued_at_unix_seconds",
+        "catalog_expires_at_unix_seconds",
+        "catalog_trust_root_version",
+        "catalog_origin",
+        "offline_bundle",
+        "status",
+        "provenance",
+        "issues"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "backend": { "type": "string", "minLength": 1 },
+        "filename": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string" },
+        "license": { "type": "string" },
+        "sample_rate": { "$ref": "#/$defs/nonNegativeInteger" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_size_bytes": { "$ref": "#/$defs/nonNegativeInteger" },
+        "path": { "type": "string" },
+        "catalog_sequence": { "$ref": "#/$defs/nonNegativeInteger" },
+        "catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "catalog_signing_key_id": { "type": "string" },
+        "catalog_issued_at_unix_seconds": { "$ref": "#/$defs/nullableTimestamp" },
+        "catalog_expires_at_unix_seconds": { "$ref": "#/$defs/nullableTimestamp" },
+        "catalog_trust_root_version": { "$ref": "#/$defs/nonNegativeInteger" },
+        "catalog_origin": { "type": "string" },
+        "offline_bundle": {
+          "oneOf": [
+            { "$ref": "#/$defs/bundleMetadata" },
+            { "type": "null" }
+          ]
+        },
+        "status": {
+          "enum": [
+            "missing",
+            "healthy",
+            "corrupt",
+            "provenance-missing",
+            "provenance-invalid",
+            "unsafe"
+          ]
+        },
+        "provenance": {
+          "oneOf": [
+            { "$ref": "#/$defs/provenance" },
+            { "type": "null" }
+          ]
+        },
+        "issues": { "type": "array", "items": { "$ref": "#/$defs/issue" } }
+      }
+    }
+  }
+}

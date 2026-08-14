@@ -26,6 +26,13 @@ pub const STATE_FILE_NAME: &str = ".denoize-state";
 pub const LEGACY_DESKTOP_STATE_FILE_NAME: &str = ".denoize-gui-state";
 /// Cross-process lease held for every batch run, including non-resume runs.
 pub const LOCK_FILE_NAME: &str = ".denoize-batch.lock";
+/// Domain separator for the stable processing recipe digest exposed to
+/// automation clients.
+pub const RECIPE_DOMAIN: &str = "denoize-batch-recipe-v3";
+/// Version of the processing recipe identity contract.
+pub const RECIPE_VERSION: u32 = 3;
+/// Revision of the encoded-output behavior covered by the recipe digest.
+pub const RECIPE_OUTPUT_ABI_VERSION: u32 = 1;
 
 const JOURNAL_VERSION: u8 = 3;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
@@ -720,9 +727,9 @@ pub fn recipe_digest(
         (None, None) => {}
     }
     let config = resolved.denoiser.clone().sanitized();
-    let mut hasher = StableHasher::new(b"denoize-batch-recipe-v3");
+    let mut hasher = StableHasher::new(RECIPE_DOMAIN.as_bytes());
     hasher.bytes(1, env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.u32(2, 1); // output ABI revision
+    hasher.u32(2, RECIPE_OUTPUT_ABI_VERSION);
     hasher.u8(3, backend_id(resolved.backend));
     hasher.bool(19, config.vad);
     if config.vad {
