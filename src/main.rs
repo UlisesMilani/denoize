@@ -24,7 +24,8 @@ use denoize::AudioInputSession;
 use denoize::{
     AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm, AtomicOutput, Backend,
     BackendOptions, BackendSession, ChannelMode, CommitMode, DownmixMode, EncodeOptions,
-    OnnxModelConfig, OutputFormat, SgmseProfile, StreamingBackendSession, WindowType,
+    OnnxModelConfig, OutputFormat, ResourceGovernor, ResourceLimits, ResourcePermit,
+    ResourceRequest, SgmseProfile, StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -40,11 +41,12 @@ const MAX_BATCH_JOBS: usize = 32;
 const VALIDATION_SAMPLE_RATE: u32 = 48_000;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const INPUT_MEMORY_EXPANSION_FACTOR: u64 = 8;
-const METADATA_REPRESENTATION_EXPANSION_FACTOR: u64 = 16;
-const METADATA_DESCRIPTOR_BYTES: u64 = 256;
 const STDIN_READ_CHUNK_BYTES: usize = 64 * 1024;
 const CLI_JSON_SCHEMA: &str = "denoize-cli-output-v1";
 const CLI_JSON_SCHEMA_VERSION: u32 = 1;
+const ISOLATED_CHILD_ENV: &str = "DENOIZE_INTERNAL_ISOLATED_CHILD";
+#[cfg(windows)]
+const ISOLATION_GATE_ENV: &str = "DENOIZE_INTERNAL_ISOLATION_GATE";
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -359,6 +361,11 @@ OPTIONS:
         --stream              bounded-memory stateful WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
+        --max-process-memory <MB> aggregate denoize RAM reservations across workers (min: 1)
+        --max-temp-space <MB> aggregate staged-output reservation in MiB (min: 1)
+        --max-gpu-memory <MB> aggregate conservative GPU reservation in MiB (min: 1)
+        --max-gpu-jobs <N>    concurrent GPU workers in 1..32 (default: 1)
+        --isolate             run processing in a resource-isolated child process
         --recursive           include subdirectories in batch mode
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
@@ -445,6 +452,11 @@ struct Overrides {
     stream: bool,
     stream_frames: Option<usize>,
     max_memory_mb: Option<usize>,
+    max_process_memory_mb: Option<usize>,
+    max_temporary_mb: Option<usize>,
+    max_gpu_memory_mb: Option<usize>,
+    max_gpu_jobs: Option<usize>,
+    isolate: bool,
     recursive: bool,
     jobs: Option<usize>,
     output_format: Option<String>,
@@ -495,6 +507,11 @@ struct FileConfig {
     stream: bool,
     stream_frames: Option<usize>,
     max_memory_mb: Option<usize>,
+    max_process_memory_mb: Option<usize>,
+    max_temporary_mb: Option<usize>,
+    max_gpu_memory_mb: Option<usize>,
+    max_gpu_jobs: Option<usize>,
+    isolate: bool,
     recursive: bool,
     jobs: Option<usize>,
     output_format: Option<String>,
@@ -621,6 +638,11 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.stream = config.stream;
     ov.stream_frames = config.stream_frames;
     ov.max_memory_mb = config.max_memory_mb;
+    ov.max_process_memory_mb = config.max_process_memory_mb;
+    ov.max_temporary_mb = config.max_temporary_mb;
+    ov.max_gpu_memory_mb = config.max_gpu_memory_mb;
+    ov.max_gpu_jobs = config.max_gpu_jobs;
+    ov.isolate = config.isolate;
     ov.recursive = config.recursive;
     ov.jobs = config.jobs;
     ov.output_format = config
@@ -801,6 +823,13 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--stream" => ov.stream = true,
             "--stream-frames" => ov.stream_frames = Some(parse_value(args, &mut i, a)?),
             "--max-memory" => ov.max_memory_mb = Some(parse_value(args, &mut i, a)?),
+            "--max-process-memory" => {
+                ov.max_process_memory_mb = Some(parse_value(args, &mut i, a)?)
+            }
+            "--max-temp-space" => ov.max_temporary_mb = Some(parse_value(args, &mut i, a)?),
+            "--max-gpu-memory" => ov.max_gpu_memory_mb = Some(parse_value(args, &mut i, a)?),
+            "--max-gpu-jobs" => ov.max_gpu_jobs = Some(parse_value(args, &mut i, a)?),
+            "--isolate" => ov.isolate = true,
             "--recursive" => ov.recursive = true,
             "--jobs" => ov.jobs = Some(parse_value(args, &mut i, a)?),
             "--output-format" => {
@@ -850,19 +879,125 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
     Ok((input, output, ov))
 }
 
-fn checked_memory_limit_bytes(max_memory_mb: Option<usize>) -> Result<Option<u64>, String> {
-    let Some(max_memory_mb) = max_memory_mb else {
+fn checked_mib_limit_bytes(value_mb: Option<usize>, option: &str) -> Result<Option<u64>, String> {
+    let Some(value_mb) = value_mb else {
         return Ok(None);
     };
-    if max_memory_mb == 0 {
-        return Err("--max-memory must be at least 1 MiB".into());
+    if value_mb == 0 {
+        return Err(format!("{option} must be at least 1 MiB"));
     }
-    let max_memory_mb = u64::try_from(max_memory_mb)
-        .map_err(|_| "--max-memory is too large to represent safely")?;
-    max_memory_mb
+    let value_mb = u64::try_from(value_mb)
+        .map_err(|_| format!("{option} is too large to represent safely"))?;
+    value_mb
         .checked_mul(BYTES_PER_MIB)
         .map(Some)
-        .ok_or_else(|| "--max-memory is too large to represent safely".into())
+        .ok_or_else(|| format!("{option} is too large to represent safely"))
+}
+
+fn checked_memory_limit_bytes(max_memory_mb: Option<usize>) -> Result<Option<u64>, String> {
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")
+}
+
+fn resource_governor(ov: &Overrides, cpu_jobs: usize) -> Result<ResourceGovernor, String> {
+    ResourceGovernor::new(
+        ResourceLimits::new()
+            .with_max_memory_bytes(checked_mib_limit_bytes(
+                ov.max_process_memory_mb,
+                "--max-process-memory",
+            )?)
+            .with_max_temporary_bytes(checked_mib_limit_bytes(
+                ov.max_temporary_mb,
+                "--max-temp-space",
+            )?)
+            .with_max_cpu_jobs(Some(cpu_jobs))
+            .with_max_gpu_jobs(Some(ov.max_gpu_jobs.unwrap_or(1)))
+            .with_max_gpu_memory_bytes(checked_mib_limit_bytes(
+                ov.max_gpu_memory_mb,
+                "--max-gpu-memory",
+            )?),
+    )
+}
+
+fn minimum_limit(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+fn effective_input_memory_mb(ov: &Overrides) -> Option<usize> {
+    match (ov.max_memory_mb, ov.max_process_memory_mb) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(limit), None) | (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
+}
+
+fn effective_input_memory_limit_bytes(ov: &Overrides) -> Result<Option<u64>, String> {
+    checked_mib_limit_bytes(
+        effective_input_memory_mb(ov),
+        "effective input memory limit",
+    )
+}
+
+fn decode_limits_for_bytes(max_working_set_bytes: Option<u64>) -> DecodeLimits {
+    DecodeLimits::new(
+        metadata_limits_for_available_bytes(max_working_set_bytes),
+        max_working_set_bytes,
+    )
+}
+
+fn decode_limits_for_options(ov: &Overrides) -> Result<DecodeLimits, String> {
+    Ok(decode_limits_for_bytes(effective_input_memory_limit_bytes(
+        ov,
+    )?))
+}
+
+fn backend_session_request(
+    options: &service::ResolvedProcessingOptions,
+) -> Result<ResourceRequest, String> {
+    backend_resource_request(
+        options.backend,
+        &options.backend_options,
+        options.accelerator,
+    )
+}
+
+fn backend_resource_request(
+    backend: Backend,
+    options: &BackendOptions,
+    accelerator: AcceleratorSelection,
+) -> Result<ResourceRequest, String> {
+    denoize::estimate_backend_session_request(backend, options, accelerator)
+}
+
+fn worker_resource_request(
+    input_bytes: u64,
+    audio: &denoize::Audio,
+    metadata_bytes: u64,
+    decode_reservation_bytes: Option<u64>,
+    processing: &service::ResolvedProcessingOptions,
+    writes_staged_output: bool,
+) -> Result<ResourceRequest, String> {
+    let memory_bytes = estimate_audio_working_set_bytes(audio)
+        .checked_add(metadata_bytes)
+        .ok_or_else(|| "worker memory reservation overflow".to_string())?
+        .max(decode_reservation_bytes.unwrap_or(0));
+    let mut request = ResourceRequest::worker(
+        memory_bytes,
+        if writes_staged_output {
+            denoize::estimate_temporary_bytes(input_bytes, audio)?
+        } else {
+            0
+        },
+    );
+    if processing.accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
+        request = request
+            .with_gpu_jobs(1)
+            .with_gpu_memory_bytes(denoize::estimate_gpu_worker_bytes(audio)?);
+    }
+    Ok(request)
 }
 
 /// Derive parser limits from bytes which are still available to metadata.
@@ -874,59 +1009,24 @@ fn checked_memory_limit_bytes(max_memory_mb: Option<usize>) -> Result<Option<u64
 /// finite bound so a stream of empty fields, pages, or blocks cannot evade the
 /// byte limits.
 fn metadata_limits_for_available_bytes(available: Option<u64>) -> MetadataLimits {
-    let defaults = MetadataLimits::default();
-    let Some(available) = available else {
-        return defaults;
-    };
-    let payload_bytes = available / METADATA_REPRESENTATION_EXPANSION_FACTOR;
-    let descriptor_count = payload_bytes / METADATA_DESCRIPTOR_BYTES;
-    let payload = usize::try_from(payload_bytes).unwrap_or(usize::MAX);
-    let descriptors = usize::try_from(descriptor_count).unwrap_or(usize::MAX);
-
-    let mut limits = defaults;
-    limits.max_total_bytes = defaults.max_total_bytes.min(payload);
-    limits.max_item_bytes = defaults.max_item_bytes.min(payload);
-    limits.max_items = defaults.max_items.min(descriptors);
-    limits.max_flac_block_bytes = defaults.max_flac_block_bytes.min(payload);
-    limits.max_flac_blocks = defaults.max_flac_blocks.min(descriptors);
-    limits.max_ogg_packet_bytes = defaults.max_ogg_packet_bytes.min(payload);
-    limits.max_ogg_pages = defaults.max_ogg_pages.min(descriptors);
-    limits.max_ogg_streams = defaults.max_ogg_streams.min(descriptors);
-    limits
-}
-
-fn decode_limits(max_memory_mb: Option<usize>) -> Result<DecodeLimits, String> {
-    let max_working_set_bytes = checked_memory_limit_bytes(max_memory_mb)?;
-    Ok(DecodeLimits::new(
-        metadata_limits_for_available_bytes(max_working_set_bytes),
-        max_working_set_bytes,
-    ))
-}
-
-fn decode_metadata_limits(max_memory_mb: Option<usize>) -> Result<MetadataLimits, String> {
-    Ok(decode_limits(max_memory_mb)?.metadata)
+    denoize::metadata_limits_for_available_memory(available)
 }
 
 fn retained_metadata_limits(
     max_memory_mb: Option<usize>,
     retained_working_set_bytes: u64,
 ) -> Result<MetadataLimits, String> {
-    let available = checked_memory_limit_bytes(max_memory_mb)?
-        .map(|limit| limit.saturating_sub(retained_working_set_bytes));
-    let mut retained = metadata_limits_for_available_bytes(available);
+    Ok(retained_metadata_limits_for_bytes(
+        checked_memory_limit_bytes(max_memory_mb)?,
+        retained_working_set_bytes,
+    ))
+}
 
-    // The decoder already proved the container structure against the full
-    // per-file cap. Reuse those structural bounds when the optional metadata
-    // payload has little or no remaining budget: a tagless FLAC still has a
-    // mandatory 34-byte STREAMINFO block, and rejecting that block would make
-    // `--max-memory 1` fail despite retaining no metadata at all.
-    let structural = decode_metadata_limits(max_memory_mb)?;
-    retained.max_flac_block_bytes = structural.max_flac_block_bytes;
-    retained.max_flac_blocks = structural.max_flac_blocks;
-    retained.max_ogg_packet_bytes = structural.max_ogg_packet_bytes;
-    retained.max_ogg_pages = structural.max_ogg_pages;
-    retained.max_ogg_streams = structural.max_ogg_streams;
-    Ok(retained)
+fn retained_metadata_limits_for_bytes(
+    maximum: Option<u64>,
+    retained_working_set_bytes: u64,
+) -> MetadataLimits {
+    denoize::metadata_limits_after_retained_memory(maximum, retained_working_set_bytes)
 }
 
 fn checked_m4a_bitrate_bps(kbps: u32) -> Result<u32, String> {
@@ -965,12 +1065,78 @@ fn validate_encode_preflight(
     Ok(())
 }
 
+fn batch_preflight_decode_admission(
+    ov: &Overrides,
+    governor: &ResourceGovernor,
+) -> Result<(DecodeLimits, Option<ResourcePermit>), String> {
+    let per_input = checked_memory_limit_bytes(ov.max_memory_mb)?;
+    let Some(process_limit) =
+        checked_mib_limit_bytes(ov.max_process_memory_mb, "--max-process-memory")?
+    else {
+        return Ok((decode_limits_for_bytes(per_input), None));
+    };
+    let usage = governor.usage()?;
+    let available = process_limit
+        .checked_sub(usage.memory_bytes())
+        .ok_or_else(|| "cached model sessions exceed --max-process-memory".to_string())?;
+    let decode_limit = minimum_limit(per_input, Some(available)).unwrap_or(available);
+    if decode_limit < BYTES_PER_MIB {
+        return Err(format!(
+            "less than 1 MiB remains under --max-process-memory after cached model sessions"
+        ));
+    }
+    let request = ResourceRequest::new().with_memory_bytes(decode_limit);
+    let permit = governor.try_acquire(request)?.ok_or_else(|| {
+        "batch preflight could not reserve the available process memory".to_string()
+    })?;
+    Ok((decode_limits_for_bytes(Some(decode_limit)), Some(permit)))
+}
+
+fn batch_worker_decode_limit(
+    ov: &Overrides,
+    governor: &ResourceGovernor,
+    transient_audio_bytes: u64,
+) -> Result<Option<u64>, String> {
+    let per_input = checked_memory_limit_bytes(ov.max_memory_mb)?;
+    let process_remaining =
+        match checked_mib_limit_bytes(ov.max_process_memory_mb, "--max-process-memory")? {
+            Some(limit) => Some(
+                limit
+                    .checked_sub(
+                        governor
+                            .usage()?
+                            .memory_bytes()
+                            .saturating_sub(transient_audio_bytes),
+                    )
+                    .ok_or_else(|| {
+                        "cached model sessions exceed --max-process-memory".to_string()
+                    })?,
+            ),
+            None => None,
+        };
+    let limit = minimum_limit(per_input, process_remaining);
+    if limit.is_some_and(|limit| limit < BYTES_PER_MIB) {
+        return Err(
+            "less than 1 MiB remains for a decoder under the process resource limits".into(),
+        );
+    }
+    Ok(limit)
+}
+
+#[derive(Clone)]
+struct GovernedBackendSession {
+    session: Arc<BackendSession>,
+    _permit: Arc<ResourcePermit>,
+}
+
 fn preflight_batch_items(
     items: &[BatchItem],
     ov: &Overrides,
     options: EncodeOptions,
     pre_resolved_backend_options: Option<&BackendOptions>,
+    governor: &ResourceGovernor,
 ) -> Result<Vec<PreparedBatchItem>, String> {
+    let effective_memory_mb = effective_input_memory_mb(ov);
     let metadata_policy = if ov.no_metadata {
         MetadataPolicy::Drop
     } else {
@@ -982,11 +1148,12 @@ fn preflight_batch_items(
         Backend,
         BackendOptions,
         AcceleratorSelection,
-        Arc<BackendSession>,
+        GovernedBackendSession,
     )>::new();
     let mut prepared = Vec::with_capacity(items.len());
-    let decode_limits = decode_limits(ov.max_memory_mb)?;
     for item in items {
+        let (decode_limits, preflight_decode_permit) =
+            batch_preflight_decode_admission(ov, governor)?;
         let mut input_session = AudioInputSession::open(&item.input).map_err(|error| {
             format!(
                 "open batch input {} during preflight: {error}",
@@ -1014,31 +1181,29 @@ fn preflight_batch_items(
                 )
             })?;
         let estimate = estimate_session_memory_bytes(&input_session);
-        ensure_memory_limit(estimate, ov.max_memory_mb, "batch input preflight")?;
-        let audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)
+        ensure_memory_limit(estimate, effective_memory_mb, "batch input preflight")?;
+        let mut audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)
             .map_err(|error| {
                 format!(
                     "decode batch input {} during preflight: {error}",
                     item.input.display()
                 )
             })?;
-        let decoded_working_set = estimate_audio_working_set_bytes(&audio);
+        let mut decoded_working_set = estimate_audio_working_set_bytes(&audio);
         ensure_memory_limit(
             decoded_working_set,
-            ov.max_memory_mb,
+            effective_memory_mb,
             "batch decoded audio working set",
         )?;
-        if !ov.no_metadata {
-            let metadata_limits = retained_metadata_limits(ov.max_memory_mb, decoded_working_set)?;
-            input_session
-                .read_metadata_with_limits(metadata_limits)
-                .map_err(|error| {
-                    format!(
-                        "read batch input metadata {} during preflight: {error}",
-                        item.input.display()
-                    )
-                })?;
-        }
+        drop(preflight_decode_permit);
+        let mut audio_permit = Some(governor
+            .try_acquire(ResourceRequest::new().with_memory_bytes(decoded_working_set))?
+            .ok_or_else(|| {
+                format!(
+                    "batch input {} cannot fit beside cached model sessions under --max-process-memory",
+                    item.input.display()
+                )
+            })?);
         item.output_format
             .validate_config(&audio, &options)
             .map_err(|error| {
@@ -1092,15 +1257,87 @@ fn preflight_batch_items(
         // source fence below then re-hashes it after preparation, so a
         // persistent pathname replacement cannot bind model A's graph to
         // model B's resume fingerprint.
-        let backend_session =
-            cached_backend_session(&mut backend_sessions, &resolved_processing, ov.report)
-                .map_err(|error| {
+        let backend_session = cached_backend_session(
+            &mut backend_sessions,
+            &resolved_processing,
+            ov.report,
+            governor,
+        )
+        .map_err(|error| {
+            format!(
+                "prepare batch backend {} for {}: {error}",
+                service::backend_name(resolved_processing.backend),
+                item.input.display()
+            )
+        })?;
+        let final_decode_limit = batch_worker_decode_limit(ov, governor, decoded_working_set)?;
+        let must_redecode = match (decode_limits.max_working_set_bytes, final_decode_limit) {
+            (Some(initial), Some(final_limit)) => final_limit < initial,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if must_redecode {
+            drop(audio_permit.take());
+            drop(audio);
+            let final_limit = final_decode_limit.expect("redecode requires a finite limit");
+            let decode_permit = governor
+                .try_acquire(ResourceRequest::new().with_memory_bytes(final_limit))?
+                .ok_or_else(|| {
                     format!(
-                        "prepare batch backend {} for {}: {error}",
-                        service::backend_name(resolved_processing.backend),
+                        "batch input {} cannot reserve its final decode budget",
                         item.input.display()
                     )
                 })?;
+            audio = read_audio_from_session_with_limits(
+                &mut input_session,
+                decode_limits_for_bytes(final_decode_limit),
+            )
+            .map_err(|error| {
+                format!(
+                    "decode batch input {} beside cached model sessions: {error}",
+                    item.input.display()
+                )
+            })?;
+            drop(decode_permit);
+            decoded_working_set = estimate_audio_working_set_bytes(&audio);
+            audio_permit = Some(
+                governor
+                    .try_acquire(
+                        ResourceRequest::new().with_memory_bytes(decoded_working_set),
+                    )?
+                    .ok_or_else(|| {
+                        format!(
+                            "batch input {} cannot retain decoded audio beside cached model sessions",
+                            item.input.display()
+                        )
+                    })?,
+            );
+        }
+        let metadata_bytes = if !ov.no_metadata {
+            let metadata_limits =
+                retained_metadata_limits_for_bytes(final_decode_limit, decoded_working_set);
+            input_session
+                .read_metadata_with_limits(metadata_limits)
+                .map_err(|error| {
+                    format!(
+                        "read batch input metadata {} during preflight: {error}",
+                        item.input.display()
+                    )
+                })?
+                .as_ref()
+                .map(denoize::metadata::Metadata::estimated_memory_bytes)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let resource_request = worker_resource_request(
+            input_session.len(),
+            &audio,
+            metadata_bytes,
+            final_decode_limit,
+            &resolved_processing,
+            !ov.report,
+        )?;
         let recipe = batch_resume::recipe_digest(
             &resolved_processing,
             audio.channels(),
@@ -1126,10 +1363,18 @@ fn preflight_batch_items(
             model,
             recipe,
         );
+        drop(audio_permit);
+        drop(governor.try_acquire(resource_request)?.ok_or_else(|| {
+            format!(
+                "batch input {} cannot be admitted under the configured process resource limits",
+                item.input.display()
+            )
+        })?);
         prepared.push(PreparedBatchItem {
             item: item.clone(),
             resolved_processing,
             backend_session,
+            resource_request,
             expectation,
             recipe,
         });
@@ -1139,6 +1384,16 @@ fn preflight_batch_items(
     // fence before the output directory or state can be touched.
     for item in &prepared {
         item.expectation.verify_sources()?;
+        drop(
+            governor
+                .try_acquire(item.resource_request)?
+                .ok_or_else(|| {
+                    format!(
+                        "batch input {} no longer fits after all backend sessions were prepared; increase --max-process-memory or lower --max-memory",
+                        item.item.input.display()
+                    )
+                })?,
+        );
     }
     debug_assert_eq!(prepared.len(), items.len());
     Ok(prepared)
@@ -1149,11 +1404,12 @@ fn cached_backend_session(
         Backend,
         BackendOptions,
         AcceleratorSelection,
-        Arc<BackendSession>,
+        GovernedBackendSession,
     )>,
     options: &service::ResolvedProcessingOptions,
     report_only: bool,
-) -> Result<Option<Arc<BackendSession>>, String> {
+    governor: &ResourceGovernor,
+) -> Result<Option<GovernedBackendSession>, String> {
     if report_only {
         return Ok(None);
     }
@@ -1166,20 +1422,31 @@ fn cached_backend_session(
                     && *accelerator == options.accelerator
             })
     {
-        return Ok(Some(Arc::clone(session)));
+        return Ok(Some(session.clone()));
     }
+    let request = backend_session_request(options)?;
+    let permit = Arc::new(governor.try_acquire(request)?.ok_or_else(|| {
+        format!(
+            "backend session {} cannot fit under the configured process resource limits",
+            service::backend_name(options.backend)
+        )
+    })?);
     let session = Arc::new(BackendSession::prepare_with_accelerator(
         options.backend,
         options.backend_options.clone(),
         options.accelerator,
     )?);
+    let governed = GovernedBackendSession {
+        session,
+        _permit: permit,
+    };
     cache.push((
         options.backend,
         options.backend_options.clone(),
         options.accelerator,
-        Arc::clone(&session),
+        governed.clone(),
     ));
-    Ok(Some(session))
+    Ok(Some(governed))
 }
 
 fn effective_batch_jobs(ov: &Overrides) -> usize {
@@ -1293,12 +1560,22 @@ fn validate_effective_options(ov: &Overrides, sample_rate: u32) -> Result<(), St
             return Err(format!("--jobs/jobs must be in 1..={MAX_BATCH_JOBS}"));
         }
     }
+    if let Some(max_gpu_jobs) = ov.max_gpu_jobs {
+        if !(1..=MAX_BATCH_JOBS).contains(&max_gpu_jobs) {
+            return Err(format!(
+                "--max-gpu-jobs/max_gpu_jobs must be in 1..={MAX_BATCH_JOBS}"
+            ));
+        }
+    }
     let encode_options = build_encode_options(ov)?;
     if let Some(extension) = ov.output_format.as_deref() {
         let path = std::path::PathBuf::from(format!("output.{extension}"));
         validate_encode_preflight(encode_options, [OutputFormat::from_path(&path)?])?;
     }
     checked_memory_limit_bytes(ov.max_memory_mb)?;
+    checked_mib_limit_bytes(ov.max_process_memory_mb, "--max-process-memory")?;
+    checked_mib_limit_bytes(ov.max_temporary_mb, "--max-temp-space")?;
+    checked_mib_limit_bytes(ov.max_gpu_memory_mb, "--max-gpu-memory")?;
     Ok(())
 }
 
@@ -1502,6 +1779,8 @@ fn print_report(
 }
 
 fn run(args: &[String]) -> Result<(), String> {
+    #[cfg(windows)]
+    wait_for_isolation_gate()?;
     if args.first().map(String::as_str) == Some("hardware") {
         return run_hardware(&args[1..]);
     }
@@ -1518,6 +1797,9 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_compare(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
+    if ov.isolate && std::env::var_os(ISOLATED_CHILD_ENV).is_none() {
+        return run_isolated(args, &ov);
+    }
     if ov.batch {
         if ov.stream {
             return Err("--stream cannot be combined with --batch".into());
@@ -1528,6 +1810,158 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_streaming_wav(&input, &output, ov);
     }
     run_one(&input, &output, ov)
+}
+
+#[cfg(unix)]
+fn run_isolated(args: &[String], ov: &Overrides) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+
+    let memory_limit = checked_mib_limit_bytes(ov.max_process_memory_mb, "--max-process-memory")?;
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locate denoize executable for --isolate: {error}"))?;
+    let mut command = std::process::Command::new(executable);
+    command.args(args).env(ISOLATED_CHILD_ENV, "1");
+    if let Some(memory_limit) = memory_limit {
+        let memory_limit = libc::rlim_t::try_from(memory_limit)
+            .map_err(|_| "--max-process-memory exceeds this platform's RLIMIT_AS range")?;
+        // SAFETY: `pre_exec` runs after fork and before exec. The closure only
+        // performs async-signal-safe resource-limit syscalls and constructs an
+        // `io::Error` from the captured errno on failure.
+        unsafe {
+            command.pre_exec(move || {
+                let mut current = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_AS, &mut current) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: current.rlim_cur.min(memory_limit),
+                    rlim_max: current.rlim_max,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    isolated_child_status(
+        command
+            .status()
+            .map_err(|error| format!("start isolated denoize child: {error}"))?,
+    )
+}
+
+#[cfg(windows)]
+fn run_isolated(args: &[String], ov: &Overrides) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+
+    struct JobHandle(HANDLE);
+    impl Drop for JobHandle {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper uniquely owns the valid job handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let memory_limit = checked_mib_limit_bytes(ov.max_process_memory_mb, "--max-process-memory")?;
+    // SAFETY: null security/name pointers request an unnamed job with default
+    // security. The returned handle is checked and then uniquely owned.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(format!(
+            "create Windows isolation job: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let job = JobHandle(job);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if let Some(memory_limit) = memory_limit {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.ProcessMemoryLimit = usize::try_from(memory_limit)
+            .map_err(|_| "--max-process-memory exceeds this platform's job-object range")?;
+    }
+    // SAFETY: the pointer and byte count describe `limits` for the documented
+    // extended-limit information class, and the job handle remains live.
+    if unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "configure Windows isolation job: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // The child waits on this private marker before parsing input. That closes
+    // the normal-spawn race between `CreateProcess` and job assignment without
+    // replacing stdin, which may carry a WAV stream.
+    let gate = tempfile::NamedTempFile::new()
+        .map_err(|error| format!("create Windows isolation gate: {error}"))?;
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locate denoize executable for --isolate: {error}"))?;
+    let mut child = std::process::Command::new(executable)
+        .args(args)
+        .env(ISOLATED_CHILD_ENV, "1")
+        .env(ISOLATION_GATE_ENV, gate.path())
+        .spawn()
+        .map_err(|error| format!("start isolated denoize child: {error}"))?;
+    let process = child.as_raw_handle() as HANDLE;
+    // SAFETY: `process` remains owned by `child`; assignment only associates
+    // it with the live job and does not transfer or close either handle.
+    if unsafe { AssignProcessToJobObject(job.0, process) } == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = child.kill();
+        return Err(format!("assign isolated child to Windows job: {error}"));
+    }
+    drop(gate);
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for isolated denoize child: {error}"))?;
+    drop(job);
+    isolated_child_status(status)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn run_isolated(_args: &[String], _ov: &Overrides) -> Result<(), String> {
+    Err("--isolate is unavailable on this platform".into())
+}
+
+fn isolated_child_status(status: std::process::ExitStatus) -> Result<(), String> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("isolated denoize child exited with {status}"))
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_isolation_gate() -> Result<(), String> {
+    let Some(path) = std::env::var_os(ISOLATION_GATE_ENV) else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    while path.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::env::remove_var(ISOLATION_GATE_ENV);
+    Ok(())
 }
 
 fn run_hardware(args: &[String]) -> Result<(), String> {
@@ -1625,6 +2059,11 @@ fn run_live(args: &[String]) -> Result<(), String> {
     let mut parseable = vec!["-".to_string(), "-".to_string()];
     parseable.extend_from_slice(args);
     let (_, _, ov) = parse_args(&parseable)?;
+    if ov.isolate && std::env::var_os(ISOLATED_CHILD_ENV).is_none() {
+        let mut child_args = vec!["live".to_string()];
+        child_args.extend_from_slice(args);
+        return run_isolated(&child_args, &ov);
+    }
     validate_effective_options(&ov, 48_000)?;
     if ov.list_devices {
         let (inputs, outputs) = denoize::live::device_names()?;
@@ -1646,14 +2085,18 @@ fn run_live(args: &[String]) -> Result<(), String> {
     let sample_rate = 48_000;
     let denoiser = build_config(&ov, sample_rate);
     let backend_options = build_backend_options(&ov);
-    denoize::live::run(denoize::live::LiveConfig {
-        input_device: ov.input_device,
-        output_device: ov.output_device,
-        chunk_ms: ov.chunk_ms.unwrap_or(100),
-        backend,
-        backend_options,
-        denoiser,
-    })
+    let governor = resource_governor(&ov, 1)?;
+    denoize::live::run_with_governor(
+        denoize::live::LiveConfig {
+            input_device: ov.input_device,
+            output_device: ov.output_device,
+            chunk_ms: ov.chunk_ms.unwrap_or(100),
+            backend,
+            backend_options,
+            denoiser,
+        },
+        &governor,
+    )
 }
 
 #[cfg(not(feature = "live"))]
@@ -1755,6 +2198,7 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
 
 struct StagedProcessOutput {
     transaction: AtomicOutput,
+    _resource_permit: Option<ResourcePermit>,
     effective_recipe: Option<Digest>,
     backend: Backend,
     accelerator: AcceleratorSelection,
@@ -1771,6 +2215,7 @@ fn run_one_with_output_format(
     planned_output_format: Option<OutputFormat>,
     pre_resolved_backend_options: Option<BackendOptions>,
 ) -> Result<(), String> {
+    let governor = resource_governor(&ov, 1)?;
     let commit_mode = if ov.force {
         CommitMode::Replace
     } else {
@@ -1794,6 +2239,7 @@ fn run_one_with_output_format(
         None,
         None,
         true,
+        Some(&governor),
     )?;
     let Some(staged) = staged else {
         return Ok(());
@@ -1832,8 +2278,10 @@ fn process_one_to_staged_output(
     expected_input_fingerprint: Option<FileFingerprint>,
     pre_prepared_backend_session: Option<Arc<BackendSession>>,
     inspect_destination: bool,
+    governor: Option<&ResourceGovernor>,
 ) -> Result<Option<StagedProcessOutput>, String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
+    let effective_memory_mb = effective_input_memory_mb(&ov);
     let standard_input = input == std::path::Path::new("-");
     let standard_output = output == std::path::Path::new("-");
     let encode_options = build_encode_options(&ov)?;
@@ -1864,7 +2312,7 @@ fn process_one_to_staged_output(
         Some(AudioInputSession::open(input)?)
     };
     if let (Some(session), Some(expected)) = (&mut input_session, expected_input_probe) {
-        let current = probe_audio_session_with_limits(session, decode_limits(ov.max_memory_mb)?)?;
+        let current = probe_audio_session_with_limits(session, decode_limits_for_options(&ov)?)?;
         if current != expected {
             return Err(format!(
                 "input codec/container changed after batch preflight: {}",
@@ -1883,30 +2331,35 @@ fn process_one_to_staged_output(
     }
     if let Some(session) = &input_session {
         let estimate = estimate_session_memory_bytes(session);
-        ensure_memory_limit(estimate, ov.max_memory_mb, "input preflight")?;
+        ensure_memory_limit(estimate, effective_memory_mb, "input preflight")?;
     }
-    let decode_limits = decode_limits(ov.max_memory_mb)?;
-    let mut audio = if standard_input {
+    let decode_limits = decode_limits_for_options(&ov)?;
+    let (mut audio, input_bytes) = if standard_input {
         let stdin = std::io::stdin();
-        read_wav_bytes_with_limits(
-            read_stdin_bytes(stdin.lock(), ov.max_memory_mb)?,
-            decode_limits,
-        )?
+        let bytes = read_stdin_bytes(stdin.lock(), effective_memory_mb)?;
+        let input_bytes = u64::try_from(bytes.len())
+            .map_err(|_| "stdin input length is too large to represent safely".to_string())?;
+        (
+            read_wav_bytes_with_limits(bytes, decode_limits)?,
+            input_bytes,
+        )
     } else {
-        read_audio_from_session_with_limits(
-            input_session
-                .as_mut()
-                .expect("filesystem input session was opened"),
-            decode_limits,
-        )?
+        let session = input_session
+            .as_mut()
+            .expect("filesystem input session was opened");
+        let input_bytes = session.len();
+        (
+            read_audio_from_session_with_limits(session, decode_limits)?,
+            input_bytes,
+        )
     };
     let decoded_working_set = estimate_audio_working_set_bytes(&audio);
     ensure_memory_limit(
         decoded_working_set,
-        ov.max_memory_mb,
+        effective_memory_mb,
         "decoded audio working set",
     )?;
-    let metadata_limits = retained_metadata_limits(ov.max_memory_mb, decoded_working_set)?;
+    let metadata_limits = retained_metadata_limits(effective_memory_mb, decoded_working_set)?;
     let metadata = if !standard_input && !ov.no_metadata {
         input_session
             .as_mut()
@@ -1955,6 +2408,28 @@ fn process_one_to_staged_output(
     if let Some(format) = output_format {
         format.validate_config(&audio, &encode_options)?;
     }
+
+    let needs_session_reservation = pre_prepared_backend_session.is_none();
+    let metadata_bytes = metadata
+        .as_ref()
+        .map(denoize::metadata::Metadata::estimated_memory_bytes)
+        .unwrap_or(0);
+    let worker_request = worker_resource_request(
+        input_bytes,
+        &audio,
+        metadata_bytes,
+        None,
+        &resolved_processing,
+        output_format.is_some(),
+    )?;
+    let request = if needs_session_reservation {
+        worker_request.checked_add(backend_session_request(&resolved_processing)?)?
+    } else {
+        worker_request
+    };
+    let resource_permit = governor
+        .map(|governor| governor.acquire(request))
+        .transpose()?;
 
     let backend_session = match pre_prepared_backend_session {
         Some(session) => session,
@@ -2015,8 +2490,20 @@ fn process_one_to_staged_output(
                 metadata_limits,
             )?;
         }
+        let staged_bytes = transaction
+            .file_mut()
+            .metadata()
+            .map_err(|error| format!("inspect staged output: {error}"))?
+            .len();
+        if staged_bytes > worker_request.temporary_bytes() {
+            return Err(format!(
+                "staged output requires {staged_bytes} bytes, exceeding its {}-byte temporary reservation",
+                worker_request.temporary_bytes()
+            ));
+        }
         Ok(Some(StagedProcessOutput {
             transaction,
+            _resource_permit: resource_permit,
             effective_recipe,
             backend: result.backend,
             accelerator: result.accelerator,
@@ -2030,6 +2517,8 @@ fn process_one_to_staged_output(
 
 fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
+    let resource_governor = resource_governor(&ov, 1)?;
+    let effective_memory_mb = effective_input_memory_mb(&ov);
     if input == "-" || output == "-" {
         return Err("--stream requires filesystem WAV input and output paths".into());
     }
@@ -2097,10 +2586,10 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
     ensure_memory_limit(
         stream_working_set,
-        ov.max_memory_mb,
+        effective_memory_mb,
         "streaming working set",
     )?;
-    let metadata_limits = retained_metadata_limits(ov.max_memory_mb, stream_working_set)?;
+    let metadata_limits = retained_metadata_limits(effective_memory_mb, stream_working_set)?;
     if ov.report {
         println!(
             "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\naccelerator: {}\nstream     : enabled ({} frames/block)",
@@ -2115,6 +2604,38 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         return Ok(());
     }
 
+    let metadata = if !ov.no_metadata {
+        input_session.read_metadata_with_limits(metadata_limits)?
+    } else {
+        None
+    };
+    let metadata_bytes = metadata
+        .as_ref()
+        .map(denoize::metadata::Metadata::estimated_memory_bytes)
+        .unwrap_or(0);
+    let worker_memory_bytes = stream_working_set
+        .checked_add(metadata_bytes)
+        .ok_or_else(|| "streaming memory reservation overflow".to_string())?;
+
+    let temporary_bytes = input_session
+        .len()
+        .checked_add(BYTES_PER_MIB)
+        .ok_or_else(|| "streaming temporary reservation overflow".to_string())?;
+    let mut worker_request = ResourceRequest::worker(worker_memory_bytes, temporary_bytes);
+    if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
+        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
+            stream_working_set
+                .checked_mul(2)
+                .ok_or_else(|| "streaming GPU reservation overflow".to_string())?,
+        );
+    }
+    let request = worker_request.checked_add(backend_resource_request(
+        backend,
+        &backend_options,
+        accelerator,
+    )?)?;
+    let _resource_permit = resource_governor.acquire(request)?;
+
     // Construct every allocation-sensitive processor before opening the
     // transactional output. Invalid or hostile resource plans therefore leave
     // neither a destination nor a temporary `.part` file behind.
@@ -2127,11 +2648,6 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         accelerator,
     )?;
     debug_assert_eq!(processor.accelerator(), accelerator);
-    let metadata = if !ov.no_metadata {
-        input_session.read_metadata_with_limits(metadata_limits)?
-    } else {
-        None
-    };
     let mut reader = WavStreamReader::from_session(input_session)?;
     let mut transaction = AtomicOutput::new(output_path)?;
     let frames = (|| -> Result<usize, String> {
@@ -2156,6 +2672,16 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             transaction.file_mut(),
             metadata_limits,
         )?;
+    }
+    let staged_bytes = transaction
+        .file_mut()
+        .metadata()
+        .map_err(|error| format!("inspect staged stream output: {error}"))?
+        .len();
+    if staged_bytes > temporary_bytes {
+        return Err(format!(
+            "staged stream output requires {staged_bytes} bytes, exceeding its {temporary_bytes}-byte temporary reservation"
+        ));
     }
     transaction.commit(if ov.force {
         CommitMode::Replace
@@ -2234,7 +2760,8 @@ struct BatchItem {
 struct PreparedBatchItem {
     item: BatchItem,
     resolved_processing: service::ResolvedProcessingOptions,
-    backend_session: Option<Arc<BackendSession>>,
+    backend_session: Option<GovernedBackendSession>,
+    resource_request: ResourceRequest,
     expectation: ResumeExpectation,
     recipe: Digest,
 }
@@ -2550,6 +3077,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     let encode_options = build_encode_options(ov)?;
     let resolved_backend_options = resolve_explicit_backend_options(ov)?;
     let jobs = effective_batch_jobs(ov);
+    let resource_governor = resource_governor(ov, jobs)?;
     let input_dir = std::path::Path::new(input);
     let output_dir = std::path::Path::new(output);
     if !input_dir.is_dir() {
@@ -2570,7 +3098,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         output_dir,
         files,
         output_extension,
-        decode_limits(ov.max_memory_mb)?,
+        decode_limits_for_options(ov)?,
     )?;
     let state_path = output_dir.join(STATE_FILE_NAME);
     let legacy_state_path = output_dir.join(LEGACY_DESKTOP_STATE_FILE_NAME);
@@ -2584,6 +3112,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         ov,
         encode_options,
         resolved_backend_options.as_ref(),
+        &resource_governor,
     )?;
 
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
@@ -2633,6 +3162,16 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         if CANCELLED.load(Ordering::SeqCst) {
             return finish(BatchFileOutcome::Cancelled, "cancelled");
         }
+        let worker_permit = match resource_governor
+            .acquire_with_cancel(planned.prepared.resource_request, || {
+                CANCELLED.load(Ordering::SeqCst)
+            }) {
+            Ok(permit) => permit,
+            Err(_error) if CANCELLED.load(Ordering::SeqCst) => {
+                return finish(BatchFileOutcome::Cancelled, "cancelled");
+            }
+            Err(error) => return finish(BatchFileOutcome::Failed(error), "failed"),
+        };
         if let Some(parent) = item.destination.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 return finish(
@@ -2654,8 +3193,13 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             Some(metadata_policy),
             Some(item.probe),
             Some(planned.prepared.expectation.input_fingerprint()),
-            planned.prepared.backend_session.clone(),
+            planned
+                .prepared
+                .backend_session
+                .as_ref()
+                .map(|session| Arc::clone(&session.session)),
             false,
+            None,
         ) {
             Ok(staged) => staged,
             Err(error) => return finish(BatchFileOutcome::Failed(error), "failed"),
@@ -2681,7 +3225,10 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
                 commit_mode,
             )
         }) {
-            Ok(Some(_)) => finish(BatchFileOutcome::Completed, "completed"),
+            Ok(Some(_)) => {
+                drop(worker_permit);
+                finish(BatchFileOutcome::Completed, "completed")
+            }
             Ok(None) => finish(BatchFileOutcome::Cancelled, "cancelled"),
             Err(error) => finish(BatchFileOutcome::Failed(error), "failed"),
         }
@@ -3010,17 +3557,20 @@ mod batch_tests {
             true_peak_dbtp: -1.0,
         };
         let mut cache = Vec::new();
-        let first = cached_backend_session(&mut cache, &options, false)
+        let governor = resource_governor(&Overrides::default(), 1).unwrap();
+        let first = cached_backend_session(&mut cache, &options, false, &governor)
             .unwrap()
             .unwrap();
-        let second = cached_backend_session(&mut cache, &options, false)
+        let second = cached_backend_session(&mut cache, &options, false, &governor)
             .unwrap()
             .unwrap();
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first.session, &second.session));
         assert_eq!(cache.len(), 1);
-        assert!(cached_backend_session(&mut cache, &options, true)
-            .unwrap()
-            .is_none());
+        assert!(
+            cached_backend_session(&mut cache, &options, true, &governor)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3113,6 +3663,7 @@ max_memory_mb = 64
             &options,
             encode,
             resolve_explicit_backend_options(&options).unwrap().as_ref(),
+            &resource_governor(&options, 1).unwrap(),
         )
         .unwrap();
         let prepared = &prepared[0];
@@ -3455,6 +4006,51 @@ max_memory_mb = 64
         assert!(error.contains("AIFF/AIFC"));
         assert!(error.contains("--output-format"));
         assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_temporary_limit_fails_before_creating_the_output_directory() {
+        let root = temporary_directory().join("temporary-limit");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        write_stereo_batch_wav(&input.join("voice.wav"));
+        let options = Overrides {
+            batch: true,
+            no_progress: true,
+            max_temporary_mb: Some(1),
+            ..Overrides::default()
+        };
+
+        let error =
+            run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap_err();
+
+        assert!(error.contains("temporary"), "unexpected error: {error}");
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_process_memory_limit_serializes_two_full_weight_workers() {
+        let root = temporary_directory().join("process-limit");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        write_stereo_batch_wav(&input.join("first.wav"));
+        write_stereo_batch_wav(&input.join("second.wav"));
+        let options = Overrides {
+            batch: true,
+            no_progress: true,
+            jobs: Some(2),
+            max_process_memory_mb: Some(1),
+            ..Overrides::default()
+        };
+
+        run_batch(input.to_str().unwrap(), output.to_str().unwrap(), &options).unwrap();
+
+        assert!(output.join("first.wav").is_file());
+        assert!(output.join("second.wav").is_file());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3937,6 +4533,11 @@ deterministic = true
 seed = 12345
 stream_frames = 4096
 max_memory_mb = 64
+max_process_memory_mb = 256
+max_temporary_mb = 128
+max_gpu_memory_mb = 512
+max_gpu_jobs = 2
+isolate = true
 chunk_ms = 100
 "#,
             "test.toml",
@@ -3957,6 +4558,11 @@ chunk_ms = 100
         assert!(options.no_metadata);
         assert_eq!(options.stream_frames, Some(4096));
         assert_eq!(options.max_memory_mb, Some(64));
+        assert_eq!(options.max_process_memory_mb, Some(256));
+        assert_eq!(options.max_temporary_mb, Some(128));
+        assert_eq!(options.max_gpu_memory_mb, Some(512));
+        assert_eq!(options.max_gpu_jobs, Some(2));
+        assert!(options.isolate);
         assert_eq!(options.chunk_ms, Some(100));
     }
 
@@ -4364,12 +4970,20 @@ chunk_ms = 2001
 
         for value in ["0", "33"] {
             assert!(cli_error(&["--jobs", value]).contains("--jobs"));
+            assert!(cli_error(&["--max-gpu-jobs", value]).contains("--max-gpu-jobs"));
         }
         for value in ["1", "32"] {
             parse_args(&[
                 "input.wav".into(),
                 "output.wav".into(),
                 "--jobs".into(),
+                value.into(),
+            ])
+            .unwrap();
+            parse_args(&[
+                "input.wav".into(),
+                "output.wav".into(),
+                "--max-gpu-jobs".into(),
                 value.into(),
             ])
             .unwrap();
@@ -4397,6 +5011,10 @@ chunk_ms = 2001
             ("--stream-frames", "stream-frames"),
             ("--jobs", "--jobs"),
             ("--max-memory", "--max-memory"),
+            ("--max-process-memory", "--max-process-memory"),
+            ("--max-temp-space", "--max-temp-space"),
+            ("--max-gpu-memory", "--max-gpu-memory"),
+            ("--max-gpu-jobs", "--max-gpu-jobs"),
         ] {
             let error = cli_error(&[flag, &usize_max]);
             assert!(error.contains(field), "{flag} produced: {error}");
@@ -4418,6 +5036,53 @@ chunk_ms = 2001
             parse_args(&["--batch".into(), "--output-format".into(), "wma".into()]).unwrap_err();
         assert!(error.contains("unsupported --output-format"));
         assert!(!error.contains("missing INPUT"));
+    }
+
+    #[test]
+    fn process_resource_flags_are_merged_and_validated_before_io() {
+        let (_, _, options) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--max-memory".into(),
+            "96".into(),
+            "--max-process-memory".into(),
+            "64".into(),
+            "--max-temp-space".into(),
+            "32".into(),
+            "--max-gpu-memory".into(),
+            "256".into(),
+            "--max-gpu-jobs".into(),
+            "3".into(),
+            "--isolate".into(),
+        ])
+        .unwrap();
+        assert_eq!(effective_input_memory_mb(&options), Some(64));
+        let governor = resource_governor(&options, 4).unwrap();
+        assert_eq!(
+            governor.limits().max_memory_bytes(),
+            Some(64 * BYTES_PER_MIB)
+        );
+        assert_eq!(
+            governor.limits().max_temporary_bytes(),
+            Some(32 * BYTES_PER_MIB)
+        );
+        assert_eq!(
+            governor.limits().max_gpu_memory_bytes(),
+            Some(256 * BYTES_PER_MIB)
+        );
+        assert_eq!(governor.limits().max_cpu_jobs(), Some(4));
+        assert_eq!(governor.limits().max_gpu_jobs(), Some(3));
+        assert!(options.isolate);
+
+        for (flag, expected) in [
+            ("--max-process-memory", "--max-process-memory"),
+            ("--max-temp-space", "--max-temp-space"),
+            ("--max-gpu-memory", "--max-gpu-memory"),
+        ] {
+            let error = parse_args(&[flag.into(), "0".into()]).unwrap_err();
+            assert!(error.contains(expected));
+            assert!(!error.contains("missing INPUT"));
+        }
     }
 
     #[test]

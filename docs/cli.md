@@ -67,6 +67,11 @@ OPTIONS:
         --stream              bounded-memory stateful WAV-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
+        --max-process-memory <MB> aggregate denoize RAM reservations across workers (min: 1)
+        --max-temp-space <MB> aggregate staged-output reservation in MiB (min: 1)
+        --max-gpu-memory <MB> aggregate conservative GPU reservation in MiB (min: 1)
+        --max-gpu-jobs <N>    concurrent GPU workers in 1..32 (default: 1)
+        --isolate             run processing in a resource-isolated child process
         --recursive           include subdirectories in batch mode
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
@@ -232,12 +237,21 @@ the same opened filesystem object rather than reopening its pathname.
 `--max-memory` limits denoize-owned decoded PCM capacity, explicitly accounted
 codec scratch space, and native metadata budgets per input/worker. Some private
 allocations inside third-party codec or model runtimes fall outside this
-enforcement, GPU device memory is not charged, and allocator capacity rounding
-means it is not an exact process-RSS ceiling. Use CPU when a GPU-memory ceiling
-cannot be managed externally.
-Batch workers can run concurrently; reduce `--jobs` when targeting a
-whole-process memory ceiling. Standard-input WAV uses its separate bounded
-buffering path.
+enforcement, and allocator capacity rounding means it is not exact RSS.
+`--max-process-memory` adds weighted admission across active workers and loaded
+model sessions; the effective per-input cap is the smaller of the two limits.
+`--max-temp-space` admits aggregate staged-output reservations and verifies the
+staged length, but is not a filesystem quota. `--max-gpu-jobs` and
+`--max-gpu-memory` bound conservative accelerator reservations rather than
+driver-reported VRAM. Standard-input WAV uses its separate bounded buffering
+path.
+
+`--isolate` runs file, batch, stream, or live processing in a child. With
+`--max-process-memory`, Unix applies an `RLIMIT_AS` address-space ceiling and
+Windows applies a Job Object process-memory ceiling. Without that value the
+child still contains an abort, but has no new OS memory ceiling. Cooperative
+resource counters do not include every private third-party allocation; use
+isolation when those allocations require a hard process boundary.
 
 On Unix, the batch output root must be owned by the current user and must not be
 group/world writable. On Windows, use an ACL-capable local filesystem and an

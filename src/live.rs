@@ -105,6 +105,7 @@ struct LiveBufferPlan {
     chunk_frames: usize,
     input_capacity: usize,
     queue_capacity: usize,
+    required_bytes: u64,
 }
 
 fn maximum_ready_burst_frames(
@@ -420,6 +421,7 @@ fn plan_live_buffers(
                 resource: "live playback queue",
             }
         })?,
+        required_bytes,
     })
 }
 
@@ -651,7 +653,18 @@ pub fn run(config: LiveConfig) -> Result<(), String> {
     let config = PreparedLiveConfig::new(config)?;
     let running = Arc::new(AtomicBool::new(true));
     let _signal_session = register_ctrl_c_session(Arc::clone(&running))?;
-    run_prepared_with_status(config, running, |_| {})
+    run_prepared_with_status_impl(config, running, |_| {}, None)
+}
+
+/// Run until Ctrl-C under one process-wide resource governor.
+pub fn run_with_governor(
+    config: LiveConfig,
+    governor: &crate::ResourceGovernor,
+) -> Result<(), String> {
+    let config = PreparedLiveConfig::new(config)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let _signal_session = register_ctrl_c_session(Arc::clone(&running))?;
+    run_prepared_with_status_impl(config, running, |_| {}, Some(governor))
 }
 
 /// Run a live session controlled by the caller and periodically report levels.
@@ -664,7 +677,7 @@ where
     F: FnMut(LiveStatus),
 {
     let config = PreparedLiveConfig::new(config)?;
-    run_prepared_with_status(config, running, report)
+    run_prepared_with_status_impl(config, running, report, None)
 }
 
 /// Validated live configuration with one captured accelerator decision.
@@ -753,7 +766,32 @@ fn register_ctrl_c_session(running: Arc<AtomicBool>) -> Result<CtrlCSession, Str
 pub fn run_prepared_with_status<F>(
     prepared: PreparedLiveConfig,
     running: Arc<AtomicBool>,
+    report: F,
+) -> Result<(), String>
+where
+    F: FnMut(LiveStatus),
+{
+    run_prepared_with_status_impl(prepared, running, report, None)
+}
+
+/// Run an already-prepared live session under aggregate resource admission.
+pub fn run_prepared_with_status_and_governor<F>(
+    prepared: PreparedLiveConfig,
+    running: Arc<AtomicBool>,
+    governor: &crate::ResourceGovernor,
+    report: F,
+) -> Result<(), String>
+where
+    F: FnMut(LiveStatus),
+{
+    run_prepared_with_status_impl(prepared, running, report, Some(governor))
+}
+
+fn run_prepared_with_status_impl<F>(
+    prepared: PreparedLiveConfig,
+    running: Arc<AtomicBool>,
     mut report: F,
+    governor: Option<&crate::ResourceGovernor>,
 ) -> Result<(), String>
 where
     F: FnMut(LiveStatus),
@@ -785,6 +823,23 @@ where
     let out_channels = output_cfg.channels as usize;
     let buffer_plan = plan_live_buffers(&config, rate, in_channels, out_channels)
         .map_err(|error| error.to_string())?;
+    let mut worker_request = crate::ResourceRequest::worker(buffer_plan.required_bytes, 0);
+    if accelerator.effective() != crate::AcceleratorRuntime::Cpu {
+        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
+            buffer_plan
+                .required_bytes
+                .checked_mul(2)
+                .ok_or_else(|| "live GPU reservation overflow".to_string())?,
+        );
+    }
+    let request = worker_request.checked_add(crate::estimate_backend_session_request(
+        config.backend,
+        &config.backend_options,
+        accelerator,
+    )?)?;
+    let _resource_permit = governor
+        .map(|governor| governor.acquire(request))
+        .transpose()?;
     config.denoiser.sample_rate = rate;
     let chunk_frames = buffer_plan.chunk_frames;
     let queue_capacity = buffer_plan.queue_capacity;
@@ -1589,14 +1644,11 @@ mod tests {
     #[test]
     fn hardware_plan_uses_effective_rate_and_checked_capacities() {
         let mut config = config();
-        assert_eq!(
-            plan_live_buffers(&config, 48_000, 2, 2).unwrap(),
-            LiveBufferPlan {
-                chunk_frames: 4_800,
-                input_capacity: 9_600,
-                queue_capacity: 90_496,
-            }
-        );
+        let normal = plan_live_buffers(&config, 48_000, 2, 2).unwrap();
+        assert_eq!(normal.chunk_frames, 4_800);
+        assert_eq!(normal.input_capacity, 9_600);
+        assert_eq!(normal.queue_capacity, 90_496);
+        assert!(normal.required_bytes > 0);
         assert!(plan_live_buffers(&config, crate::config::MAX_SAMPLE_RATE, 1, 1).is_ok());
         config.chunk_ms = MAX_CHUNK_MS;
         let oversized = plan_live_buffers(&config, crate::config::MAX_SAMPLE_RATE, 1, 1).unwrap();

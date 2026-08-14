@@ -530,27 +530,49 @@ rejected before an audio parser or output staging step runs.
 For the normal (decoded, non-streaming) path, `--max-memory MB` caps requested
 denoize-owned decoded PCM capacities and explicitly accounted codec scratch
 buffers, in addition to the conservative input-size preflight and final
-decoded-working-set check. Internal allocations made inside third-party codec
-or model runtimes can fall outside this enforcement, GPU device memory is not
-charged, and allocator capacity rounding means the cap is not an allocator-exact
-process RSS limit. Use the CPU runtime when a GPU-memory ceiling cannot be
-managed externally. FLAC and Ogg
-structure is also checked with finite block,
+decoded-working-set check. `--max-process-memory MB` adds weighted admission
+across all active workers and retained model sessions. Batch preflight reserves
+each decoder's complete configured allowance, rechecks it after model loading,
+and starts a worker only when its RAM, temporary-output, CPU, and GPU request
+fits atomically. Actual retained metadata is charged conservatively as well.
+
+`--max-temp-space MB` bounds aggregate staged-output reservations and verifies
+the final staged length before publication; it is not a filesystem quota.
+`--max-gpu-jobs N` (default 1) serializes or bounds accelerated workers, while
+`--max-gpu-memory MB` applies conservative model and transfer reservations.
+Those GPU counters are not driver-reported VRAM usage. Internal allocations
+made inside third-party codec or model runtimes can still fall outside the
+cooperative counters, and allocator capacity rounding means they are not an
+allocator-exact process RSS limit.
+
+For an OS-enforced CLI boundary, add `--isolate`. Processing runs in a child;
+on Unix, `--max-process-memory` becomes an `RLIMIT_AS` address-space ceiling,
+and on Windows it becomes a Job Object process-memory ceiling. The parent
+survives a decoder/model abort and publishes no staged output from a failed
+child. Without a process-memory value, isolation still contains child failure
+but does not invent a memory ceiling. The desktop resource controls use the
+same cooperative governor; they do not create a subprocess.
+
+FLAC and Ogg structure is also checked with finite block,
 packet, page, stream, item, and aggregate metadata limits before a decoder can
 materialize it—even with `--no-metadata`. When tags are preserved, their
 retained payload budget is derived from the memory left after the decoded PCM
 working set; the same limit is enforced again while writing the staged output.
 The default limits remain finite when `--max-memory` is omitted.
 
-The limit applies per regular-file input/worker; stdin retains its separate
-bounded WAV buffering path. Batch jobs can use memory concurrently, so lower
-`--jobs` when targeting a process-wide ceiling. Batch probing, decode, and
-metadata validation all finish before the output directory or staging files
-are created. A streaming WAV job stays bounded by its block size and denoiser
-state, and metadata uses a conservative share of the remaining budget:
+The per-input limit applies to regular-file inputs/workers; stdin retains its
+separate bounded WAV buffering path. Process admission makes `--jobs` an upper
+bound rather than a promise that every worker can run simultaneously. Batch
+probing, decode, model preparation, and metadata validation all finish before
+the output directory or staging files are created. A streaming WAV job stays
+bounded by its block size and denoiser state, and metadata uses a conservative
+share of the remaining budget:
 
 ```sh
 denoize large.mp3 cleaned.wav --max-memory 1024
+denoize recordings cleaned --batch --jobs 8 --max-memory 512 \
+  --max-process-memory 2048 --max-temp-space 4096 --max-gpu-jobs 1
+denoize input.m4a output.flac --max-process-memory 1024 --isolate
 denoize long-noisy.wav long-clean.wav --stream --stream-frames 4096 --max-memory 64
 ```
 
@@ -562,6 +584,10 @@ default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
 when selected; managed GTCRN weights are resolved automatically after install.
+The resource panel applies aggregate RAM and staged-output admission, a
+conservative GPU-memory reservation, and a GPU-worker concurrency limit to
+single-file, batch, and live jobs. Desktop jobs remain in-process; use the CLI
+with `--isolate` when an OS-enforced child boundary is required.
 The model manager shows signed-catalog identity and installed provenance and
 can update the catalog or atomically export the stable automation JSON. Its
 offline, alternate-source, proxy/direct,
@@ -724,9 +750,9 @@ any consumed model bytes, the destination identity, and the published output
 bytes. A file is skipped only when all of those still match and the output is a
 safe regular file with a single link. This also means `--backend auto` records
 the backend it actually selected, not merely the word `auto`.
-Execution-only controls such as `--max-memory`, `--jobs`, and progress output
-do not change that audio recipe, although their validation still applies to
-each run.
+Execution-only controls such as memory/temporary/GPU limits, `--isolate`,
+`--jobs`, and progress output do not change that audio recipe, although their
+validation still applies to each run.
 
 ### Automatic backend selection
 
@@ -882,6 +908,11 @@ true_peak_dbtp = -1.0
 # seed = 12345          # optional SGMSE sampler seed (implies deterministic)
 # stream_frames = 8192
 # max_memory_mb = 1024
+# max_process_memory_mb = 2048
+# max_temporary_mb = 4096
+# max_gpu_memory_mb = 4096
+# max_gpu_jobs = 1
+# isolate = true # CLI only: run processing in a child boundary
 ```
 
 ```sh
