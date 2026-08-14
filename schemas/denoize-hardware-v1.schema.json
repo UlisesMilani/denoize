@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-hardware-v1.schema.json",
+  "title": "denoize local hardware capability report v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "os",
+    "architecture",
+    "logical_cpus",
+    "cpu_features",
+    "runtimes",
+    "backends"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-hardware-v1" },
+    "schema_version": { "const": 1 },
+    "os": { "type": "string", "minLength": 1 },
+    "architecture": { "type": "string", "minLength": 1 },
+    "logical_cpus": { "type": "integer", "minimum": 1 },
+    "cpu_features": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "runtimes": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/runtime" }
+    },
+    "backends": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/backend" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "runtime": {
+      "type": "object",
+      "required": [
+        "runtime",
+        "compiled",
+        "available",
+        "device",
+        "memory_bytes",
+        "compute_capability",
+        "detail"
+      ],
+      "properties": {
+        "runtime": { "enum": ["cpu", "metal", "cuda"] },
+        "compiled": { "type": "boolean" },
+        "available": { "type": "boolean" },
+        "device": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        },
+        "memory_bytes": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1 },
+            { "type": "null" }
+          ]
+        },
+        "compute_capability": {
+          "oneOf": [
+            { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+            { "type": "null" }
+          ]
+        },
+        "detail": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "backend": {
+      "type": "object",
+      "required": ["backend", "accelerated"],
+      "properties": {
+        "backend": { "type": "string", "minLength": 1 },
+        "accelerated": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

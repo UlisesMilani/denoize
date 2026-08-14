@@ -5,9 +5,10 @@
 //! STFT, normalization, phase reconstruction, and duration preservation happen
 //! in Rust so the runtime does not depend on Python or PyTorch.
 
+use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
+use crate::AcceleratorRuntime;
 use rustfft::{num_complex::Complex32, FftPlanner};
-use std::sync::Arc;
 use tract_onnx::prelude::*;
 
 const MODEL_RATE: u32 = 16_000;
@@ -24,15 +25,18 @@ pub fn process(
     input_sample_rate: u32,
     config: &OnnxModelConfig,
 ) -> Result<Vec<Vec<f64>>, String> {
-    MpSenetModel::load(config)?.process(channels, input_sample_rate)
+    MpSenetModel::load(config, AcceleratorRuntime::Cpu)?.process(channels, input_sample_rate)
 }
 
 pub(crate) struct MpSenetModel {
-    model: Arc<TypedRunnableModel<TypedModel>>,
+    model: SharedRunnable,
 }
 
 impl MpSenetModel {
-    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+    pub(crate) fn load(
+        config: &OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
         if config.sample_rate != MODEL_RATE {
             return Err(format!(
                 "MP-SENet expects a {MODEL_RATE} Hz model, got {} Hz",
@@ -46,7 +50,7 @@ impl MpSenetModel {
             ));
         }
         Ok(Self {
-            model: Arc::new(load_model(config)?),
+            model: load_model(config, runtime)?,
         })
     }
 
@@ -57,7 +61,7 @@ impl MpSenetModel {
     ) -> Result<Vec<Vec<f64>>, String> {
         channels
             .iter()
-            .map(|channel| process_channel(channel, input_sample_rate, &self.model))
+            .map(|channel| process_channel(channel, input_sample_rate, self.model.as_ref()))
             .collect()
     }
 }
@@ -65,7 +69,7 @@ impl MpSenetModel {
 fn process_channel(
     input: &[f64],
     input_sample_rate: u32,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f64>, String> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -95,7 +99,7 @@ fn process_channel(
 
 fn enhance_chunks(
     input: &[f32],
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f32>, String> {
     let mut output = vec![0.0f32; input.len()];
     let mut envelope = vec![0.0f32; input.len()];
@@ -232,7 +236,10 @@ fn istft(
     Ok(output)
 }
 
-fn load_model(config: &OnnxModelConfig) -> Result<TypedRunnableModel<TypedModel>, String> {
+fn load_model(
+    config: &OnnxModelConfig,
+    runtime: AcceleratorRuntime,
+) -> Result<SharedRunnable, String> {
     let mut model = tract_onnx::onnx()
         .model_for_path(&config.path)
         .map_err(|error| model_error("load", error))?;
@@ -260,17 +267,17 @@ fn load_model(config: &OnnxModelConfig) -> Result<TypedRunnableModel<TypedModel>
             .set_output_fact(output_index, f32::fact(shape.clone()).into())
             .map_err(|error| model_error("configure output", error))?;
     }
-    model
-        .into_optimized()
-        .and_then(|model| model.into_runnable())
-        .map_err(|error| model_error("optimize", error))
+    let model = model
+        .into_typed()
+        .map_err(|error| model_error("type", error))?;
+    super::tract_runtime::prepare(model, runtime, "MP-SENet model")
 }
 
 fn run_model(
     magnitude: &[f32],
     phase: &[f32],
     frames: usize,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<(Vec<f32>, Vec<f32>), String> {
     if frames != MODEL_FRAMES {
         return Err(format!(
@@ -295,7 +302,7 @@ fn run_model(
 
 fn tensor_samples(tensor: &TValue, expected: usize, name: &str) -> Result<Vec<f32>, String> {
     let view = tensor
-        .to_array_view::<f32>()
+        .to_plain_array_view::<f32>()
         .map_err(|error| model_error(&format!("read {name} output"), error))?;
     if view.len() != expected {
         return Err(format!(

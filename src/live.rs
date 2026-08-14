@@ -17,8 +17,8 @@ use crate::config::{
 };
 use crate::denoiser::DenoiserConfig;
 use crate::{
-    denoise_audio_with_backend_config, Backend, BackendOptions, ChannelMode, ResourcePlan,
-    StreamingBackendSession,
+    denoise_audio_with_backend_config, select_accelerator, AcceleratorSelection, Backend,
+    BackendOptions, ChannelMode, ResourcePlan, StreamingBackendSession,
 };
 
 const MIN_CHUNK_MS: u32 = 10;
@@ -433,6 +433,8 @@ pub struct LiveStatus {
     pub output_level: f32,
     pub processed_chunks: u64,
     pub dropped_chunks: u64,
+    /// Concrete runtime used by the live processor.
+    pub accelerator: AcceleratorSelection,
 }
 
 struct CapturedChunk {
@@ -444,6 +446,7 @@ struct CapturedChunk {
 struct LiveProcessorSpec {
     backend: Backend,
     backend_options: BackendOptions,
+    accelerator: AcceleratorSelection,
     denoiser: DenoiserConfig,
     channels: usize,
 }
@@ -479,10 +482,25 @@ struct StatefulLiveProcessor {
 }
 
 impl LiveProcessor {
+    #[cfg(test)]
     fn new(config: &LiveConfig, channels: usize) -> Result<Self, String> {
+        let accelerator = select_accelerator(
+            config.backend,
+            config.backend_options.accelerator,
+            config.backend_options.deterministic,
+        )?;
+        Self::new_with_accelerator(config, channels, accelerator)
+    }
+
+    fn new_with_accelerator(
+        config: &LiveConfig,
+        channels: usize,
+        accelerator: AcceleratorSelection,
+    ) -> Result<Self, String> {
         let spec = LiveProcessorSpec {
             backend: config.backend,
             backend_options: config.backend_options.clone(),
+            accelerator,
             denoiser: config.denoiser.clone(),
             channels,
         };
@@ -582,12 +600,13 @@ impl StatefulLiveProcessor {
             config.profile_ms = -1.0;
         }
         Ok(Self {
-            processor: StreamingBackendSession::new(
+            processor: StreamingBackendSession::new_with_accelerator(
                 spec.backend,
                 spec.denoiser.sample_rate,
                 spec.channels,
                 config,
                 spec.backend_options.clone(),
+                spec.accelerator,
             )?,
         })
     }
@@ -629,7 +648,7 @@ pub fn device_names() -> Result<(Vec<String>, Vec<String>), String> {
 
 /// Run until Ctrl-C, processing bounded chunks away from the audio callbacks.
 pub fn run(config: LiveConfig) -> Result<(), String> {
-    let config = prepare_live_config(config)?;
+    let config = PreparedLiveConfig::new(config)?;
     let running = Arc::new(AtomicBool::new(true));
     let _signal_session = register_ctrl_c_session(Arc::clone(&running))?;
     run_prepared_with_status(config, running, |_| {})
@@ -644,17 +663,44 @@ pub fn run_with_status<F>(
 where
     F: FnMut(LiveStatus),
 {
-    let config = prepare_live_config(config)?;
+    let config = PreparedLiveConfig::new(config)?;
     run_prepared_with_status(config, running, report)
 }
 
-fn prepare_live_config(mut config: LiveConfig) -> Result<LiveConfig, String> {
-    config
-        .validate_config()
-        .map_err(|error| error.to_string())?;
-    config.backend_options =
-        crate::service::resolve_backend_options(config.backend, config.backend_options)?;
-    Ok(config)
+/// Validated live configuration with one captured accelerator decision.
+///
+/// Frontends can prepare this value before registering a live job, then pass
+/// it to [`run_prepared_with_status`] without probing hardware a second time.
+#[derive(Debug)]
+pub struct PreparedLiveConfig {
+    config: LiveConfig,
+    accelerator: AcceleratorSelection,
+}
+
+impl PreparedLiveConfig {
+    /// Validate resources and capture the runtime that execution will use.
+    pub fn new(mut config: LiveConfig) -> Result<Self, String> {
+        config
+            .validate_config()
+            .map_err(|error| error.to_string())?;
+        config.backend_options =
+            crate::service::resolve_backend_options(config.backend, config.backend_options)?;
+        let accelerator = select_accelerator(
+            config.backend,
+            config.backend_options.accelerator,
+            config.backend_options.deterministic,
+        )?;
+        Ok(Self {
+            config,
+            accelerator,
+        })
+    }
+
+    /// Return the concrete runtime captured during preparation.
+    #[must_use]
+    pub const fn accelerator(&self) -> AcceleratorSelection {
+        self.accelerator
+    }
 }
 
 struct CtrlCSession {
@@ -703,14 +749,19 @@ fn register_ctrl_c_session(running: Arc<AtomicBool>) -> Result<CtrlCSession, Str
     Ok(CtrlCSession { running })
 }
 
-fn run_prepared_with_status<F>(
-    mut config: LiveConfig,
+/// Run an already-prepared live session and periodically report levels.
+pub fn run_prepared_with_status<F>(
+    prepared: PreparedLiveConfig,
     running: Arc<AtomicBool>,
     mut report: F,
 ) -> Result<(), String>
 where
     F: FnMut(LiveStatus),
 {
+    let PreparedLiveConfig {
+        mut config,
+        accelerator,
+    } = prepared;
     let host = cpal::default_host();
     let input = select_device(&host, true, config.input_device.as_deref())?;
     let output = select_device(&host, false, config.output_device.as_deref())?;
@@ -747,7 +798,7 @@ where
         .try_reserve_exact(buffer_plan.input_capacity)
         .map_err(|_| ConfigError::allocation_failed("live input buffer").to_string())?;
     let (tx, rx) = mpsc::sync_channel::<CapturedChunk>(CAPTURE_QUEUE_CHUNKS);
-    let live_processor = LiveProcessor::new(&config, in_channels)?;
+    let live_processor = LiveProcessor::new_with_accelerator(&config, in_channels, accelerator)?;
     let input_level = Arc::new(AtomicU32::new(0));
     let output_level = Arc::new(AtomicU32::new(0));
     let dropped_chunks = Arc::new(AtomicU64::new(0));
@@ -860,7 +911,14 @@ where
     input_stream
         .play()
         .map_err(|e| format!("start input: {e}"))?;
-    eprintln!("denoize: live at {rate} Hz, {in_channels} input channel(s), {chunk_frames} frames/chunk; press Ctrl-C to stop");
+    let fallback = accelerator
+        .fallback()
+        .map(|reason| format!(", fallback {}", reason.name()))
+        .unwrap_or_default();
+    eprintln!(
+        "denoize: live at {rate} Hz, {in_channels} input channel(s), {chunk_frames} frames/chunk; accelerator {}{fallback}; press Ctrl-C to stop",
+        accelerator.effective().name()
+    );
     while running.load(Ordering::Relaxed) && !worker.is_finished() {
         std::thread::sleep(Duration::from_millis(100));
         report(LiveStatus {
@@ -872,6 +930,7 @@ where
             output_level: f32::from_bits(output_level.swap(0, Ordering::Relaxed)),
             processed_chunks: processed_chunks.load(Ordering::Relaxed),
             dropped_chunks: dropped_chunks.load(Ordering::Relaxed),
+            accelerator,
         });
     }
     drop(input_stream);
@@ -1212,6 +1271,7 @@ mod tests {
             let spec = LiveProcessorSpec {
                 backend: config.backend,
                 backend_options: config.backend_options.clone(),
+                accelerator: AcceleratorSelection::default(),
                 denoiser: config.denoiser.clone(),
                 channels: 2,
             };
@@ -1649,6 +1709,26 @@ mod tests {
         assert!(error.contains("`chunk_ms`"), "unexpected error: {error}");
     }
 
+    #[test]
+    fn live_accelerator_is_resolved_before_cpal_device_selection() {
+        let mut config = config();
+        config.backend_options.accelerator = crate::AcceleratorPreference::Auto;
+        let prepared = PreparedLiveConfig::new(config.clone()).unwrap();
+        assert_eq!(
+            prepared.accelerator.fallback(),
+            Some(crate::AcceleratorFallback::BackendCpuOnly)
+        );
+
+        config.backend_options.accelerator = crate::AcceleratorPreference::Gpu;
+        config.input_device = Some("device-that-must-not-be-enumerated".into());
+        let error = run_with_status(config, Arc::new(AtomicBool::new(false)), |_| {}).unwrap_err();
+        assert!(
+            error.contains("backend classical does not support accelerator gpu"),
+            "unexpected error: {error}"
+        );
+        assert!(!error.contains("device not found"));
+    }
+
     #[cfg(feature = "onnx")]
     #[test]
     fn unsupported_backend_precedes_model_and_cpal_device_selection() {
@@ -1660,7 +1740,7 @@ mod tests {
         });
         config.input_device = Some("device-that-must-not-be-enumerated".into());
 
-        let preparation_error = prepare_live_config(config.clone()).unwrap_err();
+        let preparation_error = PreparedLiveConfig::new(config.clone()).unwrap_err();
         assert!(
             preparation_error.contains("`backend`"),
             "unexpected error: {preparation_error}"

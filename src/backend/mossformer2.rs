@@ -5,12 +5,13 @@
 //! official four-second segmentation, 40 ms/8 ms frontend, non-centred
 //! symmetric-Hamming STFT, mask application, and edge-discard stitching.
 
+use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
+use crate::AcceleratorRuntime;
 use kaldi_native_fbank::{
     mel::MelOptions, FbankComputer, FbankOptions, FrameOptions, OnlineFeature,
 };
 use rustfft::{num_complex::Complex32, FftPlanner};
-use std::sync::Arc;
 use tract_onnx::prelude::*;
 
 const MODEL_RATE: u32 = 48_000;
@@ -29,15 +30,18 @@ pub fn process(
     input_sample_rate: u32,
     config: &OnnxModelConfig,
 ) -> Result<Vec<Vec<f64>>, String> {
-    Mossformer2Model::load(config)?.process(channels, input_sample_rate)
+    Mossformer2Model::load(config, AcceleratorRuntime::Cpu)?.process(channels, input_sample_rate)
 }
 
 pub(crate) struct Mossformer2Model {
-    model: Arc<TypedRunnableModel<TypedModel>>,
+    model: SharedRunnable,
 }
 
 impl Mossformer2Model {
-    pub(crate) fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+    pub(crate) fn load(
+        config: &OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
         if config.sample_rate != MODEL_RATE {
             return Err(format!(
                 "MossFormer2 expects a {MODEL_RATE} Hz model, got {} Hz",
@@ -51,7 +55,7 @@ impl Mossformer2Model {
             ));
         }
         Ok(Self {
-            model: Arc::new(load_model(config)?),
+            model: load_model(config, runtime)?,
         })
     }
 
@@ -65,7 +69,7 @@ impl Mossformer2Model {
         }
         channels
             .iter()
-            .map(|channel| process_channel(channel, input_sample_rate, &self.model))
+            .map(|channel| process_channel(channel, input_sample_rate, self.model.as_ref()))
             .collect()
     }
 }
@@ -73,7 +77,7 @@ impl Mossformer2Model {
 fn process_channel(
     input: &[f64],
     input_sample_rate: u32,
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f64>, String> {
     if input.is_empty() {
         return Ok(Vec::new());
@@ -126,7 +130,7 @@ fn segmentation_length(input_length: usize) -> usize {
 
 fn enhance_segment(
     samples: &[f32],
-    model: &TypedRunnableModel<TypedModel>,
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
 ) -> Result<Vec<f32>, String> {
     let features = fbank_with_deltas(samples)?;
     let mask = run_model(&features, model)?;
@@ -270,7 +274,10 @@ fn istft(spectrum: &[Complex32], output_length: usize) -> Result<Vec<f32>, Strin
     Ok(signal)
 }
 
-fn load_model(config: &OnnxModelConfig) -> Result<TypedRunnableModel<TypedModel>, String> {
+fn load_model(
+    config: &OnnxModelConfig,
+    runtime: AcceleratorRuntime,
+) -> Result<SharedRunnable, String> {
     let mut model = tract_onnx::onnx()
         .model_for_path(&config.path)
         .map_err(|error| model_error("load", error))?;
@@ -293,25 +300,28 @@ fn load_model(config: &OnnxModelConfig) -> Result<TypedRunnableModel<TypedModel>
     model
         .set_output_fact(0, f32::fact(tvec!(1, FRAMES, BINS)).into())
         .map_err(|error| model_error("configure output", error))?;
-    model
-        .into_optimized()
-        .and_then(|model| model.into_runnable())
-        .map_err(|error| model_error("optimize", error))
+    let model = model
+        .into_typed()
+        .map_err(|error| model_error("type", error))?;
+    super::tract_runtime::prepare(model, runtime, "MossFormer2 model")
 }
 
-fn run_model(features: &[f32], model: &TypedRunnableModel<TypedModel>) -> Result<Vec<f32>, String> {
+fn run_model(
+    features: &[f32],
+    model: &dyn tract_onnx::tract_core::runtime::Runnable,
+) -> Result<Vec<f32>, String> {
     let input = Tensor::from_shape(&[1, FRAMES, FEATURES], features)
         .map_err(|error| model_error("create feature tensor", error))?;
     let outputs = model
         .run(tvec!(input.into_tvalue()))
         .map_err(|error| model_error("run", error))?;
     let output = outputs[0]
-        .as_slice::<f32>()
+        .to_plain_array_view::<f32>()
         .map_err(|error| model_error("read output", error))?;
     if output.len() != FRAMES * BINS || output.iter().any(|value| !value.is_finite()) {
         return Err("MossFormer2 model returned an invalid mask".into());
     }
-    Ok(output.to_vec())
+    Ok(output.iter().copied().collect())
 }
 
 fn model_error(stage: &str, error: impl std::fmt::Display) -> String {

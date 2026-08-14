@@ -49,6 +49,7 @@ pub mod denoiser;
 pub mod encode;
 pub mod fft;
 pub mod gain;
+pub mod hardware;
 pub mod input;
 #[cfg(feature = "live")]
 pub mod live;
@@ -98,6 +99,11 @@ pub use decode::{
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
 pub use gain::{Algorithm, SpecSubLaw};
+pub use hardware::{
+    backend_supports_acceleration, hardware_capabilities, select_accelerator, AcceleratorFallback,
+    AcceleratorPreference, AcceleratorRuntime, AcceleratorSelection, BackendCapability,
+    HardwareCapabilities, RuntimeCapability, HARDWARE_SCHEMA, HARDWARE_SCHEMA_VERSION,
+};
 pub use input::AudioInputSession;
 pub use quality::QualityMetrics;
 pub use window::{WindowParams, WindowType};

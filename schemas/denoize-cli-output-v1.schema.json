@@ -24,6 +24,27 @@
         }
       }
     },
+    "accelerator": {
+      "type": "object",
+      "required": ["requested", "effective", "fallback"],
+      "properties": {
+        "requested": { "enum": ["cpu", "auto", "gpu", "metal", "cuda"] },
+        "effective": { "enum": ["cpu", "metal", "cuda"] },
+        "fallback": {
+          "oneOf": [
+            {
+              "enum": [
+                "deterministic-mode",
+                "backend-cpu-only",
+                "no-available-gpu"
+              ]
+            },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "common": {
       "type": "object",
       "required": ["schema", "schema_version", "event", "recipe"],
@@ -56,6 +77,7 @@
             "input": { "type": "string" },
             "output": { "type": "string" },
             "backend": { "type": "string" },
+            "accelerator": { "$ref": "#/$defs/accelerator" },
             "channels": { "type": "integer", "minimum": 1 },
             "frames": { "type": "integer", "minimum": 0 },
             "sample_rate": { "type": "integer", "minimum": 1 },
@@ -86,6 +108,7 @@
             "input": { "type": "string" },
             "output": { "type": "string" },
             "backend": { "type": "string" },
+            "accelerator": { "$ref": "#/$defs/accelerator" },
             "channels": { "type": "integer", "minimum": 1 },
             "frames": { "type": "integer", "minimum": 0 },
             "sample_rate": { "type": "integer", "minimum": 1 },

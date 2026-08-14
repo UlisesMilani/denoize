@@ -4,7 +4,9 @@
 //! three recurrent state tensors. The tensor layout follows the upstream MIT
 //! implementation in `Xiaobin-Rong/gtcrn`.
 
+use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
+use crate::AcceleratorRuntime;
 use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::sync::Arc;
 use tract_onnx::prelude::*;
@@ -77,14 +79,22 @@ fn validate_config(config: &OnnxModelConfig) -> Result<(), String> {
 /// streams without reopening or recompiling the model pathname.
 #[derive(Clone)]
 pub struct GtcrnModel {
-    model: Arc<TypedRunnableModel<TypedModel>>,
+    model: SharedRunnable,
 }
 
 impl GtcrnModel {
     pub fn load(config: &OnnxModelConfig) -> Result<Self, String> {
+        Self::load_with_accelerator(config, AcceleratorRuntime::Cpu)
+    }
+
+    /// Load the graph for a concrete already-selected runtime.
+    pub fn load_with_accelerator(
+        config: &OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
         validate_config(config)?;
         Ok(Self {
-            model: Arc::new(load_model(&config.path)?),
+            model: load_model(&config.path, runtime)?,
         })
     }
 
@@ -109,7 +119,7 @@ impl GtcrnModel {
 /// Stateful 16 kHz GTCRN processor. Each call consumes and returns exactly
 /// 256 mono samples, making it suitable for realtime hosts and pipes.
 pub struct GtcrnStream {
-    model: Arc<TypedRunnableModel<TypedModel>>,
+    model: SharedRunnable,
     conv: Vec<f32>,
     tra: Vec<f32>,
     inter: Vec<f32>,
@@ -122,11 +132,11 @@ pub struct GtcrnStream {
 
 impl GtcrnStream {
     pub fn open(path: &std::path::Path) -> Result<Self, String> {
-        let model = Arc::new(load_model(path)?);
+        let model = load_model(path, AcceleratorRuntime::Cpu)?;
         Self::from_model(model)
     }
 
-    fn from_model(model: Arc<TypedRunnableModel<TypedModel>>) -> Result<Self, String> {
+    fn from_model(model: SharedRunnable) -> Result<Self, String> {
         let window = std::array::from_fn(|index| {
             let phase = std::f32::consts::TAU * index as f32 / FFT_SIZE as f32;
             (0.5 * (1.0 - phase.cos())).sqrt()
@@ -208,7 +218,7 @@ impl GtcrnStream {
         let outputs = self.model.run(inputs).map_err(tract_error)?;
         let copy = |tensor: &TValue| -> Result<Vec<f32>, String> {
             Ok(tensor
-                .to_array_view::<f32>()
+                .to_plain_array_view::<f32>()
                 .map_err(tract_error)?
                 .iter()
                 .copied()
@@ -244,10 +254,20 @@ pub(crate) struct StreamingProcessor {
 }
 
 impl StreamingProcessor {
+    #[cfg(test)]
     pub(crate) fn new(
         config: &OnnxModelConfig,
         sample_rate: u32,
         channels: usize,
+    ) -> Result<Self, String> {
+        Self::new_with_accelerator(config, sample_rate, channels, AcceleratorRuntime::Cpu)
+    }
+
+    pub(crate) fn new_with_accelerator(
+        config: &OnnxModelConfig,
+        sample_rate: u32,
+        channels: usize,
+        runtime: AcceleratorRuntime,
     ) -> Result<Self, String> {
         if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {
             return Err(format!(
@@ -255,7 +275,7 @@ impl StreamingProcessor {
                 crate::config::MAX_STREAM_CHANNELS
             ));
         }
-        let model = GtcrnModel::load(config)?;
+        let model = GtcrnModel::load_with_accelerator(config, runtime)?;
         let to_model_rate =
             crate::resample::StreamingResampler::new(channels, sample_rate, SAMPLE_RATE)?;
         let from_model_rate =
@@ -618,7 +638,10 @@ pub(crate) fn streaming_state_bytes(channels: usize) -> Result<u64, crate::Confi
         })
 }
 
-fn load_model(path: &std::path::Path) -> Result<TypedRunnableModel<TypedModel>, String> {
+fn load_model(
+    path: &std::path::Path,
+    runtime: AcceleratorRuntime,
+) -> Result<SharedRunnable, String> {
     let mut model = tract_onnx::onnx()
         .model_for_path(path)
         .map_err(|error| format!("failed to load GTCRN model {}: {error}", path.display()))?;
@@ -639,10 +662,8 @@ fn load_model(path: &std::path::Path) -> Result<TypedRunnableModel<TypedModel>, 
             .set_output_fact(index, f32::fact(*shape).into())
             .map_err(tract_error)?;
     }
-    model
-        .into_optimized()
-        .and_then(|model| model.into_runnable())
-        .map_err(tract_error)
+    let model = model.into_typed().map_err(tract_error)?;
+    super::tract_runtime::prepare(model, runtime, "GTCRN model")
 }
 
 fn tract_error(error: impl std::fmt::Display) -> String {

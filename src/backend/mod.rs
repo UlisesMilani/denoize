@@ -3,6 +3,15 @@
 mod classical;
 mod session;
 mod stream;
+#[cfg(any(
+    feature = "onnx",
+    feature = "mpsenet",
+    feature = "bsrnn",
+    feature = "mossformer2",
+    feature = "sgmse",
+    feature = "gtcrn"
+))]
+mod tract_runtime;
 
 use std::path::PathBuf;
 
@@ -180,6 +189,11 @@ pub struct BackendOptions {
     /// channel inference and batch scheduling in a stable order. Container
     /// timestamps and diagnostic timings are not affected by this flag.
     pub deterministic: bool,
+    /// Requested inference accelerator policy.
+    ///
+    /// CPU remains the compatibility default. `Auto` may select a usable GPU
+    /// for tract-backed adapters and records an explicit CPU fallback reason.
+    pub accelerator: crate::AcceleratorPreference,
     /// Optional seed for stochastic backends such as SGMSE+.
     ///
     /// Supplying a seed makes the stochastic sampler repeatable. `None` uses
