@@ -301,9 +301,14 @@ dpss_nw = 3.0
 
 ### Managed model downloads
 
-Every build contains a versioned model catalog. Remote catalog updates are
-accepted only after detached-minisign verification against a compiled trust
-root, strict schema validation, and monotonic sequence/rollback checks. Model
+Every build contains a versioned model catalog and trust-root policy. Remote
+catalog updates are accepted only after detached-minisign verification against
+the active root, strict schema and expiry validation, and monotonic
+sequence/rollback checks. Trust-root rotations advance exactly one version and
+must satisfy distinct-signature thresholds from both the current and candidate
+root; catalog signing keys can be given closed sequence windows or explicit
+revocation cutoffs, while rotations cannot weaken the active expiration policy.
+Model
 installs and updates then use the active catalog's exact size and SHA-256 while
 supporting explicit network policy, authenticated mirrors, resumable transfers,
 and air-gapped local files. Run `denoize models --help` for the dedicated
@@ -314,6 +319,14 @@ command reference.
 denoize models catalog status
 denoize models catalog update
 denoize models catalog import catalog-v1.json catalog-v1.json.sig
+
+# Inspect, rotate, or recover catalog trust. Rotations use a JSON bundle of
+# detached signatures from the current and candidate root key sets.
+denoize models catalog trust status
+denoize models catalog trust import trust-root-v2.json trust-root-v2.signatures.json
+denoize models catalog trust recover
+# Only after correcting an accidental future system-clock jump:
+denoize models catalog trust reset-time-floor
 
 # Diagnose the whole cache without changing model data. Repair known packages,
 # then preview and apply removal of stale denoize-owned state.
@@ -366,6 +379,30 @@ installation-time catalog origin and source. Existing verified caches are
 migrated lazily; mismatched provenance fails verification. `denoize models info MODEL` reports these fields and the
 pinned length as an unscaled decimal `size-bytes` value. This per-model
 integrity bound is not an aggregate cache quota.
+
+Catalog sequence 1 is a compatibility exception because it predates signed
+timestamps. The embedded v1 trust policy requires every later sequence to carry
+`issued_at_unix_seconds` and `expires_at_unix_seconds`, with at most 180 days of
+validity. The root itself expires at its displayed Unix time. denoize persists
+the greatest trusted wall-clock value it has observed, so setting the system
+clock backwards cannot reactivate expired authority. Expiry, a newly tightened
+timestamp policy or key window, or `revoked_at_sequence` stops new installs,
+updates, local imports, and artifact reacquisition; already installed bytes
+remain usable and verifiable, and local provenance-only repair, diagnosis,
+pruning, and removal remain available.
+
+`models catalog trust recover` replaces corrupt or incomplete cached trust
+metadata only with the root compiled into the running binary. It never lowers a
+valid newer root or the catalog rollback floor; those cases require the missing
+signed chain or a newer denoize binary. A newer embedded root is therefore the
+independent emergency recovery channel. By default recovery also preserves the
+greatest trusted time already observed. After correcting an accidental future
+system-clock jump, the explicit `models catalog trust reset-time-floor` command
+resets only that clock floor to the current system time while retaining the
+active signed root and chain. It cannot lower either the trust-root version or
+catalog rollback floor, and refuses the reset unless the active root is valid at
+the corrected current time. Inspect the recorded value with `models catalog
+trust status` before using the command.
 
 `models doctor` inventories every active-catalog package plus cache sidecars
 and orphan entries without changing artifacts, provenance, or download state.
@@ -509,7 +546,9 @@ prebuilt `full`-feature binaries for:
 - macOS Intel and Apple Silicon
 - Windows x86-64
 
-Every archive has a matching `.sha256` checksum file.
+Every archive has a matching `.sha256` checksum file. Releases also publish the
+exact embedded model catalog, its detached signature, and the exact embedded
+model trust-root document for independent audit and recovery tooling.
 
 ## Install with Cargo
 

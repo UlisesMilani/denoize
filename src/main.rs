@@ -4231,6 +4231,10 @@ USAGE:
     denoize models catalog status
     denoize models catalog update [DOWNLOAD OPTIONS]
     denoize models catalog import <CATALOG.json> <CATALOG.json.sig>
+    denoize models catalog trust status
+    denoize models catalog trust import <TRUST-ROOT.json> <SIGNATURES.json>
+    denoize models catalog trust recover
+    denoize models catalog trust reset-time-floor
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:
@@ -4674,7 +4678,7 @@ fn catalog_model_info_output(
     path: &std::path::Path,
 ) -> String {
     let mut output = format!(
-        "name: {}\nbackend: {}\nsample-rate: {}\nlicense: {}\nrevision: {}\nsize-bytes: {}\nsha256: {}\nurl: {}\npath: {}\ncatalog-sequence: {}\ncatalog-sha256: {}\ncatalog-signing-key: {}\ncatalog-origin: {}\n",
+        "name: {}\nbackend: {}\nsample-rate: {}\nlicense: {}\nrevision: {}\nsize-bytes: {}\nsha256: {}\nurl: {}\npath: {}\ncatalog-sequence: {}\ncatalog-sha256: {}\ncatalog-signing-key: {}\ncatalog-issued-at-unix-seconds: {}\ncatalog-expires-at-unix-seconds: {}\ncatalog-trust-root-version: {}\ncatalog-origin: {}\n",
         model.name(),
         model.backend(),
         model.sample_rate(),
@@ -4687,6 +4691,13 @@ fn catalog_model_info_output(
         model.catalog_sequence(),
         model.catalog_sha256(),
         model.catalog_signing_key_id(),
+        model
+            .catalog_issued_at_unix_seconds()
+            .map_or_else(|| "legacy-none".into(), |value| value.to_string()),
+        model
+            .catalog_expires_at_unix_seconds()
+            .map_or_else(|| "legacy-none".into(), |value| value.to_string()),
+        model.catalog_trust_root_version(),
         catalog_origin_output(model.catalog_origin()),
     );
     match denoize::models::catalog_model_provenance(model) {
@@ -4716,6 +4727,126 @@ fn print_catalog_status(status: &denoize::models::CatalogStatus) {
         status.highest_accepted_sequence
     );
     println!("cached-path: {}", status.cached_catalog_path.display());
+    println!(
+        "issued-at-unix-seconds: {}",
+        status
+            .issued_at_unix_seconds
+            .map_or_else(|| "legacy-none".into(), |value| value.to_string())
+    );
+    println!(
+        "expires-at-unix-seconds: {}",
+        status
+            .expires_at_unix_seconds
+            .map_or_else(|| "legacy-none".into(), |value| value.to_string())
+    );
+    println!("trust-root-version: {}", status.trust_root_version);
+    println!("trust-root-sha256: {}", status.trust_root_sha256);
+    println!(
+        "trust-root-expires-at-unix-seconds: {}",
+        status.trust_root_expires_at_unix_seconds
+    );
+    println!(
+        "trust-root-highest-observed-unix-seconds: {}",
+        status
+            .trust_root_highest_observed_unix_seconds
+            .map_or_else(|| "unrecorded".into(), |value| value.to_string())
+    );
+    println!("acquisition-allowed: {}", status.acquisition_allowed);
+}
+
+fn trust_root_origin_output(origin: &denoize::models::TrustRootOrigin) -> String {
+    match origin {
+        denoize::models::TrustRootOrigin::Embedded => "embedded".into(),
+        denoize::models::TrustRootOrigin::Signed { source } if source == "local-import" => {
+            "signed:local-import".into()
+        }
+        denoize::models::TrustRootOrigin::Signed { source } => {
+            format!("signed:{}", denoize::models::redact_url(source))
+        }
+        _ => "unknown".into(),
+    }
+}
+
+fn print_trust_root_status(status: &denoize::models::TrustRootStatus) {
+    println!("version: {}", status.version);
+    println!("sha256: {}", status.sha256);
+    println!("issued-at-unix-seconds: {}", status.issued_at_unix_seconds);
+    println!(
+        "expires-at-unix-seconds: {}",
+        status.expires_at_unix_seconds
+    );
+    println!("expired: {}", status.expired);
+    println!("signature-threshold: {}", status.signature_threshold);
+    println!("root-keys: {}", status.root_key_ids.join(","));
+    println!(
+        "catalog-signing-keys: {}",
+        status.catalog_signing_key_ids.join(",")
+    );
+    println!("origin: {}", trust_root_origin_output(&status.origin));
+    println!(
+        "highest-accepted-version: {}",
+        status.highest_accepted_version
+    );
+    println!(
+        "highest-observed-unix-seconds: {}",
+        status
+            .highest_observed_unix_seconds
+            .map_or_else(|| "unrecorded".into(), |value| value.to_string())
+    );
+    println!(
+        "cached-chain-path: {}",
+        status.cached_trust_chain_path.display()
+    );
+}
+
+fn run_model_catalog_trust(args: &[String]) -> Result<(), String> {
+    let command = args.get(2).map(String::as_str).unwrap_or("status");
+    match command {
+        "status" => {
+            if args.len() != 3 {
+                return Err("models catalog trust status accepts no arguments".into());
+            }
+            print_trust_root_status(&denoize::models::trust_root_status()?);
+        }
+        "import" => {
+            if args.len() != 5 {
+                return Err(
+                    "models catalog trust import requires TRUST-ROOT.json and SIGNATURES.json"
+                        .into(),
+                );
+            }
+            let status = denoize::models::import_trust_root(&args[3], &args[4])?;
+            print_trust_root_status(&status);
+            eprintln!(
+                "verified model trust-root version {} ({})",
+                status.version, status.sha256
+            );
+        }
+        "recover" => {
+            if args.len() != 3 {
+                return Err("models catalog trust recover accepts no arguments".into());
+            }
+            let status = denoize::models::recover_embedded_trust_root()?;
+            print_trust_root_status(&status);
+            eprintln!(
+                "recovered embedded model trust-root version {} ({})",
+                status.version, status.sha256
+            );
+        }
+        "reset-time-floor" => {
+            if args.len() != 3 {
+                return Err("models catalog trust reset-time-floor accepts no arguments".into());
+            }
+            let status = denoize::models::reset_trust_time_floor()?;
+            print_trust_root_status(&status);
+            eprintln!(
+                "reset model trusted-time floor under trust-root version {} ({})",
+                status.version, status.sha256
+            );
+        }
+        value => return Err(format!("unknown models catalog trust command: {value}")),
+    }
+    Ok(())
 }
 
 fn run_model_catalog(args: &[String]) -> Result<(), String> {
@@ -4730,6 +4861,7 @@ fn run_model_catalog(args: &[String]) -> Result<(), String> {
     }
     let command = args.get(1).map(String::as_str).unwrap_or("status");
     match command {
+        "trust" => return run_model_catalog_trust(args),
         "status" => {
             if args.len() > 2 {
                 return Err("models catalog status accepts no arguments".into());

@@ -654,6 +654,13 @@ struct ModelCatalogRow {
     model_count: usize,
     highest_accepted_sequence: u64,
     cached_path: String,
+    issued_at_unix_seconds: Option<u64>,
+    expires_at_unix_seconds: Option<u64>,
+    trust_root_version: u64,
+    trust_root_sha256: String,
+    trust_root_expires_at_unix_seconds: u64,
+    trust_root_highest_observed_unix_seconds: Option<u64>,
+    acquisition_allowed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1664,6 +1671,13 @@ fn current_model_catalog_row() -> Result<ModelCatalogRow, String> {
         model_count: status.model_count,
         highest_accepted_sequence: status.highest_accepted_sequence,
         cached_path: status.cached_catalog_path.to_string_lossy().into_owned(),
+        issued_at_unix_seconds: status.issued_at_unix_seconds,
+        expires_at_unix_seconds: status.expires_at_unix_seconds,
+        trust_root_version: status.trust_root_version,
+        trust_root_sha256: status.trust_root_sha256,
+        trust_root_expires_at_unix_seconds: status.trust_root_expires_at_unix_seconds,
+        trust_root_highest_observed_unix_seconds: status.trust_root_highest_observed_unix_seconds,
+        acquisition_allowed: status.acquisition_allowed,
     })
 }
 
@@ -1683,6 +1697,26 @@ async fn update_model_catalog(
     })
     .await
     .map_err(|error| format!("モデルカタログ更新タスクに失敗しました: {error}"))?
+}
+
+#[tauri::command]
+async fn recover_model_trust_root() -> Result<ModelCatalogRow, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        denoize::models::recover_embedded_trust_root()?;
+        current_model_catalog_row()
+    })
+    .await
+    .map_err(|error| format!("モデル信頼ルート復旧タスクに失敗しました: {error}"))?
+}
+
+#[tauri::command]
+async fn reset_model_trust_time_floor() -> Result<ModelCatalogRow, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        denoize::models::reset_trust_time_floor()?;
+        current_model_catalog_row()
+    })
+    .await
+    .map_err(|error| format!("モデル信頼時刻リセットタスクに失敗しました: {error}"))?
 }
 
 #[tauri::command]
@@ -2587,6 +2621,8 @@ pub fn run() {
             list_models,
             model_catalog_status,
             update_model_catalog,
+            recover_model_trust_root,
+            reset_model_trust_time_floor,
             model_cache_doctor,
             prune_model_cache,
             model_action,

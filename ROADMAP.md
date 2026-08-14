@@ -20,7 +20,7 @@ atomicity, documentation, and release assets are covered by automated tests.
 |---:|---|---|
 | 1 | Signed, sequence-monotonic model catalog; exact artifact size/SHA-256; content-addressed installation provenance | Implemented |
 | 2 | `models doctor`, `verify`, `repair`, and `prune` for corrupt, missing, stale, and orphaned cache state | Implemented |
-| 3 | Signing-key rotation, explicit revocation, expiry policy, and emergency trust-root recovery | Planned next |
+| 3 | Signing-key rotation, explicit revocation, expiry policy, and emergency trust-root recovery | Implemented |
 | 4 | Signed offline bundles containing catalog, signature, models, licenses, and provenance for closed networks | Planned |
 | 5 | Stable JSON output for catalog/model health, provenance, recipe identity, and automation | Planned |
 | 6 | Hardware capability discovery, explicit accelerator selection, and deterministic CPU fallback | Planned |

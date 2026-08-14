@@ -121,6 +121,10 @@ USAGE:
     denoize models catalog status
     denoize models catalog update [DOWNLOAD OPTIONS]
     denoize models catalog import <CATALOG.json> <CATALOG.json.sig>
+    denoize models catalog trust status
+    denoize models catalog trust import <TRUST-ROOT.json> <SIGNATURES.json>
+    denoize models catalog trust recover
+    denoize models catalog trust reset-time-floor
     denoize models cache-dir
 
 DOWNLOAD OPTIONS:

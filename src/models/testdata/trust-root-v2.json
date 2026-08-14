@@ -1,0 +1,41 @@
+{
+  "schema": "denoize-model-trust-root-v1",
+  "version": 2,
+  "previous_root_sha256": "13cf1269bdc3589eab44afd6a73f63220ac91889c5b615ebbfa571fc604a0a33",
+  "issued_at_unix_seconds": 1786665600,
+  "expires_at_unix_seconds": 1944432000,
+  "signature_threshold": 1,
+  "root_keys": [
+    {
+      "key_id": "6C8327715B25E025",
+      "public_key_base64": "RWQl4CVbcSeDbDADk0+gc9onPtjZ/0I0iKbAvpUiSp6Cx3brRYwBDsWj"
+    }
+  ],
+  "catalog_policy": {
+    "expiration_required_from_sequence": 5,
+    "max_validity_seconds": 15552000,
+    "keys": [
+      {
+        "key_id": "F5AE02E7593C64D9",
+        "public_key_base64": "RWTZZDxZ5wKu9QcABWE2Sy7ZEg6xQhQW+vVVclypgEu8QnjbnNbZmQvi",
+        "first_sequence": 1,
+        "last_sequence": null,
+        "revoked_at_sequence": null
+      },
+      {
+        "key_id": "DF5F0E9ED6135C46",
+        "public_key_base64": "RWRGXBPWng5f30bcoLrI1zJw2RyznBVNqkqjkCVztHv9cjqT3UAwuw1W",
+        "first_sequence": 2,
+        "last_sequence": 3,
+        "revoked_at_sequence": 4
+      },
+      {
+        "key_id": "557E67D5F983C071",
+        "public_key_base64": "RWRxwIP51Wd+VQD5W1g2IGJKbiO0tEjlMfR4V58VKkamn1A9MoOXy+g+",
+        "first_sequence": 4,
+        "last_sequence": null,
+        "revoked_at_sequence": null
+      }
+    ]
+  }
+}
