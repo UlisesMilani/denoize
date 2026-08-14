@@ -51,6 +51,7 @@ expected_assets=(
   "denoize_${version}_x64_en-US.msi.sig"
   "denoize-model-catalog-v1.json"
   "denoize-model-catalog-v1.json.sig"
+  "denoize-model-trust-root-v1.json"
   "latest.json"
 )
 
@@ -113,6 +114,7 @@ gh release download "$tag" \
   --pattern '*.zip' \
   --pattern '*.sha256' \
   --pattern 'denoize-model-catalog-v1.json' \
+  --pattern 'denoize-model-trust-root-v1.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -126,6 +128,11 @@ done
 
 if ! cmp -s models/catalog-v1.json "$tmp_dir/denoize-model-catalog-v1.json"; then
   echo "release model catalog differs from tagged models/catalog-v1.json" >&2
+  exit 1
+fi
+
+if ! cmp -s models/trust-root-v1.json "$tmp_dir/denoize-model-trust-root-v1.json"; then
+  echo "release model trust root differs from tagged models/trust-root-v1.json" >&2
   exit 1
 fi
 

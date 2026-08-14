@@ -2,9 +2,9 @@
 
 Run `denoize models --help` for the command-specific usage and complete
 model-management option list. Every build embeds a strictly validated model
-catalog. A detached-minisign catalog can add or update packages only after its
-signature, signing-key sequence window, schema, and monotonic sequence have
-all been accepted.
+catalog and versioned trust root. A detached-minisign catalog can add or update
+packages only after its signature, signing-key sequence/revocation window,
+schema, validity interval, and monotonic sequence have all been accepted.
 
 Inspect or update the catalog separately from model artifacts:
 
@@ -20,6 +20,18 @@ denoize models catalog update --offline
 
 # Air-gapped catalog update from two regular files.
 denoize models catalog import catalog-v1.json catalog-v1.json.sig
+
+# Inspect trust version, digest, expiry, threshold, and authorized key IDs.
+denoize models catalog trust status
+
+# Air-gapped sequential rotation. The bundle must satisfy both root thresholds.
+denoize models catalog trust import trust-root-v2.json trust-root-v2.signatures.json
+
+# Recover corrupt same-generation cache state from this binary's embedded root.
+denoize models catalog trust recover
+
+# After correcting an accidental future clock jump, reset only trusted time.
+denoize models catalog trust reset-time-floor
 ```
 
 Network policy applies independently to catalog `update` and model
@@ -40,15 +52,44 @@ denoize models install gtcrn-dns3 --from /media/models/gtcrn_simple.onnx
 `size-bytes` field alongside `sha256`, catalog sequence/digest/signing key, and
 installed provenance when present. The byte count is not rounded or scaled.
 
-## Catalog trust and rollback safety
+## Catalog trust, rotation, expiry, and rollback safety
 
-The production trust root is compiled into denoize and is also used for the
-signed desktop updater. Catalog JSON has its own
+The production trust root is compiled into denoize. Catalog JSON has its own
 `denoize-model-catalog-v1` schema discriminator, and every accepted model entry
 has a lowercase identifier, one safe filename component, an HTTPS URL, exact
 byte length and SHA-256, revision, license, backend, and sample rate. Unknown
 fields, duplicate package names, unsafe paths, oversized documents, and
 untrusted or out-of-window signing keys are rejected.
+
+The root document uses the `denoize-model-trust-root-v1` schema and contains a
+monotonic root version, exact predecessor SHA-256, issue/expiry times, a root
+signature threshold, root public keys, and catalog policy. Catalog key records
+contain `first_sequence`, optional `last_sequence`, and optional
+`revoked_at_sequence`; the revocation cutoff is exclusive. A rotation must be
+exactly `current.version + 1`, bind the active root digest, retain every
+historical catalog public key, never widen an existing key's authority, and
+never weaken the catalog timestamp requirement or maximum validity interval,
+while satisfying the current and candidate thresholds with distinct verified
+key IDs.
+The signature bundle schema is `denoize-model-trust-signatures-v1` and contains
+an array of `{ "key_id", "signature" }` records; each signature is raw minisign
+text or the Tauri base64 wrapper over that text.
+
+Catalog sequence 1 is the only legacy timestamp exception. Beginning with
+sequence 2, the embedded policy requires paired `issued_at_unix_seconds` and
+`expires_at_unix_seconds` fields and limits the interval to 180 days. The root
+has its own displayed expiry. The greatest trusted time observed is persisted
+monotonically so a later system-clock rollback does not revive an expired root
+or catalog. A timestamp may be at most 24 hours ahead of the effective clock to
+allow bounded clock skew.
+
+Expired authority, tightened timestamp policy, or a newly revoked key blocks
+catalog activation and all operations that acquire model bytes, including
+local-file installs and artifact repair.
+It does not invalidate an artifact already accepted under that catalog:
+verification, inference, diagnosis, provenance-only repair, pruning, and
+removal remain available. This non-retroactive rule lets an emergency revocation
+contain future acquisition without bricking an offline verified cache.
 
 The highest accepted sequence is persisted independently from the signed
 catalog envelope. A lower sequence is a rollback and fails; different content
@@ -58,6 +99,21 @@ If a current signed cache or its rollback state is missing, corrupt, or
 inconsistent, denoize fails closed and asks for the same or a newer signed
 catalog to be re-imported. State is committed before activation so process
 failure cannot make an older catalog active.
+
+Trust-root state follows the same floor-first rule and retains a bounded signed
+chain. A retry of the exact candidate repairs a process failure between the
+root-floor and chain commits. `models catalog trust recover` can replace corrupt
+same-or-older cached state with the root embedded in this binary, but refuses to
+lower a valid newer root or a catalog accepted under newer authority. Re-import
+the chain or install a newer binary in those cases. Newer embedded roots are the
+independent emergency recovery path. Ordinary recovery preserves the greatest
+trusted time already observed. Once an accidental future system-clock jump has
+been corrected, `trust reset-time-floor` can reset only that time floor to the
+current clock while preserving the active signed root and chain. It does not
+lower the accepted trust-root version or catalog sequence and is refused unless
+the active root is valid at the corrected current time. `trust status` reports
+the persisted `highest-observed-unix-seconds` value so the exceptional reset is
+auditable.
 
 Online update defaults to the release assets
 `denoize-model-catalog-v1.json` and
@@ -226,9 +282,11 @@ download, publish, repair, or remove operation. The desktop model manager
 exposes the same diagnosis, per-model repair, preview, and apply operations.
 
 The desktop model manager displays the active catalog sequence, signing key,
-origin, and per-model provenance, and can authenticate and activate the latest
-catalog. It exposes equivalent offline, source, proxy, direct, authentication,
-and local-file controls. They are session-only and are excluded from saved
+trust-root version/digest, acquisition status, origin, and per-model provenance,
+and can authenticate and activate the latest catalog. It exposes separate,
+confirmed embedded-root recovery and corrected-clock time-reset actions plus
+equivalent offline, source, proxy, direct, authentication, and local-file
+controls. They are session-only and are excluded from saved
 settings and preset import/export. Bearer tokens and Basic credentials are
 cleared from the form as soon as a download operation starts. Environment
 settings remain the defaults when the corresponding control is blank. Choosing

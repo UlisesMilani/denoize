@@ -4,8 +4,9 @@ mod catalog;
 mod maintenance;
 
 pub use catalog::{
-    active_catalog, catalog_status, embedded_catalog, import_catalog, update_catalog, CatalogModel,
-    CatalogOrigin, CatalogStatus, ModelCatalog,
+    active_catalog, catalog_status, embedded_catalog, import_catalog, import_trust_root,
+    recover_embedded_trust_root, reset_trust_time_floor, trust_root_status, update_catalog,
+    CatalogModel, CatalogOrigin, CatalogStatus, ModelCatalog, TrustRootOrigin, TrustRootStatus,
 };
 pub use maintenance::{
     doctor_model_cache, doctor_model_cache_for_catalog, prune_model_cache,
@@ -582,6 +583,9 @@ where
     C: FnMut() -> bool,
     P: FnMut(u64, Option<u64>),
 {
+    if let Some(identity) = model.catalog.as_ref() {
+        catalog::require_catalog_acquisition(identity)?;
+    }
     let source = source.as_ref();
     let destination = path_for_spec(model)?;
     let parent = model_parent(&destination)?;
@@ -727,6 +731,14 @@ where
     P: FnMut(u64, Option<u64>),
 {
     let destination = path_for_spec(model)?;
+    if !force {
+        if let Ok(path) = verify_spec_at(model, &destination) {
+            return Ok(path);
+        }
+    }
+    if let Some(identity) = model.catalog.as_ref() {
+        catalog::require_catalog_acquisition(identity)?;
+    }
     let parent = model_parent(&destination)?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;

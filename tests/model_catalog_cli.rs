@@ -25,6 +25,8 @@ fn embedded_catalog_status_list_and_info_are_visible() {
     );
     assert!(status.contains("origin: embedded\n"), "{status}");
     assert!(status.contains("models: 1\n"), "{status}");
+    assert!(status.contains("trust-root-version: 1\n"), "{status}");
+    assert!(status.contains("acquisition-allowed: true\n"), "{status}");
 
     let list = run(directory.path(), &["models", "list"]);
     assert!(
@@ -50,6 +52,11 @@ fn embedded_catalog_status_list_and_info_are_visible() {
         info.contains("catalog-signing-key: F5AE02E7593C64D9\n"),
         "{info}"
     );
+    assert!(
+        info.contains("catalog-expires-at-unix-seconds: legacy-none\n"),
+        "{info}"
+    );
+    assert!(info.contains("catalog-trust-root-version: 1\n"), "{info}");
     assert!(info.contains("catalog-origin: embedded\n"), "{info}");
     assert!(info.ends_with("installed: false\n"), "{info}");
 }
@@ -82,7 +89,67 @@ fn catalog_help_is_a_successful_documented_entry_point() {
     );
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("denoize models catalog status"), "{help}");
+    assert!(
+        help.contains("denoize models catalog trust status"),
+        "{help}"
+    );
+    assert!(help.contains("trust reset-time-floor"), "{help}");
     assert!(help.contains("DENOIZE_MODEL_CATALOG_URL"), "{help}");
+}
+
+#[test]
+fn embedded_trust_root_status_and_emergency_recovery_are_visible() {
+    let directory = tempfile::tempdir().unwrap();
+    let status = run(directory.path(), &["models", "catalog", "trust", "status"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(status.contains("version: 1\n"), "{status}");
+    assert!(status.contains("expired: false\n"), "{status}");
+    assert!(status.contains("signature-threshold: 1\n"), "{status}");
+    assert!(status.contains("root-keys: F5AE02E7593C64D9\n"), "{status}");
+    assert!(status.contains("origin: embedded\n"), "{status}");
+
+    let catalog_directory = directory.path().join(".catalog");
+    std::fs::create_dir_all(&catalog_directory).unwrap();
+    std::fs::write(
+        catalog_directory.join("trust-state.json"),
+        b"{corrupt trust state",
+    )
+    .unwrap();
+    std::fs::write(
+        catalog_directory.join("trust-chain.json"),
+        b"{corrupt trust chain",
+    )
+    .unwrap();
+    let recovered = run(directory.path(), &["models", "catalog", "trust", "recover"]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert!(String::from_utf8(recovered.stdout)
+        .unwrap()
+        .contains("version: 1\n"));
+    assert!(String::from_utf8(recovered.stderr)
+        .unwrap()
+        .contains("recovered embedded model trust-root version 1"));
+
+    let reset = run(
+        directory.path(),
+        &["models", "catalog", "trust", "reset-time-floor"],
+    );
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    assert!(String::from_utf8(reset.stdout)
+        .unwrap()
+        .contains("highest-observed-unix-seconds:"));
 }
 
 #[test]

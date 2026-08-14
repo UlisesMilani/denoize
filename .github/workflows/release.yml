@@ -264,7 +264,7 @@ jobs:
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
   model-catalog:
-    name: Sign model catalog
+    name: Sign model catalog and trust root
     needs: prepare
     runs-on: ubuntu-latest
     steps:
@@ -275,14 +275,16 @@ jobs:
         working-directory: apps/desktop
         run: npm ci
 
-      - name: Sign and upload model catalog
+      - name: Sign and upload model catalog and trust root
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           asset="$GITHUB_WORKSPACE/denoize-model-catalog-v1.json"
+          trust_asset="$GITHUB_WORKSPACE/denoize-model-trust-root-v1.json"
           cp models/catalog-v1.json "$asset"
+          cp models/trust-root-v1.json "$trust_asset"
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -290,7 +292,7 @@ jobs:
             npm run tauri -- signer sign --password "" "$asset"
           )
           gh release upload "$GITHUB_REF_NAME" \
-            "$asset" "$asset.sig" --clobber
+            "$asset" "$asset.sig" "$trust_asset" --clobber
 
   publish:
     name: Publish release

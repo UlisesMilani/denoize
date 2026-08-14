@@ -189,6 +189,171 @@ fn maintenance_catalog(name: &str, filename: &str, bytes: &[u8]) -> ModelCatalog
     .unwrap()
 }
 
+#[test]
+fn trust_root_rotation_requires_both_thresholds_and_persists_a_verified_chain() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let root_path = directory.path().join("trust-root-v2.json");
+    let signatures_path = directory.path().join("trust-root-v2.signatures.json");
+    let root = include_bytes!("testdata/trust-root-v2.json");
+    let signatures = include_bytes!("testdata/trust-root-v2.signatures.json");
+    std::fs::write(&root_path, root).unwrap();
+
+    let mut incomplete: serde_json::Value = serde_json::from_slice(signatures).unwrap();
+    incomplete["signatures"].as_array_mut().unwrap().pop();
+    std::fs::write(&signatures_path, serde_json::to_vec(&incomplete).unwrap()).unwrap();
+    let error = import_trust_root(&root_path, &signatures_path).unwrap_err();
+    assert!(error.contains("candidate-root signatures"), "{error}");
+    assert!(!directory.path().join(".catalog/trust-state.json").exists());
+
+    std::fs::write(&signatures_path, signatures).unwrap();
+    let status = import_trust_root(&root_path, &signatures_path).unwrap();
+    assert_eq!(status.version, 2);
+    assert_eq!(status.highest_accepted_version, 2);
+    assert_eq!(
+        status.origin,
+        TrustRootOrigin::Signed {
+            source: "local-import".into(),
+        }
+    );
+    assert!(directory.path().join(".catalog/trust-state.json").is_file());
+    assert!(directory.path().join(".catalog/trust-chain.json").is_file());
+
+    let reloaded = trust_root_status().unwrap();
+    assert_eq!(reloaded.version, 2);
+    assert_eq!(
+        import_trust_root(&root_path, &signatures_path)
+            .unwrap()
+            .version,
+        2
+    );
+    assert_eq!(active_catalog().unwrap().sequence(), 1);
+    assert!(catalog_status().unwrap().acquisition_allowed);
+
+    let error = recover_embedded_trust_root().unwrap_err();
+    assert!(error.contains("rollback from version 2"), "{error}");
+    let reset = reset_trust_time_floor().unwrap();
+    assert_eq!(reset.version, 2);
+    assert_eq!(reset.origin, status.origin);
+}
+
+#[test]
+fn trust_root_import_repairs_a_floor_first_interrupted_commit() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let catalog_directory = directory.path().join(".catalog");
+    std::fs::create_dir_all(&catalog_directory).unwrap();
+    let root = include_bytes!("testdata/trust-root-v2.json");
+    let signatures = include_bytes!("testdata/trust-root-v2.signatures.json");
+    std::fs::write(
+        catalog_directory.join("trust-state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "highest_root_version": 2,
+            "root_sha256": test_sha256(root),
+            "highest_observed_unix_seconds": 1786665600_u64
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_path = directory.path().join("trust-root-v2.json");
+    let signatures_path = directory.path().join("trust-root-v2.signatures.json");
+    std::fs::write(&root_path, root).unwrap();
+    std::fs::write(&signatures_path, signatures).unwrap();
+
+    assert!(trust_root_status().is_err());
+    let repaired = import_trust_root(&root_path, &signatures_path).unwrap();
+    assert_eq!(repaired.version, 2);
+    assert_eq!(trust_root_status().unwrap().version, 2);
+}
+
+#[test]
+fn emergency_recovery_replaces_corrupt_cache_without_lowering_catalog_state() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let catalog_directory = directory.path().join(".catalog");
+    std::fs::create_dir_all(&catalog_directory).unwrap();
+    std::fs::write(
+        catalog_directory.join("trust-state.json"),
+        b"{not valid JSON",
+    )
+    .unwrap();
+    std::fs::write(
+        catalog_directory.join("trust-chain.json"),
+        b"{also not valid JSON",
+    )
+    .unwrap();
+
+    assert!(trust_root_status().is_err());
+    let recovered = recover_embedded_trust_root().unwrap();
+    assert_eq!(recovered.version, 1);
+    assert_eq!(recovered.origin, TrustRootOrigin::Embedded);
+    assert_eq!(trust_root_status().unwrap().version, 1);
+    assert_eq!(active_catalog().unwrap().sequence(), 1);
+}
+
+#[test]
+fn monotonic_time_floor_blocks_new_acquisition_but_preserves_verified_model_use() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let bytes = b"already authenticated model bytes";
+    let model = test_catalog_model(bytes);
+    let source = directory.path().join("source.onnx");
+    std::fs::write(&source, bytes).unwrap();
+    let installed = install_catalog_model_from_file(&model, &source).unwrap();
+    assert_eq!(verify_catalog_model(&model).unwrap(), installed);
+
+    let status = trust_root_status().unwrap();
+    std::fs::write(
+        directory.path().join(".catalog/trust-state.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "highest_root_version": status.version,
+            "root_sha256": status.sha256,
+            "highest_observed_unix_seconds": status.expires_at_unix_seconds
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(verify_catalog_model(&model).unwrap(), installed);
+    assert!(!catalog_status().unwrap().acquisition_allowed);
+    assert_eq!(
+        install_catalog_model_with_options(&model, &ModelDownloadOptions::default()).unwrap(),
+        installed
+    );
+    let error =
+        update_catalog_model_with_options(&model, &ModelDownloadOptions::default()).unwrap_err();
+    assert!(error.contains("trust-root version 1 expired"), "{error}");
+
+    let preserved = recover_embedded_trust_root().unwrap();
+    assert_eq!(
+        preserved.highest_observed_unix_seconds,
+        Some(status.expires_at_unix_seconds)
+    );
+    assert!(preserved.expired);
+    assert!(!catalog_status().unwrap().acquisition_allowed);
+
+    let before_reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let reset = reset_trust_time_floor().unwrap();
+    let after_reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let reset_floor = reset.highest_observed_unix_seconds.unwrap();
+    assert!((before_reset..=after_reset).contains(&reset_floor));
+    assert!(!reset.expired);
+    assert!(catalog_status().unwrap().acquisition_allowed);
+    assert_eq!(verify_catalog_model(&model).unwrap(), installed);
+}
+
 fn direct_options() -> ModelDownloadOptions {
     ModelDownloadOptions {
         proxy: ModelProxy::Disabled,

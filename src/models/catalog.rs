@@ -1,5 +1,12 @@
 //! Authenticated model-catalog loading and rollback protection.
 
+mod trust;
+
+pub use trust::{
+    import_trust_root, recover_embedded_trust_root, reset_trust_time_floor, trust_root_status,
+    TrustRootOrigin, TrustRootStatus,
+};
+
 use super::{
     cache_dir, open_existing_regular_file, parse_content_length, redact_url,
     request_with_redirects, validate_authentication, ModelDownloadOptions,
@@ -16,7 +23,8 @@ use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 const CATALOG_SCHEMA: &str = "denoize-model-catalog-v1";
-const CATALOG_STATE_VERSION: u32 = 1;
+const CATALOG_STATE_VERSION: u32 = 2;
+const LEGACY_CATALOG_STATE_VERSION: u32 = 1;
 const CATALOG_ENVELOPE_VERSION: u32 = 1;
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
@@ -29,53 +37,6 @@ const DEFAULT_CATALOG_URL: &str =
     "https://github.com/penguin425/denoize/releases/latest/download/denoize-model-catalog-v1.json";
 const LOCAL_IMPORT_SOURCE: &str = "local-import";
 const EMBEDDED_CATALOG: &[u8] = include_bytes!("../../models/catalog-v1.json");
-
-// The desktop updater and model catalog intentionally share the existing
-// release trust root. Signatures remain domain-separated by the exact bytes
-// and the catalog's strict schema discriminator.
-const PRODUCTION_KEY: TrustedCatalogKey = TrustedCatalogKey {
-    key_id: "F5AE02E7593C64D9",
-    public_key_base64: "RWTZZDxZ5wKu9QcABWE2Sy7ZEg6xQhQW+vVVclypgEu8QnjbnNbZmQvi",
-    first_sequence: 1,
-    last_sequence: None,
-};
-
-#[cfg(not(test))]
-const TRUSTED_KEYS: &[TrustedCatalogKey] = &[PRODUCTION_KEY];
-
-#[cfg(test)]
-const TRUSTED_KEYS: &[TrustedCatalogKey] = &[
-    PRODUCTION_KEY,
-    TrustedCatalogKey {
-        key_id: "DF5F0E9ED6135C46",
-        public_key_base64: "RWRGXBPWng5f30bcoLrI1zJw2RyznBVNqkqjkCVztHv9cjqT3UAwuw1W",
-        first_sequence: 2,
-        last_sequence: Some(3),
-    },
-    TrustedCatalogKey {
-        key_id: "557E67D5F983C071",
-        public_key_base64: "RWRxwIP51Wd+VQD5W1g2IGJKbiO0tEjlMfR4V58VKkamn1A9MoOXy+g+",
-        first_sequence: 4,
-        last_sequence: None,
-    },
-];
-
-#[derive(Clone, Copy)]
-struct TrustedCatalogKey {
-    key_id: &'static str,
-    public_key_base64: &'static str,
-    first_sequence: u64,
-    last_sequence: Option<u64>,
-}
-
-impl TrustedCatalogKey {
-    fn accepts(&self, sequence: u64) -> bool {
-        sequence >= self.first_sequence
-            && self
-                .last_sequence
-                .is_none_or(|last_sequence| sequence <= last_sequence)
-    }
-}
 
 /// Where the active catalog obtained its authenticated contents.
 #[non_exhaustive]
@@ -121,6 +82,10 @@ pub(crate) struct CatalogIdentity {
     pub sequence: u64,
     pub sha256: String,
     pub signing_key_id: String,
+    pub signing_public_key_base64: String,
+    pub issued_at_unix_seconds: Option<u64>,
+    pub expires_at_unix_seconds: Option<u64>,
+    pub trust_root_version: u64,
     pub origin: CatalogOrigin,
 }
 
@@ -189,6 +154,18 @@ impl CatalogModel {
         &self.catalog.signing_key_id
     }
 
+    pub fn catalog_issued_at_unix_seconds(&self) -> Option<u64> {
+        self.catalog.issued_at_unix_seconds
+    }
+
+    pub fn catalog_expires_at_unix_seconds(&self) -> Option<u64> {
+        self.catalog.expires_at_unix_seconds
+    }
+
+    pub fn catalog_trust_root_version(&self) -> u64 {
+        self.catalog.trust_root_version
+    }
+
     pub fn catalog_origin(&self) -> &CatalogOrigin {
         &self.catalog.origin
     }
@@ -216,6 +193,18 @@ impl ModelCatalog {
 
     pub fn signing_key_id(&self) -> &str {
         &self.identity.signing_key_id
+    }
+
+    pub fn issued_at_unix_seconds(&self) -> Option<u64> {
+        self.identity.issued_at_unix_seconds
+    }
+
+    pub fn expires_at_unix_seconds(&self) -> Option<u64> {
+        self.identity.expires_at_unix_seconds
+    }
+
+    pub fn trust_root_version(&self) -> u64 {
+        self.identity.trust_root_version
     }
 
     pub fn origin(&self) -> &CatalogOrigin {
@@ -250,6 +239,13 @@ pub struct CatalogStatus {
     pub model_count: usize,
     pub highest_accepted_sequence: u64,
     pub cached_catalog_path: PathBuf,
+    pub issued_at_unix_seconds: Option<u64>,
+    pub expires_at_unix_seconds: Option<u64>,
+    pub trust_root_version: u64,
+    pub trust_root_sha256: String,
+    pub trust_root_expires_at_unix_seconds: u64,
+    pub trust_root_highest_observed_unix_seconds: Option<u64>,
+    pub acquisition_allowed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +254,10 @@ struct CatalogDocument {
     schema: String,
     sequence: u64,
     signing_key_id: String,
+    #[serde(default)]
+    issued_at_unix_seconds: Option<u64>,
+    #[serde(default)]
+    expires_at_unix_seconds: Option<u64>,
     models: Vec<CatalogModelDocument>,
 }
 
@@ -282,6 +282,8 @@ struct CatalogState {
     highest_sequence: u64,
     catalog_sha256: String,
     signing_key_id: String,
+    #[serde(default = "legacy_trust_root_version")]
+    trust_root_version: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -293,28 +295,49 @@ struct SignedCatalogEnvelope {
     source: String,
 }
 
+const fn legacy_trust_root_version() -> u64 {
+    1
+}
+
+#[derive(Clone, Copy)]
+enum CatalogVerificationMode {
+    Historical { accepted_root_version: u64 },
+    Current { now: u64 },
+}
+
 /// Return the catalog shipped inside this exact denoize build.
 pub fn embedded_catalog() -> ModelCatalog {
-    parse_catalog(EMBEDDED_CATALOG, CatalogOrigin::Embedded)
-        .expect("the embedded model catalog is validated by the test suite")
+    let root = trust::embedded_trust_root();
+    parse_catalog_with_root(
+        EMBEDDED_CATALOG,
+        CatalogOrigin::Embedded,
+        &root,
+        CatalogVerificationMode::Historical {
+            accepted_root_version: root.version(),
+        },
+    )
+    .expect("the embedded model catalog is validated by the test suite")
 }
 
 /// Load the active signed catalog, falling back only to an equivalent embedded
 /// catalog that does not violate the persisted rollback floor.
 pub fn active_catalog() -> Result<ModelCatalog, String> {
     validate_catalog_storage_path()?;
-    let embedded = embedded_catalog();
     let directory = catalog_directory()?;
     match std::fs::symlink_metadata(&directory) {
         Ok(_) => {
             let lock_destination = directory.join("catalog.json");
             let mut never_cancelled = || false;
             let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
-            let result = load_active_catalog_locked(embedded);
+            let result = (|| {
+                let root = trust::load_active_trust_root_locked()?;
+                load_active_catalog_locked(embedded_catalog(), &root)
+            })();
             drop(lock);
             result
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let embedded = embedded_catalog();
             if embedded.sequence() > 1 {
                 promote_embedded_catalog(embedded)
             } else {
@@ -328,7 +351,10 @@ pub fn active_catalog() -> Result<ModelCatalog, String> {
     }
 }
 
-fn load_active_catalog_locked(embedded: ModelCatalog) -> Result<ModelCatalog, String> {
+fn load_active_catalog_locked(
+    embedded: ModelCatalog,
+    root: &trust::ActiveTrustRoot,
+) -> Result<ModelCatalog, String> {
     let state = load_state()?;
     // A newer binary-embedded catalog supersedes an older authenticated
     // cache. Do not let obsolete cache corruption prevent that upgrade. A
@@ -370,11 +396,15 @@ fn load_active_catalog_locked(embedded: ModelCatalog) -> Result<ModelCatalog, St
             if catalog_bytes.len() as u64 > MAX_CATALOG_BYTES {
                 return Err("cached model catalog exceeds the 1 MiB limit".into());
             }
-            let catalog = verify_signed_catalog(
+            let catalog = verify_signed_catalog_with_root(
                 &catalog_bytes,
                 envelope.signature.as_bytes(),
                 CatalogOrigin::Signed {
                     source: envelope.source,
+                },
+                root,
+                CatalogVerificationMode::Historical {
+                    accepted_root_version: state.trust_root_version,
                 },
             )?;
             if catalog.sequence() < state.highest_sequence {
@@ -416,13 +446,18 @@ pub(super) fn promote_embedded_catalog(embedded: ModelCatalog) -> Result<ModelCa
     let lock_destination = catalog_directory()?.join("catalog.json");
     let mut never_cancelled = || false;
     let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
-    let result = load_active_catalog_locked(embedded);
+    let result = (|| {
+        let root = trust::load_active_trust_root_locked()?;
+        load_active_catalog_locked(embedded, &root)
+    })();
     drop(lock);
     result
 }
 
 pub fn catalog_status() -> Result<CatalogStatus, String> {
     let catalog = active_catalog()?;
+    let root = trust_root_status()?;
+    let acquisition_allowed = catalog_acquisition_allowed(&catalog)?;
     let highest_accepted_sequence = catalog.sequence();
     Ok(CatalogStatus {
         sequence: catalog.sequence(),
@@ -432,6 +467,13 @@ pub fn catalog_status() -> Result<CatalogStatus, String> {
         model_count: catalog.models().len(),
         highest_accepted_sequence,
         cached_catalog_path: envelope_path()?,
+        issued_at_unix_seconds: catalog.issued_at_unix_seconds(),
+        expires_at_unix_seconds: catalog.expires_at_unix_seconds(),
+        trust_root_version: root.version,
+        trust_root_sha256: root.sha256,
+        trust_root_expires_at_unix_seconds: root.expires_at_unix_seconds,
+        trust_root_highest_observed_unix_seconds: root.highest_observed_unix_seconds,
+        acquisition_allowed,
     })
 }
 
@@ -489,42 +531,46 @@ fn activate_signed_catalog(
     source: &str,
 ) -> Result<ModelCatalog, String> {
     validate_catalog_source(source)?;
-    let catalog = verify_signed_catalog(
-        catalog_bytes,
-        signature,
-        CatalogOrigin::Signed {
-            source: source.to_string(),
-        },
-    )?;
-    let embedded = embedded_catalog();
-    if catalog.sequence() < embedded.sequence() {
-        return Err(format!(
-            "refusing model catalog sequence {} older than embedded sequence {}",
-            catalog.sequence(),
-            embedded.sequence()
-        ));
-    }
-    if catalog.sequence() == embedded.sequence()
-        && (catalog.sha256() != embedded.sha256()
-            || catalog.signing_key_id() != embedded.signing_key_id())
-    {
-        return Err(format!(
-            "refusing different model catalog content at embedded sequence {}",
-            embedded.sequence()
-        ));
-    }
-    if catalog.sequence() == embedded.sequence() {
-        // The signature was still authenticated above, but persisting an
-        // envelope identical to immutable embedded bytes adds no authority or
-        // rollback protection. Prefer the build's trusted copy directly.
-        return Ok(embedded);
-    }
-
     ensure_catalog_directory()?;
     let lock_destination = catalog_directory()?.join("catalog.json");
     let mut never_cancelled = || false;
     let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
     let result = (|| {
+        let root = trust::load_active_trust_root_locked()?;
+        let now = trust::effective_now_and_record_locked(&root)?;
+        trust::require_fresh_root(&root, now)?;
+        let catalog = verify_signed_catalog_with_root(
+            catalog_bytes,
+            signature,
+            CatalogOrigin::Signed {
+                source: source.to_string(),
+            },
+            &root,
+            CatalogVerificationMode::Current { now },
+        )?;
+        let embedded = embedded_catalog();
+        if catalog.sequence() < embedded.sequence() {
+            return Err(format!(
+                "refusing model catalog sequence {} older than embedded sequence {}",
+                catalog.sequence(),
+                embedded.sequence()
+            ));
+        }
+        if catalog.sequence() == embedded.sequence()
+            && (catalog.sha256() != embedded.sha256()
+                || catalog.signing_key_id() != embedded.signing_key_id())
+        {
+            return Err(format!(
+                "refusing different model catalog content at embedded sequence {}",
+                embedded.sequence()
+            ));
+        }
+        if catalog.sequence() == embedded.sequence() {
+            // The signature was still authenticated above, but persisting an
+            // envelope identical to immutable embedded bytes adds no authority
+            // or rollback protection. Prefer the build's trusted copy.
+            return Ok(Some(embedded));
+        }
         if let Some(state) = load_state()? {
             validate_state(&state)?;
             if catalog.sequence() < state.highest_sequence {
@@ -559,17 +605,21 @@ fn activate_signed_catalog(
                 source: source.to_string(),
             },
         )?;
-        Ok(())
+        Ok(None)
     })();
     drop(lock);
-    result?;
-    active_catalog()
+    match result? {
+        Some(embedded) => Ok(embedded),
+        None => active_catalog(),
+    }
 }
 
-fn verify_signed_catalog(
+fn verify_signed_catalog_with_root(
     catalog_bytes: &[u8],
     signature_bytes: &[u8],
     origin: CatalogOrigin,
+    root: &trust::ActiveTrustRoot,
+    mode: CatalogVerificationMode,
 ) -> Result<ModelCatalog, String> {
     if catalog_bytes.len() as u64 > MAX_CATALOG_BYTES {
         return Err("model catalog exceeds the 1 MiB limit".into());
@@ -579,16 +629,15 @@ fn verify_signed_catalog(
     }
     let document: CatalogDocument = serde_json::from_slice(catalog_bytes)
         .map_err(|error| format!("invalid model catalog JSON: {error}"))?;
-    let trusted_key = TRUSTED_KEYS
-        .iter()
-        .find(|key| key.key_id == document.signing_key_id)
-        .ok_or_else(|| {
-            format!(
-                "model catalog names untrusted signing key {}",
-                document.signing_key_id
-            )
-        })?;
-    if !trusted_key.accepts(document.sequence) {
+    let trusted_key = root.catalog_key(&document.signing_key_id).ok_or_else(|| {
+        format!(
+            "model catalog names untrusted signing key {}",
+            document.signing_key_id
+        )
+    })?;
+    if matches!(mode, CatalogVerificationMode::Current { .. })
+        && !trusted_key.accepts(document.sequence)
+    {
         return Err(format!(
             "model catalog signing key {} is not valid for sequence {}",
             trusted_key.key_id, document.sequence
@@ -597,17 +646,35 @@ fn verify_signed_catalog(
     let signature_text = decode_signature_text(signature_bytes)?;
     let signature = Signature::decode(signature_text.as_ref())
         .map_err(|error| format!("invalid model catalog signature: {error}"))?;
-    let public_key = PublicKey::from_base64(trusted_key.public_key_base64)
+    let public_key = PublicKey::from_base64(&trusted_key.public_key_base64)
         .map_err(|error| format!("invalid embedded catalog public key: {error}"))?;
     public_key
         .verify(catalog_bytes, &signature, false)
         .map_err(|error| format!("model catalog signature verification failed: {error}"))?;
-    validate_document(document, catalog_bytes, origin)
+    validate_document(document, catalog_bytes, origin, root, trusted_key, mode)
+}
+
+#[cfg(test)]
+fn verify_signed_catalog(
+    catalog_bytes: &[u8],
+    signature_bytes: &[u8],
+    origin: CatalogOrigin,
+) -> Result<ModelCatalog, String> {
+    let root = trust::embedded_trust_root();
+    verify_signed_catalog_with_root(
+        catalog_bytes,
+        signature_bytes,
+        origin,
+        &root,
+        CatalogVerificationMode::Current {
+            now: root.issued_at_unix_seconds() + 1,
+        },
+    )
 }
 
 fn decode_signature_text(signature_bytes: &[u8]) -> Result<Cow<'_, str>, String> {
     let signature_text = std::str::from_utf8(signature_bytes)
-        .map_err(|_| "model catalog signature is not UTF-8".to_string())?
+        .map_err(|_| "detached minisign signature is not UTF-8".to_string())?
         .trim();
     if signature_text.starts_with("untrusted comment:") {
         validate_signature_text(signature_text)?;
@@ -615,14 +682,12 @@ fn decode_signature_text(signature_bytes: &[u8]) -> Result<Cow<'_, str>, String>
     }
     let decoded = BASE64_STANDARD
         .decode(signature_text.as_bytes())
-        .map_err(|_| {
-            "model catalog signature is neither minisign text nor Tauri base64".to_string()
-        })?;
+        .map_err(|_| "detached signature is neither minisign text nor Tauri base64".to_string())?;
     if decoded.len() as u64 > MAX_SIGNATURE_BYTES {
-        return Err("decoded model catalog signature exceeds the 16 KiB limit".into());
+        return Err("decoded minisign signature exceeds the 16 KiB limit".into());
     }
     let decoded = String::from_utf8(decoded)
-        .map_err(|_| "decoded model catalog signature is not UTF-8".to_string())?;
+        .map_err(|_| "decoded minisign signature is not UTF-8".to_string())?;
     validate_signature_text(decoded.trim())?;
     Ok(Cow::Owned(decoded.trim().to_string()))
 }
@@ -633,21 +698,56 @@ fn validate_signature_text(signature: &str) -> Result<(), String> {
         || !lines[0].starts_with("untrusted comment:")
         || !lines[2].starts_with("trusted comment: ")
     {
-        return Err("model catalog signature must contain one minisign record".into());
+        return Err("detached signature must contain one minisign record".into());
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn parse_catalog(bytes: &[u8], origin: CatalogOrigin) -> Result<ModelCatalog, String> {
+    let root = trust::embedded_trust_root();
+    parse_catalog_with_root(
+        bytes,
+        origin,
+        &root,
+        CatalogVerificationMode::Historical {
+            accepted_root_version: root.version(),
+        },
+    )
+}
+
+fn parse_catalog_with_root(
+    bytes: &[u8],
+    origin: CatalogOrigin,
+    root: &trust::ActiveTrustRoot,
+    mode: CatalogVerificationMode,
+) -> Result<ModelCatalog, String> {
     let document: CatalogDocument = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid embedded model catalog JSON: {error}"))?;
-    validate_document(document, bytes, origin)
+    let trusted_key = root.catalog_key(&document.signing_key_id).ok_or_else(|| {
+        format!(
+            "model catalog names untrusted signing key {}",
+            document.signing_key_id
+        )
+    })?;
+    if matches!(mode, CatalogVerificationMode::Current { .. })
+        && !trusted_key.accepts(document.sequence)
+    {
+        return Err(format!(
+            "model catalog signing key {} is not valid for sequence {}",
+            trusted_key.key_id, document.sequence
+        ));
+    }
+    validate_document(document, bytes, origin, root, trusted_key, mode)
 }
 
 fn validate_document(
     document: CatalogDocument,
     bytes: &[u8],
     origin: CatalogOrigin,
+    root: &trust::ActiveTrustRoot,
+    trusted_key: &trust::CatalogTrustKey,
+    mode: CatalogVerificationMode,
 ) -> Result<ModelCatalog, String> {
     if !catalog_origin_is_safe(&origin) {
         return Err("invalid model catalog origin".into());
@@ -663,21 +763,7 @@ fn validate_document(
             "model catalog sequence must be between 1 and {MAX_JSON_SAFE_INTEGER}"
         ));
     }
-    let trusted_key = TRUSTED_KEYS
-        .iter()
-        .find(|key| key.key_id == document.signing_key_id)
-        .ok_or_else(|| {
-            format!(
-                "model catalog names untrusted signing key {}",
-                document.signing_key_id
-            )
-        })?;
-    if !trusted_key.accepts(document.sequence) {
-        return Err(format!(
-            "model catalog signing key {} is not valid for sequence {}",
-            trusted_key.key_id, document.sequence
-        ));
-    }
+    validate_catalog_validity(&document, root, mode)?;
     if document.models.is_empty() || document.models.len() > MAX_MODELS {
         return Err(format!(
             "model catalog must contain between 1 and {MAX_MODELS} entries"
@@ -688,6 +774,15 @@ fn validate_document(
         sequence: document.sequence,
         sha256: sha256_bytes(bytes),
         signing_key_id: document.signing_key_id,
+        signing_public_key_base64: trusted_key.public_key_base64.clone(),
+        issued_at_unix_seconds: document.issued_at_unix_seconds,
+        expires_at_unix_seconds: document.expires_at_unix_seconds,
+        trust_root_version: match mode {
+            CatalogVerificationMode::Historical {
+                accepted_root_version,
+            } => accepted_root_version,
+            CatalogVerificationMode::Current { .. } => root.version(),
+        },
         origin,
     };
     let mut names = HashSet::with_capacity(document.models.len());
@@ -752,6 +847,63 @@ fn validate_document(
         });
     }
     Ok(ModelCatalog { identity, models })
+}
+
+fn validate_catalog_validity(
+    document: &CatalogDocument,
+    root: &trust::ActiveTrustRoot,
+    mode: CatalogVerificationMode,
+) -> Result<(), String> {
+    let enforce_current_policy = matches!(mode, CatalogVerificationMode::Current { .. });
+    let validity = match (
+        document.issued_at_unix_seconds,
+        document.expires_at_unix_seconds,
+    ) {
+        (Some(issued_at), Some(expires_at)) => {
+            if issued_at == 0
+                || issued_at > MAX_JSON_SAFE_INTEGER
+                || expires_at == 0
+                || expires_at > MAX_JSON_SAFE_INTEGER
+                || expires_at <= issued_at
+                || (enforce_current_policy
+                    && expires_at - issued_at > root.max_catalog_validity_seconds())
+            {
+                return Err("model catalog has an invalid validity window".into());
+            }
+            Some((issued_at, expires_at))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(
+                "model catalog must provide issued_at_unix_seconds and expires_at_unix_seconds together"
+                    .into(),
+            );
+        }
+    };
+    let CatalogVerificationMode::Current { now } = mode else {
+        return Ok(());
+    };
+    if document.sequence >= root.expiration_required_from_sequence() && validity.is_none() {
+        return Err(format!(
+            "model catalog sequence {} must contain an expiration window",
+            document.sequence
+        ));
+    }
+    if let Some((issued_at, expires_at)) = validity {
+        if issued_at > now.saturating_add(24 * 60 * 60) {
+            return Err(format!(
+                "model catalog sequence {} is not valid yet",
+                document.sequence
+            ));
+        }
+        if expires_at <= now {
+            return Err(format!(
+                "model catalog sequence {} expired at Unix time {expires_at}",
+                document.sequence
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_identifier(description: &str, value: &str) -> Result<(), String> {
@@ -897,17 +1049,24 @@ fn load_state() -> Result<Option<CatalogState>, String> {
 }
 
 fn validate_state(state: &CatalogState) -> Result<(), String> {
-    if state.version != CATALOG_STATE_VERSION
-        || state.highest_sequence == 0
+    if !matches!(
+        state.version,
+        LEGACY_CATALOG_STATE_VERSION | CATALOG_STATE_VERSION
+    ) || state.highest_sequence == 0
         || state.highest_sequence > MAX_JSON_SAFE_INTEGER
         || state.catalog_sha256.len() != 64
         || !state
             .catalog_sha256
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        || !TRUSTED_KEYS
-            .iter()
-            .any(|key| key.key_id == state.signing_key_id && key.accepts(state.highest_sequence))
+        || state.signing_key_id.len() != 16
+        || !state
+            .signing_key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+        || state.trust_root_version == 0
+        || state.trust_root_version > MAX_JSON_SAFE_INTEGER
+        || (state.version == LEGACY_CATALOG_STATE_VERSION && state.trust_root_version != 1)
     {
         return Err("invalid model catalog rollback state".into());
     }
@@ -918,6 +1077,7 @@ fn state_matches_catalog(state: &CatalogState, catalog: &ModelCatalog) -> bool {
     state.highest_sequence == catalog.sequence()
         && state.catalog_sha256 == catalog.sha256()
         && state.signing_key_id == catalog.signing_key_id()
+        && state.trust_root_version == catalog.trust_root_version()
 }
 
 fn load_envelope() -> Result<Option<SignedCatalogEnvelope>, String> {
@@ -1009,8 +1169,147 @@ fn write_catalog_state(catalog: &ModelCatalog) -> Result<(), String> {
             highest_sequence: catalog.sequence(),
             catalog_sha256: catalog.sha256().to_string(),
             signing_key_id: catalog.signing_key_id().to_string(),
+            trust_root_version: catalog.trust_root_version(),
         },
     )
+}
+
+pub(super) fn catalog_state_trust_root_version_for_recovery() -> Result<Option<u64>, String> {
+    Ok(load_state()?.map(|state| state.trust_root_version))
+}
+
+pub(crate) fn require_catalog_acquisition(identity: &CatalogIdentity) -> Result<(), String> {
+    validate_catalog_storage_path()?;
+    ensure_catalog_directory()?;
+    let lock_destination = catalog_directory()?.join("catalog.json");
+    let mut never_cancelled = || false;
+    let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
+    let result = (|| {
+        let root = trust::load_active_trust_root_locked()?;
+        let now = trust::effective_now_and_record_locked(&root)?;
+        validate_acquisition_authority(identity, &root, now, load_state()?.as_ref())
+    })();
+    drop(lock);
+    result
+}
+
+fn catalog_acquisition_allowed(catalog: &ModelCatalog) -> Result<bool, String> {
+    validate_catalog_storage_path()?;
+    let directory = catalog_directory()?;
+    match std::fs::symlink_metadata(&directory) {
+        Ok(_) => {
+            let lock_destination = directory.join("catalog.json");
+            let mut never_cancelled = || false;
+            let lock = super::acquire_lock(&lock_destination, &mut never_cancelled)?;
+            let result = (|| {
+                let root = trust::load_active_trust_root_locked()?;
+                let now = trust::effective_now_locked(&root)?;
+                Ok(validate_acquisition_authority(
+                    catalog.identity(),
+                    &root,
+                    now,
+                    load_state()?.as_ref(),
+                )
+                .is_ok())
+            })();
+            drop(lock);
+            result
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let root = trust::embedded_trust_root();
+            let now = trust::effective_now_locked(&root)?;
+            Ok(validate_acquisition_authority(catalog.identity(), &root, now, None).is_ok())
+        }
+        Err(error) => Err(format!(
+            "failed to inspect model catalog directory {}: {error}",
+            directory.display()
+        )),
+    }
+}
+
+fn validate_acquisition_authority(
+    identity: &CatalogIdentity,
+    root: &trust::ActiveTrustRoot,
+    now: u64,
+    state: Option<&CatalogState>,
+) -> Result<(), String> {
+    trust::require_fresh_root(root, now)?;
+    if let Some(state) = state {
+        if state.highest_sequence != identity.sequence
+            || state.catalog_sha256 != identity.sha256
+            || state.signing_key_id != identity.signing_key_id
+        {
+            return Err(format!(
+                "model catalog sequence {} is no longer active; reload the active catalog before acquiring packages",
+                identity.sequence
+            ));
+        }
+    } else if !matches!(identity.origin, CatalogOrigin::Embedded) {
+        return Err("model catalog is not backed by active rollback state".into());
+    }
+    let key = root.catalog_key(&identity.signing_key_id).ok_or_else(|| {
+        format!(
+            "model catalog signing key {} is no longer trusted for new acquisitions",
+            identity.signing_key_id
+        )
+    })?;
+    if key.public_key_base64 != identity.signing_public_key_base64
+        || !key.accepts(identity.sequence)
+    {
+        return Err(format!(
+            "model catalog signing key {} is revoked or outside its allowed sequence window",
+            identity.signing_key_id
+        ));
+    }
+    if identity.sequence >= root.expiration_required_from_sequence()
+        && identity.expires_at_unix_seconds.is_none()
+    {
+        return Err(format!(
+            "model catalog sequence {} lacks the expiration required by trust-root version {}",
+            identity.sequence,
+            root.version()
+        ));
+    }
+    match (
+        identity.issued_at_unix_seconds,
+        identity.expires_at_unix_seconds,
+    ) {
+        (Some(issued), Some(expires))
+            if expires > issued && expires - issued <= root.max_catalog_validity_seconds() => {}
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "model catalog sequence {} exceeds the active maximum validity interval",
+                identity.sequence
+            ));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(format!(
+                "model catalog sequence {} has an incomplete validity interval",
+                identity.sequence
+            ));
+        }
+    }
+    if identity
+        .issued_at_unix_seconds
+        .is_some_and(|issued| issued > now.saturating_add(24 * 60 * 60))
+    {
+        return Err(format!(
+            "model catalog sequence {} is not valid yet",
+            identity.sequence
+        ));
+    }
+    if identity
+        .expires_at_unix_seconds
+        .is_some_and(|expires| expires <= now)
+    {
+        return Err(format!(
+            "model catalog sequence {} expired at Unix time {}",
+            identity.sequence,
+            identity.expires_at_unix_seconds.unwrap_or_default()
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_catalog_directory() -> Result<PathBuf, String> {
@@ -1064,15 +1363,18 @@ mod tests {
 
     #[test]
     fn embedded_catalog_has_a_stable_valid_identity() {
+        let root = trust::embedded_trust_root();
+        let production_key = root.catalog_key("F5AE02E7593C64D9").unwrap();
         let public_key = BASE64_STANDARD
-            .decode(PRODUCTION_KEY.public_key_base64)
+            .decode(&production_key.public_key_base64)
             .unwrap();
         let encoded_key_id = u64::from_le_bytes(public_key[2..10].try_into().unwrap());
-        assert_eq!(format!("{encoded_key_id:016X}"), PRODUCTION_KEY.key_id);
+        assert_eq!(format!("{encoded_key_id:016X}"), production_key.key_id);
 
         let catalog = embedded_catalog();
         assert_eq!(catalog.sequence(), 1);
-        assert_eq!(catalog.signing_key_id(), PRODUCTION_KEY.key_id);
+        assert_eq!(catalog.signing_key_id(), production_key.key_id);
+        assert_eq!(catalog.trust_root_version(), 1);
         assert_eq!(catalog.models().len(), 1);
         let model = catalog.find("gtcrn").unwrap();
         let legacy = &crate::models::MODELS[0];
@@ -1188,6 +1490,96 @@ mod tests {
         );
         let extra = format!("{}\nforged", raw.trim());
         assert!(decode_signature_text(extra.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn catalog_expiration_policy_has_exact_boundaries() {
+        let root = trust::trust_root_with_catalog_expiration_for_test(2, 100);
+        let mut document: serde_json::Value = serde_json::from_slice(SEQ2).unwrap();
+        document["issued_at_unix_seconds"] = 1_000_u64.into();
+        document["expires_at_unix_seconds"] = 1_100_u64.into();
+        let bytes = serde_json::to_vec(&document).unwrap();
+        parse_catalog_with_root(
+            &bytes,
+            CatalogOrigin::Embedded,
+            &root,
+            CatalogVerificationMode::Current { now: 1_099 },
+        )
+        .unwrap();
+
+        let error = parse_catalog_with_root(
+            &bytes,
+            CatalogOrigin::Embedded,
+            &root,
+            CatalogVerificationMode::Current { now: 1_100 },
+        )
+        .unwrap_err();
+        assert!(error.contains("expired"), "{error}");
+
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("expires_at_unix_seconds");
+        document
+            .as_object_mut()
+            .unwrap()
+            .remove("issued_at_unix_seconds");
+        let error = parse_catalog_with_root(
+            &serde_json::to_vec(&document).unwrap(),
+            CatalogOrigin::Embedded,
+            &root,
+            CatalogVerificationMode::Current { now: 1_000 },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("must contain an expiration window"),
+            "{error}"
+        );
+
+        let mut document: serde_json::Value = serde_json::from_slice(SEQ2).unwrap();
+        let issued_at = root.issued_at_unix_seconds() + 1;
+        document["issued_at_unix_seconds"] = issued_at.into();
+        document["expires_at_unix_seconds"] = (issued_at + 101).into();
+        let bytes = serde_json::to_vec(&document).unwrap();
+        let historical = parse_catalog_with_root(
+            &bytes,
+            CatalogOrigin::Embedded,
+            &root,
+            CatalogVerificationMode::Historical {
+                accepted_root_version: root.version(),
+            },
+        )
+        .unwrap();
+        let error =
+            validate_acquisition_authority(historical.identity(), &root, issued_at + 50, None)
+                .unwrap_err();
+        assert!(error.contains("maximum validity interval"), "{error}");
+
+        let error = parse_catalog_with_root(
+            &bytes,
+            CatalogOrigin::Embedded,
+            &root,
+            CatalogVerificationMode::Current {
+                now: issued_at + 50,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("invalid validity window"), "{error}");
+    }
+
+    #[test]
+    fn revocation_blocks_acquisition_without_invalidating_loaded_catalog() {
+        let catalog = embedded_catalog();
+        let root = trust::trust_root_with_revocation_for_test("F5AE02E7593C64D9", 1);
+        let error = validate_acquisition_authority(
+            catalog.identity(),
+            &root,
+            root.issued_at_unix_seconds() + 1,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("revoked"), "{error}");
+        assert_eq!(catalog.find("gtcrn").unwrap().catalog_sequence(), 1);
     }
 
     #[test]

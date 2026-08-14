@@ -1,0 +1,27 @@
+{
+  "schema": "denoize-model-trust-root-v1",
+  "version": 1,
+  "previous_root_sha256": null,
+  "issued_at_unix_seconds": 1786665600,
+  "expires_at_unix_seconds": 1944432000,
+  "signature_threshold": 1,
+  "root_keys": [
+    {
+      "key_id": "F5AE02E7593C64D9",
+      "public_key_base64": "RWTZZDxZ5wKu9QcABWE2Sy7ZEg6xQhQW+vVVclypgEu8QnjbnNbZmQvi"
+    }
+  ],
+  "catalog_policy": {
+    "expiration_required_from_sequence": 2,
+    "max_validity_seconds": 15552000,
+    "keys": [
+      {
+        "key_id": "F5AE02E7593C64D9",
+        "public_key_base64": "RWTZZDxZ5wKu9QcABWE2Sy7ZEg6xQhQW+vVVclypgEu8QnjbnNbZmQvi",
+        "first_sequence": 1,
+        "last_sequence": null,
+        "revoked_at_sequence": null
+      }
+    ]
+  }
+}
