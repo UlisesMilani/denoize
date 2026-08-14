@@ -19,6 +19,8 @@ type GuiConfig = {
   preserve_metadata: boolean; force: boolean; mp3_bitrate_kbps: number; m4a_bitrate_kbps: number;
   aac_encoder: string; onnx_model?: string | null; onnx_rate: number; sgmse_profile: string;
   accelerator: string; deterministic: boolean;
+  max_process_memory_mb?: number | null; max_temporary_mb?: number | null;
+  max_gpu_memory_mb?: number | null; max_gpu_jobs: number;
 };
 type JobProgress = {
   jobId: number; kind: string; status: string; message: string; current: number; total: number;
@@ -174,6 +176,13 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                 <label class="toggle"><input id="force" type="checkbox"><span></span><div><b>上書きを許可</b><small>既存の出力を置換</small></div></label>
                 <label class="toggle"><input id="deterministic" type="checkbox"><span></span><div><b>再現性モード</b><small>同じ入力・設定から同じ音声を生成</small></div></label>
               </div>
+              <div class="form-grid two">
+                <label>プロセスメモリ MiB<input id="resource-process-memory" type="number" min="1" placeholder="無制限"></label>
+                <label>一時領域 MiB<input id="resource-temp-space" type="number" min="1" placeholder="無制限"></label>
+                <label>GPUメモリ MiB<input id="resource-gpu-memory" type="number" min="1" placeholder="無制限"></label>
+                <label>GPU並列数<input id="resource-gpu-jobs" type="number" value="1" min="1" max="32"></label>
+              </div>
+              <p class="field-hint">空欄の上限は無制限です。バッチでは各ワーカーを、モデル・PCM・メタデータ・一時出力・GPU予約が全体上限へ収まるまで待機させます。予約値は厳密なRSS/VRAM/ディスクquotaではありません。</p>
             </article>
           </div>
 
@@ -278,7 +287,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
-const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
+const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
 type SavedValues = Record<string, string | number | boolean>;
 
 function captureSettings(): SavedValues {
@@ -424,6 +433,11 @@ function onnxRateForBackend(backend: string, modelRate = Number($<HTMLInputEleme
   return descriptor?.externalModel === true ? modelRate : descriptor?.sampleRate ?? 16000;
 }
 
+function optionalPositiveNumber(selector: string): number | null {
+  const value = $<HTMLInputElement>(selector).value.trim();
+  return value === "" ? null : Number(value);
+}
+
 function options(backend = $<HTMLSelectElement>("#backend").value) {
   return {
     backend,
@@ -446,6 +460,10 @@ function options(backend = $<HTMLSelectElement>("#backend").value) {
     sgmseProfile: $<HTMLSelectElement>("#sgmse-profile").value,
     accelerator: $<HTMLSelectElement>("#accelerator").value,
     deterministic: $<HTMLInputElement>("#deterministic").checked,
+    maxProcessMemoryMb: optionalPositiveNumber("#resource-process-memory"),
+    maxTemporaryMb: optionalPositiveNumber("#resource-temp-space"),
+    maxGpuMemoryMb: optionalPositiveNumber("#resource-gpu-memory"),
+    maxGpuJobs: Number($<HTMLInputElement>("#resource-gpu-jobs").value),
   };
 }
 
@@ -553,6 +571,10 @@ function exportConfig() {
     aac_encoder: values["aac-encoder"], onnx_model: onnxModelForBackend(backend, String(values["model-path"])),
     onnx_rate: onnxRateForBackend(backend, Number(values["onnx-rate"])), sgmse_profile: values["sgmse-profile"],
     accelerator: values.accelerator, deterministic: values.deterministic,
+    max_process_memory_mb: values["resource-process-memory"] === "" ? null : Number(values["resource-process-memory"]),
+    max_temporary_mb: values["resource-temp-space"] === "" ? null : Number(values["resource-temp-space"]),
+    max_gpu_memory_mb: values["resource-gpu-memory"] === "" ? null : Number(values["resource-gpu-memory"]),
+    max_gpu_jobs: Number(values["resource-gpu-jobs"]),
   };
 }
 $("#export-config").addEventListener("click", async () => {
@@ -572,6 +594,10 @@ $("#import-config").addEventListener("click", async () => {
       "aac-encoder": config.aac_encoder, "model-path": config.onnx_model ?? "",
       "onnx-rate": config.onnx_rate, "sgmse-profile": config.sgmse_profile,
       accelerator: config.accelerator, deterministic: config.deterministic,
+      "resource-process-memory": config.max_process_memory_mb ?? "",
+      "resource-temp-space": config.max_temporary_mb ?? "",
+      "resource-gpu-memory": config.max_gpu_memory_mb ?? "",
+      "resource-gpu-jobs": config.max_gpu_jobs,
     };
     applyAndSaveSettings(values); showToast("設定を読み込みました");
   } catch (error) { showToast(errorText(error), true); }

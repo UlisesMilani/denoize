@@ -30,6 +30,10 @@ use lofty::tag::{ItemValue, Tag, TagType};
 
 use crate::atomic_output::{AtomicOutput, CommitMode};
 
+const RESIDENT_REPRESENTATION_MULTIPLIER: u64 = 16;
+const RESIDENT_ITEM_DESCRIPTOR_BYTES: u64 = 256;
+const RESIDENT_BASE_BYTES: u64 = 1024;
+
 /// Metadata captured from an input file.
 ///
 /// The generic tag remains available through [`Metadata::tag`]. The private
@@ -52,6 +56,49 @@ impl Metadata {
     #[must_use]
     pub fn into_tag(self) -> Tag {
         self.tag
+    }
+
+    /// Conservatively estimate the denoize-owned memory retained by this snapshot.
+    ///
+    /// The estimate charges generic and raw Vorbis representations separately,
+    /// includes per-item allocation overhead, and leaves room for the temporary
+    /// representations created while rewriting a destination container. It is
+    /// admission accounting rather than an allocator-exact heap measurement.
+    #[must_use]
+    pub fn estimated_memory_bytes(&self) -> u64 {
+        let mut payload_bytes = 0u64;
+        let mut items = 0u64;
+        for item in self.tag.items() {
+            let value_len = match item.value() {
+                ItemValue::Text(value) | ItemValue::Locator(value) => value.len(),
+                ItemValue::Binary(value) => value.len(),
+            };
+            payload_bytes = payload_bytes
+                .saturating_add(item.description().len() as u64)
+                .saturating_add(value_len as u64);
+            items = items.saturating_add(1);
+        }
+        for picture in self.tag.pictures() {
+            payload_bytes = payload_bytes
+                .saturating_add(picture.data().len() as u64)
+                .saturating_add(picture.description().map_or(0, str::len) as u64)
+                .saturating_add(picture.mime_type().map_or(0, |mime| mime.as_str().len()) as u64);
+            items = items.saturating_add(1);
+        }
+        if let Some(vorbis) = &self.vorbis_comments {
+            payload_bytes = payload_bytes.saturating_add(vorbis.vendor.len() as u64);
+            items = items.saturating_add(1);
+            for (key, value) in &vorbis.items {
+                payload_bytes = payload_bytes
+                    .saturating_add(key.len() as u64)
+                    .saturating_add(value.len() as u64);
+                items = items.saturating_add(1);
+            }
+        }
+        payload_bytes
+            .saturating_add(items.saturating_mul(RESIDENT_ITEM_DESCRIPTOR_BYTES))
+            .saturating_add(RESIDENT_BASE_BYTES)
+            .saturating_mul(RESIDENT_REPRESENTATION_MULTIPLIER)
     }
 }
 
@@ -1208,6 +1255,35 @@ mod tests {
         assert!(limits.max_ogg_packet_bytes > 0);
         assert!(limits.max_ogg_pages > 0);
         assert!(limits.max_ogg_streams > 0);
+    }
+
+    #[test]
+    fn retained_metadata_estimate_counts_generic_and_raw_representations() {
+        let empty = Metadata {
+            tag: Tag::new(TagType::Id3v2),
+            vorbis_comments: None,
+        };
+        assert_eq!(
+            empty.estimated_memory_bytes(),
+            RESIDENT_BASE_BYTES * RESIDENT_REPRESENTATION_MULTIPLIER
+        );
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::EncoderSoftware, "source encoder".into());
+        let generic = Metadata {
+            tag,
+            vorbis_comments: None,
+        };
+        assert!(generic.estimated_memory_bytes() > empty.estimated_memory_bytes());
+
+        let raw = Metadata {
+            tag: generic.tag.clone(),
+            vorbis_comments: Some(VorbisCommentsSnapshot::new(
+                "vendor".into(),
+                vec![("CUSTOM".into(), "value".into())],
+            )),
+        };
+        assert!(raw.estimated_memory_bytes() > generic.estimated_memory_bytes());
     }
 
     #[test]

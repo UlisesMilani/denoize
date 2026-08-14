@@ -24,15 +24,25 @@ atomicity, documentation, and release assets are covered by automated tests.
 | 4 | Signed offline bundles containing catalog, signature, models, licenses, and provenance for closed networks | Implemented |
 | 5 | Stable JSON output for catalog/model health, provenance, recipe identity, and automation | Implemented |
 | 6 | Hardware capability discovery, explicit accelerator selection, and deterministic CPU fallback | Implemented |
-| 7 | Process-level resource controls, worker admission based on memory, and stronger isolation of third-party codec/model allocations | Planned |
-| 8 | Input-aware quality/model recommendation with reproducible calibration evidence | Planned |
-| 9 | Reproducible releases with per-artifact SBOMs, signed build provenance, and offline verification for binaries, crates, and converted models | Planned |
+| 7 | Process-level RAM/temporary/GPU admission, memory-weighted workers, and opt-in OS child isolation for third-party codec/model failures | Implemented |
+| 8 | Bounded streaming for compressed inputs and restartable processing checkpoints for long-running jobs | Planned |
+| 9 | Input-aware quality/model recommendation with reproducible calibration evidence | Planned |
+| 10 | Reproducible releases with per-artifact SBOMs, signed build provenance, and offline verification for binaries, crates, and converted models | Planned |
 
 Stages 2–5 extend the authenticated distribution system without weakening its
-rollback or provenance guarantees. Stages 6–8 are runtime improvements and
-must retain a portable CPU path and deterministic validation fixtures. Stage 9
+rollback or provenance guarantees. Stages 6–9 are runtime improvements and
+must retain a portable CPU path and deterministic validation fixtures. Stage 10
 extends authentication from downloaded model bytes to the release and model
 conversion processes that produced every distributed artifact.
+
+Stage 7 exposes a cloneable library `ResourceGovernor` and connects it to CLI,
+desktop, batch, streaming, and live processing. Admission atomically reserves
+denoize-owned RAM, staged-output bytes, CPU/GPU worker slots, and conservative
+GPU/model allowances; retained metadata and configured decoder scratch budgets
+participate in the worker weight. The CLI's optional `--isolate` child adds an
+`RLIMIT_AS` boundary on Unix or a Job Object process-memory boundary on Windows.
+Cooperative counters deliberately do not claim allocator-exact RSS, filesystem
+quota, or driver-exact VRAM enforcement.
 
 ## Investigation status
 

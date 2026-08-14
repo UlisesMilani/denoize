@@ -61,6 +61,7 @@ pub mod perceptual;
 pub mod postfilter;
 pub mod quality;
 pub mod resample;
+pub mod resource;
 pub mod service;
 pub mod stft;
 mod stoi_resample;
@@ -106,6 +107,12 @@ pub use hardware::{
 };
 pub use input::AudioInputSession;
 pub use quality::QualityMetrics;
+pub use resource::{
+    estimate_backend_session_request, estimate_gpu_session_bytes, estimate_gpu_worker_bytes,
+    estimate_model_session_bytes, estimate_temporary_bytes, metadata_limits_after_retained_memory,
+    metadata_limits_for_available_memory, ResourceGovernor, ResourceLimits, ResourcePermit,
+    ResourceRequest, ResourceUsage,
+};
 pub use window::{WindowParams, WindowType};
 
 /// Encode audio and optional metadata into a staged file, then publish it in

@@ -432,6 +432,49 @@ fn filesystem_decode_capacity_is_capped_before_output_staging() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn isolated_child_succeeds_normally_and_contains_a_hard_memory_failure() {
+    let root = temp_root("isolated-child");
+    let input = root.join("input.wav");
+    let success_output = root.join("success.wav");
+    let limited_output = root.join("limited.wav");
+    write_wav(&input, 1, 16_000);
+
+    let success = run(&[
+        input.to_string_lossy().into_owned(),
+        success_output.to_string_lossy().into_owned(),
+        "--isolate".into(),
+        "--no-metadata".into(),
+        "--json".into(),
+    ]);
+    assert!(
+        success.status.success(),
+        "isolated conversion failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&success.stdout),
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert!(success_output.is_file());
+
+    let limited = run(&[
+        input.to_string_lossy().into_owned(),
+        limited_output.to_string_lossy().into_owned(),
+        "--isolate".into(),
+        "--max-process-memory".into(),
+        "1".into(),
+        "--no-metadata".into(),
+        "--json".into(),
+    ]);
+    assert!(!limited.status.success());
+    let stderr = String::from_utf8_lossy(&limited.stderr);
+    assert!(
+        stderr.contains("isolated denoize child"),
+        "unexpected isolation error: {stderr}"
+    );
+    assert_no_staged_output(&root, &limited_output);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn no_metadata_still_rejects_oversized_flac_metadata_before_staging() {
     let root = temp_root("bounded-flac-metadata");

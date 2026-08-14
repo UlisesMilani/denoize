@@ -1,16 +1,19 @@
-use denoize::audio::{read_audio, write_audio};
+use denoize::audio::{
+    estimate_audio_working_set_bytes, read_audio, read_audio_from_session_with_limits, write_audio,
+};
 use denoize::batch_resume::{
     self, BatchSession, Digest, MetadataPolicy, ResumeDecision, ResumeExpectation,
 };
 use denoize::benchmark::{BenchmarkReport, ComparisonReport};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::encode::write_audio_to_file;
+use denoize::metadata::MetadataLimits;
 use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
     AacEncoder, AcceleratorPreference, AtomicOutput, Backend, BackendOptions, BackendSession,
-    ChannelMode, CommitMode, DownmixMode, EncodeOptions, OnnxModelConfig, OutputFormat,
-    SgmseProfile,
+    ChannelMode, CommitMode, DecodeLimits, DownmixMode, EncodeOptions, OnnxModelConfig,
+    OutputFormat, ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -31,9 +34,14 @@ const MAX_LOUDNESS_LUFS: f64 = 0.0;
 const MIN_TRUE_PEAK_DBTP: f64 = -20.0;
 const MAX_TRUE_PEAK_DBTP: f64 = 0.0;
 const DEFAULT_MODEL_SAMPLE_RATE_HZ: u32 = 16_000;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 fn default_accelerator() -> String {
     "cpu".into()
+}
+
+const fn default_max_gpu_jobs() -> usize {
+    1
 }
 
 #[derive(Default)]
@@ -105,6 +113,14 @@ struct ProcessOptions {
     deterministic: bool,
     #[serde(default)]
     seed: Option<u64>,
+    #[serde(default)]
+    max_process_memory_mb: Option<usize>,
+    #[serde(default)]
+    max_temporary_mb: Option<usize>,
+    #[serde(default)]
+    max_gpu_memory_mb: Option<usize>,
+    #[serde(default = "default_max_gpu_jobs")]
+    max_gpu_jobs: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -134,6 +150,14 @@ struct GuiConfig {
     #[serde(default = "default_accelerator")]
     accelerator: String,
     deterministic: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_process_memory_mb: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_temporary_mb: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_gpu_memory_mb: Option<usize>,
+    #[serde(default = "default_max_gpu_jobs")]
+    max_gpu_jobs: usize,
 }
 
 /// A typed, partial desktop/CLI configuration import.
@@ -164,6 +188,10 @@ struct GuiConfigPatch {
     sgmse_profile: Option<String>,
     accelerator: Option<String>,
     deterministic: Option<bool>,
+    max_process_memory_mb: Option<usize>,
+    max_temporary_mb: Option<usize>,
+    max_gpu_memory_mb: Option<usize>,
+    max_gpu_jobs: Option<usize>,
 }
 
 impl GuiConfig {
@@ -190,6 +218,10 @@ impl GuiConfig {
             accelerator: self.accelerator.clone(),
             deterministic: self.deterministic,
             seed: None,
+            max_process_memory_mb: self.max_process_memory_mb,
+            max_temporary_mb: self.max_temporary_mb,
+            max_gpu_memory_mb: self.max_gpu_memory_mb,
+            max_gpu_jobs: self.max_gpu_jobs,
         }
     }
 
@@ -260,6 +292,16 @@ impl GuiConfigPatch {
         replace_present!(sgmse_profile);
         replace_present!(accelerator);
         replace_present!(deterministic);
+        if let Some(value) = self.max_process_memory_mb {
+            current.max_process_memory_mb = Some(value);
+        }
+        if let Some(value) = self.max_temporary_mb {
+            current.max_temporary_mb = Some(value);
+        }
+        if let Some(value) = self.max_gpu_memory_mb {
+            current.max_gpu_memory_mb = Some(value);
+        }
+        replace_present!(max_gpu_jobs);
         current.normalized()
     }
 }
@@ -301,6 +343,11 @@ struct PreparedBatchItem {
     metadata_policy: MetadataPolicy,
     processing: service::ResolvedProcessingOptions,
     backend_session: Arc<BackendSession>,
+    _backend_session_permit: Arc<ResourcePermit>,
+    governor: ResourceGovernor,
+    resource_request: ResourceRequest,
+    decode_limits: DecodeLimits,
+    metadata_limits: MetadataLimits,
     expectation: ResumeExpectation,
 }
 
@@ -954,6 +1001,14 @@ fn start_batch(
                     Err(outcome) => return outcome,
                 };
             let prepared = &batch_item.prepared;
+            let worker_permit = match prepared
+                .governor
+                .acquire_with_cancel(prepared.resource_request, || control.is_cancelled())
+            {
+                Ok(permit) => permit,
+                Err(_) if control.is_cancelled() => return BatchItemOutcome::Cancelled,
+                Err(error) => return BatchItemOutcome::Failed(error),
+            };
             let result = stage_batch_output(
                 &prepared.item.input,
                 &prepared.item.output,
@@ -962,6 +1017,9 @@ fn start_batch(
                 prepared.metadata_policy,
                 &prepared.processing,
                 &prepared.backend_session,
+                prepared.decode_limits,
+                prepared.metadata_limits,
+                prepared.resource_request.temporary_bytes(),
                 &control,
             )
             .and_then(|transaction| {
@@ -972,6 +1030,7 @@ fn start_batch(
                         .map(|_| ())
                 })
             });
+            drop(worker_permit);
             match result {
                 Ok(_) => BatchItemOutcome::Completed,
                 Err(error) if error == "cancelled" => BatchItemOutcome::Cancelled,
@@ -1504,6 +1563,7 @@ fn start_live(
     let backend = validate_live_request(&request)?;
     let backend_options = parsed_backend_options_for(backend, &request.options)?;
     let denoiser = processing_config(&request.options, 48_000)?;
+    let governor = desktop_resource_governor(&request.options, 1)?;
     let prepared = denoize::live::PreparedLiveConfig::new(denoize::live::LiveConfig {
         input_device: request.input_device,
         output_device: request.output_device,
@@ -1513,45 +1573,33 @@ fn start_live(
         denoiser,
     })?;
     let accelerator = prepared.accelerator();
-    if !state
-        .jobs
-        .lock()
-        .map_err(|_| "ジョブ状態を取得できません")?
-        .is_empty()
-    {
-        return Err("ファイル処理の完了後に開始してください".into());
-    }
     let running = Arc::new(AtomicBool::new(true));
-    {
-        let mut live = state
-            .live
-            .lock()
-            .map_err(|_| "ライブ状態を更新できません")?;
-        if live.is_some() {
-            return Err("ライブ処理は既に実行中です".into());
-        }
-        *live = Some(Arc::clone(&running));
-    }
+    register_live_session(&state, Arc::clone(&running))?;
     let live_state = Arc::clone(&state.live);
     std::thread::spawn(move || {
-        let result = denoize::live::run_prepared_with_status(prepared, running, |status| {
-            let _ = app.emit(
-                "live-status",
-                LiveEvent {
-                    status: "running",
-                    message: "ライブ処理中".into(),
-                    sample_rate: status.sample_rate,
-                    input_channels: status.input_channels,
-                    output_channels: status.output_channels,
-                    chunk_frames: status.chunk_frames,
-                    input_level: status.input_level,
-                    output_level: status.output_level,
-                    processed_chunks: status.processed_chunks,
-                    dropped_chunks: status.dropped_chunks,
-                    accelerator: Some(accelerator_result(status.accelerator)),
-                },
-            );
-        });
+        let result = denoize::live::run_prepared_with_status_and_governor(
+            prepared,
+            running,
+            &governor,
+            |status| {
+                let _ = app.emit(
+                    "live-status",
+                    LiveEvent {
+                        status: "running",
+                        message: "ライブ処理中".into(),
+                        sample_rate: status.sample_rate,
+                        input_channels: status.input_channels,
+                        output_channels: status.output_channels,
+                        chunk_frames: status.chunk_frames,
+                        input_level: status.input_level,
+                        output_level: status.output_level,
+                        processed_chunks: status.processed_chunks,
+                        dropped_chunks: status.dropped_chunks,
+                        accelerator: Some(accelerator_result(status.accelerator)),
+                    },
+                );
+            },
+        );
         let (status, message) = match result {
             Ok(()) => ("stopped", "ライブ処理を停止しました".into()),
             Err(error) => ("failed", error),
@@ -2207,25 +2255,99 @@ fn save_text_file(path: String, contents: String) -> Result<(), String> {
 }
 
 fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
-    if state
-        .live
-        .lock()
-        .map_err(|_| "ライブ状態を取得できません")?
-        .is_some()
-    {
-        return Err("ライブ処理を停止してから開始してください".into());
-    }
     let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
     let control = Arc::new(JobControl::default());
     let mut jobs = state
         .jobs
         .lock()
         .map_err(|_| "ジョブ状態を更新できません")?;
+    let live = state
+        .live
+        .lock()
+        .map_err(|_| "ライブ状態を取得できません")?;
+    if live.is_some() {
+        return Err("ライブ処理を停止してから開始してください".into());
+    }
     if !jobs.is_empty() {
         return Err("別の処理が実行中です。完了またはキャンセル後に再試行してください".into());
     }
     jobs.insert(job_id, Arc::clone(&control));
     Ok((job_id, control))
+}
+
+fn register_live_session(state: &AppState, running: Arc<AtomicBool>) -> Result<(), String> {
+    // Use the same jobs-then-live lock order as `register_job`. Holding both
+    // guards across validation and insertion makes the desktop's one-active-
+    // operation contract atomic instead of allowing simultaneous file/live
+    // registration to pass two independent observations.
+    let jobs = state
+        .jobs
+        .lock()
+        .map_err(|_| "ジョブ状態を取得できません")?;
+    let mut live = state
+        .live
+        .lock()
+        .map_err(|_| "ライブ状態を更新できません")?;
+    if !jobs.is_empty() {
+        return Err("ファイル処理の完了後に開始してください".into());
+    }
+    if live.is_some() {
+        return Err("ライブ処理は既に実行中です".into());
+    }
+    *live = Some(running);
+    Ok(())
+}
+
+fn checked_desktop_mib(value: Option<usize>, name: &str) -> Result<Option<u64>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value == 0 {
+        return Err(format!("{name}は1 MiB以上にしてください"));
+    }
+    u64::try_from(value)
+        .ok()
+        .and_then(|value| value.checked_mul(BYTES_PER_MIB))
+        .map(Some)
+        .ok_or_else(|| format!("{name}が大きすぎます"))
+}
+
+fn desktop_resource_governor(
+    options: &ProcessOptions,
+    cpu_jobs: usize,
+) -> Result<ResourceGovernor, String> {
+    ResourceGovernor::new(
+        ResourceLimits::new()
+            .with_max_memory_bytes(checked_desktop_mib(
+                options.max_process_memory_mb,
+                "プロセスメモリ上限",
+            )?)
+            .with_max_temporary_bytes(checked_desktop_mib(
+                options.max_temporary_mb,
+                "一時領域上限",
+            )?)
+            .with_max_cpu_jobs(Some(cpu_jobs))
+            .with_max_gpu_jobs(Some(options.max_gpu_jobs))
+            .with_max_gpu_memory_bytes(checked_desktop_mib(
+                options.max_gpu_memory_mb,
+                "GPUメモリ上限",
+            )?),
+    )
+}
+
+fn desktop_decode_limits(options: &ProcessOptions) -> Result<DecodeLimits, String> {
+    let maximum = checked_desktop_mib(options.max_process_memory_mb, "プロセスメモリ上限")?;
+    Ok(DecodeLimits::new(
+        denoize::metadata_limits_for_available_memory(maximum),
+        maximum,
+    ))
+}
+
+fn desktop_retained_metadata_limits(
+    maximum: Option<u64>,
+    retained_working_set_bytes: u64,
+) -> MetadataLimits {
+    denoize::metadata_limits_after_retained_memory(maximum, retained_working_set_bytes)
 }
 
 fn validate_process_options(options: &ProcessOptions) -> Result<(), String> {
@@ -2244,6 +2366,12 @@ fn validate_process_options(options: &ProcessOptions) -> Result<(), String> {
     }
     if options.loudness_lufs.is_none() && options.true_peak_dbtp != -1.0 {
         return Err("True Peakはラウドネス正規化と一緒に指定してください".into());
+    }
+    checked_desktop_mib(options.max_process_memory_mb, "プロセスメモリ上限")?;
+    checked_desktop_mib(options.max_temporary_mb, "一時領域上限")?;
+    checked_desktop_mib(options.max_gpu_memory_mb, "GPUメモリ上限")?;
+    if !(1..=32).contains(&options.max_gpu_jobs) {
+        return Err("GPU並列数は1〜32にしてください".into());
     }
     if options.mp3_bitrate_kbps < 32 || options.aac_bitrate_kbps < 32 {
         return Err("ビットレートは32kbps以上にしてください".into());
@@ -2300,13 +2428,66 @@ fn prepare_batch_request(request: &BatchRequest) -> Result<Vec<PreparedBatchItem
         return Err("対応する音声ファイルがありません".into());
     }
     validate_batch_control_paths(&items, Path::new(&request.output_dir))?;
-    preflight_batch_items(&request.options, request.resume, items)
+    let governor = desktop_resource_governor(&request.options, request.jobs)?;
+    preflight_batch_items(&request.options, request.resume, items, &governor)
+}
+
+fn desktop_preflight_decode_admission(
+    options: &ProcessOptions,
+    governor: &ResourceGovernor,
+) -> Result<(DecodeLimits, Option<ResourcePermit>), String> {
+    let Some(process_limit) =
+        checked_desktop_mib(options.max_process_memory_mb, "プロセスメモリ上限")?
+    else {
+        return Ok((DecodeLimits::default(), None));
+    };
+    let available = process_limit
+        .checked_sub(governor.usage()?.memory_bytes())
+        .ok_or_else(|| "モデルセッションがプロセスメモリ上限を超えています".to_string())?;
+    if available < BYTES_PER_MIB {
+        return Err("モデル読込後の利用可能メモリが1 MiB未満です".into());
+    }
+    let permit = governor
+        .try_acquire(ResourceRequest::new().with_memory_bytes(available))?
+        .ok_or_else(|| "バッチ事前検査用メモリを予約できません".to_string())?;
+    Ok((
+        DecodeLimits::new(
+            denoize::metadata_limits_for_available_memory(Some(available)),
+            Some(available),
+        ),
+        Some(permit),
+    ))
+}
+
+fn desktop_worker_decode_limit(
+    options: &ProcessOptions,
+    governor: &ResourceGovernor,
+    transient_audio_bytes: u64,
+) -> Result<Option<u64>, String> {
+    let Some(process_limit) =
+        checked_desktop_mib(options.max_process_memory_mb, "プロセスメモリ上限")?
+    else {
+        return Ok(None);
+    };
+    let available = process_limit
+        .checked_sub(
+            governor
+                .usage()?
+                .memory_bytes()
+                .saturating_sub(transient_audio_bytes),
+        )
+        .ok_or_else(|| "モデルセッションがプロセスメモリ上限を超えています".to_string())?;
+    if available < BYTES_PER_MIB {
+        return Err("デコード用の利用可能メモリが1 MiB未満です".into());
+    }
+    Ok(Some(available))
 }
 
 fn preflight_batch_items(
     options: &ProcessOptions,
     resume_enabled: bool,
     items: Vec<BatchItem>,
+    governor: &ResourceGovernor,
 ) -> Result<Vec<PreparedBatchItem>, String> {
     let encode = parsed_encode_options(options)?;
     let metadata_policy = if options.preserve_metadata {
@@ -2320,21 +2501,42 @@ fn preflight_batch_items(
         BackendOptions,
         denoize::AcceleratorSelection,
         Arc<BackendSession>,
+        Arc<ResourcePermit>,
     )>::new();
     let mut prepared = Vec::with_capacity(items.len());
     for item in items {
-        let input_fingerprint = batch_resume::fingerprint_file(&item.input).map_err(|error| {
-            format!(
-                "バッチ入力 {} の内容を確認できません: {error}",
-                item.input.display()
-            )
+        let (decode_limits, preflight_decode_permit) =
+            desktop_preflight_decode_admission(options, governor)?;
+        let mut input_session = denoize::AudioInputSession::open(&item.input).map_err(|error| {
+            format!("バッチ入力 {} を開けません: {error}", item.input.display())
         })?;
-        let audio = read_audio(&item.input).map_err(|error| {
-            format!(
-                "バッチ入力 {} を事前検査できません: {error}",
-                item.input.display()
-            )
-        })?;
+        let input_bytes = input_session.len();
+        let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)
+            .map_err(|error| {
+                format!(
+                    "バッチ入力 {} の内容を確認できません: {error}",
+                    item.input.display()
+                )
+            })?;
+        let mut audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)
+            .map_err(|error| {
+                format!(
+                    "バッチ入力 {} を事前検査できません: {error}",
+                    item.input.display()
+                )
+            })?;
+        drop(preflight_decode_permit);
+        let mut decoded_working_set = estimate_audio_working_set_bytes(&audio);
+        let mut audio_permit = Some(
+            governor
+                .try_acquire(ResourceRequest::new().with_memory_bytes(decoded_working_set))?
+                .ok_or_else(|| {
+                    format!(
+                        "バッチ入力 {} がモデルと同時にプロセスメモリ上限へ収まりません",
+                        item.input.display()
+                    )
+                })?,
+        );
         item.output_format
             .validate_config(&audio, &encode)
             .map_err(|error| {
@@ -2376,16 +2578,30 @@ fn preflight_batch_items(
         // Bind the prepared graph to the model bytes already captured by the
         // resume recipe. The whole-plan source fence below re-hashes the path
         // after graph preparation and rejects a persistent replacement.
-        let backend_session = if let Some((_, _, _, session)) =
+        let (backend_session, backend_session_permit) = if let Some((_, _, _, session, permit)) =
             backend_sessions
                 .iter()
-                .find(|(backend, backend_options, accelerator, _)| {
+                .find(|(backend, backend_options, accelerator, _, _)| {
                     *backend == processing.backend
                         && backend_options == &processing.backend_options
                         && *accelerator == processing.accelerator
                 }) {
-            Arc::clone(session)
+            (Arc::clone(session), Arc::clone(permit))
         } else {
+            let permit = Arc::new(
+                governor
+                    .try_acquire(denoize::estimate_backend_session_request(
+                        processing.backend,
+                        &processing.backend_options,
+                        processing.accelerator,
+                    )?)?
+                    .ok_or_else(|| {
+                        format!(
+                            "バッチ入力 {} のモデルがプロセス資源上限へ収まりません",
+                            item.input.display()
+                        )
+                    })?,
+            );
             let session = Arc::new(
                 BackendSession::prepare_with_accelerator(
                     processing.backend,
@@ -2404,9 +2620,78 @@ fn preflight_batch_items(
                 processing.backend_options.clone(),
                 processing.accelerator,
                 Arc::clone(&session),
+                Arc::clone(&permit),
             ));
-            session
+            (session, permit)
         };
+        let final_decode_limit =
+            desktop_worker_decode_limit(options, governor, decoded_working_set)?;
+        let must_redecode = match (decode_limits.max_working_set_bytes, final_decode_limit) {
+            (Some(initial), Some(final_limit)) => final_limit < initial,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if must_redecode {
+            drop(audio_permit.take());
+            drop(audio);
+            let final_limit = final_decode_limit.expect("再デコードには有限の上限が必要です");
+            let decode_permit = governor
+                .try_acquire(ResourceRequest::new().with_memory_bytes(final_limit))?
+                .ok_or_else(|| {
+                    format!(
+                        "バッチ入力 {} の最終デコード予算を予約できません",
+                        item.input.display()
+                    )
+                })?;
+            audio = read_audio_from_session_with_limits(
+                &mut input_session,
+                DecodeLimits::new(
+                    denoize::metadata_limits_for_available_memory(final_decode_limit),
+                    final_decode_limit,
+                ),
+            )
+            .map_err(|error| {
+                format!(
+                    "モデル読込後にバッチ入力 {} をデコードできません: {error}",
+                    item.input.display()
+                )
+            })?;
+            drop(decode_permit);
+            decoded_working_set = estimate_audio_working_set_bytes(&audio);
+            audio_permit = Some(
+                governor
+                    .try_acquire(ResourceRequest::new().with_memory_bytes(decoded_working_set))?
+                    .ok_or_else(|| {
+                        format!(
+                            "バッチ入力 {} のデコード済み音声を保持できません",
+                            item.input.display()
+                        )
+                    })?,
+            );
+        }
+        let final_decode_limits = DecodeLimits::new(
+            denoize::metadata_limits_for_available_memory(final_decode_limit),
+            final_decode_limit,
+        );
+        let metadata_limits =
+            desktop_retained_metadata_limits(final_decode_limit, decoded_working_set);
+        let metadata_bytes = if metadata_policy == MetadataPolicy::Preserve {
+            input_session
+                .read_metadata_with_limits(metadata_limits)?
+                .as_ref()
+                .map(denoize::metadata::Metadata::estimated_memory_bytes)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let resource_request = desktop_worker_request(
+            input_bytes,
+            &audio,
+            metadata_bytes,
+            final_decode_limit,
+            &processing,
+            true,
+        )?;
         let recipe = batch_resume::recipe_digest(
             &processing,
             audio.channels(),
@@ -2425,6 +2710,13 @@ fn preflight_batch_items(
             model,
             recipe,
         );
+        drop(audio_permit);
+        drop(governor.try_acquire(resource_request)?.ok_or_else(|| {
+            format!(
+                "バッチ入力 {} を設定された資源上限で実行できません",
+                item.input.display()
+            )
+        })?);
         prepared.push(PreparedBatchItem {
             item,
             input_channels: audio.channels(),
@@ -2432,11 +2724,26 @@ fn preflight_batch_items(
             metadata_policy,
             processing,
             backend_session,
+            _backend_session_permit: backend_session_permit,
+            governor: governor.clone(),
+            resource_request,
+            decode_limits: final_decode_limits,
+            metadata_limits,
             expectation,
         });
     }
     for item in &prepared {
         item.expectation.verify_sources()?;
+        drop(
+            governor
+                .try_acquire(item.resource_request)?
+                .ok_or_else(|| {
+                    format!(
+                        "バッチ入力 {} は全モデル読込後のプロセス資源上限へ収まりません",
+                        item.item.input.display()
+                    )
+                })?,
+        );
     }
     Ok(prepared)
 }
@@ -2614,6 +2921,34 @@ fn resolved_processing_options(
     service::resolve_processing_options(audio, validated_processing_options(options, audio)?)
 }
 
+fn desktop_worker_request(
+    input_bytes: u64,
+    audio: &denoize::Audio,
+    metadata_bytes: u64,
+    decode_reservation_bytes: Option<u64>,
+    processing: &service::ResolvedProcessingOptions,
+    writes_output: bool,
+) -> Result<ResourceRequest, String> {
+    let memory_bytes = estimate_audio_working_set_bytes(audio)
+        .checked_add(metadata_bytes)
+        .ok_or_else(|| "ワーカーメモリ予約量が大きすぎます".to_string())?
+        .max(decode_reservation_bytes.unwrap_or(0));
+    let mut request = ResourceRequest::worker(
+        memory_bytes,
+        if writes_output {
+            denoize::estimate_temporary_bytes(input_bytes, audio)?
+        } else {
+            0
+        },
+    );
+    if processing.accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
+        request = request
+            .with_gpu_jobs(1)
+            .with_gpu_memory_bytes(denoize::estimate_gpu_worker_bytes(audio)?);
+    }
+    Ok(request)
+}
+
 fn process_file(
     request: &ProcessRequest,
     control: &JobControl,
@@ -2622,20 +2957,54 @@ fn process_file(
     check_cancelled(control)?;
     let input = Path::new(&request.input);
     let output = Path::new(&request.output);
+    let mut input_session = denoize::AudioInputSession::open(input)?;
+    let input_bytes = input_session.len();
+    let decode_limits = desktop_decode_limits(&request.options)?;
+    let mut audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)?;
+    let decoded_working_set = estimate_audio_working_set_bytes(&audio);
+    let metadata_limits =
+        desktop_retained_metadata_limits(decode_limits.max_working_set_bytes, decoded_working_set);
     let metadata = if request.options.preserve_metadata {
-        denoize::metadata::read_extended(input)?
+        input_session.read_metadata_with_limits(metadata_limits)?
     } else {
         None
     };
-    let mut audio = read_audio(input)?;
+    let metadata_bytes = metadata
+        .as_ref()
+        .map(denoize::metadata::Metadata::estimated_memory_bytes)
+        .unwrap_or(0);
     let encode = parsed_encode_options(&request.options)?;
     let format = OutputFormat::from_path(output)?;
     format.validate_config(&audio, &encode)?;
     progress(1, "ノイズ除去を実行しています");
     check_cancelled(control)?;
-    let processing = validated_processing_options(&request.options, &audio)?;
+    let processing = resolved_processing_options(&request.options, &audio)?;
+    let governor = desktop_resource_governor(&request.options, 1)?;
+    let worker_request =
+        desktop_worker_request(input_bytes, &audio, metadata_bytes, None, &processing, true)?;
+    let resource_request =
+        worker_request.checked_add(denoize::estimate_backend_session_request(
+            processing.backend,
+            &processing.backend_options,
+            processing.accelerator,
+        )?)?;
+    let _permit = governor
+        .acquire_with_cancel(resource_request, || control.is_cancelled())
+        .map_err(|error| {
+            if control.is_cancelled() {
+                "cancelled".to_string()
+            } else {
+                error
+            }
+        })?;
+    let backend_session = BackendSession::prepare_with_accelerator(
+        processing.backend,
+        processing.backend_options.clone(),
+        processing.accelerator,
+    )?;
     progress(2, "ラウドネスと出力を準備しています");
-    let processing_result = service::process_audio(&mut audio, processing)?;
+    let processing_result =
+        service::process_audio_resolved_with_session(&mut audio, &processing, &backend_session)?;
     check_cancelled(control)?;
     progress(3, "ファイルを書き出しています");
     if let Some(parent) = output
@@ -2648,7 +3017,22 @@ fn process_file(
     let mut transaction = AtomicOutput::new(output)?;
     write_audio_to_file(transaction.file_mut(), format, &audio, encode)?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
+        denoize::metadata::write_extended_to_file_with_limits(
+            metadata,
+            transaction.file_mut(),
+            metadata_limits,
+        )?;
+    }
+    let staged_bytes = transaction
+        .file_mut()
+        .metadata()
+        .map_err(|error| format!("一時出力のサイズを確認できません: {error}"))?
+        .len();
+    if staged_bytes > worker_request.temporary_bytes() {
+        return Err(format!(
+            "一時出力が予約量を超えました: {staged_bytes} > {} bytes",
+            worker_request.temporary_bytes()
+        ));
     }
     progress(4, "出力を確定しています");
     let commit_mode = if request.options.force {
@@ -2671,15 +3055,19 @@ fn stage_batch_output(
     metadata_policy: MetadataPolicy,
     processing: &service::ResolvedProcessingOptions,
     backend_session: &BackendSession,
+    decode_limits: DecodeLimits,
+    metadata_limits: MetadataLimits,
+    temporary_reservation_bytes: u64,
     control: &JobControl,
 ) -> Result<AtomicOutput, String> {
     check_cancelled(control)?;
+    let mut input_session = denoize::AudioInputSession::open(input)?;
+    let mut audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)?;
     let metadata = if metadata_policy == MetadataPolicy::Preserve {
-        denoize::metadata::read_extended(input)?
+        input_session.read_metadata_with_limits(metadata_limits)?
     } else {
         None
     };
-    let mut audio = read_audio(input)?;
     format.validate_config(&audio, &encode)?;
     check_cancelled(control)?;
     service::process_audio_resolved_with_session(&mut audio, processing, backend_session)?;
@@ -2694,7 +3082,21 @@ fn stage_batch_output(
     let mut transaction = AtomicOutput::new(output)?;
     write_audio_to_file(transaction.file_mut(), format, &audio, encode)?;
     if let Some(metadata) = metadata {
-        denoize::metadata::write_extended_to_file(metadata, transaction.file_mut())?;
+        denoize::metadata::write_extended_to_file_with_limits(
+            metadata,
+            transaction.file_mut(),
+            metadata_limits,
+        )?;
+    }
+    let staged_bytes = transaction
+        .file_mut()
+        .metadata()
+        .map_err(|error| format!("一時出力のサイズを確認できません: {error}"))?
+        .len();
+    if staged_bytes > temporary_reservation_bytes {
+        return Err(format!(
+            "一時出力が予約量を超えました: {staged_bytes} > {temporary_reservation_bytes} bytes"
+        ));
     }
     Ok(transaction)
 }
@@ -3057,6 +3459,10 @@ mod tests {
             accelerator: "cpu".into(),
             deterministic: false,
             seed: None,
+            max_process_memory_mb: None,
+            max_temporary_mb: None,
+            max_gpu_memory_mb: None,
+            max_gpu_jobs: 1,
         }
     }
 
@@ -3082,6 +3488,10 @@ mod tests {
             sgmse_profile: "balanced".into(),
             accelerator: "cpu".into(),
             deterministic: false,
+            max_process_memory_mb: None,
+            max_temporary_mb: None,
+            max_gpu_memory_mb: None,
+            max_gpu_jobs: 1,
         }
     }
 
@@ -3219,6 +3629,9 @@ deterministic = false
             item.prepared.metadata_policy,
             &item.prepared.processing,
             &item.prepared.backend_session,
+            item.prepared.decode_limits,
+            item.prepared.metadata_limits,
+            item.prepared.resource_request.temporary_bytes(),
             &control,
         )?;
         verify_prepared_batch_recipe(&item.prepared)?;
@@ -3568,6 +3981,24 @@ deterministic = false
             .contains("並列数"));
         assert!(!Path::new(&batch.output_dir).exists());
         assert!(state.jobs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_and_live_registration_share_one_atomic_operation_slot() {
+        let state = AppState::default();
+        let running = Arc::new(AtomicBool::new(true));
+        register_live_session(&state, Arc::clone(&running)).unwrap();
+        let file_error = register_job(&state)
+            .err()
+            .expect("a live session must exclude a file job");
+        assert!(file_error.contains("ライブ処理を停止"));
+
+        *state.live.lock().unwrap() = None;
+        let (job_id, _) = register_job(&state).unwrap();
+        assert!(register_live_session(&state, running)
+            .unwrap_err()
+            .contains("ファイル処理の完了後"));
+        state.jobs.lock().unwrap().remove(&job_id);
     }
 
     #[test]
