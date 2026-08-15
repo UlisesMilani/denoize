@@ -193,6 +193,8 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <label>サラウンド出力<select id="downmix"><option value="preserve" selected>レイアウトを保持（非対応時は停止）</option><option value="stereo">明示的にステレオへダウンミックス</option></select></label>
               <div class="form-grid two"><label>MP3 kbps<input id="mp3-bitrate" type="number" value="192" min="32"></label><label>AAC kbps<input id="aac-bitrate" type="number" value="192" min="32"></label></div>
               <label>AACエンコーダー<select id="aac-encoder"><option value="oxide">OxideAV</option></select></label>
+              <div class="toggle-grid"><label class="toggle"><input id="file-stream" type="checkbox"><span></span><div><b>長時間ストリーム</b><small>WAV / FLAC / Ogg Vorbis → WAV</small></div></label><label class="toggle"><input id="file-stream-resume" type="checkbox" disabled><span></span><div><b>中断から再開</b><small>耐久チェックポイントを使用</small></div></label></div>
+              <label>ストリームブロック frames<input id="file-stream-frames" type="number" value="8192" min="1" max="1048576" disabled></label>
               <label class="toggle inline"><input id="loudness-enabled" type="checkbox"><span></span><div><b>ラウドネス正規化</b></div></label>
               <div class="form-grid two muted-fields" id="loudness-fields"><label>目標 LUFS<input id="loudness" type="number" value="-16" min="-70" max="0" step="0.5"></label><label>True Peak<input id="true-peak" type="number" value="-1" min="-20" max="0" step="0.1"></label></div>
               <div class="preset-manager"><label>ユーザープリセット<select id="user-preset"><option value="">プリセットを選択</option></select></label><div><input id="preset-name" placeholder="プリセット名"><button id="save-preset">保存</button><button id="delete-preset">削除</button></div></div>
@@ -287,7 +289,7 @@ const errorText = (error: unknown) => error instanceof Error ? error.message : S
 const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
-const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
+const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
 type SavedValues = Record<string, string | number | boolean>;
 
 function captureSettings(): SavedValues {
@@ -329,7 +331,7 @@ function commitSettings(updates: SettingUpdate[]) {
   $("#loudness-fields").classList.toggle("enabled", $<HTMLInputElement>("#loudness-enabled").checked);
   const modelPath = $<HTMLInputElement>("#model-path").value || null;
   setPath("#model-path", "#model-path-display", modelPath);
-  updateBackendSettings(); renderBatch();
+  updateBackendSettings(); updateFileStreamSettings(); renderBatch();
 }
 
 function applySettings(values: Record<string, unknown>) { commitSettings(planSettings(values)); }
@@ -501,6 +503,7 @@ async function init() {
   await loadLiveDevices();
   restoreSettings();
   updateBackendSettings();
+  updateFileStreamSettings();
   renderCompareInputs();
   await loadModels();
   window.setTimeout(() => void checkForUpdate(false), 1500);
@@ -676,11 +679,27 @@ async function defaultOutput(input: string) {
 $("#strength").addEventListener("input", (event) => $("#strength-value").textContent = `${Math.round(Number((event.target as HTMLInputElement).value) * 100)}%`);
 $("#loudness-enabled").addEventListener("change", (event) => $("#loudness-fields").classList.toggle("enabled", (event.target as HTMLInputElement).checked));
 
+function updateFileStreamSettings() {
+  const enabled = $<HTMLInputElement>("#file-stream").checked;
+  $<HTMLInputElement>("#file-stream-resume").disabled = !enabled;
+  $<HTMLInputElement>("#file-stream-frames").disabled = !enabled;
+}
+
+$("#file-stream").addEventListener("change", updateFileStreamSettings);
+
 $("#start-process").addEventListener("click", async () => {
   try {
     const input = $<HTMLInputElement>("#input-path").value, output = $<HTMLInputElement>("#output-path").value;
     if (!input || !output) throw new Error("入力と出力を選択してください");
-    await beginJob("file", "start_process", { input, output, options: options() });
+    const stream = $<HTMLInputElement>("#file-stream").checked;
+    await beginJob("file", "start_process", {
+      input,
+      output,
+      stream,
+      resume: stream && $<HTMLInputElement>("#file-stream-resume").checked,
+      streamFrames: Number($<HTMLInputElement>("#file-stream-frames").value),
+      options: options(),
+    });
   } catch (error) { showToast(errorText(error), true); }
 });
 $("#cancel-process").addEventListener("click", () => cancelActive());

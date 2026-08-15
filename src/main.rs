@@ -2,9 +2,8 @@
 
 use denoize::audio::{
     ensure_memory_limit, estimate_audio_working_set_bytes, estimate_session_memory_bytes,
-    estimate_stream_memory_bytes_checked, inspect_wav_session, read_audio,
-    read_audio_from_session_with_limits, read_wav_bytes_with_limits, write_wav_bytes,
-    write_wav_channel_mask_to_file, WavStreamReader, WavStreamWriter,
+    estimate_stream_memory_bytes_checked, read_audio, read_audio_from_session_with_limits,
+    read_wav_bytes_with_limits, write_wav_bytes, write_wav_channel_mask_to_file, WavStreamWriter,
 };
 use denoize::batch_resume::{
     self, BatchSession, ConsumedModel, Digest, FileFingerprint, MetadataPolicy, ResumeDecision,
@@ -13,8 +12,9 @@ use denoize::batch_resume::{
 };
 use denoize::config::{MAX_SAMPLE_RATE, MAX_STREAM_BLOCK_FRAMES};
 use denoize::decode::{
+    inspect_audio_stream_session,
     probe_file_from_session_with_limits as probe_audio_session_with_limits, AudioCodec,
-    AudioFormat, AudioProbe, DecodeLimits,
+    AudioFormat, AudioProbe, AudioStreamReader, DecodeLimits,
 };
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::metadata::MetadataLimits;
@@ -34,6 +34,7 @@ use std::time::Instant;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_BLOCK_FRAMES: usize = 8192;
+const STREAM_CHECKPOINT_FRAMES: u64 = 1_048_576;
 const MIN_STREAM_BLOCK_FRAMES: usize = 1;
 const MIN_LIVE_CHUNK_MS: u32 = 10;
 const MAX_LIVE_CHUNK_MS: u32 = 2_000;
@@ -48,6 +49,39 @@ const ISOLATED_CHILD_ENV: &str = "DENOIZE_INTERNAL_ISOLATED_CHILD";
 #[cfg(windows)]
 const ISOLATION_GATE_ENV: &str = "DENOIZE_INTERNAL_ISOLATION_GATE";
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STREAM_CHECKPOINT_FRAMES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_STOP_AFTER_STREAM_CHECKPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_STOP_AFTER_STREAM_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn stream_checkpoint_frames() -> u64 {
+    #[cfg(test)]
+    if let Some(frames) = TEST_STREAM_CHECKPOINT_FRAMES.with(std::cell::Cell::get) {
+        return frames;
+    }
+    STREAM_CHECKPOINT_FRAMES
+}
+
+fn injected_stop_after_stream_checkpoint() -> bool {
+    #[cfg(test)]
+    {
+        return TEST_STOP_AFTER_STREAM_CHECKPOINT.with(|value| value.replace(false));
+    }
+    #[cfg(not(test))]
+    false
+}
+
+fn injected_stop_after_stream_commit() -> bool {
+    #[cfg(test)]
+    {
+        return TEST_STOP_AFTER_STREAM_COMMIT.with(|value| value.replace(false));
+    }
+    #[cfg(not(test))]
+    false
+}
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
 fn with_batch_publication_fence<T>(
@@ -358,7 +392,7 @@ OPTIONS:
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
-        --stream              bounded-memory stateful WAV-to-WAV processing
+        --stream              bounded-memory WAV/FLAC/Vorbis-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --max-process-memory <MB> aggregate denoize RAM reservations across workers (min: 1)
@@ -370,7 +404,7 @@ OPTIONS:
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
-        --resume              verify and skip exact outputs recorded by v3 batch state
+        --resume              resume a stream checkpoint or verify exact v3 batch outputs
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork/chapters to the output
@@ -1797,6 +1831,9 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_compare(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
+    if ov.resume && !ov.batch && !ov.stream {
+        return Err("--resume requires --batch or --stream".into());
+    }
     if ov.isolate && std::env::var_os(ISOLATED_CHILD_ENV).is_none() {
         return run_isolated(args, &ov);
     }
@@ -2515,12 +2552,109 @@ fn process_one_to_staged_output(
     }
 }
 
+fn stream_temporary_reservation_bytes(
+    info: denoize::AudioStreamInfo,
+    configured_limit: Option<u64>,
+    checkpointed: bool,
+    metadata_allowance_bytes: u64,
+) -> Result<u64, String> {
+    const MAX_WAV_FILE_BYTES: u64 = u32::MAX as u64 + 8;
+    let Some(frames) = info.total_frames else {
+        // Ogg does not expose the terminal granule until packets have been
+        // consumed. Reserve the complete configured temporary budget when it
+        // is finite; without a cap, reserve the largest RIFF file that the
+        // writer can ever publish.
+        if let Some(limit) = configured_limit {
+            return Ok(limit);
+        }
+        if !checkpointed {
+            return Ok(MAX_WAV_FILE_BYTES);
+        }
+        let data_limit = MAX_WAV_FILE_BYTES.saturating_sub(68);
+        let output_sample_bytes = u64::from(info.output_spec.bits_per_sample / 8);
+        let max_samples = data_limit / output_sample_bytes;
+        let spool_bytes = max_samples
+            .checked_mul(std::mem::size_of::<f64>() as u64)
+            .ok_or_else(|| "stream checkpoint spool reservation overflows".to_string())?;
+        return MAX_WAV_FILE_BYTES
+            .checked_add(spool_bytes)
+            .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string());
+    };
+    let bytes_per_sample = u64::from(info.output_spec.bits_per_sample / 8);
+    let data_bytes = frames
+        .checked_mul(u64::from(info.output_spec.channels))
+        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .ok_or_else(|| "stream output byte count overflows".to_string())?;
+    let file_bytes = data_bytes
+        .checked_add(68)
+        .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
+        .ok_or_else(|| "stream output file size overflows".to_string())?;
+    if file_bytes > MAX_WAV_FILE_BYTES {
+        return Err(format!(
+            "streamed WAV would require {file_bytes} bytes, exceeding the RIFF container limit"
+        ));
+    }
+    if !checkpointed {
+        return Ok(file_bytes);
+    }
+    let spool_bytes = frames
+        .checked_mul(u64::from(info.output_spec.channels))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+        .ok_or_else(|| "stream checkpoint spool reservation overflows".to_string())?;
+    file_bytes
+        .checked_add(spool_bytes)
+        .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string())
+}
+
+fn replay_stream_checkpoint(
+    reader: &mut AudioStreamReader,
+    processor: &mut StreamingBackendSession,
+    block_frames: usize,
+    checkpoint: batch_resume::StreamCheckpoint,
+    channels: usize,
+) -> Result<u64, String> {
+    let mut digest = batch_resume::StreamPcmDigest::new(channels)?;
+    let mut input_frames = 0_u64;
+    while input_frames < checkpoint.input_frames() {
+        if CANCELLED.load(Ordering::Relaxed) {
+            return Err(
+                "streaming cancelled during checkpoint replay; checkpoint preserved".into(),
+            );
+        }
+        let block = reader
+            .next_block(block_frames)?
+            .ok_or_else(|| "stream checkpoint extends beyond the input".to_string())?;
+        let frames = block.first().map(Vec::len).unwrap_or(0) as u64;
+        let next = input_frames
+            .checked_add(frames)
+            .ok_or_else(|| "stream replay frame count overflows".to_string())?;
+        if next > checkpoint.input_frames() {
+            return Err(
+                "stream checkpoint is not aligned to the configured decoder block boundary".into(),
+            );
+        }
+        let enhanced = processor.process_block(&block)?;
+        digest.update(&enhanced)?;
+        input_frames = next;
+    }
+    if digest.frames() != checkpoint.output_frames()
+        || digest.len() != checkpoint.spool_len()
+        || digest.digest() != checkpoint.spool_digest()
+    {
+        return Err(
+            "replayed stream state does not match the durable checkpoint; use --force to restart"
+                .into(),
+        );
+    }
+    Ok(input_frames)
+}
+
 fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
     let resource_governor = resource_governor(&ov, 1)?;
     let effective_memory_mb = effective_input_memory_mb(&ov);
     if input == "-" || output == "-" {
-        return Err("--stream requires filesystem WAV input and output paths".into());
+        return Err("--stream requires filesystem audio input and WAV output paths".into());
     }
     let input_path = std::path::Path::new(input);
     let output_path = std::path::Path::new(output);
@@ -2530,8 +2664,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             .map(|extension| extension.eq_ignore_ascii_case("wav"))
             .unwrap_or(false)
     };
-    if !is_wav(input_path) || !is_wav(output_path) {
-        return Err("--stream currently supports WAV-to-WAV paths only".into());
+    if !is_wav(output_path) {
+        return Err("--stream currently requires a WAV output path".into());
     }
     let backend = if ov.auto_backend {
         service::select_live_backend()
@@ -2557,11 +2691,16 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         backend_options.accelerator,
         backend_options.deterministic,
     )?;
-    ensure_output_available(output_path, ov.force)?;
+    if !ov.resume {
+        ensure_output_available(output_path, ov.force)?;
+    }
 
     let mut input_session = AudioInputSession::open(input_path)?;
-    let stream_info = inspect_wav_session(&mut input_session)?;
-    let spec = stream_info.spec;
+    let effective_memory_bytes = effective_input_memory_limit_bytes(&ov)?;
+    let initial_metadata_limits = metadata_limits_for_available_bytes(effective_memory_bytes);
+    let initial_decode_limits = DecodeLimits::new(initial_metadata_limits, effective_memory_bytes);
+    let stream_info = inspect_audio_stream_session(&mut input_session, initial_decode_limits)?;
+    let spec = stream_info.output_spec;
     let channel_mask = stream_info.channel_mask;
     validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
@@ -2581,18 +2720,53 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         backend_options.channel_mode,
     )
     .map_err(|error| error.to_string())?;
+    let checkpoint_scratch = if ov.resume {
+        batch_resume::STREAM_CHECKPOINT_SCRATCH_BYTES
+    } else {
+        0
+    };
+    let initial_stream_working_set = base_stream_working_set
+        .checked_add(backend_stream_state)
+        .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
+        .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
+    ensure_memory_limit(
+        initial_stream_working_set,
+        effective_memory_mb,
+        "streaming working set",
+    )?;
+    let metadata_limits =
+        retained_metadata_limits(effective_memory_mb, initial_stream_working_set)?;
+    let decode_limits = DecodeLimits::new(metadata_limits, effective_memory_bytes);
+    let final_stream_info = inspect_audio_stream_session(&mut input_session, decode_limits)?;
+    if final_stream_info.format != stream_info.format
+        || final_stream_info.codec != stream_info.codec
+        || final_stream_info.output_spec != stream_info.output_spec
+        || final_stream_info.channel_mask != stream_info.channel_mask
+        || final_stream_info.total_frames != stream_info.total_frames
+        || final_stream_info.max_decoder_frames != stream_info.max_decoder_frames
+    {
+        return Err("stream input geometry changed during preflight".into());
+    }
+    let stream_info = final_stream_info;
     let stream_working_set = base_stream_working_set
         .checked_add(backend_stream_state)
+        .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
         .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
     ensure_memory_limit(
         stream_working_set,
         effective_memory_mb,
         "streaming working set",
     )?;
-    let metadata_limits = retained_metadata_limits(effective_memory_mb, stream_working_set)?;
     if ov.report {
+        if ov.resume {
+            ensure_output_available(output_path, ov.force)?;
+        }
         println!(
-            "input      : {input}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\naccelerator: {}\nstream     : enabled ({} frames/block)",
+            "input      : {input}\ncontainer  : {:?} / {:?}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\naccelerator: {}\nstream     : enabled ({} frames/block)",
+            stream_info.format,
+            stream_info.codec,
             spec.channels,
             spec.sample_rate,
             spec.bits_per_sample,
@@ -2603,6 +2777,41 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         );
         return Ok(());
     }
+
+    let resume_identity = if ov.resume {
+        let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
+        let resolved = service::ResolvedProcessingOptions {
+            backend,
+            denoiser: cfg.clone(),
+            backend_options: backend_options.clone(),
+            accelerator,
+            loudness_lufs: None,
+            true_peak_dbtp: -1.0,
+        };
+        resolved.validate_config()?;
+        let model = match batch_resume::consumed_model_config(&resolved)? {
+            Some(config) => Some(batch_resume::fingerprint_resumable_model(config)?),
+            None => None,
+        };
+        let base_recipe = batch_resume::recipe_digest(
+            &resolved,
+            spec.channels as usize,
+            OutputFormat::Wav,
+            EncodeOptions::default(),
+            if ov.no_metadata {
+                MetadataPolicy::Drop
+            } else {
+                MetadataPolicy::Preserve
+            },
+            model
+                .as_ref()
+                .map(|model| (&model.fingerprint, model.sample_rate)),
+        )?;
+        let recipe = batch_resume::stream_recipe_digest(base_recipe, block_frames, stream_info)?;
+        Some((input_fingerprint, recipe, model))
+    } else {
+        None
+    };
 
     let metadata = if !ov.no_metadata {
         input_session.read_metadata_with_limits(metadata_limits)?
@@ -2617,10 +2826,12 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         .checked_add(metadata_bytes)
         .ok_or_else(|| "streaming memory reservation overflow".to_string())?;
 
-    let temporary_bytes = input_session
-        .len()
-        .checked_add(BYTES_PER_MIB)
-        .ok_or_else(|| "streaming temporary reservation overflow".to_string())?;
+    let temporary_bytes = stream_temporary_reservation_bytes(
+        stream_info,
+        resource_governor.limits().max_temporary_bytes(),
+        ov.resume,
+        metadata_bytes,
+    )?;
     let mut worker_request = ResourceRequest::worker(worker_memory_bytes, temporary_bytes);
     if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
         worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
@@ -2648,46 +2859,185 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         accelerator,
     )?;
     debug_assert_eq!(processor.accelerator(), accelerator);
-    let mut reader = WavStreamReader::from_session(input_session)?;
-    let mut transaction = AtomicOutput::new(output_path)?;
-    let frames = (|| -> Result<usize, String> {
-        let sink = std::io::BufWriter::new(transaction.file_mut());
-        let mut writer = WavStreamWriter::from_sink(sink, spec)?;
-        let mut frames = 0usize;
-        while let Some(block) = reader.next_block(block_frames)? {
-            let block_frames = block.first().map(Vec::len).unwrap_or(0);
-            let enhanced = processor.process_block(&block)?;
-            writer.write_block(&enhanced)?;
-            frames = frames.saturating_add(block_frames);
-        }
-        let tail = processor.finish()?;
-        writer.write_block(&tail)?;
-        writer.finalize()?;
-        Ok(frames)
-    })()?;
-    write_wav_channel_mask_to_file(transaction.file_mut(), spec.channels as usize, channel_mask)?;
-    if let Some(metadata) = metadata {
-        denoize::metadata::write_extended_to_file_with_limits(
-            metadata,
-            transaction.file_mut(),
-            metadata_limits,
-        )?;
-    }
-    let staged_bytes = transaction
-        .file_mut()
-        .metadata()
-        .map_err(|error| format!("inspect staged stream output: {error}"))?
-        .len();
-    if staged_bytes > temporary_bytes {
-        return Err(format!(
-            "staged stream output requires {staged_bytes} bytes, exceeding its {temporary_bytes}-byte temporary reservation"
-        ));
-    }
-    transaction.commit(if ov.force {
+    let mut reader = AudioStreamReader::from_session(input_session, decode_limits)?;
+    let commit_mode = if ov.force {
         CommitMode::Replace
     } else {
         CommitMode::NoClobber
-    })?;
+    };
+    let frames = if let Some((input_fingerprint, recipe, model)) = resume_identity {
+        if let Some(model) = model.as_ref() {
+            let current = batch_resume::fingerprint_file(&model.path)?;
+            if current != model.fingerprint {
+                return Err(format!(
+                    "selected streaming model changed while it was prepared: {}",
+                    model.path.display()
+                ));
+            }
+        }
+        let acquired = batch_resume::StreamCheckpointSession::acquire(
+            output_path,
+            input_fingerprint,
+            recipe,
+            spec,
+            block_frames,
+            Some(temporary_bytes),
+            ov.force,
+        )?;
+        match acquired {
+            batch_resume::StreamCheckpointAcquire::Completed(completed) => {
+                usize::try_from(completed.input_frames())
+                    .map_err(|_| "streaming frame count does not fit this platform".to_string())?
+            }
+            batch_resume::StreamCheckpointAcquire::Active(mut checkpoint, loaded) => {
+                let mut input_frames = match loaded {
+                    Some(saved) => replay_stream_checkpoint(
+                        &mut reader,
+                        &mut processor,
+                        block_frames,
+                        saved,
+                        spec.channels as usize,
+                    )?,
+                    None => 0,
+                };
+                let checkpoint_frames = stream_checkpoint_frames();
+                let mut next_checkpoint = input_frames
+                    .checked_div(checkpoint_frames)
+                    .and_then(|multiple| multiple.checked_add(1))
+                    .and_then(|multiple| multiple.checked_mul(checkpoint_frames))
+                    .unwrap_or(u64::MAX);
+                while let Some(block) = reader.next_block(block_frames)? {
+                    if CANCELLED.load(Ordering::Relaxed) {
+                        return Err("streaming cancelled; checkpoint preserved".into());
+                    }
+                    let decoded_frames = block.first().map(Vec::len).unwrap_or(0) as u64;
+                    let enhanced = processor.process_block(&block)?;
+                    checkpoint.append_block(&enhanced)?;
+                    input_frames = input_frames
+                        .checked_add(decoded_frames)
+                        .ok_or_else(|| "streaming input frame count overflows".to_string())?;
+                    if input_frames >= next_checkpoint {
+                        checkpoint.checkpoint(input_frames)?;
+                        if injected_stop_after_stream_checkpoint() {
+                            return Err("injected stop after durable stream checkpoint".into());
+                        }
+                        next_checkpoint = input_frames
+                            .checked_div(checkpoint_frames)
+                            .and_then(|multiple| multiple.checked_add(1))
+                            .and_then(|multiple| multiple.checked_mul(checkpoint_frames))
+                            .unwrap_or(u64::MAX);
+                    }
+                }
+                let tail = processor.finish()?;
+                checkpoint.append_block(&tail)?;
+                let final_fingerprint = reader.fingerprint_input()?;
+                if final_fingerprint != input_fingerprint {
+                    return Err(
+                        "stream input changed while it was being processed; checkpoint preserved"
+                            .into(),
+                    );
+                }
+
+                checkpoint.prepare_spool_read()?;
+                let mut transaction = AtomicOutput::new(output_path)?;
+                {
+                    let sink = std::io::BufWriter::new(transaction.file_mut());
+                    let mut writer = WavStreamWriter::from_sink(sink, spec)?;
+                    while let Some(block) = checkpoint.next_spool_block(block_frames)? {
+                        writer.write_block(&block)?;
+                    }
+                    writer.finalize()?;
+                }
+                write_wav_channel_mask_to_file(
+                    transaction.file_mut(),
+                    spec.channels as usize,
+                    channel_mask,
+                )?;
+                if let Some(metadata) = metadata {
+                    denoize::metadata::write_extended_to_file_with_limits(
+                        metadata,
+                        transaction.file_mut(),
+                        metadata_limits,
+                    )?;
+                }
+                let staged_bytes = transaction
+                    .file_mut()
+                    .metadata()
+                    .map_err(|error| format!("inspect staged stream output: {error}"))?
+                    .len();
+                let combined_bytes = staged_bytes
+                    .checked_add(checkpoint.spool_len())
+                    .ok_or_else(|| {
+                        "stream checkpoint temporary byte count overflows".to_string()
+                    })?;
+                if combined_bytes > temporary_bytes {
+                    return Err(format!(
+                        "checkpoint spool and staged output require {combined_bytes} bytes, exceeding their {temporary_bytes}-byte temporary reservation"
+                    ));
+                }
+                let output_fingerprint =
+                    batch_resume::fingerprint_open_file_at(transaction.file_mut(), output_path)?;
+                checkpoint.prepare_publish(input_frames, output_fingerprint)?;
+                transaction.commit(commit_mode)?;
+                if injected_stop_after_stream_commit() {
+                    return Err("injected stop after committed stream output".into());
+                }
+                if let Err(error) = checkpoint.cleanup() {
+                    eprintln!(
+                        "denoize: warning: output committed but checkpoint cleanup failed: {error}"
+                    );
+                }
+                usize::try_from(input_frames)
+                    .map_err(|_| "streaming frame count does not fit this platform".to_string())?
+            }
+        }
+    } else {
+        let mut transaction = AtomicOutput::new(output_path)?;
+        let frames = (|| -> Result<usize, String> {
+            let sink = std::io::BufWriter::new(transaction.file_mut());
+            let mut writer = WavStreamWriter::from_sink(sink, spec)?;
+            let mut frames = 0usize;
+            while let Some(block) = reader.next_block(block_frames)? {
+                if CANCELLED.load(Ordering::Relaxed) {
+                    return Err("streaming cancelled".into());
+                }
+                let block_frames = block.first().map(Vec::len).unwrap_or(0);
+                let enhanced = processor.process_block(&block)?;
+                writer.write_block(&enhanced)?;
+                frames = frames
+                    .checked_add(block_frames)
+                    .ok_or_else(|| "streaming frame count overflows".to_string())?;
+            }
+            let tail = processor.finish()?;
+            writer.write_block(&tail)?;
+            writer.finalize()?;
+            Ok(frames)
+        })()?;
+        write_wav_channel_mask_to_file(
+            transaction.file_mut(),
+            spec.channels as usize,
+            channel_mask,
+        )?;
+        if let Some(metadata) = metadata {
+            denoize::metadata::write_extended_to_file_with_limits(
+                metadata,
+                transaction.file_mut(),
+                metadata_limits,
+            )?;
+        }
+        let staged_bytes = transaction
+            .file_mut()
+            .metadata()
+            .map_err(|error| format!("inspect staged stream output: {error}"))?
+            .len();
+        if staged_bytes > temporary_bytes {
+            return Err(format!(
+                "staged stream output requires {staged_bytes} bytes, exceeding its {temporary_bytes}-byte temporary reservation"
+            ));
+        }
+        transaction.commit(commit_mode)?;
+        frames
+    };
     if ov.json {
         println!(
             "{}",
@@ -4259,6 +4609,7 @@ mod auto_backend_tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
+    use base64::Engine as _;
     #[cfg(feature = "gtcrn")]
     use prost::Message;
     #[cfg(feature = "gtcrn")]
@@ -4266,6 +4617,27 @@ mod streaming_tests {
         tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
         OperatorSetIdProto, TensorShapeProto, TypeProto, ValueInfoProto,
     };
+
+    struct ResetCheckpointHooks;
+
+    impl Drop for ResetCheckpointHooks {
+        fn drop(&mut self) {
+            TEST_STREAM_CHECKPOINT_FRAMES.with(|value| value.set(None));
+            TEST_STOP_AFTER_STREAM_CHECKPOINT.with(|value| value.set(false));
+            TEST_STOP_AFTER_STREAM_COMMIT.with(|value| value.set(false));
+        }
+    }
+
+    fn stop_after_checkpoint(interval_frames: u64) -> ResetCheckpointHooks {
+        TEST_STREAM_CHECKPOINT_FRAMES.with(|value| value.set(Some(interval_frames)));
+        TEST_STOP_AFTER_STREAM_CHECKPOINT.with(|value| value.set(true));
+        ResetCheckpointHooks
+    }
+
+    fn stop_after_stream_commit() -> ResetCheckpointHooks {
+        TEST_STOP_AFTER_STREAM_COMMIT.with(|value| value.set(true));
+        ResetCheckpointHooks
+    }
 
     #[test]
     fn parses_stream_option() {
@@ -4282,6 +4654,18 @@ mod streaming_tests {
         assert!(options.stream);
         assert_eq!(options.stream_frames, Some(4096));
         assert_eq!(options.max_memory_mb, Some(64));
+    }
+
+    #[test]
+    fn resume_requires_batch_or_stream_before_input_io() {
+        let error = run(&[
+            "missing-input.wav".into(),
+            "unused-output.wav".into(),
+            "--resume".into(),
+            "--isolate".into(),
+        ])
+        .expect_err("standalone resume must be rejected before isolation or input I/O");
+        assert_eq!(error, "--resume requires --batch or --stream");
     }
 
     #[test]
@@ -4377,6 +4761,240 @@ mod streaming_tests {
         assert_eq!(result.channels(), 1);
         assert_eq!(result.frames(), 20_000);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn streams_flac_to_atomic_wav() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.flac");
+        let output = root.path().join("output.wav");
+        let frames = 12_345;
+        let audio = denoize::Audio {
+            sample_rate: 24_000,
+            channels: vec![(0..frames)
+                .map(|frame| (frame as f64 * 0.03).sin() * 0.4)
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                stream_frames: Some(131),
+                max_memory_mb: Some(32),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let result = read_audio(&output).unwrap();
+        assert_eq!(result.sample_rate, audio.sample_rate);
+        assert_eq!(result.channels(), 1);
+        assert_eq!(result.frames(), frames);
+    }
+
+    #[test]
+    fn resumes_flac_stream_from_a_durable_checkpoint_byte_exactly() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.flac");
+        let resumed_output = root.path().join("resumed.wav");
+        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        let frames = 2_000;
+        let audio = denoize::Audio {
+            sample_rate: 24_000,
+            channels: vec![(0..frames)
+                .map(|frame| {
+                    let phase = frame as f64 * 0.041;
+                    phase.sin() * 0.35 + (phase * 0.37).cos() * 0.08
+                })
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(73),
+            max_memory_mb: Some(32),
+            ..Overrides::default()
+        };
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected stop after durable stream checkpoint"));
+        assert!(!resumed_output.exists());
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
+            .expect("resolve checkpoint sidecars");
+        assert!(state.exists());
+        assert!(spool.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        assert!(!state.exists());
+        assert!(!spool.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            uninterrupted_output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(73),
+                max_memory_mb: Some(32),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&resumed_output).unwrap(),
+            std::fs::read(&uninterrupted_output).unwrap()
+        );
+    }
+
+    #[test]
+    fn reconciles_a_committed_stream_after_cleanup_was_interrupted() {
+        let _reset = stop_after_stream_commit();
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.flac");
+        let output = root.path().join("output.wav");
+        let frames = 1_111;
+        let audio = denoize::Audio {
+            sample_rate: 24_000,
+            channels: vec![(0..frames)
+                .map(|frame| (frame as f64 * 0.029).sin() * 0.3)
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: None,
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(97),
+            max_memory_mb: Some(32),
+            ..Overrides::default()
+        };
+
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected stop after committed stream output"));
+        let published = std::fs::read(&output).unwrap();
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&output).unwrap();
+        assert!(state.exists());
+        assert!(spool.exists());
+
+        run_streaming_wav(input.to_str().unwrap(), output.to_str().unwrap(), options).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), published);
+        assert!(!state.exists());
+        assert!(!spool.exists());
+        assert_eq!(read_audio(&output).unwrap().frames(), frames);
+    }
+
+    #[test]
+    fn streams_ogg_vorbis_to_atomic_wav() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.ogg");
+        let output = root.path().join("output.wav");
+        let encoded = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("decode/testdata/tiny-vorbis.ogg.b64").trim())
+            .unwrap();
+        std::fs::write(&input, encoded).unwrap();
+        let expected = read_audio(&input).unwrap();
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                stream_frames: Some(73),
+                max_memory_mb: Some(32),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let result = read_audio(&output).unwrap();
+        assert_eq!(result.sample_rate, expected.sample_rate);
+        assert_eq!(result.channels(), expected.channels());
+        assert_eq!(result.frames(), expected.frames());
+    }
+
+    #[test]
+    fn resumes_ogg_vorbis_stream_from_a_durable_checkpoint_byte_exactly() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.ogg");
+        let resumed_output = root.path().join("resumed.wav");
+        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        let encoded = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("decode/testdata/tiny-vorbis.ogg.b64").trim())
+            .unwrap();
+        std::fs::write(&input, encoded).unwrap();
+
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(73),
+            max_memory_mb: Some(32),
+            ..Overrides::default()
+        };
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected stop after durable stream checkpoint"));
+        assert!(!resumed_output.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            uninterrupted_output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(73),
+                max_memory_mb: Some(32),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&resumed_output).unwrap(),
+            std::fs::read(&uninterrupted_output).unwrap()
+        );
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
+            .expect("resolve checkpoint sidecars");
+        assert!(!state.exists());
+        assert!(!spool.exists());
     }
 
     #[cfg(feature = "gtcrn")]

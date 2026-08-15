@@ -1,5 +1,6 @@
 use denoize::audio::{
-    estimate_audio_working_set_bytes, read_audio, read_audio_from_session_with_limits, write_audio,
+    estimate_audio_working_set_bytes, estimate_stream_memory_bytes_checked, read_audio,
+    read_audio_from_session_with_limits, write_audio, WavStreamWriter,
 };
 use denoize::batch_resume::{
     self, BatchSession, Digest, MetadataPolicy, ResumeDecision, ResumeExpectation,
@@ -11,14 +12,16 @@ use denoize::metadata::MetadataLimits;
 use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, AcceleratorPreference, AtomicOutput, Backend, BackendOptions, BackendSession,
-    ChannelMode, CommitMode, DecodeLimits, DownmixMode, EncodeOptions, OnnxModelConfig,
-    OutputFormat, ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile,
+    AacEncoder, AcceleratorPreference, AtomicOutput, AudioStreamInfo, AudioStreamReader, Backend,
+    BackendOptions, BackendSession, ChannelMode, CommitMode, DecodeLimits, DownmixMode,
+    EncodeOptions, OnnxModelConfig, OutputFormat, ResourceGovernor, ResourceLimits, ResourcePermit,
+    ResourceRequest, SgmseProfile, StreamingBackendSession,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +38,12 @@ const MIN_TRUE_PEAK_DBTP: f64 = -20.0;
 const MAX_TRUE_PEAK_DBTP: f64 = 0.0;
 const DEFAULT_MODEL_SAMPLE_RATE_HZ: u32 = 16_000;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const DEFAULT_STREAM_BLOCK_FRAMES: usize = 8_192;
+const STREAM_CHECKPOINT_FRAMES: u64 = 1_048_576;
+
+const fn default_stream_block_frames() -> usize {
+    DEFAULT_STREAM_BLOCK_FRAMES
+}
 
 fn default_accelerator() -> String {
     "cpu".into()
@@ -311,6 +320,12 @@ impl GuiConfigPatch {
 struct ProcessRequest {
     input: String,
     output: String,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    resume: bool,
+    #[serde(default = "default_stream_block_frames")]
+    stream_frames: usize,
     options: ProcessOptions,
 }
 
@@ -908,7 +923,7 @@ fn start_process(
     state: State<'_, AppState>,
     request: ProcessRequest,
 ) -> Result<u64, String> {
-    validate_request(&request.input, &request.output, &request.options)?;
+    validate_request(&request)?;
     let (job_id, control) = register_job(&state)?;
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
@@ -2875,15 +2890,51 @@ fn ensure_output_available(path: &Path, force: bool) -> Result<(), String> {
     }
 }
 
-fn validate_request(input: &str, output: &str, options: &ProcessOptions) -> Result<(), String> {
-    validate_process_options(options)?;
-    let format = OutputFormat::from_path(Path::new(output))?;
-    format.validate_encoder(parse_aac_encoder(&options.aac_encoder)?)?;
-    preflight_explicit_backend_resources(options)?;
-    if !Path::new(input).is_file() {
+fn validate_request(request: &ProcessRequest) -> Result<(), String> {
+    validate_process_options(&request.options)?;
+    let format = OutputFormat::from_path(Path::new(&request.output))?;
+    if request.stream {
+        if format != OutputFormat::Wav {
+            return Err("長時間ストリームの出力形式はWAVにしてください".into());
+        }
+        if !(1..=denoize::config::MAX_STREAM_BLOCK_FRAMES).contains(&request.stream_frames) {
+            return Err(format!(
+                "ストリームブロックは1〜{} framesにしてください",
+                denoize::config::MAX_STREAM_BLOCK_FRAMES
+            ));
+        }
+        if request.options.vad {
+            return Err("長時間ストリームではVADを無効にしてください".into());
+        }
+        if request.options.loudness_lufs.is_some() {
+            return Err("長時間ストリームではラウドネス正規化を無効にしてください".into());
+        }
+        if request.options.downmix != "preserve" {
+            return Err("長時間ストリームではチャンネルレイアウトを保持してください".into());
+        }
+        if let Some(backend) = configured_backend(&request.options.backend)? {
+            if !StreamingBackendSession::supports(backend) {
+                return Err(format!(
+                    "バックエンド {} は長時間ストリームに対応していません",
+                    service::backend_name(backend)
+                ));
+            }
+        }
+    } else {
+        if request.resume {
+            return Err("単一ファイルの再開には長時間ストリームを有効にしてください".into());
+        }
+        format.validate_encoder(parse_aac_encoder(&request.options.aac_encoder)?)?;
+    }
+    preflight_explicit_backend_resources(&request.options)?;
+    if !Path::new(&request.input).is_file() {
         return Err("入力ファイルが存在しません".into());
     }
-    ensure_output_available(Path::new(output), options.force)
+    if request.resume {
+        Ok(())
+    } else {
+        ensure_output_available(Path::new(&request.output), request.options.force)
+    }
 }
 
 fn validated_processing_options(
@@ -2949,11 +3000,436 @@ fn desktop_worker_request(
     Ok(request)
 }
 
+fn desktop_stream_temporary_bytes(
+    info: AudioStreamInfo,
+    configured_limit: Option<u64>,
+    checkpointed: bool,
+    metadata_allowance_bytes: u64,
+) -> Result<u64, String> {
+    const MAX_WAV_FILE_BYTES: u64 = u32::MAX as u64 + 8;
+    let Some(frames) = info.total_frames else {
+        if let Some(limit) = configured_limit {
+            return Ok(limit);
+        }
+        if !checkpointed {
+            return Ok(MAX_WAV_FILE_BYTES);
+        }
+        let data_limit = MAX_WAV_FILE_BYTES.saturating_sub(68);
+        let output_sample_bytes = u64::from(info.output_spec.bits_per_sample / 8);
+        let max_samples = data_limit / output_sample_bytes;
+        let spool_bytes = max_samples
+            .checked_mul(std::mem::size_of::<f64>() as u64)
+            .ok_or_else(|| "ストリームチェックポイントの一時領域が大きすぎます".to_string())?;
+        return MAX_WAV_FILE_BYTES
+            .checked_add(spool_bytes)
+            .ok_or_else(|| "ストリームチェックポイントの一時領域が大きすぎます".to_string());
+    };
+    let data_bytes = frames
+        .checked_mul(u64::from(info.output_spec.channels))
+        .and_then(|samples| samples.checked_mul(u64::from(info.output_spec.bits_per_sample / 8)))
+        .ok_or_else(|| "ストリーム出力サイズが大きすぎます".to_string())?;
+    let file_bytes = data_bytes
+        .checked_add(68)
+        .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
+        .ok_or_else(|| "ストリーム出力サイズが大きすぎます".to_string())?;
+    if file_bytes > MAX_WAV_FILE_BYTES {
+        return Err("ストリーム出力がRIFF WAVのサイズ上限を超えます".into());
+    }
+    if !checkpointed {
+        return Ok(file_bytes);
+    }
+    let spool_bytes = frames
+        .checked_mul(u64::from(info.output_spec.channels))
+        .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+        .ok_or_else(|| "ストリームチェックポイントのPCMサイズが大きすぎます".to_string())?;
+    file_bytes
+        .checked_add(spool_bytes)
+        .ok_or_else(|| "ストリームチェックポイントの一時領域が大きすぎます".to_string())
+}
+
+fn replay_desktop_stream_checkpoint(
+    reader: &mut AudioStreamReader,
+    processor: &mut StreamingBackendSession,
+    block_frames: usize,
+    checkpoint: batch_resume::StreamCheckpoint,
+    channels: usize,
+    control: &JobControl,
+) -> Result<u64, String> {
+    let mut digest = batch_resume::StreamPcmDigest::new(channels)?;
+    let mut input_frames = 0_u64;
+    while input_frames < checkpoint.input_frames() {
+        check_cancelled(control)?;
+        let block = reader
+            .next_block(block_frames)?
+            .ok_or_else(|| "チェックポイントが入力音声の終端を超えています".to_string())?;
+        let frames = block.first().map(Vec::len).unwrap_or(0) as u64;
+        let next = input_frames
+            .checked_add(frames)
+            .ok_or_else(|| "ストリーム再生フレーム数が大きすぎます".to_string())?;
+        if next > checkpoint.input_frames() {
+            return Err("チェックポイントとデコーダーブロック境界が一致しません".into());
+        }
+        digest.update(&processor.process_block(&block)?)?;
+        input_frames = next;
+    }
+    if digest.frames() != checkpoint.output_frames()
+        || digest.len() != checkpoint.spool_len()
+        || digest.digest() != checkpoint.spool_digest()
+    {
+        return Err(
+            "再生したストリーム状態がチェックポイントと一致しません。上書きで再作成してください"
+                .into(),
+        );
+    }
+    Ok(input_frames)
+}
+
+fn process_stream_file(
+    request: &ProcessRequest,
+    control: &JobControl,
+    progress: impl Fn(usize, &'static str),
+) -> Result<ProcessFileResult, String> {
+    check_cancelled(control)?;
+    let input = Path::new(&request.input);
+    let output = Path::new(&request.output);
+    let maximum = checked_desktop_mib(request.options.max_process_memory_mb, "プロセスメモリ上限")?;
+    let mut input_session = denoize::AudioInputSession::open(input)?;
+    let initial_limits = desktop_decode_limits(&request.options)?;
+    let initial_info = denoize::inspect_audio_stream_session(&mut input_session, initial_limits)?;
+    let spec = initial_info.output_spec;
+    let channel_mask = initial_info.channel_mask;
+    let config = processing_config(&request.options, spec.sample_rate)?;
+    if config.vad {
+        return Err("長時間ストリームではVADを無効にしてください".into());
+    }
+    let backend =
+        configured_backend(&request.options.backend)?.unwrap_or_else(service::select_live_backend);
+    if !StreamingBackendSession::supports(backend) {
+        return Err(format!(
+            "バックエンド {} は長時間ストリームに対応していません",
+            service::backend_name(backend)
+        ));
+    }
+    let backend_options = resolve_gui_backend_options(backend, &request.options)?;
+    let accelerator = denoize::select_accelerator(
+        backend,
+        backend_options.accelerator,
+        backend_options.deterministic,
+    )?;
+    let base_working_set = estimate_stream_memory_bytes_checked(
+        spec.channels as usize,
+        request.stream_frames,
+        config.frame_size,
+        spec.sample_rate,
+        config.profile_ms,
+    )
+    .map_err(|error| error.to_string())?;
+    let backend_state = StreamingBackendSession::estimate_additional_bytes(
+        backend,
+        spec.sample_rate,
+        spec.channels as usize,
+        backend_options.channel_mode,
+    )
+    .map_err(|error| error.to_string())?;
+    let checkpoint_scratch = if request.resume {
+        batch_resume::STREAM_CHECKPOINT_SCRATCH_BYTES
+    } else {
+        0
+    };
+    let initial_working_set = base_working_set
+        .checked_add(backend_state)
+        .and_then(|bytes| bytes.checked_add(initial_info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
+        .ok_or_else(|| "ストリームのメモリ予約量が大きすぎます".to_string())?;
+    if maximum.is_some_and(|limit| initial_working_set > limit) {
+        return Err(format!(
+            "ストリームには{initial_working_set} bytes必要ですが、プロセスメモリ上限を超えます"
+        ));
+    }
+    let metadata_limits = desktop_retained_metadata_limits(maximum, initial_working_set);
+    let decode_limits = DecodeLimits::new(metadata_limits, maximum);
+    let info = denoize::inspect_audio_stream_session(&mut input_session, decode_limits)?;
+    if info.format != initial_info.format
+        || info.codec != initial_info.codec
+        || info.output_spec != initial_info.output_spec
+        || info.channel_mask != initial_info.channel_mask
+        || info.total_frames != initial_info.total_frames
+        || info.max_decoder_frames != initial_info.max_decoder_frames
+    {
+        return Err("事前検査中にストリーム入力形状が変化しました".into());
+    }
+    let working_set = base_working_set
+        .checked_add(backend_state)
+        .and_then(|bytes| bytes.checked_add(info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
+        .ok_or_else(|| "ストリームのメモリ予約量が大きすぎます".to_string())?;
+    if maximum.is_some_and(|limit| working_set > limit) {
+        return Err(format!(
+            "ストリームには{working_set} bytes必要ですが、プロセスメモリ上限を超えます"
+        ));
+    }
+
+    let resolved = service::ResolvedProcessingOptions {
+        backend,
+        denoiser: config.clone(),
+        backend_options: backend_options.clone(),
+        accelerator,
+        loudness_lufs: None,
+        true_peak_dbtp: -1.0,
+    };
+    resolved.validate_config()?;
+    let resume_identity = if request.resume {
+        let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
+        let model = match batch_resume::consumed_model_config(&resolved)? {
+            Some(config) => Some(batch_resume::fingerprint_resumable_model(config)?),
+            None => None,
+        };
+        let base_recipe = batch_resume::recipe_digest(
+            &resolved,
+            spec.channels as usize,
+            OutputFormat::Wav,
+            EncodeOptions::default(),
+            if request.options.preserve_metadata {
+                MetadataPolicy::Preserve
+            } else {
+                MetadataPolicy::Drop
+            },
+            model
+                .as_ref()
+                .map(|model| (&model.fingerprint, model.sample_rate)),
+        )?;
+        let recipe = batch_resume::stream_recipe_digest(base_recipe, request.stream_frames, info)?;
+        Some((input_fingerprint, recipe, model))
+    } else {
+        None
+    };
+    let metadata = if request.options.preserve_metadata {
+        input_session.read_metadata_with_limits(metadata_limits)?
+    } else {
+        None
+    };
+    let metadata_bytes = metadata
+        .as_ref()
+        .map(denoize::metadata::Metadata::estimated_memory_bytes)
+        .unwrap_or(0);
+    let temporary_bytes = desktop_stream_temporary_bytes(
+        info,
+        checked_desktop_mib(request.options.max_temporary_mb, "一時領域上限")?,
+        request.resume,
+        metadata_bytes,
+    )?;
+    let governor = desktop_resource_governor(&request.options, 1)?;
+    let mut worker_request = ResourceRequest::worker(
+        working_set
+            .checked_add(metadata_bytes)
+            .ok_or_else(|| "ストリームのメモリ予約量が大きすぎます".to_string())?,
+        temporary_bytes,
+    );
+    if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
+        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
+            working_set
+                .checked_mul(2)
+                .ok_or_else(|| "ストリームのGPU予約量が大きすぎます".to_string())?,
+        );
+    }
+    let request_resources = worker_request.checked_add(
+        denoize::estimate_backend_session_request(backend, &backend_options, accelerator)?,
+    )?;
+    let _permit = governor
+        .acquire_with_cancel(request_resources, || control.is_cancelled())
+        .map_err(|error| {
+            if control.is_cancelled() {
+                "cancelled".to_string()
+            } else {
+                error
+            }
+        })?;
+    let mut processor = StreamingBackendSession::new_with_accelerator(
+        backend,
+        spec.sample_rate,
+        spec.channels as usize,
+        config,
+        backend_options,
+        accelerator,
+    )?;
+    let mut reader = AudioStreamReader::from_session(input_session, decode_limits)?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("出力フォルダを作成できません: {error}"))?;
+    }
+    progress(1, "ストリームを処理しています");
+    let commit_mode = if request.options.force {
+        CommitMode::Replace
+    } else {
+        CommitMode::NoClobber
+    };
+
+    if let Some((input_fingerprint, recipe, model)) = resume_identity {
+        if let Some(model) = model.as_ref() {
+            if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
+                return Err(format!(
+                    "準備中にストリームモデルが変更されました: {}",
+                    model.path.display()
+                ));
+            }
+        }
+        let acquired = batch_resume::StreamCheckpointSession::acquire(
+            output,
+            input_fingerprint,
+            recipe,
+            spec,
+            request.stream_frames,
+            Some(temporary_bytes),
+            request.options.force,
+        )?;
+        let (mut checkpoint, loaded) = match acquired {
+            batch_resume::StreamCheckpointAcquire::Completed(_) => {
+                progress(4, "既存の完了済み出力を確認しました");
+                return Ok(ProcessFileResult {
+                    output: output.to_string_lossy().into_owned(),
+                    accelerator,
+                });
+            }
+            batch_resume::StreamCheckpointAcquire::Active(checkpoint, loaded) => {
+                (checkpoint, loaded)
+            }
+        };
+        let mut input_frames = match loaded {
+            Some(saved) => replay_desktop_stream_checkpoint(
+                &mut reader,
+                &mut processor,
+                request.stream_frames,
+                saved,
+                spec.channels as usize,
+                control,
+            )?,
+            None => 0,
+        };
+        let mut next_checkpoint = input_frames
+            .checked_div(STREAM_CHECKPOINT_FRAMES)
+            .and_then(|multiple| multiple.checked_add(1))
+            .and_then(|multiple| multiple.checked_mul(STREAM_CHECKPOINT_FRAMES))
+            .unwrap_or(u64::MAX);
+        while let Some(block) = reader.next_block(request.stream_frames)? {
+            check_cancelled(control)?;
+            let frames = block.first().map(Vec::len).unwrap_or(0) as u64;
+            checkpoint.append_block(&processor.process_block(&block)?)?;
+            input_frames = input_frames
+                .checked_add(frames)
+                .ok_or_else(|| "ストリーム入力フレーム数が大きすぎます".to_string())?;
+            if input_frames >= next_checkpoint {
+                checkpoint.checkpoint(input_frames)?;
+                next_checkpoint = input_frames
+                    .checked_div(STREAM_CHECKPOINT_FRAMES)
+                    .and_then(|multiple| multiple.checked_add(1))
+                    .and_then(|multiple| multiple.checked_mul(STREAM_CHECKPOINT_FRAMES))
+                    .unwrap_or(u64::MAX);
+            }
+        }
+        checkpoint.append_block(&processor.finish()?)?;
+        if reader.fingerprint_input()? != input_fingerprint {
+            return Err("処理中にストリーム入力が変更されました".into());
+        }
+        check_cancelled(control)?;
+        progress(3, "WAV出力を準備しています");
+        checkpoint.prepare_spool_read()?;
+        let mut transaction = AtomicOutput::new(output)?;
+        {
+            let mut writer =
+                WavStreamWriter::from_sink(BufWriter::new(transaction.file_mut()), spec)?;
+            while let Some(block) = checkpoint.next_spool_block(request.stream_frames)? {
+                check_cancelled(control)?;
+                writer.write_block(&block)?;
+            }
+            writer.finalize()?;
+        }
+        denoize::audio::write_wav_channel_mask_to_file(
+            transaction.file_mut(),
+            spec.channels as usize,
+            channel_mask,
+        )?;
+        if let Some(metadata) = metadata {
+            denoize::metadata::write_extended_to_file_with_limits(
+                metadata,
+                transaction.file_mut(),
+                metadata_limits,
+            )?;
+        }
+        let staged_bytes = transaction
+            .file_mut()
+            .metadata()
+            .map_err(|error| format!("一時出力のサイズを確認できません: {error}"))?
+            .len();
+        let combined = staged_bytes
+            .checked_add(checkpoint.spool_len())
+            .ok_or_else(|| "ストリームの一時領域が大きすぎます".to_string())?;
+        if combined > temporary_bytes {
+            return Err(format!(
+                "チェックポイントと一時出力が予約量を超えました: {combined} > {temporary_bytes} bytes"
+            ));
+        }
+        let output_fingerprint =
+            batch_resume::fingerprint_open_file_at(transaction.file_mut(), output)?;
+        checkpoint.prepare_publish(input_frames, output_fingerprint)?;
+        progress(4, "出力を確定しています");
+        control.commit(transaction, commit_mode)?;
+        if let Err(error) = checkpoint.cleanup() {
+            eprintln!("denoize desktop: checkpoint cleanup failed after commit: {error}");
+        }
+    } else {
+        let mut transaction = AtomicOutput::new(output)?;
+        {
+            let mut writer =
+                WavStreamWriter::from_sink(BufWriter::new(transaction.file_mut()), spec)?;
+            while let Some(block) = reader.next_block(request.stream_frames)? {
+                check_cancelled(control)?;
+                writer.write_block(&processor.process_block(&block)?)?;
+            }
+            writer.write_block(&processor.finish()?)?;
+            writer.finalize()?;
+        }
+        denoize::audio::write_wav_channel_mask_to_file(
+            transaction.file_mut(),
+            spec.channels as usize,
+            channel_mask,
+        )?;
+        if let Some(metadata) = metadata {
+            denoize::metadata::write_extended_to_file_with_limits(
+                metadata,
+                transaction.file_mut(),
+                metadata_limits,
+            )?;
+        }
+        let staged_bytes = transaction
+            .file_mut()
+            .metadata()
+            .map_err(|error| format!("一時出力のサイズを確認できません: {error}"))?
+            .len();
+        if staged_bytes > temporary_bytes {
+            return Err(format!(
+                "一時出力が予約量を超えました: {staged_bytes} > {temporary_bytes} bytes"
+            ));
+        }
+        progress(4, "出力を確定しています");
+        control.commit(transaction, commit_mode)?;
+    }
+    Ok(ProcessFileResult {
+        output: output.to_string_lossy().into_owned(),
+        accelerator,
+    })
+}
+
 fn process_file(
     request: &ProcessRequest,
     control: &JobControl,
     progress: impl Fn(usize, &'static str),
 ) -> Result<ProcessFileResult, String> {
+    if request.stream {
+        return process_stream_file(request, control, progress);
+    }
     check_cancelled(control)?;
     let input = Path::new(&request.input);
     let output = Path::new(&request.output);
@@ -3434,6 +3910,17 @@ mod tests {
         options.preserve_metadata = false;
         options.force = force;
         options
+    }
+
+    fn process_request(input: &Path, output: &Path, options: ProcessOptions) -> ProcessRequest {
+        ProcessRequest {
+            input: input.to_string_lossy().into_owned(),
+            output: output.to_string_lossy().into_owned(),
+            stream: false,
+            resume: false,
+            stream_frames: DEFAULT_STREAM_BLOCK_FRAMES,
+            options,
+        }
     }
 
     fn options() -> ProcessOptions {
@@ -3957,12 +4444,8 @@ deterministic = false
         let mut process = classical_options(false);
         process.strength = f64::NAN;
 
-        let error = validate_request(
-            &missing_input.to_string_lossy(),
-            &output.to_string_lossy(),
-            &process,
-        )
-        .unwrap_err();
+        let request = process_request(&missing_input, &output, process);
+        let error = validate_request(&request).unwrap_err();
 
         assert!(error.contains("強度"));
         assert_eq!(std::fs::read(&output).unwrap(), b"existing output");
@@ -3981,6 +4464,68 @@ deterministic = false
             .contains("並列数"));
         assert!(!Path::new(&batch.output_dir).exists());
         assert!(state.jobs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_request_validation_rejects_incompatible_options() {
+        let directory = TestDirectory::create("stream-validation");
+        let input = directory.join("input.wav");
+        write_test_wav(&input);
+
+        let mut request = process_request(
+            &input,
+            &directory.join("output.flac"),
+            classical_options(false),
+        );
+        request.stream = true;
+        assert!(validate_request(&request)
+            .unwrap_err()
+            .contains("出力形式はWAV"));
+
+        request.output = directory.join("output.wav").to_string_lossy().into_owned();
+        request.stream_frames = 0;
+        assert!(validate_request(&request)
+            .unwrap_err()
+            .contains("ストリームブロック"));
+
+        request.stream_frames = DEFAULT_STREAM_BLOCK_FRAMES;
+        request.options.vad = true;
+        assert!(validate_request(&request).unwrap_err().contains("VAD"));
+
+        request.options.vad = false;
+        request.stream = false;
+        request.resume = true;
+        assert!(validate_request(&request)
+            .unwrap_err()
+            .contains("長時間ストリーム"));
+    }
+
+    #[test]
+    fn desktop_flac_stream_resume_writes_wav_and_cleans_data_sidecars() {
+        let directory = TestDirectory::create("stream-flac-resume");
+        let wav = directory.join("source.wav");
+        let input = directory.join("input.flac");
+        let output = directory.join("output.wav");
+        write_test_wav(&wav);
+        let original = read_audio(&wav).unwrap();
+        write_audio(&input, &original, EncodeOptions::default()).unwrap();
+
+        let mut request = process_request(&input, &output, classical_options(false));
+        request.stream = true;
+        request.resume = true;
+        request.stream_frames = 113;
+        validate_request(&request).unwrap();
+        process_file(&request, &JobControl::default(), |_, _| {}).unwrap();
+
+        let enhanced = read_audio(&output).unwrap();
+        assert_eq!(enhanced.sample_rate, original.sample_rate);
+        assert_eq!(enhanced.channels(), original.channels());
+        assert_eq!(enhanced.frames(), original.frames());
+        let (state, spool, lock) = batch_resume::stream_checkpoint_sidecar_paths(&output).unwrap();
+        assert!(!state.exists());
+        assert!(!spool.exists());
+        assert!(lock.is_file());
+        directory.assert_no_staged_outputs();
     }
 
     #[test]
@@ -4192,12 +4737,8 @@ deterministic = false
         let input = directory.join("input.wav");
         let output = directory.join("output.wav");
         write_test_wav(&input);
-        let request = ProcessRequest {
-            input: input.to_string_lossy().into_owned(),
-            output: output.to_string_lossy().into_owned(),
-            options: classical_options(false),
-        };
-        validate_request(&request.input, &request.output, &request.options).unwrap();
+        let request = process_request(&input, &output, classical_options(false));
+        validate_request(&request).unwrap();
 
         let result = process_file(&request, &JobControl::default(), |stage, _| {
             if stage == 3 {
@@ -4217,11 +4758,7 @@ deterministic = false
         let output = directory.join("output.wav");
         write_test_wav(&input);
         std::fs::write(&output, b"existing output").unwrap();
-        let request = ProcessRequest {
-            input: input.to_string_lossy().into_owned(),
-            output: output.to_string_lossy().into_owned(),
-            options: classical_options(true),
-        };
+        let request = process_request(&input, &output, classical_options(true));
         let control = Arc::new(JobControl::default());
         let worker_control = Arc::clone(&control);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -4310,11 +4847,7 @@ deterministic = false
         std::fs::write(&input, wav).unwrap();
         let output_dir = directory.join("new-output-directory");
         let output = output_dir.join("output.mp3");
-        let request = ProcessRequest {
-            input: input.to_string_lossy().into_owned(),
-            output: output.to_string_lossy().into_owned(),
-            options: classical_options(false),
-        };
+        let request = process_request(&input, &output, classical_options(false));
         let stages = Mutex::new(Vec::new());
 
         let error = process_file(&request, &JobControl::default(), |stage, _| {
@@ -4342,11 +4875,7 @@ deterministic = false
         write_test_wav(&input);
         std::fs::write(&victim, b"victim").unwrap();
         std::os::unix::fs::symlink(&victim, &legacy_stage).unwrap();
-        let request = ProcessRequest {
-            input: input.to_string_lossy().into_owned(),
-            output: output.to_string_lossy().into_owned(),
-            options: classical_options(false),
-        };
+        let request = process_request(&input, &output, classical_options(false));
 
         process_file(&request, &JobControl::default(), |_, _| {}).unwrap();
 

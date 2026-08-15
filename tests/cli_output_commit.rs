@@ -203,6 +203,41 @@ fn streaming_output_ignores_legacy_predictable_stage_symlink() {
     assert_valid_wav(&output);
 }
 
+#[test]
+fn successful_stream_resume_cleans_durable_data_sidecars() {
+    let directory = TestDirectory::create();
+    let input = directory.join("input.wav");
+    let output = directory.join("output.wav");
+    write_test_wav(&input);
+
+    let result = run(
+        &input,
+        &output,
+        &[
+            "--stream",
+            "--resume",
+            "--stream-frames",
+            "73",
+            "--no-metadata",
+        ],
+    );
+
+    assert_success(&result);
+    assert_valid_wav(&output);
+    let (state, spool, lock) = denoize::batch_resume::stream_checkpoint_sidecar_paths(&output)
+        .expect("resolve stream checkpoint sidecars");
+    assert!(
+        !state.exists(),
+        "completed stream retained its state journal"
+    );
+    assert!(!spool.exists(), "completed stream retained its PCM spool");
+    assert!(
+        lock.exists(),
+        "stream checkpoint lock should remain reusable"
+    );
+    directory.assert_no_staged_outputs();
+}
+
 #[cfg(unix)]
 #[test]
 fn no_force_rejects_dangling_destination_symlink() {

@@ -502,24 +502,42 @@ proxy precedence, and resume validation details.
 
 ### Long recordings with bounded memory
 
-For long WAV recordings, use the stateful streaming path. It keeps only a
-fixed-size input block plus backend overlap, recurrent, and resampler state in
-memory instead of loading the whole file:
+For long WAV, FLAC, or Ogg Vorbis recordings, use the stateful streaming path.
+It keeps only a fixed-size input block plus bounded decoder, backend overlap,
+recurrent, and resampler state in memory instead of loading the whole file:
 
 ```sh
 ./target/release/denoize long-noisy.wav long-clean.wav --stream
 ```
 
-`--stream` supports the compiled Classical, RNNoise, and GTCRN backends for
-filesystem WAV-to-WAV processing, including independent, linked-stereo, and
-mid/side channel modes. GTCRN uses an explicit `--onnx-model` or the installed
-managed `gtcrn` model. VAD, loudness normalization, other AI backends, and
-encoded output require the normal (non-streaming) path. The default block size
-is 8192 frames; use
+`--stream` supports regular-file WAV, FLAC, and Ogg Vorbis input and writes an
+atomic WAV output with the compiled Classical, RNNoise, and GTCRN backends,
+including independent, linked-stereo, and mid/side channel modes. GTCRN uses an
+explicit `--onnx-model` or the installed managed `gtcrn` model. Ogg Opus, MP3,
+M4A/ALAC, and ADTS AAC remain on the normal path until their gapless, granule,
+or edit-list semantics can be preserved by a bounded decoder. VAD, loudness
+normalization, other AI backends, and encoded output also require the normal
+(non-streaming) path. The default block size is 8192 frames; use
 `--stream-frames N` (1–1,048,576) to trade latency and working memory for
 throughput. Noise profiling retains only a bounded leading segment before
 output begins. Stream resource arithmetic is checked from the input header,
 and the processor is constructed before an output or temporary file is staged.
+
+Add `--resume` to make a long stream restartable. The CLI periodically
+synchronizes a private append-only checkpoint journal and an interleaved `f64`
+PCM spool beside the destination. After interruption it deterministically
+replays the same opened input to the last durable boundary, verifies the saved
+PCM digest, restores backend state, and continues. The input bytes, effective
+recipe, model bytes, source format, channel geometry, and block size are bound
+to the checkpoint. A mismatch is preserved and rejected unless `--force`
+explicitly discards it. The final WAV is still staged and committed atomically;
+success removes the journal and PCM spool while retaining the reusable lock
+file. The journal records the exact staged WAV fingerprint before publication;
+if the process exits after the atomic commit but before sidecar cleanup, the
+next identical resume verifies the destination and removes the stale data
+sidecars without reprocessing. A changed destination is preserved and rejected
+unless `--force` resets the checkpoint. Because the PCM spool and staged WAV
+coexist during publication, both are charged to `--max-temp-space`.
 
 Filesystem inputs are opened once per processing phase as validated regular
 files. Size estimation, probing, decoding, and metadata reads within that
@@ -536,8 +554,9 @@ each decoder's complete configured allowance, rechecks it after model loading,
 and starts a worker only when its RAM, temporary-output, CPU, and GPU request
 fits atomically. Actual retained metadata is charged conservatively as well.
 
-`--max-temp-space MB` bounds aggregate staged-output reservations and verifies
-the final staged length before publication; it is not a filesystem quota.
+`--max-temp-space MB` bounds aggregate staged-output reservations (including a
+restartable stream's PCM spool) and verifies the final staged length before
+publication; it is not a filesystem quota.
 `--max-gpu-jobs N` (default 1) serializes or bounds accelerated workers, while
 `--max-gpu-memory MB` applies conservative model and transfer reservations.
 Those GPU counters are not driver-reported VRAM usage. Internal allocations
@@ -564,9 +583,9 @@ The per-input limit applies to regular-file inputs/workers; stdin retains its
 separate bounded WAV buffering path. Process admission makes `--jobs` an upper
 bound rather than a promise that every worker can run simultaneously. Batch
 probing, decode, model preparation, and metadata validation all finish before
-the output directory or staging files are created. A streaming WAV job stays
-bounded by its block size and denoiser state, and metadata uses a conservative
-share of the remaining budget:
+the output directory or staging files are created. A streaming job stays
+bounded by its block size, decoder allowance, and denoiser state, and metadata
+uses a conservative share of the remaining budget:
 
 ```sh
 denoize large.mp3 cleaned.wav --max-memory 1024
@@ -574,6 +593,8 @@ denoize recordings cleaned --batch --jobs 8 --max-memory 512 \
   --max-process-memory 2048 --max-temp-space 4096 --max-gpu-jobs 1
 denoize input.m4a output.flac --max-process-memory 1024 --isolate
 denoize long-noisy.wav long-clean.wav --stream --stream-frames 4096 --max-memory 64
+denoize long-noisy.flac long-clean.wav --stream --resume \
+  --stream-frames 4096 --max-memory 64 --max-temp-space 8192
 ```
 
 ## Desktop app
@@ -604,6 +625,9 @@ Desktop settings are restored automatically, can be stored as named presets,
 and can be imported or exported as CLI-compatible TOML. Recent input files are
 kept locally for quick reuse. The single-file and batch views also expose a
 reproducibility mode that serializes processing and uses stable model seeds.
+The single-file view can also run the bounded WAV/FLAC/Ogg Vorbis-to-WAV path,
+choose its block size, and enable the same durable restart checkpoints as the
+CLI.
 Audio files and folders can be dropped onto the single-file or batch input
 zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
