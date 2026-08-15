@@ -60,6 +60,7 @@ pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
 pub mod quality;
+pub mod recommendation;
 pub mod resample;
 pub mod resource;
 pub mod service;
@@ -108,6 +109,13 @@ pub use hardware::{
 };
 pub use input::AudioInputSession;
 pub use quality::QualityMetrics;
+pub use recommendation::{
+    recommend_audio, recommend_file, recommend_file_with_options, run_device_calibration,
+    CalibrationEvidence, RecommendationCandidate, RecommendationDecision, RecommendationDevice,
+    RecommendationGoal, RecommendationInput, RecommendationMaterial, RecommendationOptions,
+    RecommendationReason, RecommendationReport, RECOMMENDATION_SCHEMA,
+    RECOMMENDATION_SCHEMA_VERSION,
+};
 pub use resource::{
     estimate_backend_session_request, estimate_gpu_session_bytes, estimate_gpu_worker_bytes,
     estimate_model_session_bytes, estimate_temporary_bytes, metadata_limits_after_retained_memory,

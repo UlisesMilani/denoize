@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-recommendation-v1.schema.json",
+  "title": "denoize recommendation report v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "network_accessed",
+    "goal",
+    "input",
+    "device",
+    "calibration",
+    "decision",
+    "candidates"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-recommendation-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1 },
+    "network_accessed": { "const": false },
+    "goal": { "enum": ["balanced", "quality", "speed", "low-memory"] },
+    "input": { "$ref": "#/$defs/input" },
+    "device": { "$ref": "#/$defs/device" },
+    "calibration": {
+      "oneOf": [
+        { "$ref": "#/$defs/calibration" },
+        { "type": "null" }
+      ]
+    },
+    "decision": { "$ref": "#/$defs/decision" },
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/candidate" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "nullableInteger": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonNegativeInteger" },
+        { "type": "null" }
+      ]
+    },
+    "nullableNumber": {
+      "oneOf": [
+        { "type": "number" },
+        { "type": "null" }
+      ]
+    },
+    "nullableString": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "input": {
+      "type": "object",
+      "required": [
+        "format",
+        "codec",
+        "sample_rate",
+        "channels",
+        "total_frames",
+        "analyzed_frames",
+        "analysis_mode",
+        "analysis_sha256",
+        "rms_dbfs",
+        "peak_dbfs",
+        "crest_db",
+        "active_ratio",
+        "zero_crossing_rate",
+        "transient_ratio",
+        "stereo_correlation",
+        "material",
+        "material_confidence"
+      ],
+      "properties": {
+        "format": { "type": "string", "minLength": 1 },
+        "codec": { "type": "string", "minLength": 1 },
+        "sample_rate": { "type": "integer", "minimum": 1 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "total_frames": { "$ref": "#/$defs/nullableInteger" },
+        "analyzed_frames": { "type": "integer", "minimum": 1 },
+        "analysis_mode": {
+          "enum": ["bounded-stream", "whole-file-fallback", "decoded-audio"]
+        },
+        "analysis_sha256": { "$ref": "#/$defs/sha256" },
+        "rms_dbfs": { "type": "number", "minimum": -120 },
+        "peak_dbfs": { "type": "number", "minimum": -120 },
+        "crest_db": { "type": "number", "minimum": 0 },
+        "active_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "zero_crossing_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "transient_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "stereo_correlation": {
+          "oneOf": [
+            { "type": "number", "minimum": -1, "maximum": 1 },
+            { "type": "null" }
+          ]
+        },
+        "material": { "enum": ["speech", "music", "mixed", "quiet"] },
+        "material_confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "device": {
+      "type": "object",
+      "required": [
+        "os",
+        "architecture",
+        "logical_cpus",
+        "requested_accelerator",
+        "available_runtimes"
+      ],
+      "properties": {
+        "os": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "logical_cpus": { "type": "integer", "minimum": 1 },
+        "requested_accelerator": { "enum": ["cpu", "auto", "gpu", "metal", "cuda"] },
+        "available_runtimes": {
+          "type": "array",
+          "items": { "enum": ["cpu", "metal", "cuda"] },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "calibration": {
+      "type": "object",
+      "required": [
+        "workload",
+        "fixture_sha256",
+        "sample_rate",
+        "channels",
+        "frames",
+        "warmup_runs",
+        "measured_runs",
+        "elapsed_ms",
+        "median_elapsed_ms",
+        "baseline_realtime_headroom"
+      ],
+      "properties": {
+        "workload": { "const": "classical-hifi-v1" },
+        "fixture_sha256": { "$ref": "#/$defs/sha256" },
+        "sample_rate": { "const": 48000 },
+        "channels": { "const": 1 },
+        "frames": { "const": 24000 },
+        "warmup_runs": { "const": 1 },
+        "measured_runs": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "elapsed_ms": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "items": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "median_elapsed_ms": { "type": "number", "exclusiveMinimum": 0 },
+        "baseline_realtime_headroom": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "reason": {
+      "type": "object",
+      "required": ["code", "impact", "detail"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "impact": { "type": "integer", "minimum": -100, "maximum": 100 },
+        "detail": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "candidate": {
+      "type": "object",
+      "required": [
+        "backend",
+        "preset",
+        "model",
+        "eligible",
+        "score",
+        "requested_accelerator",
+        "effective_accelerator",
+        "accelerator_fallback",
+        "estimated_memory_bytes",
+        "estimated_gpu_memory_bytes",
+        "calibrated_realtime_headroom",
+        "reasons"
+      ],
+      "properties": {
+        "backend": { "type": "string", "minLength": 1 },
+        "preset": {
+          "enum": ["speech", "music", "aggressive", "gentle", "restore", "hifi"]
+        },
+        "model": { "$ref": "#/$defs/nullableString" },
+        "eligible": { "type": "boolean" },
+        "score": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "requested_accelerator": { "enum": ["cpu", "auto", "gpu", "metal", "cuda"] },
+        "effective_accelerator": {
+          "oneOf": [
+            { "enum": ["cpu", "metal", "cuda"] },
+            { "type": "null" }
+          ]
+        },
+        "accelerator_fallback": { "$ref": "#/$defs/nullableString" },
+        "estimated_memory_bytes": { "$ref": "#/$defs/nullableInteger" },
+        "estimated_gpu_memory_bytes": { "$ref": "#/$defs/nullableInteger" },
+        "calibrated_realtime_headroom": { "$ref": "#/$defs/nullableNumber" },
+        "reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/reason" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "decision": {
+      "type": "object",
+      "required": [
+        "backend",
+        "preset",
+        "processing_mode",
+        "strength",
+        "adaptive_noise",
+        "vad",
+        "accelerator",
+        "model",
+        "arguments"
+      ],
+      "properties": {
+        "backend": { "type": "string", "minLength": 1 },
+        "preset": {
+          "enum": ["speech", "music", "aggressive", "gentle", "restore", "hifi"]
+        },
+        "processing_mode": { "enum": ["speech", "music", "ambient"] },
+        "strength": { "type": "number", "minimum": 0, "maximum": 1 },
+        "adaptive_noise": { "type": "boolean" },
+        "vad": { "type": "boolean" },
+        "accelerator": { "enum": ["cpu", "metal", "cuda"] },
+        "model": { "$ref": "#/$defs/nullableString" },
+        "arguments": {
+          "type": "array",
+          "minItems": 10,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

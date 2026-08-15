@@ -281,10 +281,20 @@ impl HardwareCapabilities {
 /// Probe the current process without opening a model or a network connection.
 #[must_use]
 pub fn hardware_capabilities() -> HardwareCapabilities {
+    hardware_capabilities_with(false)
+}
+
+/// Probe capabilities without testing or creating a runtime cache directory.
+#[must_use]
+pub(crate) fn hardware_capabilities_read_only() -> HardwareCapabilities {
+    hardware_capabilities_with(true)
+}
+
+fn hardware_capabilities_with(read_only: bool) -> HardwareCapabilities {
     let runtimes = [
-        runtime_capability(AcceleratorRuntime::Cpu),
-        runtime_capability(AcceleratorRuntime::Metal),
-        runtime_capability(AcceleratorRuntime::Cuda),
+        runtime_capability(AcceleratorRuntime::Cpu, read_only),
+        runtime_capability(AcceleratorRuntime::Metal, read_only),
+        runtime_capability(AcceleratorRuntime::Cuda, read_only),
     ]
     .into_iter()
     .collect();
@@ -318,6 +328,29 @@ pub fn select_accelerator(
 ) -> Result<AcceleratorSelection, String> {
     select_accelerator_with(backend, requested, deterministic, |runtime| {
         probe_runtime(runtime).map_err(|error| error.to_string())
+    })
+}
+
+pub(crate) fn select_accelerator_from_capabilities(
+    backend: Backend,
+    requested: AcceleratorPreference,
+    deterministic: bool,
+    capabilities: &HardwareCapabilities,
+) -> Result<AcceleratorSelection, String> {
+    select_accelerator_with(backend, requested, deterministic, |runtime| {
+        let capability = capabilities
+            .runtimes
+            .iter()
+            .find(|capability| capability.runtime == runtime)
+            .ok_or_else(|| format!("{} runtime was not probed", runtime.name()))?;
+        if capability.available {
+            Ok(())
+        } else {
+            Err(capability
+                .detail
+                .clone()
+                .unwrap_or_else(|| format!("{} runtime is unavailable", runtime.name())))
+        }
     })
 }
 
@@ -489,7 +522,7 @@ pub(crate) const fn test_selection(
     selection(requested, effective, None)
 }
 
-fn runtime_capability(runtime: AcceleratorRuntime) -> RuntimeCapability {
+fn runtime_capability(runtime: AcceleratorRuntime, read_only: bool) -> RuntimeCapability {
     if runtime == AcceleratorRuntime::Cpu {
         return RuntimeCapability {
             runtime,
@@ -513,7 +546,12 @@ fn runtime_capability(runtime: AcceleratorRuntime) -> RuntimeCapability {
             detail: Some("runtime is not compiled for this binary and target".into()),
         };
     }
-    match probe_runtime_device(runtime) {
+    let probe = if read_only {
+        probe_runtime_device_read_only(runtime)
+    } else {
+        probe_runtime_device(runtime)
+    };
+    match probe {
         Ok(device) => RuntimeCapability {
             runtime,
             compiled,
@@ -565,20 +603,37 @@ fn probe_runtime_device(runtime: AcceleratorRuntime) -> Result<RuntimeDevice, St
     }
 }
 
-#[cfg(all(
-    feature = "accelerators",
-    any(target_os = "linux", target_os = "windows")
-))]
-fn probe_cuda_device() -> Result<RuntimeDevice, String> {
-    static RESULT: OnceLock<Result<RuntimeDevice, String>> = OnceLock::new();
-    RESULT.get_or_init(probe_cuda_uncached).clone()
+fn probe_runtime_device_read_only(runtime: AcceleratorRuntime) -> Result<RuntimeDevice, String> {
+    match runtime {
+        AcceleratorRuntime::Cpu => Ok(RuntimeDevice::default()),
+        AcceleratorRuntime::Metal => probe_metal_device(),
+        AcceleratorRuntime::Cuda => probe_cuda_device_read_only(),
+    }
 }
 
 #[cfg(all(
     feature = "accelerators",
     any(target_os = "linux", target_os = "windows")
 ))]
-fn probe_cuda_uncached() -> Result<RuntimeDevice, String> {
+fn probe_cuda_device() -> Result<RuntimeDevice, String> {
+    static RESULT: OnceLock<Result<RuntimeDevice, String>> = OnceLock::new();
+    RESULT.get_or_init(|| probe_cuda_uncached(true)).clone()
+}
+
+#[cfg(all(
+    feature = "accelerators",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn probe_cuda_device_read_only() -> Result<RuntimeDevice, String> {
+    static RESULT: OnceLock<Result<RuntimeDevice, String>> = OnceLock::new();
+    RESULT.get_or_init(|| probe_cuda_uncached(false)).clone()
+}
+
+#[cfg(all(
+    feature = "accelerators",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn probe_cuda_uncached(require_writable_cache: bool) -> Result<RuntimeDevice, String> {
     probe_tract_runtime("cuda")?;
     let context = cudarc::driver::CudaContext::new(0)
         .map_err(|error| format!("CUDA device 0 is unavailable: {error}"))?;
@@ -593,7 +648,9 @@ fn probe_cuda_uncached() -> Result<RuntimeDevice, String> {
     let name = String::from_utf8_lossy(&name).into_owned();
     drop(context);
     probe_cuda_toolkit_headers()?;
-    probe_cuda_cache()?;
+    if require_writable_cache {
+        probe_cuda_cache()?;
+    }
     Ok(RuntimeDevice {
         name: (!name.is_empty()).then_some(name),
         memory_bytes: u64::try_from(properties.totalGlobalMem)
@@ -608,6 +665,14 @@ fn probe_cuda_uncached() -> Result<RuntimeDevice, String> {
     any(target_os = "linux", target_os = "windows")
 )))]
 fn probe_cuda_device() -> Result<RuntimeDevice, String> {
+    Err("CUDA runtime is not compiled for this binary and target".into())
+}
+
+#[cfg(not(all(
+    feature = "accelerators",
+    any(target_os = "linux", target_os = "windows")
+)))]
+fn probe_cuda_device_read_only() -> Result<RuntimeDevice, String> {
     Err("CUDA runtime is not compiled for this binary and target".into())
 }
 
@@ -923,6 +988,24 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["schema"], HARDWARE_SCHEMA);
         assert_eq!(parsed["schema_version"], 1);
+    }
+
+    #[test]
+    fn read_only_snapshot_drives_selection_without_a_second_probe() {
+        let report = hardware_capabilities_read_only();
+        let selected = select_accelerator_from_capabilities(
+            Backend::Classical,
+            AcceleratorPreference::Auto,
+            false,
+            &report,
+        )
+        .unwrap();
+        assert_eq!(selected.effective(), AcceleratorRuntime::Cpu);
+        assert_eq!(
+            selected.fallback(),
+            Some(AcceleratorFallback::BackendCpuOnly)
+        );
+        assert!(report.runtimes()[0].available());
     }
 
     #[cfg(feature = "onnx")]

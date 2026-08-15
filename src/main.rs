@@ -24,8 +24,9 @@ use denoize::AudioInputSession;
 use denoize::{
     AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm, AtomicOutput, Backend,
     BackendOptions, BackendSession, ChannelMode, CommitMode, DownmixMode, EncodeOptions,
-    OnnxModelConfig, OutputFormat, ResourceGovernor, ResourceLimits, ResourcePermit,
-    ResourceRequest, SgmseProfile, StreamingBackendSession, WindowType,
+    OnnxModelConfig, OutputFormat, RecommendationGoal, RecommendationOptions, ResourceGovernor,
+    ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile, StreamingBackendSession,
+    WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -340,6 +341,7 @@ USAGE:
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
     denoize hardware [--json|--pretty]
+    denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
@@ -1818,6 +1820,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("hardware") {
         return run_hardware(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("recommend") {
+        return run_recommend(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("live") {
         return run_live(&args[1..]);
     }
@@ -2077,6 +2082,231 @@ fn run_hardware(args: &[String]) -> Result<(), String> {
         .filter(|backend| backend.accelerated())
     {
         println!("  {}", backend.backend());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecommendationOutput {
+    Human,
+    Json,
+    PrettyJson,
+}
+
+fn recommendation_usage() -> &'static str {
+    "\
+USAGE:
+    denoize recommend <INPUT> [OPTIONS]
+
+Analyze a bounded input prefix and rank only locally runnable backends. This
+command never updates the model catalog/cache or downloads a model.
+
+OPTIONS:
+        --goal <NAME>          balanced|quality|speed|low-memory (default: balanced)
+        --analysis-seconds <N> analyze 1..60 seconds (default: 12)
+        --calibrate            run the fixed on-device Classical Hi-Fi benchmark
+        --calibration-runs <N> measured calibration runs in 1..9 (default: 3)
+        --accelerator <NAME>   cpu|auto|gpu|metal|cuda (default: auto)
+        --max-memory <MB>      decode/model reservation ceiling (minimum: 1)
+        --max-gpu-memory <MB>  GPU session reservation ceiling (minimum: 1)
+        --deterministic        keep the recommended execution path reproducible
+        --json                 emit compact denoize-recommendation-v1 JSON
+        --pretty               emit indented denoize-recommendation-v1 JSON
+    -h, --help                 show this help
+"
+}
+
+fn parse_recommendation_args(
+    args: &[String],
+) -> Result<(String, RecommendationOptions, RecommendationOutput), String> {
+    let mut input = None;
+    let mut goal = RecommendationGoal::Balanced;
+    let mut analysis_seconds = 12_u32;
+    let mut calibration_runs = None;
+    let mut accelerator = AcceleratorPreference::Auto;
+    let mut max_memory_mb = None;
+    let mut max_gpu_memory_mb = None;
+    let mut deterministic = false;
+    let mut output = RecommendationOutput::Human;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--goal" => {
+                let value: String = parse_value(args, &mut index, "--goal")?;
+                goal = RecommendationGoal::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown recommendation goal: {value} (expected balanced, quality, speed, or low-memory)"
+                    )
+                })?;
+            }
+            "--analysis-seconds" => {
+                analysis_seconds = parse_value(args, &mut index, "--analysis-seconds")?;
+            }
+            "--calibrate" => {
+                if calibration_runs.is_none() {
+                    calibration_runs = Some(3);
+                }
+            }
+            "--calibration-runs" => {
+                calibration_runs = Some(parse_value(args, &mut index, "--calibration-runs")?);
+            }
+            "--accelerator" => {
+                let value: String = parse_value(args, &mut index, "--accelerator")?;
+                accelerator = AcceleratorPreference::parse(&value)
+                    .ok_or_else(|| format!("unknown accelerator: {value}"))?;
+            }
+            "--max-memory" => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-gpu-memory" => {
+                max_gpu_memory_mb = Some(parse_value(args, &mut index, "--max-gpu-memory")?);
+            }
+            "--deterministic" => deterministic = true,
+            "--json" => {
+                if output != RecommendationOutput::Human {
+                    return Err("recommend accepts only one of --json or --pretty".into());
+                }
+                output = RecommendationOutput::Json;
+            }
+            "--pretty" => {
+                if output != RecommendationOutput::Human {
+                    return Err("recommend accepts only one of --json or --pretty".into());
+                }
+                output = RecommendationOutput::PrettyJson;
+            }
+            "-h" | "--help" => return Err("recommendation help requested".into()),
+            "-" => {
+                if input.replace("-".into()).is_some() {
+                    return Err("unexpected extra recommend argument: -".into());
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown recommend option: {value}"));
+            }
+            value => {
+                if input.replace(value.to_string()).is_some() {
+                    return Err(format!("unexpected extra recommend argument: {value}"));
+                }
+            }
+        }
+        index += 1;
+    }
+    let input = input.ok_or("recommend requires INPUT")?;
+    if input == "-" {
+        return Err(
+            "recommend requires a regular-file INPUT; bounded stdin analysis is planned for Stage 12"
+                .into(),
+        );
+    }
+    let maximum = checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    let maximum_gpu = checked_mib_limit_bytes(max_gpu_memory_mb, "--max-gpu-memory")?;
+    let limits = DecodeLimits::new(metadata_limits_for_available_bytes(maximum), maximum);
+    let options = RecommendationOptions::new()
+        .with_goal(goal)
+        .with_analysis_seconds(analysis_seconds)
+        .with_calibration_runs(calibration_runs)
+        .with_decode_limits(limits)
+        .with_max_gpu_memory_bytes(maximum_gpu)
+        .with_accelerator(accelerator)
+        .with_deterministic(deterministic);
+    // Validate option-only errors before opening the positional input.
+    options.validate()?;
+    Ok((input, options, output))
+}
+
+fn run_recommend(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("recommend --help accepts no other arguments".into());
+        }
+        print!("{}", recommendation_usage());
+        return Ok(());
+    }
+    let (input, options, output) = parse_recommendation_args(args)?;
+    let report = denoize::recommend_file_with_options(&input, options)?;
+    match output {
+        RecommendationOutput::Json => println!("{}", report.to_json()?),
+        RecommendationOutput::PrettyJson => println!("{}", report.to_pretty_json()?),
+        RecommendationOutput::Human => {
+            println!(
+                "recommendation: backend={} preset={} mode={} strength={:.2} adaptive={} vad={} accelerator={}",
+                report.decision.backend,
+                report.decision.preset,
+                report.decision.processing_mode,
+                report.decision.strength,
+                report.decision.adaptive_noise,
+                report.decision.vad,
+                report.decision.accelerator
+            );
+            println!(
+                "input: {} {} Hz, {} channel(s), material={} confidence={:.3}, analyzed={} frames ({})",
+                report.input.format,
+                report.input.sample_rate,
+                report.input.channels,
+                report.input.material.name(),
+                report.input.material_confidence,
+                report.input.analyzed_frames,
+                report.input.analysis_mode
+            );
+            println!(
+                "signal: rms={:.2} dBFS peak={:.2} dBFS crest={:.2} dB active={:.3}",
+                report.input.rms_dbfs,
+                report.input.peak_dbfs,
+                report.input.crest_db,
+                report.input.active_ratio
+            );
+            println!(
+                "device: {} {} ({} logical CPUs; runtimes={})",
+                report.device.os,
+                report.device.architecture,
+                report.device.logical_cpus,
+                report.device.available_runtimes.join(",")
+            );
+            if let Some(calibration) = &report.calibration {
+                println!(
+                    "calibration: {} runs, median {:.3} ms, baseline headroom {:.3}x, fixture {}",
+                    calibration.measured_runs,
+                    calibration.median_elapsed_ms,
+                    calibration.baseline_realtime_headroom,
+                    calibration.fixture_sha256
+                );
+            } else {
+                println!("calibration: not requested (use --calibrate)");
+            }
+            println!("arguments: {}", report.decision.arguments.join(" "));
+            println!("candidates:");
+            for candidate in &report.candidates {
+                println!(
+                    "  {} score={} eligible={} runtime={} ram={} gpu={}{}",
+                    candidate.backend,
+                    candidate.score,
+                    candidate.eligible,
+                    candidate.effective_accelerator.as_deref().unwrap_or("none"),
+                    candidate
+                        .estimated_memory_bytes
+                        .map(format_device_memory)
+                        .unwrap_or_else(|| "n/a".into()),
+                    candidate
+                        .estimated_gpu_memory_bytes
+                        .map(format_device_memory)
+                        .unwrap_or_else(|| "n/a".into()),
+                    candidate
+                        .model
+                        .as_ref()
+                        .map(|model| format!(" model={model}"))
+                        .unwrap_or_default()
+                );
+                for reason in &candidate.reasons {
+                    println!(
+                        "    {} ({:+}): {}",
+                        reason.code, reason.impact, reason.detail
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -7362,6 +7592,85 @@ mod model_command_tests {
             let error = run_models(&args).unwrap_err();
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn parses_recommendation_options_without_input_io() {
+        let (input, options, output) = parse_recommendation_args(&[
+            "missing.wav".into(),
+            "--goal".into(),
+            "quality".into(),
+            "--analysis-seconds".into(),
+            "7".into(),
+            "--calibration-runs".into(),
+            "2".into(),
+            "--accelerator".into(),
+            "cpu".into(),
+            "--max-memory".into(),
+            "64".into(),
+            "--max-gpu-memory".into(),
+            "128".into(),
+            "--deterministic".into(),
+            "--pretty".into(),
+        ])
+        .unwrap();
+        assert_eq!(input, "missing.wav");
+        assert_eq!(options.goal(), RecommendationGoal::Quality);
+        assert_eq!(options.analysis_seconds(), 7);
+        assert_eq!(options.calibration_runs(), Some(2));
+        assert_eq!(options.accelerator(), AcceleratorPreference::Cpu);
+        assert!(options.deterministic());
+        assert_eq!(
+            options.decode_limits().max_working_set_bytes,
+            Some(64 * BYTES_PER_MIB)
+        );
+        assert_eq!(options.max_gpu_memory_bytes(), Some(128 * BYTES_PER_MIB));
+        assert_eq!(output, RecommendationOutput::PrettyJson);
+    }
+
+    #[test]
+    fn recommendation_rejects_invalid_options_before_input_io() {
+        for (args, expected) in [
+            (
+                vec![
+                    "missing.wav".into(),
+                    "--analysis-seconds".into(),
+                    "0".into(),
+                ],
+                "analysis duration",
+            ),
+            (
+                vec![
+                    "missing.wav".into(),
+                    "--calibration-runs".into(),
+                    "10".into(),
+                ],
+                "calibration runs",
+            ),
+            (
+                vec!["missing.wav".into(), "--max-memory".into(), "0".into()],
+                "at least 1 MiB",
+            ),
+            (
+                vec!["missing.wav".into(), "--max-gpu-memory".into(), "0".into()],
+                "at least 1 MiB",
+            ),
+            (
+                vec!["missing.wav".into(), "--json".into(), "--pretty".into()],
+                "only one",
+            ),
+        ] {
+            let error = parse_recommendation_args(&args).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("read input"), "{error}");
+        }
+    }
+
+    #[test]
+    fn recommendation_keeps_nonseekable_input_for_stage_twelve() {
+        let error = parse_recommendation_args(&["-".into()]).unwrap_err();
+        assert!(error.contains("regular-file INPUT"));
+        assert!(error.contains("Stage 12"));
     }
 }
 

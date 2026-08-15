@@ -262,6 +262,15 @@ completed commit whose data sidecars were not yet removed. MP3, Ogg Opus,
 M4A/ALAC, and ADTS AAC remain in Stage 12 until their presentation-timeline
 semantics can be retained without whole-file decoding.
 
+Stage 9 keeps recommendation read-only and network-free. It analyzes a bounded
+signal prefix, considers compiled backends, verified local managed models,
+one read-only hardware/runtime snapshot, and CPU/GPU resource limits, then emits
+stable reason codes and explicit settings. Optional calibration runs a fixed
+hash-identified Classical Hi-Fi workload locally and preserves the raw timing
+evidence; backend headroom is an explainable cost-class estimate, not a claim
+that every neural candidate was executed or that wall-clock time is
+deterministic.
+
 Every remaining stage also carries an upgrade-compatibility gate: persisted
 presets, journals, checkpoints, receipts, and automation schemas must migrate
 from at least the two preceding releases or reject an unknown future format

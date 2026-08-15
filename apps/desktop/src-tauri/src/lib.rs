@@ -330,6 +330,19 @@ struct ProcessRequest {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecommendationRequest {
+    input: String,
+    goal: String,
+    calibrate: bool,
+    analysis_seconds: u32,
+    max_memory_mb: Option<usize>,
+    max_gpu_memory_mb: Option<usize>,
+    accelerator: String,
+    deterministic: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchRequest {
     inputs: Vec<String>,
@@ -915,6 +928,47 @@ fn app_info() -> AppInfo {
             })
             .collect(),
     }
+}
+
+fn desktop_recommendation_options(
+    request: &RecommendationRequest,
+) -> Result<denoize::RecommendationOptions, String> {
+    let goal = denoize::RecommendationGoal::parse(&request.goal)
+        .ok_or_else(|| format!("不明な推奨目標です: {}", request.goal))?;
+    let accelerator = AcceleratorPreference::parse(&request.accelerator)
+        .ok_or_else(|| format!("不明なアクセラレータです: {}", request.accelerator))?;
+    let maximum = checked_desktop_mib(request.max_memory_mb, "プロセスメモリ上限")?;
+    let maximum_gpu = checked_desktop_mib(request.max_gpu_memory_mb, "GPUメモリ上限")?;
+    let limits = DecodeLimits::new(
+        denoize::metadata_limits_for_available_memory(maximum),
+        maximum,
+    );
+    let options = denoize::RecommendationOptions::new()
+        .with_goal(goal)
+        .with_analysis_seconds(request.analysis_seconds)
+        .with_calibration(request.calibrate)
+        .with_decode_limits(limits)
+        .with_max_gpu_memory_bytes(maximum_gpu)
+        .with_accelerator(accelerator)
+        .with_deterministic(request.deterministic);
+    options.validate()?;
+    Ok(options)
+}
+
+#[tauri::command]
+async fn recommend_settings(
+    request: RecommendationRequest,
+) -> Result<denoize::RecommendationReport, String> {
+    let options = desktop_recommendation_options(&request)?;
+    if request.input.trim().is_empty() {
+        return Err("推奨を分析する入力ファイルを選択してください".into());
+    }
+    let input = request.input;
+    tauri::async_runtime::spawn_blocking(move || {
+        denoize::recommend_file_with_options(input, options)
+    })
+    .await
+    .map_err(|error| format!("推奨分析タスクに失敗しました: {error}"))?
 }
 
 #[tauri::command]
@@ -3734,6 +3788,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             app_info,
+            recommend_settings,
             start_process,
             start_batch,
             cancel_job,
@@ -3786,6 +3841,55 @@ mod tests {
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
         "e51313ed64b3beaa3243489da4c378bfb8635534b9a75422d3c4f93d60385d51";
+
+    #[test]
+    fn recommendation_request_maps_to_bounded_library_options() {
+        let request = RecommendationRequest {
+            input: "missing.wav".into(),
+            goal: "quality".into(),
+            calibrate: true,
+            analysis_seconds: 7,
+            max_memory_mb: Some(64),
+            max_gpu_memory_mb: Some(128),
+            accelerator: "cpu".into(),
+            deterministic: true,
+        };
+        let options = desktop_recommendation_options(&request).unwrap();
+        assert_eq!(options.goal(), denoize::RecommendationGoal::Quality);
+        assert_eq!(options.analysis_seconds(), 7);
+        assert_eq!(options.calibration_runs(), Some(3));
+        assert_eq!(options.accelerator(), AcceleratorPreference::Cpu);
+        assert!(options.deterministic());
+        assert_eq!(
+            options.decode_limits().max_working_set_bytes,
+            Some(64 * BYTES_PER_MIB)
+        );
+        assert_eq!(options.max_gpu_memory_bytes(), Some(128 * BYTES_PER_MIB));
+    }
+
+    #[test]
+    fn recommendation_request_rejects_invalid_options_before_input() {
+        let request = RecommendationRequest {
+            input: "missing.wav".into(),
+            goal: "unknown".into(),
+            calibrate: false,
+            analysis_seconds: 12,
+            max_memory_mb: None,
+            max_gpu_memory_mb: None,
+            accelerator: "cpu".into(),
+            deterministic: false,
+        };
+        assert!(desktop_recommendation_options(&request)
+            .unwrap_err()
+            .contains("不明な推奨目標"));
+
+        let mut request = request;
+        request.goal = "balanced".into();
+        request.max_gpu_memory_mb = Some(0);
+        assert!(desktop_recommendation_options(&request)
+            .unwrap_err()
+            .contains("GPUメモリ上限は1 MiB以上"));
+    }
 
     struct TestDirectory {
         path: PathBuf,

@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes three versioned JSON contracts for local automation. Their
+denoize publishes four versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -11,6 +11,9 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-hardware-v1.schema.json`](../schemas/denoize-hardware-v1.schema.json)
   describes a network-free snapshot of CPU features, compiled accelerator
   runtimes, runtime availability, and backend accelerator support.
+- [`denoize-recommendation-v1.schema.json`](../schemas/denoize-recommendation-v1.schema.json)
+  describes bounded input measurements, local device/calibration evidence,
+  ranked candidates, exclusions, and explicit recommended settings.
 
 Within a schema version, required field names, field types, digest encoding, and
 documented enum/string values are stable. A future release may add fields, so
@@ -124,3 +127,48 @@ set. CUDA also reports its `compute_capability`; fields that do not apply are
 `null`.
 Backend entries distinguish adapters that can be prepared through a tract GPU
 runtime from CPU-only implementations.
+
+## Recommendation report
+
+```sh
+# Bounded input and local-device recommendation, with no network access.
+denoize recommend noisy.wav --goal balanced --json > recommendation.json
+
+# Add fixed on-device calibration evidence and indented output.
+denoize recommend noisy.wav --calibrate --pretty
+```
+
+The root discriminator is `"schema": "denoize-recommendation-v1"` with
+`"schema_version": 1`. The document records the content-detected format and
+codec, total frame count when known, analyzed frame count, analysis mode,
+SHA-256 of the canonical frame-major `f64` samples, bounded signal metrics,
+inferred coarse material class, and confidence. It never serializes the input
+path. The sample SHA-256 is still a content fingerprint and should be redacted
+before sharing when source-audio correlation would be sensitive.
+
+The device section records CPU count, requested accelerator, and locally
+available runtimes. When requested, calibration uses the fixed
+`classical-hifi-v1` half-second fixture, one warmup, and one to nine measured
+runs after its fixed scratch allowance passes the supplied memory limit. Its
+SHA-256, raw elapsed times, median, and baseline realtime headroom
+make the evidence comparable without claiming deterministic wall-clock time.
+Candidate headroom is a heuristic combination of that measured baseline and a
+documented backend cost class, not a direct neural-backend benchmark.
+
+Every compiled backend has a candidate row. `eligible` is false when its
+managed model is not verified locally, the requested runtime is unavailable,
+configuration is invalid, its conservative CPU/model reservation exceeds the
+supplied limit, or its GPU reservation exceeds `--max-gpu-memory` or an
+available runtime-reported device limit. `estimated_memory_bytes` and
+`estimated_gpu_memory_bytes` keep the two address spaces explicit. Backends
+that require a caller-supplied model path are reported but excluded because
+paths are intentionally absent from this document. Stable reason codes explain
+score contributions and exclusions. The first eligible row is repeated as
+`decision`, including reproducible explicit CLI arguments and the effective
+strength, adaptive-noise, and VAD values.
+
+Recommendation uses one read-only hardware snapshot plus the embedded signed
+catalog and read-only artifact verification. It never updates the catalog,
+migrates model provenance, downloads a model, advances persisted trust state,
+or creates/tests a CUDA kernel cache. Actual processing revalidates runtime
+cache writability before model preparation.
