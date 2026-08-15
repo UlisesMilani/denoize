@@ -668,7 +668,9 @@ mod windows_security {
                     "receipt key DACL contains an unsupported or inherited ACE",
                 ));
             }
-            let sid: PSID = std::ptr::addr_of_mut!((*ace).SidStart).cast();
+            // SAFETY: `GetAce` returned a non-null ordinary ACCESS_ALLOWED_ACE,
+            // and its declared size was checked above before locating SidStart.
+            let sid: PSID = unsafe { std::ptr::addr_of_mut!((*ace).SidStart).cast() };
             let mut accepted = false;
             for approved_sid in approved {
                 if unsafe { EqualSid(sid, approved_sid) } != 0 {
