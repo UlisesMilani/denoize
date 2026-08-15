@@ -263,9 +263,21 @@ pub fn stream_checkpoint_sidecar_paths(
     ))
 }
 
+/// Exclusive advisory lock whose lease is released even if its descriptor was cloned.
+struct StreamCheckpointLock(File);
+
+impl Drop for StreamCheckpointLock {
+    fn drop(&mut self) {
+        // A concurrently spawned child can inherit this open file description
+        // before exec applies CLOEXEC. Release the advisory lease explicitly so
+        // that transient duplicate cannot keep a completed session locked.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 /// Locked durable state for one restartable streaming output.
 pub struct StreamCheckpointSession {
-    _lock: File,
+    _lock: StreamCheckpointLock,
     state_path: PathBuf,
     spool_path: PathBuf,
     state: File,
@@ -300,8 +312,10 @@ impl StreamCheckpointSession {
     ) -> Result<StreamCheckpointAcquire, String> {
         let expected = identity(input, recipe, spec, block_frames)?;
         let (state_path, spool_path, lock_path) = stream_checkpoint_sidecar_paths(output)?;
-        let lock = acquire_batch_lock(&lock_path)
-            .map_err(|error| error.replace("batch", "stream checkpoint"))?;
+        let lock = StreamCheckpointLock(
+            acquire_batch_lock(&lock_path)
+                .map_err(|error| error.replace("batch", "stream checkpoint"))?,
+        );
         let state = open_secure_existing(&state_path, true, true)
             .map_err(|error| error.replace("batch state", "stream checkpoint state"))?;
         let spool = open_secure_existing(&spool_path, true, true)
@@ -1363,6 +1377,33 @@ mod tests {
         );
         assert!(loaded.is_none());
         reset.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_drop_releases_an_inherited_lock_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("result.wav");
+        let (_, _, lock_path) = stream_checkpoint_sidecar_paths(&output).unwrap();
+        let (session, _) = active(
+            StreamCheckpointSession::acquire(
+                &output,
+                fingerprint(8),
+                Digest::from_bytes([9; 32]),
+                spec(),
+                64,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        let inherited = session._lock.0.try_clone().unwrap();
+
+        drop(session);
+        let exclusive = acquire_batch_lock(&lock_path).unwrap();
+        fs2::FileExt::unlock(&exclusive).unwrap();
+        drop(exclusive);
+        drop(inherited);
     }
 
     #[test]
