@@ -55,6 +55,7 @@ expected_assets=(
   "denoize-automation-v1.schema.json"
   "denoize-cli-output-v1.schema.json"
   "denoize-hardware-v1.schema.json"
+  "denoize-recommendation-v1.schema.json"
   "denoize-models-${tag}.dmb"
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
@@ -124,6 +125,7 @@ gh release download "$tag" \
   --pattern 'denoize-automation-v1.schema.json' \
   --pattern 'denoize-cli-output-v1.schema.json' \
   --pattern 'denoize-hardware-v1.schema.json' \
+  --pattern 'denoize-recommendation-v1.schema.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -145,7 +147,7 @@ if ! cmp -s models/trust-root-v1.json "$tmp_dir/denoize-model-trust-root-v1.json
   exit 1
 fi
 
-for schema in denoize-automation-v1.schema.json denoize-cli-output-v1.schema.json denoize-hardware-v1.schema.json; do
+for schema in denoize-automation-v1.schema.json denoize-cli-output-v1.schema.json denoize-hardware-v1.schema.json denoize-recommendation-v1.schema.json; do
   if ! cmp -s "schemas/$schema" "$tmp_dir/$schema"; then
     echo "release JSON Schema differs from tagged schemas/$schema" >&2
     exit 1

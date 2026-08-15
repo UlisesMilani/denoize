@@ -60,10 +60,12 @@ if [[ "$is_dry_run" == true ]]; then
   fi
   for required in \
     "denoize-${package_version}/src/automation.rs" \
+    "denoize-${package_version}/src/recommendation.rs" \
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
-    "denoize-${package_version}/schemas/denoize-hardware-v1.schema.json"
+    "denoize-${package_version}/schemas/denoize-hardware-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-recommendation-v1.schema.json"
   do
     if ! tar -tf "$package_archive" | grep -Fx "$required" >/dev/null; then
       echo "dry-run package is missing $required" >&2

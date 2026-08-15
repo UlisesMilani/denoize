@@ -80,6 +80,47 @@ prerequisite. The first CUDA model preparation can compile and cache kernels;
 the host probe does not claim that every user-supplied ONNX graph is supported
 by a GPU transform, so model preparation errors remain explicit.
 
+### Offline input and device recommendation
+
+`denoize recommend` analyzes the signal, compiled backends, locally installed
+models authenticated by the embedded signed catalog, resource limit, and
+current CPU/GPU availability without updating the catalog or model cache,
+downloading a model, or contacting a service:
+
+```sh
+denoize recommend noisy.wav
+denoize recommend noisy.wav --goal quality --calibrate
+denoize recommend noisy.wav --goal speed --max-memory 256 \
+  --max-gpu-memory 2048 --json
+```
+
+The command analyzes at most 12 seconds by default (configurable from 1 to 60).
+WAV, FLAC, and Ogg Vorbis are analyzed through the bounded block decoder; other
+supported formats use their existing whole-file decoder under the same
+`--max-memory` ceiling and then analyze only the bounded prefix. Filesystem
+inputs retain the regular-file and same-opened-object guarantees. Stdin is
+reserved for the bounded non-seekable work in Stage 12.
+
+`--calibrate` adds a fixed, hash-identified Classical Hi-Fi workload with one
+warmup and three measured runs after its fixed scratch allowance fits the same
+memory ceiling. The report records raw timings and median
+baseline realtime headroom, then combines that evidence with documented
+backend cost classes; it does not pretend to be a full-reference audio-quality
+benchmark or an exact runtime prediction for a neural model. Every candidate
+includes stable reason codes, eligibility, local model/runtime state, estimated
+denoize-owned CPU and GPU memory, and the suggested explicit arguments. GPU
+eligibility respects both `--max-gpu-memory` and a runtime-reported device limit
+when one is available. Recommendation captures one read-only hardware snapshot
+and does not create or test a CUDA kernel cache; actual processing revalidates
+cache writability before preparing a model. Compact and pretty output use the
+versioned
+[`denoize-recommendation-v1`](schemas/denoize-recommendation-v1.schema.json)
+contract. Backends that require a caller-supplied model path remain visible as
+excluded candidates; the report does not disclose paths, so only configurations
+that can be reproduced without inventing a model argument are auto-selected.
+The analyzed-sample SHA-256 is a content fingerprint; remove it before sharing
+a report when correlating the source audio would be sensitive.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -674,7 +715,8 @@ trust-root document, and `denoize-models-<tag>.dmb` plus its checksum. The signe
 bundle contains the catalog models, upstream licenses, and provenance for
 closed-network installation; the standalone catalog/root assets remain
 available for independent audit and recovery tooling. Releases also publish the
-versioned automation and CLI-output JSON Schemas used by monitoring clients.
+versioned automation, CLI-output, hardware, and recommendation JSON Schemas
+used by monitoring clients.
 
 ## Install with Cargo
 

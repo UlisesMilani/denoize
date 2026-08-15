@@ -811,6 +811,22 @@ fn catalog_import_rejects_fifo_inputs_without_blocking() {
 }
 
 #[test]
+fn read_only_catalog_verification_never_creates_provenance() {
+    let _environment = lock_model_environment();
+    let directory = tempfile::tempdir().unwrap();
+    let _model_dir = ModelDirGuard::set(directory.path());
+    let bytes = b"read-only catalog model bytes";
+    let model = test_catalog_model(bytes);
+    let destination = path_for_catalog_model(&model).unwrap();
+    std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, bytes).unwrap();
+
+    assert_eq!(verify_catalog_model_read_only(&model).unwrap(), destination);
+    assert!(!destination.parent().unwrap().join(".provenance").exists());
+    assert!(!directory.path().join(".catalog").exists());
+}
+
+#[test]
 fn catalog_model_install_records_validates_and_removes_provenance() {
     let _environment = lock_model_environment();
     let directory = tempfile::tempdir().unwrap();

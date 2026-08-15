@@ -12,6 +12,7 @@ USAGE:
     denoize live [--input-device NAME] [--output-device NAME] [OPTIONS]
     denoize live --list-devices
     denoize hardware [--json|--pretty]
+    denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
@@ -184,6 +185,24 @@ runtime availability, available GPU device names and memory limits, CUDA
 compute capability, and the backends that can use an accelerator. `--pretty`
 emits the same contract indented. File and streaming JSON results include the
 requested and effective accelerator plus an explicit CPU fallback reason.
+
+`denoize recommend INPUT --json` emits `denoize-recommendation-v1`. It analyzes
+at most 12 seconds by default, ranks only locally runnable candidates, records
+stable explanation codes, and never updates a catalog/model cache or downloads
+a model.
+
+WAV, FLAC, and Ogg Vorbis use bounded block decoding; other supported formats
+use their explicitly memory-limited whole-file path before the prefix is
+analyzed. `--calibrate` adds raw and median timings for a fixed hash-identified
+Classical Hi-Fi workload after its fixed scratch allowance passes the same
+memory ceiling. Candidate realtime headroom remains a reported
+cost-class heuristic rather than a direct neural-backend benchmark.
+
+Recommendation captures one read-only hardware snapshot. Candidate rows keep
+conservative CPU/model and GPU session reservations separate; GPU eligibility
+honors `--max-gpu-memory` and a runtime-reported device limit when available.
+The read-only probe does not create or test a CUDA kernel cache, so actual
+processing revalidates cache writability before model preparation.
 
 ## Hardware acceleration
 

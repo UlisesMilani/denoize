@@ -30,6 +30,40 @@ type JobProgress = {
   accelerator?: AcceleratorSelection | null;
 };
 type AcceleratorSelection = { requested: string; effective: string; fallback: string | null };
+type RecommendationReason = { code: string; impact: number; detail: string };
+type RecommendationCandidate = {
+  backend: string; preset: string; model: string | null; eligible: boolean; score: number;
+  requested_accelerator: string; effective_accelerator: string | null;
+  accelerator_fallback: string | null; estimated_memory_bytes: number | null;
+  estimated_gpu_memory_bytes: number | null;
+  calibrated_realtime_headroom: number | null; reasons: RecommendationReason[];
+};
+type RecommendationReport = {
+  schema: string; schema_version: number; denoize_version: string; network_accessed: boolean;
+  goal: string;
+  input: {
+    format: string; codec: string; sample_rate: number; channels: number;
+    total_frames: number | null; analyzed_frames: number; analysis_mode: string;
+    analysis_sha256: string; rms_dbfs: number; peak_dbfs: number; crest_db: number;
+    active_ratio: number; zero_crossing_rate: number; transient_ratio: number;
+    stereo_correlation: number | null; material: string; material_confidence: number;
+  };
+  device: {
+    os: string; architecture: string; logical_cpus: number;
+    requested_accelerator: string; available_runtimes: string[];
+  };
+  calibration: {
+    workload: string; fixture_sha256: string; sample_rate: number; channels: number;
+    frames: number; warmup_runs: number; measured_runs: number; elapsed_ms: number[];
+    median_elapsed_ms: number; baseline_realtime_headroom: number;
+  } | null;
+  decision: {
+    backend: string; preset: string; processing_mode: string; strength: number;
+    adaptive_noise: boolean; vad: boolean; accelerator: string; model: string | null;
+    arguments: string[];
+  };
+  candidates: RecommendationCandidate[];
+};
 type Comparison = {
   markdown: string; json: string; html: string; noisySnrDb: number; enhancedSnrDb: number; improvementDb: number;
   metrics: {
@@ -119,6 +153,8 @@ let pendingModelEvents: ModelProgress[] = [];
 let selectedModelBundle: OfflineBundleRow | null = null;
 const previews: { input?: PreviewData; output?: PreviewData } = {};
 let activePreview: "input" | "output" = "input";
+let currentRecommendation: RecommendationReport | null = null;
+let recommendationRunning = false;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div class="shell">
@@ -167,6 +203,19 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
                 <div class="file-row"><div><label>ONNXモデル</label><div id="model-path-display" class="path empty">モデルファイルを選択</div></div><button class="secondary" id="choose-model">選択</button></div>
                 <div class="form-grid two"><label>モデルレート Hz<input id="onnx-rate" type="number" value="16000" min="1" max="768000"></label><label id="sgmse-profile-field" class="hidden">SGMSE品質<select id="sgmse-profile"><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="quality">Quality</option></select></label></div>
                 <input type="hidden" id="model-path"><p id="backend-hint" class="field-hint"></p>
+              </div>
+              <div class="recommendation-panel">
+                <div class="recommendation-heading"><div><b>入力から設定を提案</b><small>先頭最大12秒を端末内だけで解析</small></div><button class="secondary" id="analyze-recommendation">解析</button></div>
+                <div class="recommendation-controls">
+                  <label>優先目標<select id="recommendation-goal"><option value="balanced">バランス</option><option value="quality">品質</option><option value="speed">速度</option><option value="low-memory">省メモリ</option></select></label>
+                  <label class="toggle"><input id="recommendation-calibrate" type="checkbox"><span></span><div><b>端末を計測</b><small>固定ワークロードを3回実行</small></div></label>
+                </div>
+                <div id="recommendation-result" class="recommendation-result hidden" aria-live="polite">
+                  <div><span>RECOMMENDED</span><strong id="recommendation-title"></strong></div>
+                  <p id="recommendation-summary"></p>
+                  <div id="recommendation-reasons" class="recommendation-reasons"></div>
+                  <button class="primary" id="apply-recommendation">この設定を適用</button>
+                </div>
               </div>
               <div class="strength-row"><div><label>除去強度</label><span id="strength-value">40%</span></div><input id="strength" type="range" min="0" max="1" step="0.01" value="0.4"><div class="range-labels"><span>自然</span><span>強力</span></div></div>
               <div class="toggle-grid">
@@ -378,8 +427,16 @@ function renderRecentFiles() {
   const files = recentFiles();
   $("#recent-files").innerHTML = files.length ? `<span>最近:</span>${files.map((path) => `<button data-recent="${escapeHtml(path)}" title="${escapeHtml(path)}">${escapeHtml(path.split(/[\\/]/).pop() ?? path)}</button>`).join("")}` : "";
   document.querySelectorAll<HTMLButtonElement>("[data-recent]").forEach((button) => button.addEventListener("click", async () => {
-    const path = button.dataset.recent!; setPath("#input-path", "#input-display", path); setPath("#output-path", "#output-display", await defaultOutput(path)); await preparePreview("input", path);
+    await useSingleInput(button.dataset.recent!);
   }));
+}
+
+function clearRecommendation() {
+  currentRecommendation = null;
+  $("#recommendation-result").classList.add("hidden");
+  $("#recommendation-title").textContent = "";
+  $("#recommendation-summary").textContent = "";
+  $("#recommendation-reasons").innerHTML = "";
 }
 
 function activatePage(page: string) { document.querySelector<HTMLButtonElement>(`.nav-item[data-page="${page}"]`)?.click(); }
@@ -388,6 +445,7 @@ async function dropZoneAt(x: number, y: number) {
   return (document.elementFromPoint(x / scale, y / scale)?.closest("[data-drop-zone]") as HTMLElement | null)?.dataset.dropZone ?? "auto";
 }
 async function useSingleInput(path: string) {
+  clearRecommendation();
   setPath("#input-path", "#input-display", path); setPath("#output-path", "#output-display", await defaultOutput(path));
   rememberFile(path); previews.output = undefined; $<HTMLButtonElement>("#preview-output").disabled = true; activatePage("process"); await preparePreview("input", path);
 }
@@ -660,11 +718,7 @@ $<HTMLAudioElement>("#preview-audio").addEventListener("timeupdate", (event) => 
 
 $("#choose-input").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: audioFilters }); if (typeof path !== "string") return;
-  setPath("#input-path", "#input-display", path);
-  const output = await defaultOutput(path); setPath("#output-path", "#output-display", output);
-  rememberFile(path);
-  previews.output = undefined; $<HTMLButtonElement>("#preview-output").disabled = true;
-  await preparePreview("input", path);
+  await useSingleInput(path);
 });
 $("#choose-output").addEventListener("click", async () => {
   const path = await save({ filters: audioFilters, defaultPath: $<HTMLInputElement>("#output-path").value || undefined });
@@ -674,6 +728,92 @@ async function defaultOutput(input: string) {
   const dot = input.lastIndexOf("."); const separator = Math.max(input.lastIndexOf("/"), input.lastIndexOf("\\"));
   const base = dot > separator ? input.slice(0, dot) : input;
   return `${base}.denoized.wav`;
+}
+
+function formatBytes(value: number | null) {
+  if (value == null || !Number.isFinite(value) || value < 0) return "n/a";
+  const gib = 1024 ** 3;
+  const mib = 1024 ** 2;
+  return value >= gib ? `${(value / gib).toFixed(2)} GiB` : `${(value / mib).toFixed(1)} MiB`;
+}
+
+function renderRecommendation(report: RecommendationReport) {
+  const selected = report.candidates.find(({ backend, eligible }) => eligible && backend === report.decision.backend);
+  const analyzedSeconds = report.input.sample_rate > 0 ? report.input.analyzed_frames / report.input.sample_rate : 0;
+  const calibration = report.calibration == null
+    ? "端末計測なし"
+    : `端末計測 ${report.calibration.baseline_realtime_headroom.toFixed(2)}x 基準ヘッドルーム`;
+  const memory = selected == null
+    ? ""
+    : ` · RAM ${formatBytes(selected.estimated_memory_bytes)} · GPU ${formatBytes(selected.estimated_gpu_memory_bytes)}`;
+  $("#recommendation-title").textContent = `${report.decision.backend} · ${report.decision.preset} · ${report.decision.accelerator}`;
+  $("#recommendation-summary").textContent = `${report.input.material}（確度 ${(report.input.material_confidence * 100).toFixed(0)}%）· ${analyzedSeconds.toFixed(1)}秒解析 · score ${selected?.score ?? "—"} · ${calibration}${memory}`;
+  $("#recommendation-reasons").innerHTML = (selected?.reasons ?? []).map((reason) => {
+    const impact = reason.impact > 0 ? `+${reason.impact}` : String(reason.impact);
+    return `<div><span>${escapeHtml(reason.code)} · ${impact}</span><p>${escapeHtml(reason.detail)}</p></div>`;
+  }).join("");
+  $("#recommendation-result").classList.remove("hidden");
+}
+
+$("#analyze-recommendation").addEventListener("click", async () => {
+  const button = $<HTMLButtonElement>("#analyze-recommendation");
+  const input = $<HTMLInputElement>("#input-path").value;
+  if (!input) return showToast("先に入力ファイルを選択してください", true);
+  if (activeJob !== null || pendingJobKind !== null || recommendationRunning) return showToast("実行中の処理が終わってから推奨を解析してください", true);
+  clearRecommendation();
+  recommendationRunning = true;
+  button.disabled = true;
+  button.textContent = $<HTMLInputElement>("#recommendation-calibrate").checked ? "解析・計測中…" : "解析中…";
+  try {
+    const report = await invoke<RecommendationReport>("recommend_settings", {
+      request: {
+        input,
+        goal: $<HTMLSelectElement>("#recommendation-goal").value,
+        calibrate: $<HTMLInputElement>("#recommendation-calibrate").checked,
+        analysisSeconds: 12,
+        maxMemoryMb: optionalPositiveNumber("#resource-process-memory"),
+        maxGpuMemoryMb: optionalPositiveNumber("#resource-gpu-memory"),
+        accelerator: $<HTMLSelectElement>("#accelerator").value,
+        deterministic: $<HTMLInputElement>("#deterministic").checked,
+      },
+    });
+    if ($<HTMLInputElement>("#input-path").value !== input) return;
+    currentRecommendation = report;
+    renderRecommendation(report);
+  } catch (error) { showToast(`推奨分析: ${errorText(error)}`, true); }
+  finally { recommendationRunning = false; button.disabled = false; button.textContent = "解析"; }
+});
+
+$("#apply-recommendation").addEventListener("click", () => {
+  try {
+    const report = currentRecommendation;
+    if (report == null) throw new Error("先に入力を解析してください");
+    const backend = appInfo.backends.find(({ name }) => name === report.decision.backend);
+    if (backend == null) throw new Error(`推奨バックエンド ${report.decision.backend} は現在利用できません`);
+    if (backend.externalModel) throw new Error("外部モデル型の推奨はモデルファイルを明示して適用してください");
+    const accelerator = $<HTMLSelectElement>("#accelerator");
+    const acceleratorOption = [...accelerator.options].find(({ value }) => value === report.decision.accelerator);
+    const runtimeAvailable = report.decision.accelerator === "cpu"
+      || appInfo.accelerators.some(({ name, available }) => name === report.decision.accelerator && available);
+    if (acceleratorOption == null || !runtimeAvailable) {
+      throw new Error(`推奨アクセラレータ ${report.decision.accelerator} は現在利用できません`);
+    }
+    const mode = report.decision.processing_mode;
+    applyAndSaveSettings({
+      backend: report.decision.backend,
+      preset: report.decision.preset,
+      mode,
+      accelerator: report.decision.accelerator,
+      strength: report.decision.strength,
+      adaptive: report.decision.adaptive_noise,
+      vad: report.decision.vad,
+    });
+    showToast(`${report.decision.backend} / ${report.decision.preset} を適用しました`);
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+for (const id of ["recommendation-goal", "recommendation-calibrate", "resource-process-memory", "resource-gpu-memory", "accelerator", "deterministic"]) {
+  document.getElementById(id)?.addEventListener("change", clearRecommendation);
 }
 
 $("#strength").addEventListener("input", (event) => $("#strength-value").textContent = `${Math.round(Number((event.target as HTMLInputElement).value) * 100)}%`);
@@ -1187,6 +1327,7 @@ async function loadLiveDevices() {
 $("#refresh-live-devices").addEventListener("click", () => void loadLiveDevices());
 $("#start-live").addEventListener("click", async () => {
   try {
+    if (recommendationRunning) throw new Error("推奨分析の完了後に開始してください");
     const backend = $<HTMLSelectElement>("#live-backend").value;
     await invoke("start_live", { request: {
       inputDevice: $<HTMLSelectElement>("#live-input").value || null,
@@ -1232,7 +1373,7 @@ function handleJobProgress(payload: JobProgress) {
 }
 async function beginJob(kind: "file" | "batch", command: "start_process" | "start_batch", request: unknown) {
   await jobProgressReady;
-  if (activeJob !== null || pendingJobKind !== null) throw new Error("別の処理が実行中です");
+  if (activeJob !== null || pendingJobKind !== null || recommendationRunning) throw new Error("別の処理が実行中です");
   pendingJobKind = kind;
   pendingJobEvents = [];
   setJobUi(true, kind);

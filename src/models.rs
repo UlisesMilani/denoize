@@ -427,6 +427,24 @@ pub fn verify_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
     verify_spec_at(&model, &path_for_spec(&model)?)
 }
 
+/// Verify an installed catalog artifact without creating or migrating its
+/// provenance record.
+///
+/// This crate-private path is for read-only inspection such as recommendation.
+/// Installation and execution keep using [`verify_catalog_model`] so their
+/// authenticated provenance requirements remain unchanged.
+pub(crate) fn verify_catalog_model_read_only(model: &CatalogModel) -> Result<PathBuf, String> {
+    let model = ModelSpec::catalog(model);
+    let destination = path_for_spec(&model)?;
+    validate_model_storage_path(&destination)?;
+    let verified = verify_bytes_at(&model, &destination)?;
+    let provenance_path = provenance_path(&model, &destination)?;
+    if let Some(provenance) = read_provenance(&provenance_path)? {
+        validate_provenance(&model, &provenance)?;
+    }
+    Ok(verified)
+}
+
 #[cfg(test)]
 fn verify_at(model: &ModelInfo, destination: &Path) -> Result<PathBuf, String> {
     verify_bytes_at(&ModelSpec::legacy(model), destination)

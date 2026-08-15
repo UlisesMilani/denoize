@@ -296,6 +296,7 @@ jobs:
           automation_schema="$asset_dir/denoize-automation-v1.schema.json"
           cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
+          recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
           bundle="$asset_dir/denoize-models-${GITHUB_REF_NAME}.dmb"
           bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
@@ -303,6 +304,7 @@ jobs:
           cp schemas/denoize-automation-v1.schema.json "$automation_schema"
           cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
+          cp schemas/denoize-recommendation-v1.schema.json "$recommendation_schema"
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -314,6 +316,7 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
             "$automation_schema" "$cli_schema" "$hardware_schema" \
+            "$recommendation_schema" \
             "$bundle" "$bundle_checksum" --clobber
 
   publish:
