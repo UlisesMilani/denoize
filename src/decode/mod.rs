@@ -20,10 +20,12 @@ mod m4a;
 mod mp3;
 mod opus;
 mod pcm;
+mod stream;
 
 pub(crate) use budget::DecodeBudget;
 pub use budget::DecodeLimits;
 pub use pcm::DecodedPcm;
+pub use stream::{inspect_audio_stream_session, AudioStreamInfo, AudioStreamReader};
 
 use std::path::Path;
 

@@ -64,7 +64,7 @@ OPTIONS:
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
-        --stream              bounded-memory stateful WAV-to-WAV processing
+        --stream              bounded-memory WAV/FLAC/Vorbis-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --max-process-memory <MB> aggregate denoize RAM reservations across workers (min: 1)
@@ -76,7 +76,7 @@ OPTIONS:
         --jobs <N>            workers in 1..32 (default: min(CPU count, 32))
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
-        --resume              verify and skip exact outputs recorded by v3 batch state
+        --resume              resume a stream checkpoint or verify exact v3 batch outputs
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork/chapters to the output
@@ -252,6 +252,29 @@ Windows applies a Job Object process-memory ceiling. Without that value the
 child still contains an abort, but has no new OS memory ceiling. Cooperative
 resource counters do not include every private third-party allocation; use
 isolation when those allocations require a hard process boundary.
+
+## Bounded streaming and restart checkpoints
+
+`--stream` accepts regular-file WAV, FLAC, and Ogg Vorbis input and publishes an
+atomic WAV output with a compiled streaming backend. Ogg Opus, MP3, M4A/ALAC,
+and ADTS AAC remain on the normal path until their gapless, granule, or edit-list
+semantics can be preserved by a bounded decoder. `--stream-frames` controls the
+bounded input block and participates in restart identity.
+
+With `--stream --resume`, denoize periodically synchronizes a private
+append-only journal and interleaved `f64` PCM spool beside the destination. A
+restart deterministically replays the same opened input to the last durable
+boundary, verifies the saved PCM digest, reconstructs backend state, and then
+continues. Checkpoints bind the input bytes, effective recipe, model bytes,
+source format, channel geometry, and block size. Mismatches are preserved and
+rejected unless `--force` explicitly resets them. Final output remains atomic;
+success removes the state journal and PCM spool but retains the reusable lock.
+The exact staged WAV fingerprint is recorded before publication. If the process
+exits after commit but before cleanup, the next identical resume verifies the
+destination and removes the stale data sidecars without reprocessing; a changed
+destination is preserved and rejected unless `--force` resets the checkpoint.
+The spool and staged WAV coexist during publication and both count toward
+`--max-temp-space`.
 
 On Unix, the batch output root must be owned by the current user and must not be
 group/world writable. On Windows, use an ACL-capable local filesystem and an

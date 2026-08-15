@@ -222,3 +222,42 @@ correlated with the same deterministic Python/ONNX sampler at
 gate improved SI-SNR from `2.719 dB` to `11.471 dB` (`+8.752 dB`). The graph is
 about 252 MiB. A release build on the reference x86-64 Linux host took 737.92
 seconds for the two-second fixture and used 1,204,648 KiB maximum RSS.
+
+## Product delivery stages
+
+This sequence tracks the operational work around the neural backends. A stage
+is marked implemented only after its CLI and desktop surfaces, documentation,
+focused and broad tests, release package, CI, tag, and published assets have
+been verified. Stages are released in order rather than accumulated into one
+unreviewable release.
+
+| Stage | Deliverable | Status |
+|---:|---|---|
+| 1 | Signed, rollback-resistant managed-model catalog and install provenance | Released in v0.49.0 |
+| 2 | Conservative model-cache doctor, repair, and prune workflows | Released in v0.50.0 |
+| 3 | Signed trust-root rotation with rollback and expiry policy | Released in v0.51.0 |
+| 4 | Signed offline multi-model transfer bundles | Released in v0.52.0 |
+| 5 | Stable CLI, model, and hardware automation contracts | Released in v0.53.0 |
+| 6 | Explicit CPU/Metal/CUDA discovery and accelerator selection | Released in v0.54.0 |
+| 7 | Process-wide RAM, temporary-space, CPU, GPU, and isolation admission | Released in v0.55.0 |
+| 8 | Bounded compressed-input streaming with durable restart checkpoints | In progress |
+| 9 | Network-free backend and preset recommendation with an explainable decision report | Planned |
+| 10 | Release SBOMs, build provenance, and asset-to-source verification | Planned |
+| 11 | Read-only execution plans, signed receipts, and offline result verification | Planned |
+| 12 | Native gapless/granule/edit-aware checkpoints and encoded streaming output | Planned |
+| 13 | Parser fuzzing, deterministic fault injection, and crash/power-loss simulation | Planned |
+| 14 | Desktop child isolation, cancellation fences, and restart recovery UX | Planned |
+| 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Planned |
+| 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Planned |
+| 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
+| 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
+
+Stage 8 accepts regular-file WAV, FLAC, and Ogg Vorbis input, writes an atomic
+WAV, and supports the stateful Classical, RNNoise, and GTCRN backends. Its
+checkpoint binds the input, effective recipe, model, decoder geometry, and
+block size; it synchronizes a bounded journal and PCM spool, replays backend
+state deterministically, and records the staged output fingerprint before
+publication. A restart therefore resumes an incomplete stream or reconciles a
+completed commit whose data sidecars were not yet removed. MP3, Ogg Opus,
+M4A/ALAC, and ADTS AAC remain in Stage 12 until their presentation-timeline
+semantics can be retained without whole-file decoding.

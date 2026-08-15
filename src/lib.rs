@@ -93,9 +93,10 @@ pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
 pub use config::{ConfigError, ResourcePlan};
 pub use decode::{
     decode_file, decode_file_from_session_with_limits, decode_file_with_limits,
-    decode_file_with_metadata_limits, probe_file, probe_file_from_session_with_limits,
-    probe_file_with_limits, probe_file_with_metadata_limits, AudioCodec, AudioFormat, AudioProbe,
-    DecodeLimits, DecodedPcm,
+    decode_file_with_metadata_limits, inspect_audio_stream_session, probe_file,
+    probe_file_from_session_with_limits, probe_file_with_limits, probe_file_with_metadata_limits,
+    AudioCodec, AudioFormat, AudioProbe, AudioStreamInfo, AudioStreamReader, DecodeLimits,
+    DecodedPcm,
 };
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};

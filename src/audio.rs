@@ -364,7 +364,11 @@ pub fn inspect_wav_session(
     let reader = WavReader::new(file).map_err(|e| format!("open: {e}"))?;
     let spec = reader.spec();
     validate_readable_wav_spec(spec)?;
-    Ok(WavStreamInfo { spec, channel_mask })
+    Ok(WavStreamInfo {
+        spec,
+        channel_mask,
+        total_frames: u64::from(reader.duration()),
+    })
 }
 
 /// Read WAV data supplied by a pipe or another in-memory source.
@@ -777,6 +781,8 @@ pub struct WavStreamInfo {
     pub spec: WavSpec,
     /// WAVE_FORMAT_EXTENSIBLE speaker mask, when present.
     pub channel_mask: Option<ChannelMask>,
+    /// Number of complete inter-channel frames declared by the container.
+    pub total_frames: u64,
 }
 
 /// Block-oriented WAV reader. Samples are returned as planar `f64` channels,
@@ -847,7 +853,11 @@ impl WavStreamReader<BufReader<std::fs::File>> {
     /// after this call. This prevents another session operation from moving
     /// the shared file cursor while streaming is in progress.
     pub fn from_session(session: crate::input::AudioInputSession) -> Result<Self, String> {
-        let mut file = session.into_file_rewound("open WAV stream")?;
+        let file = session.into_file_rewound("open WAV stream")?;
+        Self::from_file(file)
+    }
+
+    pub(crate) fn from_file(mut file: std::fs::File) -> Result<Self, String> {
         let channel_mask = read_wav_channel_mask_reader(&mut file)?;
         file.seek(SeekFrom::Start(0))
             .map_err(|e| format!("rewind WAV input: {e}"))?;

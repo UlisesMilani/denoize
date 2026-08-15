@@ -20,6 +20,13 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 
+mod stream_checkpoint;
+pub use stream_checkpoint::{
+    stream_checkpoint_sidecar_paths, stream_recipe_digest, StreamCheckpoint,
+    StreamCheckpointAcquire, StreamCheckpointSession, StreamPcmDigest,
+    STREAM_CHECKPOINT_SCRATCH_BYTES,
+};
+
 /// Canonical v3 journal name shared by the CLI and desktop application.
 pub const STATE_FILE_NAME: &str = ".denoize-state";
 /// Legacy desktop journal. It is detected for migration but never trusted.
@@ -455,6 +462,78 @@ pub fn fingerprint_input_session(
     let path = session.path().to_path_buf();
     let mut file = session.try_clone_rewound("input fingerprint")?;
     fingerprint_open_file(&mut file, &path, false)
+}
+
+/// Fingerprint one open regular file without changing its shared cursor.
+///
+/// Bounded stream readers use this after consuming audio so the original
+/// filesystem object can be fenced without reopening its pathname or moving a
+/// decoder's cloned file description.
+#[doc(hidden)]
+pub fn fingerprint_open_file_at(file: &File, path: &Path) -> Result<FileFingerprint, String> {
+    let before = file
+        .metadata()
+        .map_err(|error| format!("inspect content file {}: {error}", path.display()))?;
+    if !before.is_file() {
+        return Err(format!(
+            "content path is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let expected_len = before.len();
+    let expected_modified = before.modified().ok();
+    let mut hasher = Sha256::new();
+    let mut offset = 0_u64;
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+    while offset < expected_len {
+        let remaining = expected_len - offset;
+        let requested = usize::try_from(remaining.min(HASH_BUFFER_BYTES as u64))
+            .expect("bounded fingerprint request fits usize");
+        let count = read_at(file, &mut buffer[..requested], offset)
+            .map_err(|error| format!("read content file {}: {error}", path.display()))?;
+        if count == 0 {
+            return Err(format!(
+                "content file changed while hashing: {}",
+                path.display()
+            ));
+        }
+        offset = offset
+            .checked_add(count as u64)
+            .ok_or_else(|| format!("content length overflow for {}", path.display()))?;
+        hasher.update(&buffer[..count]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("reinspect content file {}: {error}", path.display()))?;
+    if after.len() != expected_len || after.modified().ok() != expected_modified {
+        return Err(format!(
+            "content file changed while hashing: {}",
+            path.display()
+        ));
+    }
+    Ok(FileFingerprint {
+        len: offset,
+        digest: Digest(hasher.finalize().into()),
+    })
+}
+
+#[cfg(unix)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt as _;
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut clone = file.try_clone()?;
+    clone.seek(SeekFrom::Start(offset))?;
+    clone.read(buffer)
 }
 
 fn fingerprint_file_after_hash(
