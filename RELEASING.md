@@ -42,6 +42,7 @@ the repository's built-in `GITHUB_TOKEN`.
    cargo build --locked --features full --bin denoize
    python3 scripts/validate-deepfilter.py --denoize target/debug/denoize
    bash scripts/publish-crates-io.sh --dry-run
+   bash scripts/test-release-evidence.sh
    ```
 
 5. Commit and push the release change.
@@ -53,18 +54,30 @@ the repository's built-in `GITHUB_TOKEN`.
    ```
 
 The workflow first validates and tests the tag, builds and uploads every OS
-archive, publishes the crate, and verifies the complete release asset set. The
-verification checks that every CLI archive, desktop installer, signature, and
-`latest.json` is present and non-empty, validates the SHA-256 manifests, and
-confirms that updater metadata points at uploaded assets. Only then is the
-GitHub draft release published. If any step fails, the GitHub release remains a
-draft.
+archive, packages the exact crates.io archive, and generates the release
+evidence. Evidence generation creates a CycloneDX SBOM for every installable
+artifact, attests all subjects from the tagged workflow with GitHub Sigstore,
+and packages the deterministic SBOMs, manifest, schema, and offline verifier
+into a reproducible archive. The timestamped Sigstore bundles and trusted-root
+snapshot remain separate release assets. The verification checks that
+every CLI archive, desktop installer, signature, evidence file, and
+`latest.json` is present and non-empty, validates the SHA-256 manifests and
+offline provenance policy, and confirms that updater metadata points at
+uploaded assets. Only then can the exact pre-attested crate be published; its
+crates.io checksum must match before the GitHub draft becomes public. If any
+step fails, the GitHub release remains a draft.
 
 The same release check can be run against an existing release with:
 
 ```sh
 bash scripts/verify-release-assets.sh v0.7.0
 ```
+
+For a credential-free, network-free check, download the complete release and a
+fresh trusted root on a connected machine, then follow
+[`docs/release-evidence.md`](docs/release-evidence.md). The trusted root is part
+of the offline trust transfer and must not be accepted solely because it came
+from the same untrusted mirror as the artifacts.
 
 Pull requests also run the desktop packaging matrix on Linux, macOS (Intel and
 Apple Silicon), and Windows. Those CI builds disable signing and updater

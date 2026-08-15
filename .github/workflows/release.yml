@@ -22,7 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           fetch-depth: 0
 
@@ -70,6 +71,20 @@ jobs:
           # preceding test targets.
           cargo build --locked --no-default-features --bin denoize
           bash scripts/generate-cli-docs.sh --check
+
+      - name: Verify release evidence tooling
+        run: |
+          bash -n \
+            scripts/package-release-evidence.sh \
+            scripts/publish-crates-io.sh \
+            scripts/release-evidence-assets.sh \
+            scripts/test-release-evidence.sh \
+            scripts/verify-release-assets.sh \
+            scripts/verify-release-evidence.sh
+          python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
+          jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
+            schemas/denoize-release-evidence-v1.schema.json >/dev/null
+          bash scripts/test-release-evidence.sh
 
       - name: Verify crates.io package
         run: |
@@ -119,13 +134,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
-      - name: Select stable Rust
+      - name: Select release Rust
         shell: bash
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
 
       - name: Enable legacy CMake policy compatibility (Unix)
         if: runner.os != 'Windows'
@@ -225,7 +241,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Install Linux desktop dependencies
         if: runner.os == 'Linux'
@@ -236,11 +253,11 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
             libasound2-dev libayatana-appindicator3-dev
 
-      - name: Select stable Rust
+      - name: Select release Rust
         shell: bash
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
           rustup target add "${{ matrix.target }}"
 
       - name: Install frontend dependencies
@@ -248,7 +265,8 @@ jobs:
         run: npm ci
 
       - name: Build and upload desktop bundles
-        uses: tauri-apps/tauri-action@v1
+        # tauri-apps/tauri-action v1.
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -269,13 +287,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
-      - name: Select stable Rust
+      - name: Select release Rust
         shell: bash
         run: |
-          rustup update stable --no-self-update
-          rustup default stable
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
 
       - name: Install Tauri signer
         working-directory: apps/desktop
@@ -297,6 +316,7 @@ jobs:
           cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
           recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
+          release_evidence_schema="$asset_dir/denoize-release-evidence-v1.schema.json"
           bundle="$asset_dir/denoize-models-${GITHUB_REF_NAME}.dmb"
           bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
@@ -305,6 +325,7 @@ jobs:
           cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
           cp schemas/denoize-recommendation-v1.schema.json "$recommendation_schema"
+          cp schemas/denoize-release-evidence-v1.schema.json "$release_evidence_schema"
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -316,8 +337,145 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
             "$automation_schema" "$cli_schema" "$hardware_schema" \
-            "$recommendation_schema" \
+            "$recommendation_schema" "$release_evidence_schema" \
             "$bundle" "$bundle_checksum" --clobber
+
+  release-evidence:
+    name: Generate release SBOMs and provenance
+    needs: [build, desktop-build, model-catalog]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Download installable release artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_dir=$(mktemp -d /tmp/denoize-release-assets.XXXXXX)
+          evidence_dir="$RUNNER_TEMP/denoize-release-evidence-v1"
+          asset_spec="$RUNNER_TEMP/release-primary-assets.tsv"
+          bash scripts/release-evidence-assets.sh primary "$GITHUB_REF_NAME" > "$asset_spec"
+          while IFS=$'\t' read -r kind target name; do
+            if [[ "$kind" != crate ]]; then
+              gh release download "$GITHUB_REF_NAME" \
+                --pattern "$name" --dir "$asset_dir"
+            fi
+          done < "$asset_spec"
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          source_commit=$(git rev-parse HEAD)
+          {
+            echo "DENOIZE_RELEASE_ASSET_DIR=$asset_dir"
+            echo "DENOIZE_RELEASE_EVIDENCE_DIR=$evidence_dir"
+            echo "DENOIZE_RELEASE_ASSET_SPEC=$asset_spec"
+            echo "DENOIZE_RELEASE_SOURCE_COMMIT=$source_commit"
+            echo "SOURCE_DATE_EPOCH=$source_date_epoch"
+          } >> "$GITHUB_ENV"
+
+      - name: Package exact crates.io archive
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          package="$DENOIZE_RELEASE_ASSET_DIR/denoize-${version}.crate"
+          bash scripts/publish-crates-io.sh --package-only "$package"
+          (
+            cd "$DENOIZE_RELEASE_ASSET_DIR"
+            sha256sum "$(basename "$package")" > "$(basename "$package").sha256"
+          )
+          gh release upload "$GITHUB_REF_NAME" \
+            "$package" "$package.sha256" --clobber
+
+      - name: Install pinned Syft
+        id: syft
+        # anchore/sbom-action v0, with the scanner itself fixed below.
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610
+        with:
+          syft-version: v1.50.0
+
+      - name: Generate per-artifact CycloneDX SBOMs
+        shell: bash
+        run: |
+          python3 scripts/generate-release-evidence.py generate \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$DENOIZE_RELEASE_SOURCE_COMMIT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --artifact-dir "$DENOIZE_RELEASE_ASSET_DIR" \
+            --asset-spec "$DENOIZE_RELEASE_ASSET_SPEC" \
+            --model-catalog "$GITHUB_WORKSPACE/models/catalog-v1.json" \
+            --syft "${{ steps.syft.outputs.cmd }}" \
+            --syft-version 1.50.0 \
+            --output-dir "$DENOIZE_RELEASE_EVIDENCE_DIR"
+
+      - name: Attest installable release artifacts
+        id: attest-subjects
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-checksums: ${{ runner.temp }}/denoize-release-evidence-v1/subjects.sha256
+
+      - name: Assemble reproducible offline evidence archive
+        shell: bash
+        run: |
+          cp scripts/verify-release-evidence.sh \
+            "$DENOIZE_RELEASE_EVIDENCE_DIR/verify-release-evidence.sh"
+          cp schemas/denoize-release-evidence-v1.schema.json \
+            "$DENOIZE_RELEASE_EVIDENCE_DIR/denoize-release-evidence-v1.schema.json"
+          cp docs/release-evidence.md "$DENOIZE_RELEASE_EVIDENCE_DIR/README.md"
+          python3 scripts/generate-release-evidence.py finalize \
+            --output-dir "$DENOIZE_RELEASE_EVIDENCE_DIR"
+          evidence_archive="$RUNNER_TEMP/denoize-release-evidence-${GITHUB_REF_NAME}.tar.gz"
+          bash scripts/package-release-evidence.sh \
+            "$DENOIZE_RELEASE_EVIDENCE_DIR" \
+            "$evidence_archive" \
+            "$SOURCE_DATE_EPOCH"
+          (
+            cd "$RUNNER_TEMP"
+            sha256sum "$(basename "$evidence_archive")" \
+              > "$(basename "$evidence_archive").sha256"
+          )
+          echo "DENOIZE_RELEASE_EVIDENCE_ARCHIVE=$evidence_archive" >> "$GITHUB_ENV"
+
+      - name: Attest offline evidence archive
+        id: attest-evidence
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/denoize-release-evidence-${{ github.ref_name }}.tar.gz
+
+      - name: Upload release evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          evidence_bundle="$DENOIZE_RELEASE_EVIDENCE_ARCHIVE.sigstore.json"
+          subjects_bundle="$DENOIZE_RELEASE_ASSET_DIR/denoize-release-subjects-${GITHUB_REF_NAME}.sigstore.json"
+          trusted_root="$DENOIZE_RELEASE_ASSET_DIR/denoize-sigstore-trusted-root.jsonl"
+          cp "${{ steps.attest-evidence.outputs.bundle-path }}" "$evidence_bundle"
+          cp "${{ steps.attest-subjects.outputs.bundle-path }}" "$subjects_bundle"
+          gh attestation trusted-root > "$trusted_root"
+          gh release upload "$GITHUB_REF_NAME" \
+            "$DENOIZE_RELEASE_EVIDENCE_ARCHIVE" \
+            "$DENOIZE_RELEASE_EVIDENCE_ARCHIVE.sha256" \
+            "$evidence_bundle" \
+            "$subjects_bundle" \
+            "$trusted_root" \
+            --clobber
 
   publish:
     name: Publish release
@@ -331,11 +489,12 @@ jobs:
 
   verify-assets:
     name: Verify release assets
-    needs: [build, desktop-build, model-catalog]
+    needs: release-evidence
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Verify uploaded release assets
         env:
@@ -349,7 +508,13 @@ jobs:
     environment: crates-io
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v6
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
@@ -357,9 +522,15 @@ jobs:
       - name: Publish denoize to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           version=${GITHUB_REF_NAME#v}
+          package="$RUNNER_TEMP/denoize-${version}.crate"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "$(basename "$package")" \
+            --dir "$RUNNER_TEMP"
+          expected_checksum=$(sha256sum "$package" | awk '{print $1}')
           response=$(curl --fail --silent --show-error \
             --user-agent "denoize-release-workflow ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)" \
             "https://crates.io/api/v1/crates/denoize" || true)
@@ -371,5 +542,22 @@ jobs:
               echo "CRATES_IO_TOKEN is not configured in the crates-io environment." >&2
               exit 1
             fi
-            bash scripts/publish-crates-io.sh
+            bash scripts/publish-crates-io.sh --expected-package "$package"
           fi
+          published_checksum=""
+          for attempt in $(seq 1 30); do
+            response=$(curl --fail --silent --show-error \
+              --user-agent "denoize-release-workflow ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)" \
+              "https://crates.io/api/v1/crates/denoize" || true)
+            published_checksum=$(jq -r --arg version "$version" \
+              '.versions[]? | select(.num == $version) | .checksum' <<<"$response" | head -n 1)
+            if [[ -n "$published_checksum" ]]; then
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$published_checksum" != "$expected_checksum" ]]; then
+            echo "crates.io checksum mismatch: expected $expected_checksum, got ${published_checksum:-<missing>}" >&2
+            exit 1
+          fi
+          echo "crates.io denoize $version matches release evidence checksum $expected_checksum"

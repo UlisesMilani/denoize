@@ -715,8 +715,15 @@ trust-root document, and `denoize-models-<tag>.dmb` plus its checksum. The signe
 bundle contains the catalog models, upstream licenses, and provenance for
 closed-network installation; the standalone catalog/root assets remain
 available for independent audit and recovery tooling. Releases also publish the
-versioned automation, CLI-output, hardware, and recommendation JSON Schemas
-used by monitoring clients.
+versioned automation, CLI-output, hardware, recommendation, and release-evidence
+JSON Schemas used by monitoring and verification clients.
+
+Every installable CLI archive, desktop package, crates.io archive, and offline
+model bundle also has a per-artifact CycloneDX SBOM. The release evidence
+archive binds those 14 artifacts and SBOMs to their sizes and SHA-256 digests,
+while companion GitHub Sigstore/SLSA bundles prove the exact tag commit and
+release workflow. See [release evidence and offline verification](docs/release-evidence.md)
+for the trust model and an air-gapped verification procedure.
 
 ## Install with Cargo
 
@@ -746,13 +753,16 @@ git push origin v0.1.0
 The `GitHub Release` workflow verifies that the tag is on the default branch and
 matches every release version field, runs the full test suite, and builds all
 CLI and desktop targets before publishing the crates.io package. It then checks
-all archives, checksums, signatures, and updater metadata before publishing the
-draft release and generated notes. When `docs/releases/vTAG.md` exists, its
+all archives, checksums, signatures, per-artifact SBOMs, build provenance, and
+updater metadata before publishing the draft release and generated notes. The
+exact `.crate` archive is attested before publication and its checksum must
+match the crates.io API afterward. When `docs/releases/vTAG.md` exists, its
 curated notes are prepended to the generated notes. Installed desktop apps
-check the signed `latest.json` feed on startup; updates are only installed
-after user confirmation. The updater private key is kept in the
+check the signed `latest.json` feed on startup; updates are only installed after
+user confirmation. The updater private key is kept in the
 `TAURI_SIGNING_PRIVATE_KEY` repository secret. A failed build leaves the release
-as a draft and cannot publish the crate before every target has built.
+as a draft and cannot publish the crate before every target and its evidence
+have been verified.
 
 ## CLI highlights
 
