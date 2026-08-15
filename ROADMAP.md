@@ -26,7 +26,7 @@ atomicity, documentation, and release assets are covered by automated tests.
 | 6 | Hardware capability discovery, explicit accelerator selection, and deterministic CPU fallback | Implemented |
 | 7 | Process-level RAM/temporary/GPU admission, memory-weighted workers, and opt-in OS child isolation for third-party codec/model failures | Implemented |
 | 8 | Bounded streaming for compressed inputs and restartable processing checkpoints for long-running jobs | Implemented |
-| 9 | Input- and device-aware quality/model recommendation with reproducible calibration evidence | Planned |
+| 9 | Input- and device-aware quality/model recommendation with reproducible calibration evidence | Implemented |
 | 10 | Reproducible releases with per-artifact SBOMs, signed build provenance, and offline verification for binaries, crates, and converted models | Planned |
 
 Stages 2–5 extend the authenticated distribution system without weakening its
@@ -241,7 +241,7 @@ unreviewable release.
 | 6 | Explicit CPU/Metal/CUDA discovery and accelerator selection | Released in v0.54.0 |
 | 7 | Process-wide RAM, temporary-space, CPU, GPU, and isolation admission | Released in v0.55.0 |
 | 8 | Bounded compressed-input streaming with durable restart checkpoints | Released in v0.56.0 |
-| 9 | Network-free backend and preset recommendation with on-device benchmark calibration and an explainable decision report | Planned |
+| 9 | Network-free backend and preset recommendation with on-device benchmark calibration and an explainable decision report | Released in v0.57.0 |
 | 10 | Release SBOMs, build provenance, and asset-to-source verification | Planned |
 | 11 | Read-only execution plans, signed receipts, and offline result verification | Planned |
 | 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Planned |
