@@ -244,7 +244,7 @@ unreviewable release.
 | 9 | Network-free backend and preset recommendation with on-device benchmark calibration and an explainable decision report | Released in v0.57.0 |
 | 10 | Release SBOMs, build provenance, and asset-to-source verification | Released in v0.58.0 |
 | 11 | Read-only execution plans, signed receipts, and offline result verification | Released in v0.59.0 |
-| 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Planned |
+| 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Released in v0.60.0 |
 | 13 | Parser and resource-amplification fuzzing, deterministic fault injection, and crash/power-loss simulation | Planned |
 | 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Planned |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Planned |
