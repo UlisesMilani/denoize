@@ -419,7 +419,13 @@ fn analyze_session(
     let probe = crate::probe_file_from_session_with_limits(&mut session, options.decode_limits)?;
     if matches!(
         probe.format,
-        AudioFormat::Wav | AudioFormat::Flac | AudioFormat::OggVorbis
+        AudioFormat::Wav
+            | AudioFormat::Flac
+            | AudioFormat::OggVorbis
+            | AudioFormat::OggOpus
+            | AudioFormat::Mp3
+            | AudioFormat::AacAdts
+            | AudioFormat::M4a
     ) {
         let mut reader = AudioStreamReader::from_session(session, options.decode_limits)?;
         let info = reader.info();
@@ -1474,6 +1480,70 @@ mod tests {
         assert_eq!(first.decision, second.decision);
         assert_eq!(first.input.material, RecommendationMaterial::Music);
         assert!(first.input.stereo_correlation.is_some());
+    }
+
+    #[test]
+    fn mp3_file_recommendation_uses_the_bounded_stream_reader() {
+        let directory = tempfile::tempdir().expect("create recommendation directory");
+        let path = directory.path().join("input.mp3");
+        let audio = speech_like();
+        crate::encode::write_audio(&path, &audio, crate::EncodeOptions::default())
+            .expect("encode recommendation MP3");
+
+        let report = recommend_file_with_options(
+            &path,
+            RecommendationOptions::new().with_accelerator(AcceleratorPreference::Cpu),
+        )
+        .expect("recommend MP3");
+        assert_eq!(report.input.format, "mp3");
+        assert_eq!(report.input.codec, "mp3");
+        assert_eq!(report.input.analysis_mode, "bounded-stream");
+        assert_eq!(report.input.sample_rate, audio.sample_rate);
+        assert_eq!(report.input.channels, audio.channels());
+        assert!(report.input.analyzed_frames > 0);
+    }
+
+    #[test]
+    fn opus_file_recommendation_uses_the_granule_aware_stream_reader() {
+        let directory = tempfile::tempdir().expect("create recommendation directory");
+        let path = directory.path().join("input.opus");
+        let audio = speech_like();
+        crate::encode::write_audio(&path, &audio, crate::EncodeOptions::default())
+            .expect("encode recommendation Opus");
+
+        let report = recommend_file_with_options(
+            &path,
+            RecommendationOptions::new().with_accelerator(AcceleratorPreference::Cpu),
+        )
+        .expect("recommend Opus");
+        assert_eq!(report.input.format, "ogg-opus");
+        assert_eq!(report.input.codec, "opus");
+        assert_eq!(report.input.analysis_mode, "bounded-stream");
+        assert_eq!(report.input.sample_rate, 48_000);
+        assert_eq!(report.input.channels, audio.channels());
+        assert!(report.input.analyzed_frames > 0);
+    }
+
+    #[test]
+    fn adts_aac_file_recommendation_uses_the_frame_aware_stream_reader() {
+        const SILENT_STEREO_ADTS: [u8; 13] = [
+            0xff, 0xf1, 0x50, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x00, 0x00, 0x00, 0x00, 0x1c,
+        ];
+        let directory = tempfile::tempdir().expect("create recommendation directory");
+        let path = directory.path().join("input.aac");
+        std::fs::write(&path, SILENT_STEREO_ADTS.repeat(3)).expect("write recommendation ADTS AAC");
+
+        let report = recommend_file_with_options(
+            &path,
+            RecommendationOptions::new().with_accelerator(AcceleratorPreference::Cpu),
+        )
+        .expect("recommend ADTS AAC");
+        assert_eq!(report.input.format, "aac-adts");
+        assert_eq!(report.input.codec, "aac");
+        assert_eq!(report.input.analysis_mode, "bounded-stream");
+        assert_eq!(report.input.sample_rate, 44_100);
+        assert_eq!(report.input.channels, 2);
+        assert_eq!(report.input.analyzed_frames, 3 * 1_024);
     }
 
     #[test]

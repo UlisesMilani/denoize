@@ -1,6 +1,10 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use denoize::{decode_file, write_audio, Audio, ChannelLayout, EncodeOptions};
+use denoize::{
+    decode_file, inspect_audio_stream_session, write_audio, Audio, AudioCodec, AudioFormat,
+    AudioInputSession, AudioStreamInfo, AudioStreamReader, ChannelLayout, DecodeLimits,
+    EncodeOptions,
+};
 use hound::SampleFormat;
 use sha2::{Digest, Sha256};
 
@@ -112,6 +116,90 @@ fn write_fixture(bytes: &[u8], name: &str) -> (tempfile::TempDir, std::path::Pat
 
 fn rms(samples: &[f64]) -> f64 {
     (samples.iter().map(|sample| sample * sample).sum::<f64>() / samples.len() as f64).sqrt()
+}
+
+fn collect_bounded_stream(
+    path: &std::path::Path,
+    block_frames: usize,
+) -> (AudioStreamInfo, Vec<Vec<f64>>) {
+    let session = AudioInputSession::open(path).expect("open MP3 stream session");
+    let mut reader = AudioStreamReader::from_session(session, DecodeLimits::default())
+        .expect("open bounded MP3 stream");
+    let info = reader.info();
+    let mut channels = vec![Vec::new(); info.channels()];
+    while let Some(block) = reader
+        .next_block(block_frames)
+        .expect("decode bounded MP3 block")
+    {
+        assert!(!block[0].is_empty());
+        assert!(block[0].len() <= block_frames);
+        for (destination, source) in channels.iter_mut().zip(block) {
+            destination.extend(source);
+        }
+    }
+    (info, channels)
+}
+
+#[test]
+fn bounded_mp3_stream_preserves_gapless_info_and_xing_timelines() {
+    for (name, encoded, expected_rate, expected_channels, expected_frames, block_frames) in [
+        (
+            "info-lavc-stream.mp3",
+            fixture_bytes(),
+            48_000,
+            1,
+            1_500,
+            127,
+        ),
+        (
+            "xing-vbr-stream.mp3",
+            vbr_fixture_bytes(),
+            44_100,
+            2,
+            3_001,
+            613,
+        ),
+    ] {
+        let (_directory, path) = write_fixture(&encoded, name);
+        let whole = decode_file(&path).expect("decode whole gapless MP3 fixture");
+        let (info, streamed) = collect_bounded_stream(&path, block_frames);
+
+        assert_eq!(info.format, AudioFormat::Mp3);
+        assert_eq!(info.codec, AudioCodec::Mp3);
+        assert_eq!(info.sample_rate(), expected_rate);
+        assert_eq!(info.channels(), expected_channels);
+        assert_eq!(info.total_frames, Some(expected_frames as u64));
+        assert_eq!(streamed.len(), whole.channels.len());
+        for (streamed, whole) in streamed.iter().zip(&whole.channels) {
+            assert_eq!(streamed.len(), expected_frames);
+            assert_eq!(streamed.len(), whole.len());
+            let error = streamed
+                .iter()
+                .zip(whole)
+                .map(|(streamed, whole)| (streamed - whole).abs())
+                .fold(0.0, f64::max);
+            assert!(error <= f64::EPSILON, "stream/whole MP3 error {error}");
+        }
+    }
+}
+
+#[test]
+fn bounded_mp3_decoder_allowance_has_an_exact_preopen_boundary() {
+    let (_directory, path) = write_fixture(&fixture_bytes(), "mp3-stream-budget.mp3");
+    let mut session = AudioInputSession::open(&path).expect("open MP3 stream session");
+    let info = inspect_audio_stream_session(&mut session, DecodeLimits::default())
+        .expect("inspect MP3 stream accounting");
+    assert!(info.decoder_additional_bytes > 0);
+
+    let exact =
+        DecodeLimits::default().with_max_working_set_bytes(Some(info.decoder_additional_bytes));
+    inspect_audio_stream_session(&mut session, exact).expect("accept exact MP3 decoder allowance");
+    let error = inspect_audio_stream_session(
+        &mut session,
+        DecodeLimits::default().with_max_working_set_bytes(Some(info.decoder_additional_bytes - 1)),
+    )
+    .expect_err("reject one byte below MP3 decoder allowance");
+    assert!(error.contains("MP3 stream decoder"));
 }
 
 #[test]

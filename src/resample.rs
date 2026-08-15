@@ -19,7 +19,6 @@ const FFT_PLAN_SCALAR_SAFETY_FACTOR: u128 = 64;
 /// Output may be empty while enough input is accumulated to cover the fixed
 /// FFT block and filter delay. [`finish`](Self::finish) emits the remaining
 /// delayed samples and fixes the total length to the rounded rate ratio.
-#[cfg(any(feature = "rnnoise", feature = "gtcrn", test))]
 pub(crate) struct StreamingResampler {
     channels: usize,
     from_rate: u32,
@@ -32,7 +31,6 @@ pub(crate) struct StreamingResampler {
     finished: bool,
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn", test))]
 impl StreamingResampler {
     pub(crate) fn new(channels: usize, from_rate: u32, to_rate: u32) -> Result<Self, String> {
         validate_sample_rates(from_rate, to_rate)?;
@@ -500,7 +498,6 @@ fn clone_channels(input: &[Vec<f64>], sanitize: bool) -> Result<Vec<Vec<f64>>, S
     Ok(cloned)
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn", test))]
 fn empty_channels(channels: usize, capacity: usize) -> Result<Vec<Vec<f64>>, String> {
     let mut output = Vec::new();
     output
@@ -516,7 +513,6 @@ fn empty_channels(channels: usize, capacity: usize) -> Result<Vec<Vec<f64>>, Str
     Ok(output)
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn", test))]
 fn validate_stream_channels(input: &[Vec<f64>], channels: usize) -> Result<usize, String> {
     if input.len() != channels {
         return Err(format!(
@@ -531,7 +527,6 @@ fn validate_stream_channels(input: &[Vec<f64>], channels: usize) -> Result<usize
     Ok(frames)
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn", test))]
 fn append_streaming(
     output: &mut [Vec<f64>],
     chunk: &[Vec<f64>],

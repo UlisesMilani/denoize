@@ -98,8 +98,9 @@ The command analyzes at most 12 seconds by default (configurable from 1 to 60).
 WAV, FLAC, and Ogg Vorbis are analyzed through the bounded block decoder; other
 supported formats use their existing whole-file decoder under the same
 `--max-memory` ceiling and then analyze only the bounded prefix. Filesystem
-inputs retain the regular-file and same-opened-object guarantees. Stdin is
-reserved for the bounded non-seekable work in Stage 12.
+inputs retain the regular-file and same-opened-object guarantees. Recommendation
+still requires a filesystem input; `-` is reserved for bounded `--stream`
+processing rather than recommendation.
 
 `--calibrate` adds a fixed, hash-identified Classical Hi-Fi workload with one
 warmup and three measured runs after its fixed scratch allowance fits the same
@@ -543,26 +544,44 @@ proxy precedence, and resume validation details.
 
 ### Long recordings with bounded memory
 
-For long WAV, FLAC, or Ogg Vorbis recordings, use the stateful streaming path.
-It keeps only a fixed-size input block plus bounded decoder, backend overlap,
-recurrent, and resampler state in memory instead of loading the whole file:
+For long recordings, use the stateful streaming path. It keeps only a
+fixed-size input block plus bounded decoder, backend overlap, recurrent,
+resampler, and encoder state in memory instead of loading the whole file:
 
 ```sh
 ./target/release/denoize long-noisy.wav long-clean.wav --stream
 ```
 
-`--stream` supports regular-file WAV, FLAC, and Ogg Vorbis input and writes an
-atomic WAV output with the compiled Classical, RNNoise, and GTCRN backends,
-including independent, linked-stereo, and mid/side channel modes. GTCRN uses an
-explicit `--onnx-model` or the installed managed `gtcrn` model. Ogg Opus, MP3,
-M4A/ALAC, and ADTS AAC remain on the normal path until their gapless, granule,
-or edit-list semantics can be preserved by a bounded decoder. VAD, loudness
-normalization, other AI backends, and encoded output also require the normal
-(non-streaming) path. The default block size is 8192 frames; use
+`--stream` accepts content-detected WAV, FLAC, Ogg Vorbis, granule-aware Ogg
+Opus, gapless MP3, frame-aware ADTS AAC, and edit-aware M4A AAC/ALAC input. It
+writes WAV, FLAC, Ogg Opus, MP3, M4A AAC, or ADTS AAC with the compiled
+Classical, RNNoise, and GTCRN backends, including independent, linked-stereo,
+and mid/side channel modes. GTCRN uses an explicit `--onnx-model` or the
+installed managed `gtcrn` model. A regular-file destination is staged, decoded
+end-to-end to verify its codec, geometry, and presentation duration, then
+published atomically. Supported metadata is retained unless `--no-metadata` is
+selected. VAD, two-pass loudness normalization, and additional AI backends
+remain for Stage 15. The default block size is 8192 frames; use
 `--stream-frames N` (1–1,048,576) to trade latency and working memory for
 throughput. Noise profiling retains only a bounded leading segment before
 output begins. Stream resource arithmetic is checked from the input header,
 and the processor is constructed before an output or temporary file is staged.
+
+`-` selects stdin or stdout for `--stream`. Stdin is copied into an anonymous
+regular-file spool before parsing, preserving one authoritative seekable input
+without retaining all encoded bytes in RAM. Stdout accumulates bounded PCM and
+encoded anonymous spools, verifies the completed encoded stream, then copies it
+to the sink. Stdin and stdout share the `--max-temp-space` allowance (1 GiB by
+default); stdout drops metadata, and a sink error can leave partial external
+bytes because a pipe has no atomic rename. `--resume` intentionally rejects
+stdin/stdout because their anonymous spools cannot survive process restart.
+
+Library callers use `AudioStreamReader::from_reader_with_limits` for a plain
+`Read` source and `SpooledAudioStreamWriter::new_with_limits` for a plain
+`Write` sink. `StreamSpoolLimits` bounds encoded input bytes or, for output,
+the simultaneous PCM spool, encoded spool, and codec auxiliary files. The
+seekable `AudioStreamWriter` remains the lower-overhead choice when the caller
+already owns a private `Write + Seek` transaction.
 
 Add `--resume` to make a long stream restartable. The CLI periodically
 synchronizes a private append-only checkpoint journal and an interleaved `f64`
@@ -571,14 +590,18 @@ replays the same opened input to the last durable boundary, verifies the saved
 PCM digest, restores backend state, and continues. The input bytes, effective
 recipe, model bytes, source format, channel geometry, and block size are bound
 to the checkpoint. A mismatch is preserved and rejected unless `--force`
-explicitly discards it. The final WAV is still staged and committed atomically;
-success removes the journal and PCM spool while retaining the reusable lock
-file. The journal records the exact staged WAV fingerprint before publication;
-if the process exits after the atomic commit but before sidecar cleanup, the
-next identical resume verifies the destination and removes the stale data
-sidecars without reprocessing. A changed destination is preserved and rejected
-unless `--force` resets the checkpoint. Because the PCM spool and staged WAV
-coexist during publication, both are charged to `--max-temp-space`.
+explicitly discards it. Codec delay, Ogg granules, and M4A edit lists are
+applied before presentation PCM reaches a durable boundary. The final encoded
+output is staged, decoded for verification, and committed atomically; success
+removes the journal and PCM spool while retaining the reusable lock file. The
+journal records the exact verified staged-output fingerprint before
+publication. If the process exits after the atomic commit but before receipt
+publication or sidecar cleanup, the next identical resume verifies the
+destination, reports a `skip/completed` plan when requested, can publish the
+matching signed receipt, and removes the stale data sidecars without
+reprocessing. A changed destination is preserved and rejected unless `--force`
+resets the checkpoint. The PCM spool, staged encoded file, encoder auxiliary
+data, and retained metadata are all charged to `--max-temp-space`.
 
 Filesystem inputs are opened once per processing phase as validated regular
 files. Size estimation, probing, decoding, and metadata reads within that
@@ -666,9 +689,10 @@ Desktop settings are restored automatically, can be stored as named presets,
 and can be imported or exported as CLI-compatible TOML. Recent input files are
 kept locally for quick reuse. The single-file and batch views also expose a
 reproducibility mode that serializes processing and uses stable model seeds.
-The single-file view can also run the bounded WAV/FLAC/Ogg Vorbis-to-WAV path,
-choose its block size, and enable the same durable restart checkpoints as the
-CLI.
+The single-file view can also run the bounded WAV, FLAC, Ogg Vorbis/Opus, MP3,
+ADTS AAC, and M4A AAC/ALAC input path, choose any supported encoded output and
+block size, preview the read-only v2 execution plan, publish a signed receipt,
+and enable the same durable restart checkpoints as the CLI.
 Audio files and folders can be dropped onto the single-file or batch input
 zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
@@ -768,12 +792,13 @@ have been verified.
 
 ### Read-only plans and signed receipts
 
-Preview the exact finite-file or batch work without creating output, state,
-locks, or model-cache updates:
+Preview exact file, batch, or bounded-stream work without creating output,
+state, locks, or model-cache updates:
 
 ```sh
 denoize plan noisy.wav clean.wav --pretty > plan.json
 denoize plan input-dir output-dir --batch --resume --pretty > batch-plan.json
+denoize plan long.mp3 clean.flac --stream --resume --pretty > stream-plan.json
 ```
 
 Plans use portable relative locators rather than absolute paths and bind input
@@ -782,10 +807,10 @@ geometry, publication decision, and conservative admitted resources. Planning
 performs bounded decode, backend/model preparation, and encoder validation, so
 it can fail before any execution side effect. A skipped batch item also binds
 the exact fingerprint of the existing output whose journal evidence justified
-that decision.
+that decision. Stream plans use additive v2 and inspect resumable checkpoint
+sidecars without locking, repairing, truncating, or deleting them.
 
-Generate an Ed25519 key and publish a receipt only after successful finite
-output:
+Generate an Ed25519 key and publish a receipt only after successful output:
 
 ```sh
 denoize receipts keygen receipt-secret.json receipt-public.json
@@ -804,12 +829,15 @@ rehashes every rooted output. Batch receipts require the whole batch to finish
 without failure or cancellation. Output and receipt are distinct atomic files,
 so a final receipt-path race is reported after preserving already committed
 audio rather than silently replacing either file. Streaming and stdin receipts
-arrive with Stage 12's bounded non-seekable/checkpoint contract.
+use additive v2 schemas. A captured stdout stream is verified with
+`receipts verify --output CAPTURED_AUDIO`; its receipt is emitted only after
+stdout accepts and flushes the complete verified bytes.
 
-The desktop app exposes the same finite-file and batch plan preview, plan JSON
-export, optional receipt publication, owner-private key generation, public-key
-export, trust-policy creation, and offline receipt/output verification. Secret
-key paths are session-only UI values and are never stored in desktop settings.
+The desktop app exposes the same file, batch, and bounded-stream plan preview,
+plan JSON export, optional receipt publication, owner-private key generation,
+public-key export, trust-policy creation, and offline receipt/output
+verification. Secret key paths are session-only UI values and are never stored
+in desktop settings.
 
 See the [stable JSON contracts](docs/json.md) for schema, privacy, verification,
 and key-rotation details.

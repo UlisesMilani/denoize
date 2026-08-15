@@ -101,7 +101,13 @@ pub use decode::{
     DecodedPcm,
 };
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
-pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
+pub use encode::{
+    estimate_spooled_stream_output_bytes, estimate_stream_encode_additional_bytes,
+    estimate_stream_encode_output_bytes, estimate_stream_encode_temporary_bytes,
+    estimate_stream_output_verification_bytes, verify_stream_output_file, AacEncoder,
+    AudioStreamWriter, DownmixMode, EncodeOptions, OutputFormat, SpooledAudioStreamWriter,
+    StreamEncodeLimits, StreamEncodeSpec, StreamOutputVerification,
+};
 pub use execution::{
     execution_item_id, export_receipt_public_key, generate_receipt_keypair, portable_file_locator,
     portable_locator, write_execution_plan, write_new_receipt_keypair, write_receipt_trust_policy,
@@ -110,7 +116,9 @@ pub use execution::{
     ReceiptSecretKey, ReceiptSignature, ReceiptTrustPolicy, ReceiptVerificationReport,
     SignedExecutionReceipt, VerifiedReceiptItem, EXECUTION_PLAN_SCHEMA, EXECUTION_RECEIPT_SCHEMA,
     EXECUTION_SCHEMA_VERSION, RECEIPT_PUBLIC_KEY_SCHEMA, RECEIPT_SECRET_KEY_SCHEMA,
-    RECEIPT_TRUST_POLICY_SCHEMA, RECEIPT_VERIFICATION_SCHEMA,
+    RECEIPT_TRUST_POLICY_SCHEMA, RECEIPT_VERIFICATION_SCHEMA, STREAM_EXECUTION_PLAN_SCHEMA,
+    STREAM_EXECUTION_RECEIPT_SCHEMA, STREAM_EXECUTION_SCHEMA_VERSION,
+    STREAM_RECEIPT_VERIFICATION_SCHEMA,
 };
 pub use gain::{Algorithm, SpecSubLaw};
 pub use hardware::{
@@ -119,6 +127,7 @@ pub use hardware::{
     HardwareCapabilities, RuntimeCapability, HARDWARE_SCHEMA, HARDWARE_SCHEMA_VERSION,
 };
 pub use input::AudioInputSession;
+pub use input::StreamSpoolLimits;
 pub use quality::QualityMetrics;
 pub use recommendation::{
     recommend_audio, recommend_file, recommend_file_with_options, run_device_calibration,

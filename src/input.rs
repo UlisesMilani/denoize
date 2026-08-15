@@ -5,10 +5,42 @@
 //! probing, and decoding consume clones of the same file description.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::metadata::{Metadata, MetadataLimits};
+
+const STREAM_SPOOL_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_STREAM_SPOOL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Finite disk-spool bound for a non-seekable audio stream.
+///
+/// The spool is an anonymous regular file, so compressed parsers can inspect
+/// and rewind one authoritative object without retaining the complete input in
+/// memory. The limit counts encoded bytes, not decoded PCM or codec memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct StreamSpoolLimits {
+    max_bytes: u64,
+}
+
+impl StreamSpoolLimits {
+    #[must_use]
+    pub const fn new(max_bytes: u64) -> Self {
+        Self { max_bytes }
+    }
+
+    #[must_use]
+    pub const fn max_bytes(self) -> u64 {
+        self.max_bytes
+    }
+}
+
+impl Default for StreamSpoolLimits {
+    fn default() -> Self {
+        Self::new(DEFAULT_STREAM_SPOOL_BYTES)
+    }
+}
 
 /// One validated regular-file input kept open for a processing session.
 ///
@@ -37,6 +69,85 @@ impl AudioInputSession {
             file,
             len,
         })
+    }
+
+    /// Copy a non-seekable source into a finite anonymous spool and bind it to
+    /// a processing session.
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self, String> {
+        Self::from_reader_with_limits(reader, StreamSpoolLimits::default())
+    }
+
+    /// Bind an already-open regular file to a diagnostic pathname.
+    ///
+    /// This is used internally to validate a private staged output through the
+    /// same bounded decoders before its atomic publication. The supplied
+    /// handle, rather than a potentially replaceable pathname, is authoritative.
+    pub(crate) fn from_open_file(
+        path: impl AsRef<Path>,
+        mut file: File,
+        context: &str,
+    ) -> Result<Self, String> {
+        let path = path.as_ref();
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("inspect {context} {}: {error}", path.display()))?;
+        #[cfg(windows)]
+        ensure_windows_disk_handle(&file, path, context)?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "{context} is not a regular file: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        clear_unix_nonblocking(&file, path, context)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind {context} {}: {error}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            len: metadata.len(),
+        })
+    }
+
+    /// Copy a non-seekable source into a finite anonymous spool.
+    ///
+    /// Callers that only need decoded blocks normally enter through
+    /// [`crate::AudioStreamReader::from_reader_with_limits`], which immediately
+    /// applies the bounded container and decoder checks as well.
+    pub fn from_reader_with_limits<R: Read>(
+        mut reader: R,
+        limits: StreamSpoolLimits,
+    ) -> Result<Self, String> {
+        let mut file = tempfile::tempfile()
+            .map_err(|error| format!("create anonymous audio input spool: {error}"))?;
+        let mut buffer = [0_u8; STREAM_SPOOL_BUFFER_BYTES];
+        let mut written = 0_u64;
+        loop {
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("read non-seekable audio input: {error}"))?;
+            if count == 0 {
+                break;
+            }
+            let next = written
+                .checked_add(count as u64)
+                .ok_or_else(|| "non-seekable audio input length overflows".to_string())?;
+            if next > limits.max_bytes {
+                return Err(format!(
+                    "non-seekable audio input exceeds its {}-byte spool limit",
+                    limits.max_bytes
+                ));
+            }
+            file.write_all(&buffer[..count])
+                .map_err(|error| format!("write anonymous audio input spool: {error}"))?;
+            written = next;
+        }
+        file.flush()
+            .map_err(|error| format!("flush anonymous audio input spool: {error}"))?;
+        let session = Self::from_open_file("<reader>", file, "spooled audio input")?;
+        debug_assert_eq!(session.len, written);
+        Ok(session)
     }
 
     /// Return the pathname used to open this session.
@@ -193,7 +304,6 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::fs;
-    use std::io::Write as _;
 
     #[test]
     fn regular_file_reports_open_handle_length() {
@@ -263,5 +373,24 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let error = AudioInputSession::open(directory.path()).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
+    }
+
+    #[test]
+    fn reader_spool_enforces_its_exact_encoded_byte_limit() {
+        let bytes = b"bounded reader bytes".to_vec();
+        let exact = AudioInputSession::from_reader_with_limits(
+            std::io::Cursor::new(bytes.clone()),
+            StreamSpoolLimits::new(bytes.len() as u64),
+        )
+        .unwrap();
+        assert_eq!(exact.len(), bytes.len() as u64);
+        assert_eq!(exact.path(), Path::new("<reader>"));
+
+        let error = AudioInputSession::from_reader_with_limits(
+            std::io::Cursor::new(bytes.clone()),
+            StreamSpoolLimits::new(bytes.len() as u64 - 1),
+        )
+        .unwrap_err();
+        assert!(error.contains("spool limit"), "{error}");
     }
 }

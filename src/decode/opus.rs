@@ -1,5 +1,7 @@
+use super::stream::AudioStreamInfo;
 use super::DecodedPcm;
-use super::{budget::DecodeBudget, DecodeLimits};
+use super::{budget::DecodeBudget, AudioCodec, AudioFormat, DecodeLimits};
+use hound::{SampleFormat, WavSpec};
 use opus::{Channels, Decoder};
 use std::ops::Range;
 
@@ -8,6 +10,143 @@ const OGG_MAX_PAGE_BODY_BYTES: u64 = 255 * 255;
 // Page lacing/position vectors, one page body, and fixed HashMap/reader state
 // for the single logical stream proven by our allocation-free preflight.
 const OGG_PACKET_READER_FIXED_BYTES: u64 = 128 * 1024;
+const OPUS_DECODER_FIXED_BYTES: u64 = 128 * 1024;
+const OPUS_MAX_PACKET_FRAMES: usize = 5_760;
+const OPUS_MAX_PAGE_PACKETS: usize = 255;
+const OPUS_MAX_PAGE_FRAMES: usize = OPUS_MAX_PACKET_FRAMES * OPUS_MAX_PAGE_PACKETS;
+
+#[derive(Clone, Copy)]
+struct OpusPacketMemory {
+    reader_internal_bytes: u64,
+    maximum_reader_bytes: u64,
+}
+
+fn opus_packet_memory(limits: DecodeLimits) -> Result<OpusPacketMemory, String> {
+    let packet_allocation_bytes = u64::try_from(limits.metadata.max_ogg_packet_bytes)
+        .map_err(|_| "Ogg packet limit does not fit in u64".to_string())?;
+    let reader_internal_bytes = packet_allocation_bytes
+        .checked_add(OGG_MAX_PAGE_BODY_BYTES)
+        .and_then(|bytes| bytes.checked_add(OGG_PACKET_READER_FIXED_BYTES))
+        .ok_or("Opus packet reader byte count overflows")?;
+    let maximum_reader_bytes = reader_internal_bytes
+        .checked_add(packet_allocation_bytes)
+        .ok_or("Opus packet reader byte count overflows")?;
+    Ok(OpusPacketMemory {
+        reader_internal_bytes,
+        maximum_reader_bytes,
+    })
+}
+
+fn opus_stream_additional_bytes(
+    channel_count: usize,
+    packet_memory: OpusPacketMemory,
+) -> Result<u64, String> {
+    let scratch_samples = OPUS_MAX_PACKET_FRAMES
+        .checked_mul(channel_count)
+        .ok_or("Opus stream scratch sample count overflows")?;
+    let page_samples = OPUS_MAX_PAGE_FRAMES
+        .checked_mul(channel_count)
+        .ok_or("Opus stream page sample count overflows")?;
+    allocation_bytes::<f32>(scratch_samples, "Opus stream scratch")?
+        .checked_add(allocation_bytes::<f32>(
+            page_samples,
+            "Opus stream page PCM",
+        )?)
+        .and_then(|bytes| bytes.checked_add(packet_memory.maximum_reader_bytes))
+        .and_then(|bytes| bytes.checked_add(OPUS_DECODER_FIXED_BYTES))
+        .ok_or_else(|| "Opus stream decoder byte count overflows".to_string())
+}
+
+#[derive(Clone, Copy)]
+struct OpusStreamHeader {
+    channel_count: usize,
+    channels: Channels,
+    pre_skip: usize,
+    stream_serial: u32,
+}
+
+fn read_opus_stream_headers<R>(
+    packets: &mut ogg::PacketReader<R>,
+) -> Result<OpusStreamHeader, String>
+where
+    R: std::io::Read + std::io::Seek,
+{
+    let head = packets
+        .read_packet()
+        .map_err(|error| format!("Ogg read: {error}"))?
+        .ok_or("missing OpusHead")?;
+    if head.data.len() < 19 || &head.data[..8] != b"OpusHead" {
+        return Err("Ogg stream is not Opus".into());
+    }
+    if head.data[8] & 0xf0 != 0 {
+        return Err(format!("unsupported OpusHead version {}", head.data[8]));
+    }
+    let channel_count = usize::from(head.data[9]);
+    if !(1..=2).contains(&channel_count) || head.data[18] != 0 {
+        return Err("only mono/stereo mapping-family-0 Opus is supported".into());
+    }
+    let pre_skip = usize::from(u16::from_le_bytes([head.data[10], head.data[11]]));
+    let stream_serial = head.stream_serial();
+    let channels = if channel_count == 1 {
+        Channels::Mono
+    } else {
+        Channels::Stereo
+    };
+    drop(head);
+
+    let tags = packets
+        .read_packet()
+        .map_err(|error| format!("Ogg tags: {error}"))?
+        .ok_or("missing OpusTags")?;
+    if tags.stream_serial() != stream_serial || !tags.data.starts_with(b"OpusTags") {
+        return Err("invalid OpusTags packet".into());
+    }
+    drop(tags);
+    Ok(OpusStreamHeader {
+        channel_count,
+        channels,
+        pre_skip,
+        stream_serial,
+    })
+}
+
+pub(super) fn inspect_ogg_opus_stream(
+    mut file: std::fs::File,
+    limits: DecodeLimits,
+) -> Result<AudioStreamInfo, String> {
+    use std::io::{Seek, SeekFrom};
+
+    let packet_memory = opus_packet_memory(limits)?;
+    // Channel geometry lives in OpusHead, which PacketReader must allocate
+    // before returning. Charge the supported stereo worst case first so a
+    // decode cap can reject without entering either metadata or packet parsers.
+    let decoder_additional_bytes = opus_stream_additional_bytes(2, packet_memory)?;
+    DecodeBudget::new(limits).check_peak(0, decoder_additional_bytes, "Ogg Opus stream decoder")?;
+    crate::metadata::preflight_ogg_decode(&mut file, limits.metadata)?;
+    preflight_single_logical_stream(&mut file)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("Opus stream rewind: {error}"))?;
+    let mut packets = ogg::PacketReader::new(std::io::BufReader::new(file));
+    let header = read_opus_stream_headers(&mut packets)?;
+    Ok(AudioStreamInfo {
+        format: AudioFormat::OggOpus,
+        codec: AudioCodec::Opus,
+        output_spec: WavSpec {
+            channels: u16::try_from(header.channel_count)
+                .map_err(|_| "Opus stream channel count does not fit in WAV".to_string())?,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        },
+        channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(
+            header.channel_count,
+        )
+        .mask(),
+        total_frames: None,
+        max_decoder_frames: OPUS_MAX_PACKET_FRAMES,
+        decoder_additional_bytes,
+    })
+}
 
 pub(super) fn decode_ogg_opus_with_limits(
     mut file: std::fs::File,
@@ -19,16 +158,8 @@ pub(super) fn decode_ogg_opus_with_limits(
     // PacketReader materializes a complete packet before returning it. Check
     // the structurally enforced maximum before constructing or entering that
     // third-party reader, including for a real zero-byte decode cap.
-    let packet_allocation_bytes = u64::try_from(limits.metadata.max_ogg_packet_bytes)
-        .map_err(|_| "Ogg packet limit does not fit in u64".to_string())?;
-    let packet_reader_internal_bytes = packet_allocation_bytes
-        .checked_add(OGG_MAX_PAGE_BODY_BYTES)
-        .and_then(|bytes| bytes.checked_add(OGG_PACKET_READER_FIXED_BYTES))
-        .ok_or("Opus packet reader byte count overflows")?;
-    let maximum_packet_reader_bytes = packet_reader_internal_bytes
-        .checked_add(packet_allocation_bytes)
-        .ok_or("Opus packet reader byte count overflows")?;
-    budget.check_peak(0, maximum_packet_reader_bytes, "Opus packet reader")?;
+    let packet_memory = opus_packet_memory(limits)?;
+    budget.check_peak(0, packet_memory.maximum_reader_bytes, "Opus packet reader")?;
     crate::metadata::preflight_ogg_decode(&mut file, limits.metadata)?;
     preflight_single_logical_stream(&mut file)?;
     file.seek(SeekFrom::Start(0))
@@ -59,11 +190,12 @@ pub(super) fn decode_ogg_opus_with_limits(
     drop(tags);
     let mut decoded = Vec::<f32>::new();
     let mut granules = OpusGranuleTracker::new(pre_skip);
-    let scratch_samples = 5_760usize
+    let scratch_samples = OPUS_MAX_PACKET_FRAMES
         .checked_mul(count)
         .ok_or("Opus decode scratch sample count overflows")?;
     let scratch_bytes = allocation_bytes::<f32>(scratch_samples, "Opus decode scratch")?;
-    let packet_and_scratch = maximum_packet_reader_bytes
+    let packet_and_scratch = packet_memory
+        .maximum_reader_bytes
         .checked_add(scratch_bytes)
         .ok_or("Opus packet scratch byte count overflows")?;
     budget.check_peak(0, packet_and_scratch, "Opus decode scratch")?;
@@ -87,7 +219,8 @@ pub(super) fn decode_ogg_opus_with_limits(
         let packet_bytes = u64::try_from(packet.data.capacity())
             .map_err(|_| "Opus packet capacity does not fit in u64".to_string())?;
         let retained_f32 = allocation_bytes::<f32>(decoded.capacity(), "Opus retained PCM")?;
-        let live_packet_scratch = packet_reader_internal_bytes
+        let live_packet_scratch = packet_memory
+            .reader_internal_bytes
             .checked_add(packet_bytes)
             .and_then(|bytes| bytes.checked_add(scratch_bytes))
             .ok_or("Opus packet scratch byte count overflows")?;
@@ -140,6 +273,237 @@ pub(super) fn decode_ogg_opus_with_limits(
         channels: output,
         channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(count).mask(),
     })
+}
+
+pub(super) struct OpusStreamReader {
+    packets: ogg::PacketReader<std::io::BufReader<std::fs::File>>,
+    decoder: Decoder,
+    header: OpusStreamHeader,
+    limits: DecodeLimits,
+    packet_memory: OpusPacketMemory,
+    scratch: Vec<f32>,
+    page_pcm: Vec<f32>,
+    pending_frames: Range<usize>,
+    physical_eof: bool,
+    granules: OpusGranuleTracker,
+}
+
+impl OpusStreamReader {
+    pub(super) fn new(
+        mut file: std::fs::File,
+        info: AudioStreamInfo,
+        limits: DecodeLimits,
+    ) -> Result<Self, String> {
+        use std::io::{Seek, SeekFrom};
+
+        let packet_memory = opus_packet_memory(limits)?;
+        DecodeBudget::new(limits).check_peak(
+            0,
+            info.decoder_additional_bytes,
+            "Ogg Opus stream decoder",
+        )?;
+        crate::metadata::preflight_ogg_decode(&mut file, limits.metadata)?;
+        preflight_single_logical_stream(&mut file)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("Opus stream rewind: {error}"))?;
+        let mut packets = ogg::PacketReader::new(std::io::BufReader::new(file));
+        let header = read_opus_stream_headers(&mut packets)?;
+        if info.format != AudioFormat::OggOpus
+            || info.codec != AudioCodec::Opus
+            || info.sample_rate() != 48_000
+            || info.channels() != header.channel_count
+        {
+            return Err("Ogg Opus geometry changed after stream inspection".into());
+        }
+        let scratch_samples = OPUS_MAX_PACKET_FRAMES
+            .checked_mul(header.channel_count)
+            .ok_or("Opus stream scratch sample count overflows")?;
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(scratch_samples)
+            .map_err(|error| format!("reserve Opus stream scratch: {error}"))?;
+        scratch.resize(scratch_samples, 0.0);
+        let decoder = Decoder::new(48_000, header.channels)
+            .map_err(|error| format!("Opus stream decoder: {error}"))?;
+        Ok(Self {
+            packets,
+            decoder,
+            header,
+            limits,
+            packet_memory,
+            scratch,
+            page_pcm: Vec::new(),
+            pending_frames: 0..0,
+            physical_eof: false,
+            granules: OpusGranuleTracker::new(header.pre_skip),
+        })
+    }
+
+    fn retained_page_bytes(&self) -> Result<u64, String> {
+        allocation_bytes::<f32>(self.page_pcm.capacity(), "Opus stream page PCM")
+    }
+
+    fn fixed_decode_bytes(&self) -> Result<u64, String> {
+        allocation_bytes::<f32>(self.scratch.capacity(), "Opus stream scratch")?
+            .checked_add(OPUS_DECODER_FIXED_BYTES)
+            .ok_or_else(|| "Opus stream fixed decoder byte count overflows".to_string())
+    }
+
+    fn maximum_packet_temporary_bytes(&self) -> Result<u64, String> {
+        self.packet_memory
+            .maximum_reader_bytes
+            .checked_add(self.fixed_decode_bytes()?)
+            .ok_or_else(|| "Opus stream packet byte count overflows".to_string())
+    }
+
+    fn live_packet_temporary_bytes(&self, packet_capacity: usize) -> Result<u64, String> {
+        let packet_bytes = u64::try_from(packet_capacity)
+            .map_err(|_| "Opus stream packet capacity does not fit in u64".to_string())?;
+        let fixed_decode_bytes = self.fixed_decode_bytes()?;
+        self.packet_memory
+            .reader_internal_bytes
+            .checked_add(packet_bytes)
+            .and_then(|bytes| bytes.checked_add(fixed_decode_bytes))
+            .ok_or_else(|| "Opus stream packet byte count overflows".to_string())
+    }
+
+    fn decode_next_page(&mut self) -> Result<bool, String> {
+        if self.physical_eof {
+            return Ok(false);
+        }
+        self.page_pcm.clear();
+        self.pending_frames = 0..0;
+        loop {
+            DecodeBudget::new(self.limits).check_peak(
+                self.retained_page_bytes()?,
+                self.maximum_packet_temporary_bytes()?,
+                "Ogg Opus stream packet read",
+            )?;
+            let Some(packet) = self
+                .packets
+                .read_packet()
+                .map_err(|error| format!("Ogg Opus stream read: {error}"))?
+            else {
+                self.physical_eof = true;
+                if self.granules.eos_end_frame.is_none() {
+                    return Err("Ogg Opus stream ended without an EOS granule".into());
+                }
+                if !self.page_pcm.is_empty() {
+                    return Err("Ogg Opus stream ended with an incomplete audio page".into());
+                }
+                return Ok(false);
+            };
+            if self.granules.eos_end_frame.is_some() {
+                return Err("Ogg Opus contains packets after the end of stream".into());
+            }
+            if packet.stream_serial() != self.header.stream_serial {
+                return Err("chained or multiplexed Ogg Opus streams are not supported".into());
+            }
+            if packet.data.len() > self.limits.metadata.max_ogg_packet_bytes {
+                return Err("Ogg Opus packet exceeds the configured packet limit".into());
+            }
+            let live_packet_temporary = self.live_packet_temporary_bytes(packet.data.capacity())?;
+            DecodeBudget::new(self.limits).check_peak(
+                self.retained_page_bytes()?,
+                live_packet_temporary,
+                "Ogg Opus stream packet decode",
+            )?;
+            let frames = self
+                .decoder
+                .decode_float(&packet.data, &mut self.scratch, false)
+                .map_err(|error| format!("Opus stream decode: {error}"))?;
+            if frames == 0 || frames > OPUS_MAX_PACKET_FRAMES {
+                return Err(format!(
+                    "Opus stream decoder returned an invalid {frames}-frame packet"
+                ));
+            }
+            let retained_frames = self.page_pcm.len() / self.header.channel_count;
+            let next_page_frames = retained_frames
+                .checked_add(frames)
+                .ok_or("Opus stream page frame count overflows")?;
+            if next_page_frames > OPUS_MAX_PAGE_FRAMES {
+                return Err("Ogg Opus page exceeds the bounded decoded-frame limit".into());
+            }
+            let packet_samples = frames
+                .checked_mul(self.header.channel_count)
+                .ok_or("Opus stream decoded sample count overflows")?;
+            let maximum_page_samples = OPUS_MAX_PAGE_FRAMES
+                .checked_mul(self.header.channel_count)
+                .ok_or("Opus stream page sample limit overflows")?;
+            reserve_interleaved_additional_bounded(
+                &mut self.page_pcm,
+                packet_samples,
+                maximum_page_samples,
+                DecodeBudget::new(self.limits),
+                live_packet_temporary,
+                "Opus stream page PCM",
+            )?;
+            self.page_pcm
+                .extend_from_slice(&self.scratch[..packet_samples]);
+            let completed = self.granules.push_packet(
+                frames,
+                packet.last_in_page(),
+                packet.last_in_stream(),
+                packet.absgp_page(),
+            )?;
+            let Some(completed) = completed else {
+                continue;
+            };
+            if completed.frame_range.end > next_page_frames {
+                return Err("Ogg Opus page window exceeds decoded PCM".into());
+            }
+            self.pending_frames = completed.frame_range;
+            if !self.pending_frames.is_empty() {
+                return Ok(true);
+            }
+            self.page_pcm.clear();
+            if completed.end_of_stream {
+                continue;
+            }
+        }
+    }
+
+    pub(super) fn next_block(
+        &mut self,
+        max_frames: usize,
+    ) -> Result<Option<Vec<Vec<f64>>>, String> {
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(self.header.channel_count)
+            .map_err(|error| format!("reserve Ogg Opus stream channel list: {error}"))?;
+        for _ in 0..self.header.channel_count {
+            let mut channel = Vec::new();
+            channel
+                .try_reserve_exact(max_frames)
+                .map_err(|error| format!("reserve Ogg Opus stream block: {error}"))?;
+            output.push(channel);
+        }
+        while output[0].len() < max_frames {
+            if self.pending_frames.is_empty() && !self.decode_next_page()? {
+                break;
+            }
+            let take = self.pending_frames.len().min(max_frames - output[0].len());
+            for frame in self.pending_frames.start..self.pending_frames.start + take {
+                let base = frame
+                    .checked_mul(self.header.channel_count)
+                    .ok_or("Opus stream sample offset overflows")?;
+                for (channel, destination) in output.iter_mut().enumerate() {
+                    destination.push(crate::sanitize_sample(f64::from(
+                        self.page_pcm[base + channel],
+                    )));
+                }
+            }
+            self.pending_frames.start += take;
+            if self.pending_frames.is_empty() {
+                self.page_pcm.clear();
+            }
+        }
+        if output[0].is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(output))
+        }
+    }
 }
 
 /// PacketReader retains an unfinished packet for every logical stream. The
@@ -211,10 +575,33 @@ fn reserve_interleaved_additional(
     temporary_bytes: u64,
     context: &str,
 ) -> Result<usize, String> {
+    reserve_interleaved_additional_bounded(
+        samples,
+        additional,
+        usize::MAX,
+        budget,
+        temporary_bytes,
+        context,
+    )
+}
+
+fn reserve_interleaved_additional_bounded(
+    samples: &mut Vec<f32>,
+    additional: usize,
+    maximum_samples: usize,
+    budget: DecodeBudget,
+    temporary_bytes: u64,
+    context: &str,
+) -> Result<usize, String> {
     let required = samples
         .len()
         .checked_add(additional)
         .ok_or_else(|| format!("{context} sample count overflows"))?;
+    if required > maximum_samples {
+        return Err(format!(
+            "{context} exceeds its {maximum_samples}-sample capacity limit"
+        ));
+    }
     if samples.capacity() >= required {
         let retained = allocation_bytes::<f32>(samples.capacity(), context)?;
         budget.check_peak(retained, temporary_bytes, context)?;
@@ -226,7 +613,8 @@ fn reserve_interleaved_additional(
         .checked_mul(2)
         .unwrap_or(usize::MAX)
         .max(MIN_OPUS_RETAINED_SAMPLES)
-        .max(required);
+        .max(required)
+        .min(maximum_samples);
     let retained = allocation_bytes::<f32>(geometric, context)?;
     let reserve_capacity = if budget
         .check_peak(retained, temporary_bytes, context)
@@ -261,6 +649,12 @@ fn reserve_interleaved_additional(
 }
 
 #[derive(Debug)]
+struct CompletedOpusPage {
+    frame_range: Range<usize>,
+    end_of_stream: bool,
+}
+
+#[derive(Debug)]
 struct OpusGranuleTracker {
     pre_skip: usize,
     total_frames: usize,
@@ -288,7 +682,7 @@ impl OpusGranuleTracker {
         last_in_page: bool,
         last_in_stream: bool,
         page_granule: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Option<CompletedOpusPage>, String> {
         if self.eos_end_frame.is_some() {
             return Err("Ogg Opus contains audio packets after the end of stream".into());
         }
@@ -305,7 +699,7 @@ impl OpusGranuleTracker {
             return Err("Ogg Opus end-of-stream packet is not last in its page".into());
         }
         if !last_in_page {
-            return Ok(());
+            return Ok(None);
         }
         // Ogg encodes an unset granule position as all one bits. A page that
         // completes an Opus packet must carry a real granule position.
@@ -358,9 +752,21 @@ impl OpusGranuleTracker {
             self.previous_page_granule = Some(page_granule);
         }
 
-        self.page_start_frame = self.total_frames;
+        let page_start = self.page_start_frame;
+        let page_end = self.total_frames;
+        let kept_start = self.pre_skip.max(page_start).min(page_end);
+        let kept_end = self
+            .eos_end_frame
+            .unwrap_or(page_end)
+            .min(page_end)
+            .max(kept_start);
+        let frame_range = kept_start - page_start..kept_end - page_start;
+        self.page_start_frame = page_end;
         self.page_frames = 0;
-        Ok(())
+        Ok(Some(CompletedOpusPage {
+            frame_range,
+            end_of_stream: last_in_stream,
+        }))
     }
 
     fn decoded_sample_range(
@@ -402,6 +808,15 @@ mod tests {
         final_granule: u64,
         tag_padding: usize,
     ) -> Vec<u8> {
+        opus_ogg_fixture(first_granule, final_granule, tag_padding, true)
+    }
+
+    fn opus_ogg_fixture(
+        first_granule: Option<u64>,
+        final_granule: u64,
+        tag_padding: usize,
+        split_audio_pages: bool,
+    ) -> Vec<u8> {
         let channel_count = 2u8;
         let pre_skip = 312u16;
         let mut head = b"OpusHead".to_vec();
@@ -440,7 +855,11 @@ mod tests {
                 .write_packet(
                     Cow::Owned(first_packet),
                     serial,
-                    PacketWriteEndInfo::EndPage,
+                    if split_audio_pages {
+                        PacketWriteEndInfo::EndPage
+                    } else {
+                        PacketWriteEndInfo::NormalPacket
+                    },
                     first_granule,
                 )
                 .expect("write first Opus audio packet");
@@ -463,6 +882,100 @@ mod tests {
                 .expect("write Opus audio packet");
         }
         writer.into_inner()
+    }
+
+    #[test]
+    fn bounded_opus_stream_preserves_pre_skip_and_final_page_granules() {
+        for (name, encoded, expected_frames, block_frames) in [
+            (
+                "single-page-single-packet.opus",
+                opus_ogg_with_granules(None, 1_860),
+                648,
+                127,
+            ),
+            (
+                "split-audio-pages.opus",
+                opus_ogg_with_granules(Some(960), 1_860),
+                1_548,
+                137,
+            ),
+            (
+                "shared-final-audio-page.opus",
+                opus_ogg_fixture(Some(960), 1_860, 0, false),
+                1_548,
+                149,
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("create bounded Opus directory");
+            let path = directory.path().join(name);
+            std::fs::write(&path, encoded).expect("write bounded Opus fixture");
+            let whole = crate::decode_file(&path).expect("decode whole Opus fixture");
+            let session = crate::AudioInputSession::open(&path).expect("open Opus stream session");
+            let mut reader =
+                crate::AudioStreamReader::from_session(session, DecodeLimits::default())
+                    .expect("open bounded Opus stream");
+            let info = reader.info();
+            assert_eq!(info.format, AudioFormat::OggOpus);
+            assert_eq!(info.codec, AudioCodec::Opus);
+            assert_eq!(info.sample_rate(), 48_000);
+            assert_eq!(info.channels(), 2);
+            assert_eq!(info.max_decoder_frames, OPUS_MAX_PACKET_FRAMES);
+            let mut streamed = vec![Vec::new(); info.channels()];
+            while let Some(block) = reader
+                .next_block(block_frames)
+                .expect("decode bounded Opus block")
+            {
+                assert!(block[0].len() <= block_frames);
+                for (destination, source) in streamed.iter_mut().zip(block) {
+                    destination.extend(source);
+                }
+            }
+            assert_eq!(streamed.len(), whole.channels.len());
+            for (streamed, whole) in streamed.iter().zip(&whole.channels) {
+                assert_eq!(streamed.len(), expected_frames);
+                assert_eq!(streamed.len(), whole.len());
+                let error = streamed
+                    .iter()
+                    .zip(whole)
+                    .map(|(streamed, whole)| (streamed - whole).abs())
+                    .fold(0.0, f64::max);
+                assert!(error <= f64::EPSILON, "stream/whole Opus error {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_opus_decoder_allowance_has_an_exact_preopen_boundary() {
+        let directory = tempfile::tempdir().expect("create bounded Opus directory");
+        let path = directory.path().join("budget.opus");
+        std::fs::write(&path, opus_ogg_with_granules(Some(960), 1_860))
+            .expect("write bounded Opus fixture");
+        let mut session = crate::AudioInputSession::open(&path).expect("open Opus stream session");
+        let info = super::inspect_ogg_opus_stream(
+            session
+                .try_clone_rewound("inspect Opus stream budget")
+                .expect("clone Opus stream"),
+            DecodeLimits::default(),
+        )
+        .expect("inspect Opus stream budget");
+        let exact =
+            DecodeLimits::default().with_max_working_set_bytes(Some(info.decoder_additional_bytes));
+        super::inspect_ogg_opus_stream(
+            session
+                .try_clone_rewound("inspect exact Opus stream budget")
+                .expect("clone exact Opus stream"),
+            exact,
+        )
+        .expect("accept exact Opus stream decoder allowance");
+        let error = super::inspect_ogg_opus_stream(
+            session
+                .try_clone_rewound("inspect short Opus stream budget")
+                .expect("clone short Opus stream"),
+            DecodeLimits::default()
+                .with_max_working_set_bytes(Some(info.decoder_additional_bytes - 1)),
+        )
+        .expect_err("reject one byte below Opus stream decoder allowance");
+        assert!(error.contains("Ogg Opus stream decoder"), "{error}");
     }
 
     #[test]

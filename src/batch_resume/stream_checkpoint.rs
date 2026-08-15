@@ -187,6 +187,10 @@ pub fn stream_recipe_digest(
             AudioFormat::Wav => 1,
             AudioFormat::Flac => 2,
             AudioFormat::OggVorbis => 3,
+            AudioFormat::OggOpus => 4,
+            AudioFormat::Mp3 => 5,
+            AudioFormat::AacAdts => 6,
+            AudioFormat::M4a => 7,
             _ => return Err("unsupported format in stream recipe".into()),
         },
     );
@@ -299,6 +303,178 @@ pub enum StreamCheckpointAcquire {
     Completed(StreamCheckpoint),
 }
 
+/// Read-only decision for one restartable stream checkpoint.
+///
+/// Inspection never creates a lock, journal, spool, output, or directory and
+/// never truncates a torn journal or uncheckpointed spool tail. A later
+/// [`StreamCheckpointSession::acquire`] revalidates the same state under its
+/// advisory lock before changing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamCheckpointDecision {
+    /// Process from scratch or resume the returned durable decoder boundary.
+    Process {
+        checkpoint: Option<StreamCheckpoint>,
+        reset: bool,
+    },
+    /// The exact published output is already complete.
+    Skip {
+        checkpoint: StreamCheckpoint,
+        output: FileFingerprint,
+    },
+}
+
+impl StreamCheckpointDecision {
+    #[must_use]
+    pub const fn checkpoint(self) -> Option<StreamCheckpoint> {
+        match self {
+            Self::Process { checkpoint, .. } => checkpoint,
+            Self::Skip { checkpoint, .. } => Some(checkpoint),
+        }
+    }
+
+    #[must_use]
+    pub const fn existing_output(self) -> Option<FileFingerprint> {
+        match self {
+            Self::Process { .. } => None,
+            Self::Skip { output, .. } => Some(output),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_skip(self) -> bool {
+        matches!(self, Self::Skip { .. })
+    }
+
+    #[must_use]
+    pub const fn reset(self) -> bool {
+        matches!(self, Self::Process { reset: true, .. })
+    }
+}
+
+/// Inspect the restart decision without acquiring or creating control state.
+#[allow(clippy::too_many_arguments)]
+pub fn inspect_stream_checkpoint_decision(
+    output: &Path,
+    input: FileFingerprint,
+    recipe: Digest,
+    spec: WavSpec,
+    block_frames: usize,
+    temporary_limit: Option<u64>,
+    force_reset: bool,
+) -> Result<StreamCheckpointDecision, String> {
+    let expected = identity(input, recipe, spec, block_frames)?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match std::fs::canonicalize(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ensure_stream_output_available(output, force_reset)?;
+            return Ok(StreamCheckpointDecision::Process {
+                checkpoint: None,
+                reset: false,
+            });
+        }
+        Err(error) => {
+            return Err(format!(
+                "resolve stream output directory for {}: {error}",
+                output.display()
+            ));
+        }
+    }
+    let (state_path, spool_path, _) = stream_checkpoint_sidecar_paths(output)?;
+    let state = open_secure_existing(&state_path, false, true)
+        .map_err(|error| error.replace("batch state", "stream checkpoint state"))?;
+    let spool = open_secure_existing(&spool_path, false, true)
+        .map_err(|error| error.replace("batch state", "stream checkpoint spool"))?;
+    let (mut state, mut spool) = match (state, spool) {
+        (Some(state), Some(spool)) => (state, spool),
+        (state, spool) => {
+            if state.is_some() || spool.is_some() {
+                if !force_reset {
+                    return Err(format!(
+                        "stream checkpoint sidecars are incomplete for {}; use --force to discard them",
+                        output.display()
+                    ));
+                }
+                ensure_stream_output_available(output, true)?;
+                return Ok(StreamCheckpointDecision::Process {
+                    checkpoint: None,
+                    reset: true,
+                });
+            }
+            ensure_stream_output_available(output, force_reset)?;
+            return Ok(StreamCheckpointDecision::Process {
+                checkpoint: None,
+                reset: false,
+            });
+        }
+    };
+
+    let inspected = (|| -> Result<StreamCheckpointDecision, String> {
+        let journal = load_journal(&mut state, &state_path, &expected, false)?;
+        if let Some(publish) = journal.publish.as_ref() {
+            let output_fingerprint = *publish
+                .output
+                .as_ref()
+                .expect("validated publish record has an output fingerprint");
+            match published_output_matches(output, &output_fingerprint) {
+                Ok(Some(true)) => {
+                    return Ok(StreamCheckpointDecision::Skip {
+                        checkpoint: StreamCheckpoint::from(publish),
+                        output: output_fingerprint,
+                    });
+                }
+                Ok(None) => {}
+                Ok(Some(false)) if !force_reset => {
+                    return Err(format!(
+                        "completed stream output changed after publication: {}; use --force to restart",
+                        output.display()
+                    ));
+                }
+                Err(error) if !force_reset => return Err(error),
+                Ok(Some(false)) | Err(_) => {
+                    return Ok(StreamCheckpointDecision::Process {
+                        checkpoint: None,
+                        reset: true,
+                    });
+                }
+            }
+        } else {
+            ensure_stream_output_available(output, force_reset)?;
+        }
+        check_checkpoint_temporary_limit(
+            temporary_limit,
+            &expected,
+            journal.checkpoint.spool_len,
+            journal.checkpoint.output_frames,
+        )?;
+        let (checkpoint, _) = restore_pcm(
+            &mut spool,
+            &spool_path,
+            expected.channels,
+            &journal.checkpoint,
+            false,
+        )?;
+        Ok(StreamCheckpointDecision::Process {
+            checkpoint: Some(StreamCheckpoint::from(&checkpoint)),
+            reset: false,
+        })
+    })();
+    match inspected {
+        Ok(decision) => Ok(decision),
+        Err(_) if force_reset => {
+            ensure_stream_output_available(output, true)?;
+            Ok(StreamCheckpointDecision::Process {
+                checkpoint: None,
+                reset: true,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 impl StreamCheckpointSession {
     #[allow(clippy::too_many_arguments)]
     pub fn acquire(
@@ -341,7 +517,7 @@ impl StreamCheckpointSession {
 
         if let Some((mut state, mut spool)) = existing.take() {
             let loaded = (|| -> Result<ExistingCheckpoint, String> {
-                let journal = load_journal(&mut state, &state_path, &expected)?;
+                let journal = load_journal(&mut state, &state_path, &expected, true)?;
                 if let Some(publish) = journal.publish.as_ref() {
                     let output_fingerprint = publish
                         .output
@@ -386,6 +562,7 @@ impl StreamCheckpointSession {
                     &spool_path,
                     expected.channels,
                     &journal.checkpoint,
+                    true,
                 )
                 .map(|(checkpoint, pcm)| ExistingCheckpoint::Active(checkpoint, pcm))
             })();
@@ -493,6 +670,12 @@ impl StreamCheckpointSession {
         self.pcm.len()
     }
 
+    /// Frames currently retained in the durable enhanced-PCM spool.
+    #[must_use]
+    pub const fn output_frames(&self) -> u64 {
+        self.pcm.frames()
+    }
+
     pub fn append_block(&mut self, channels: &[Vec<f64>]) -> Result<(), String> {
         if channels.len() != usize::from(self.identity.channels) {
             return Err(format!(
@@ -535,7 +718,7 @@ impl StreamCheckpointSession {
         self.append_record(input_frames, CHECKPOINT_KIND, None)
     }
 
-    /// Durably bind the fully staged WAV bytes before its atomic publication.
+    /// Durably bind the fully verified encoded bytes before atomic publication.
     ///
     /// A later opener can then distinguish a completed commit whose sidecars
     /// were not cleaned from a stream that still needs to resume.
@@ -683,7 +866,7 @@ fn check_checkpoint_temporary_limit(
         .ok_or_else(|| "stream checkpoint temporary byte count overflows".to_string())?;
     if combined > limit {
         return Err(format!(
-            "stream checkpoint and staged WAV require {combined} bytes, exceeding --max-temp-space ({limit} bytes)"
+            "stream checkpoint and staged output require {combined} bytes, exceeding --max-temp-space ({limit} bytes)"
         ));
     }
     Ok(())
@@ -693,6 +876,7 @@ fn load_journal(
     state: &mut File,
     path: &Path,
     expected: &StreamIdentity,
+    repair: bool,
 ) -> Result<LoadedJournal, String> {
     let len = state
         .metadata()
@@ -788,7 +972,7 @@ fn load_journal(
             }
         }
     }
-    if valid_len < len {
+    if repair && valid_len < len {
         state
             .set_len(valid_len)
             .and_then(|_| state.sync_data())
@@ -842,6 +1026,7 @@ fn restore_pcm(
     path: &Path,
     channels: u16,
     latest: &CheckpointLine,
+    repair: bool,
 ) -> Result<(CheckpointLine, StreamPcmDigest), String> {
     let len = spool
         .metadata()
@@ -870,7 +1055,7 @@ fn restore_pcm(
     if pcm.digest() != latest.spool_digest {
         return Err("stream checkpoint spool digest does not match its journal".into());
     }
-    if len > latest.spool_len {
+    if repair && len > latest.spool_len {
         spool
             .set_len(latest.spool_len)
             .and_then(|_| spool.sync_data())
@@ -1080,6 +1265,131 @@ mod tests {
         let (state, spool, _) = stream_checkpoint_sidecar_paths(&output).unwrap();
         assert!(!state.exists());
         assert!(!spool.exists());
+    }
+
+    #[test]
+    fn read_only_inspection_preserves_checkpoint_and_uncommitted_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("result.wav");
+        let recipe = Digest::from_bytes([10; 32]);
+        let (mut first, _) = active(
+            StreamCheckpointSession::acquire(
+                &output,
+                fingerprint(2),
+                recipe,
+                spec(),
+                257,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        first.append_block(&block()).unwrap();
+        let saved = first.checkpoint(3).unwrap();
+        first.append_block(&block()).unwrap();
+        drop(first);
+        let (state, spool, _) = stream_checkpoint_sidecar_paths(&output).unwrap();
+        let state_before = std::fs::read(&state).unwrap();
+        let spool_before = std::fs::read(&spool).unwrap();
+
+        let decision = inspect_stream_checkpoint_decision(
+            &output,
+            fingerprint(2),
+            recipe,
+            spec(),
+            257,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            StreamCheckpointDecision::Process {
+                checkpoint: Some(saved),
+                reset: false,
+            }
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), state_before);
+        assert_eq!(std::fs::read(&spool).unwrap(), spool_before);
+        assert!(!output.exists());
+        let (session, loaded) = active(
+            StreamCheckpointSession::acquire(
+                &output,
+                fingerprint(2),
+                recipe,
+                spec(),
+                257,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        assert_eq!(loaded, Some(saved));
+        session.cleanup().unwrap();
+    }
+
+    #[test]
+    fn read_only_inspection_reports_completed_output_without_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("result.wav");
+        let recipe = Digest::from_bytes([11; 32]);
+        let (mut first, _) = active(
+            StreamCheckpointSession::acquire(
+                &output,
+                fingerprint(3),
+                recipe,
+                spec(),
+                64,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        first.append_block(&block()).unwrap();
+        first.checkpoint(3).unwrap();
+        std::fs::write(&output, b"published output").unwrap();
+        let output_fingerprint = fingerprint_file(&output).unwrap();
+        let prepared = first.prepare_publish(3, output_fingerprint).unwrap();
+        drop(first);
+        let (state, spool, _) = stream_checkpoint_sidecar_paths(&output).unwrap();
+        let state_before = std::fs::read(&state).unwrap();
+        let spool_before = std::fs::read(&spool).unwrap();
+
+        let decision = inspect_stream_checkpoint_decision(
+            &output,
+            fingerprint(3),
+            recipe,
+            spec(),
+            64,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            StreamCheckpointDecision::Skip {
+                checkpoint: prepared,
+                output: output_fingerprint,
+            }
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), state_before);
+        assert_eq!(std::fs::read(&spool).unwrap(), spool_before);
+        match StreamCheckpointSession::acquire(
+            &output,
+            fingerprint(3),
+            recipe,
+            spec(),
+            64,
+            None,
+            false,
+        )
+        .unwrap()
+        {
+            StreamCheckpointAcquire::Completed(completed) => assert_eq!(completed, prepared),
+            StreamCheckpointAcquire::Active(_, _) => panic!("checkpoint unexpectedly active"),
+        }
     }
 
     #[test]
@@ -1377,6 +1687,34 @@ mod tests {
         );
         assert!(loaded.is_none());
         reset.cleanup().unwrap();
+    }
+
+    #[test]
+    fn future_checkpoint_version_is_rejected_without_modifying_v1_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("result.wav");
+        let input = fingerprint(31);
+        let recipe = Digest::from_bytes([32; 32]);
+        let (first, _) = active(
+            StreamCheckpointSession::acquire(&output, input, recipe, spec(), 64, None, false)
+                .unwrap(),
+        );
+        drop(first);
+        let (state, spool, _) = stream_checkpoint_sidecar_paths(&output).unwrap();
+        let current = std::fs::read_to_string(&state).unwrap();
+        assert!(current.contains("\"version\":1"));
+        let future = current.replacen("\"version\":1", "\"version\":2", 1);
+        std::fs::write(&state, future.as_bytes()).unwrap();
+        let state_before = std::fs::read(&state).unwrap();
+        let spool_before = std::fs::read(&spool).unwrap();
+
+        let error =
+            inspect_stream_checkpoint_decision(&output, input, recipe, spec(), 64, None, false)
+                .unwrap_err();
+
+        assert!(error.contains("unsupported stream checkpoint record"));
+        assert_eq!(std::fs::read(&state).unwrap(), state_before);
+        assert_eq!(std::fs::read(&spool).unwrap(), spool_before);
     }
 
     #[cfg(unix)]

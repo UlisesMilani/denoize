@@ -1119,7 +1119,7 @@ fn wav_stream_data_byte_limit(spec: WavSpec) -> u64 {
     u64::from(u32::MAX) - riff_overhead
 }
 
-fn validate_wav_stream_spec(spec: WavSpec) -> Result<(), String> {
+pub(crate) fn validate_wav_stream_spec(spec: WavSpec) -> Result<(), String> {
     if spec.channels == 0 {
         return Err("WAV stream requires at least one channel".into());
     }

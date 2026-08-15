@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes eleven versioned JSON contracts for local automation. Their
+denoize publishes fourteen versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -10,8 +10,13 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes single-file results, streaming results, and batch NDJSON events.
 - [`denoize-execution-plan-v1.schema.json`](../schemas/denoize-execution-plan-v1.schema.json)
   describes a deterministic, read-only finite-file or batch plan.
+- [`denoize-execution-plan-v2.schema.json`](../schemas/denoize-execution-plan-v2.schema.json)
+  describes a deterministic, read-only bounded-stream plan, including
+  stdin/stdout and durable checkpoint decisions.
 - [`denoize-execution-receipt-v1.schema.json`](../schemas/denoize-execution-receipt-v1.schema.json)
   describes the Ed25519-signed result of a successfully published plan.
+- [`denoize-execution-receipt-v2.schema.json`](../schemas/denoize-execution-receipt-v2.schema.json)
+  describes an Ed25519-signed bounded-stream result.
 - [`denoize-hardware-v1.schema.json`](../schemas/denoize-hardware-v1.schema.json)
   describes a network-free snapshot of CPU features, compiled accelerator
   runtimes, runtime availability, and backend accelerator support.
@@ -23,6 +28,9 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes explicit trusted-key rotation and revocation state.
 - [`denoize-receipt-verification-v1.schema.json`](../schemas/denoize-receipt-verification-v1.schema.json)
   describes successful offline signature and output verification.
+- [`denoize-receipt-verification-v2.schema.json`](../schemas/denoize-receipt-verification-v2.schema.json)
+  describes successful offline verification of a bounded-stream receipt,
+  including an exact captured stdout stream.
 - [`denoize-recommendation-v1.schema.json`](../schemas/denoize-recommendation-v1.schema.json)
   describes bounded input measurements, local device/calibration evidence,
   ranked candidates, exclusions, and explicit recommended settings.
@@ -127,16 +135,22 @@ The effective runtime participates in finite-file recipe identity.
 
 ## Read-only plans and signed execution receipts
 
-`denoize plan INPUT OUTPUT` emits `denoize-execution-plan-v1` without creating
-an output, batch directory, resume journal, lock, model-cache update, or catalog
-state. Planning still opens and hashes the regular input, performs bounded
-decode and metadata checks, resolves and prepares the effective backend/model,
-validates the encoder, and admits the conservative resource request. Batch
-planning additionally reports the exact process/skip decision and reason for
-every item. A skipped item binds the exact existing-output fingerprint that
-justified the skip; a processing item carries `null` because its output does
-not exist yet or will be replaced. A plan is therefore an executable preflight,
-not a filename-only estimate.
+`denoize plan INPUT OUTPUT` emits `denoize-execution-plan-v1` for finite-file or
+batch processing and additive `denoize-execution-plan-v2` for `--stream`. It
+does not create an output, batch directory, resume journal, lock, model-cache
+update, or catalog state. Planning still opens and hashes the input, performs
+bounded decode and metadata checks, resolves and prepares the effective
+backend/model, validates the encoder, and admits the conservative resource
+request. A stdin stream is consumed into a bounded anonymous spool because
+planning must inspect the exact bytes that execution would consume. A durable
+resume plan reads existing checkpoint sidecars without locking, truncating,
+repairing, or deleting them. It reports `process/checkpoint` for resumable work
+or `skip/completed` plus the exact existing-output fingerprint after a commit
+whose cleanup was interrupted. Batch planning reports the equivalent exact
+process/skip decision and reason for every item. A processing item carries a
+null existing fingerprint because its output does not exist yet or will be
+replaced. A plan is therefore an executable preflight, not a filename-only
+estimate.
 
 Plan paths are portable UTF-8 relative locators. A single-file plan records
 only each artifact's filename; a batch plan records paths relative to its input
@@ -160,13 +174,23 @@ denoize receipts verify clean.receipt.json \
 ```
 
 The receipt authenticates the plan digest and the actual fingerprints of all
-published outputs. Batch receipts are emitted only after every planned item
-has succeeded or been exactly skipped and all current inputs, models, and
-outputs have been rechecked. A failure or cancellation leaves no successful
-receipt. Audio and receipt files are separate atomic publications rather than
-one cross-file transaction: if a destination race prevents the final receipt
-rename after outputs commit, denoize reports that state explicitly and never
-overwrites the competing receipt.
+published outputs. File and batch receipts use v1; bounded stream receipts use
+v2. Batch receipts are emitted only after every planned item has succeeded or
+been exactly skipped and all current inputs, models, and outputs have been
+rechecked. A resumed stream can likewise authenticate a completed output as a
+`skipped` result without reprocessing. A failure or cancellation leaves no
+successful receipt. Audio and receipt files are separate atomic publications
+rather than one cross-file transaction: if a destination race or process exit
+prevents the final receipt rename after audio commits, denoize preserves the
+audio and durable checkpoint evidence so the next identical resume can verify
+and publish the matching receipt without overwriting either destination.
+
+For stdout, v2 signs the fingerprint of the complete verified encoded spool
+only after the sink accepts and flushes every byte. Save stdout exactly, then
+pass that file to `receipts verify --output CAPTURED_AUDIO`; rooted output
+lookup is not used for the `-` locator. A pipe can still contain partial bytes
+after a sink failure and provides neither atomic publication nor restartable
+state.
 
 The signer key is deliberately absent from the receipt. Offline verification
 must receive either a separately distributed `denoize-receipt-public-key-v1`
@@ -188,10 +212,14 @@ and crash dumps remain outside best-effort zeroization. `public-key` safely
 recovers a public companion if publication was interrupted. `policy create`
 supports sorted trusted keys and explicit revoked key IDs for rotation.
 
-All six Stage 11 documents reject unknown fields and unsupported future schema
-versions. Their array, text, locator, and JSON-file sizes are bounded before
-trust decisions. Streaming/stdin plans and receipts are intentionally absent
-until Stage 12 can bind bounded non-seekable and checkpoint semantics.
+All six Stage 11 v1 documents remain accepted without migration. The three
+additive Stage 12 v2 documents are used only for bounded streams, preserving
+the v1 signature and plan-digest domains for v0.59 file/batch artifacts. All
+nine execution documents reject unknown fields and unsupported future schema
+versions without modifying the source file. Their array, text, locator, and
+JSON-file sizes are bounded before trust decisions. The v1 stream-checkpoint
+and v3 batch-journal formats used by v0.58 and v0.59 likewise remain readable;
+unknown future records fail closed without repair or truncation.
 
 ## Hardware capability snapshot
 

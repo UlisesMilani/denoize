@@ -3,7 +3,7 @@
 use denoize::audio::{
     ensure_memory_limit, estimate_audio_working_set_bytes, estimate_session_memory_bytes,
     estimate_stream_memory_bytes_checked, read_audio, read_audio_from_session_with_limits,
-    read_wav_bytes_with_limits, write_wav_bytes, write_wav_channel_mask_to_file, WavStreamWriter,
+    read_wav_bytes_with_limits, write_wav_bytes, write_wav_channel_mask_to_file,
 };
 use denoize::batch_resume::{
     self, BatchSession, ConsumedModel, Digest, FileFingerprint, MetadataPolicy, ResumeDecision,
@@ -22,13 +22,14 @@ use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::AudioInputSession;
 use denoize::{
-    AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm, AtomicOutput, Backend,
-    BackendOptions, BackendSession, ChannelMode, CommitMode, DownmixMode, EncodeOptions,
-    ExecutionKind, ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, OnnxModelConfig,
-    OutputFormat, PlannedArtifact, PlannedOutput, PlannedResources, ReceiptItem, ReceiptPublicKey,
-    ReceiptSecretKey, ReceiptTrustPolicy, RecommendationGoal, RecommendationOptions,
-    ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile,
-    SignedExecutionReceipt, StreamingBackendSession, WindowType,
+    verify_stream_output_file, AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm,
+    AtomicOutput, AudioStreamWriter, Backend, BackendOptions, BackendSession, ChannelMode,
+    CommitMode, DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
+    ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
+    PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
+    RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
+    ResourceRequest, SgmseProfile, SignedExecutionReceipt, SpooledAudioStreamWriter,
+    StreamEncodeLimits, StreamEncodeSpec, StreamSpoolLimits, StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -58,6 +59,7 @@ thread_local! {
     static TEST_STREAM_CHECKPOINT_FRAMES: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static TEST_STOP_AFTER_STREAM_CHECKPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_STOP_AFTER_STREAM_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_CORRUPT_STREAM_OUTPUT_BEFORE_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn stream_checkpoint_frames() -> u64 {
@@ -84,6 +86,16 @@ fn injected_stop_after_stream_commit() -> bool {
     }
     #[cfg(not(test))]
     false
+}
+
+fn inject_stream_output_corruption(file: &mut std::fs::File) -> Result<(), String> {
+    #[cfg(test)]
+    if TEST_CORRUPT_STREAM_OUTPUT_BEFORE_VERIFY.with(|value| value.replace(false)) {
+        file.set_len(16)
+            .map_err(|error| format!("inject staged stream output corruption: {error}"))?;
+    }
+    let _ = file;
+    Ok(())
 }
 static CANCEL_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -398,7 +410,7 @@ OPTIONS:
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
-        --stream              bounded-memory WAV/FLAC/Vorbis-to-WAV processing
+        --stream              bounded WAV/FLAC/Vorbis/Opus/MP3/ADTS-AAC/M4A-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --max-process-memory <MB> aggregate denoize RAM reservations across workers (min: 1)
@@ -1904,13 +1916,8 @@ fn validate_receipt_cli_options(
         (Some(_), Some(_)) => {}
         _ => return Err("--receipt and --receipt-key must be supplied together".into()),
     }
-    if input == "-" || output == "-" {
-        return Err(
-            "signed receipts for stdin/stdout arrive with bounded streams in Stage 12".into(),
-        );
-    }
-    if options.stream {
-        return Err("signed --stream receipts arrive with bounded streams in Stage 12".into());
+    if (input == "-" || output == "-") && !options.stream {
+        return Err("signed stdin/stdout receipts require --stream".into());
     }
     if options.report {
         return Err(
@@ -1927,6 +1934,9 @@ fn validate_receipt_cli_options(
             .is_some_and(|path| path.is_empty())
     {
         return Err("receipt and receipt-key paths must not be empty".into());
+    }
+    if options.receipt.as_deref() == Some("-") || options.receipt_key.as_deref() == Some("-") {
+        return Err("receipt and receipt-key must use durable regular-file paths".into());
     }
     Ok(())
 }
@@ -2174,12 +2184,14 @@ USAGE:
 VERIFY OPTIONS:
         --plan <PLAN.json>   require exact correspondence to a read-only plan
         --output-root <DIR> anchor portable output locators below DIR
-        --json               emit compact denoize-receipt-verification-v1 JSON
+        --output <FILE>      exact file that captured a v2 stdout stream
+        --json               emit compact verification JSON
         --pretty             emit indented verification JSON
 
 Secret keys are unencrypted and generated owner-only. Receipts never embed a
 trust key: verification requires an explicit public key or a rotation/revocation
-policy. Without --output-root, output locators are anchored beside the receipt.
+policy. Without --output-root, file locators are anchored beside the receipt.
+Stdout stream receipts use the `-` locator and require --output during verification.
 "
 }
 
@@ -2281,6 +2293,7 @@ fn run_receipt_verify(args: &[String]) -> Result<(), String> {
     let mut policy = None;
     let mut plan_path = None;
     let mut output_root = None;
+    let mut stream_output = None;
     let mut output = ReceiptVerificationOutput::Human;
     let mut index = 1;
     while index < args.len() {
@@ -2317,6 +2330,14 @@ fn run_receipt_verify(args: &[String]) -> Result<(), String> {
                         .clone(),
                 );
             }
+            "--output" => {
+                index += 1;
+                stream_output = Some(
+                    args.get(index)
+                        .ok_or("missing captured stream path for --output")?
+                        .clone(),
+                );
+            }
             "--json" => {
                 if output != ReceiptVerificationOutput::Human {
                     return Err("receipts verify accepts only one of --json or --pretty".into());
@@ -2342,6 +2363,7 @@ fn run_receipt_verify(args: &[String]) -> Result<(), String> {
 
     let receipt = SignedExecutionReceipt::from_file(receipt_path)?;
     let root = output_root.as_deref().map(std::path::Path::new);
+    let stream_output = stream_output.as_deref().map(std::path::Path::new);
     let report = match (public_key, policy) {
         (Some(path), None) => {
             let key = ReceiptPublicKey::from_file(path)?;
@@ -2350,11 +2372,12 @@ fn run_receipt_verify(args: &[String]) -> Result<(), String> {
                 .as_deref()
                 .map(ExecutionPlan::from_file)
                 .transpose()?;
-            receipt.verify_with_key(
+            receipt.verify_with_key_at_stream_output(
                 &key,
                 plan.as_ref(),
                 std::path::Path::new(receipt_path),
                 root,
+                stream_output,
             )?
         }
         (None, Some(path)) => {
@@ -2364,11 +2387,12 @@ fn run_receipt_verify(args: &[String]) -> Result<(), String> {
                 .as_deref()
                 .map(ExecutionPlan::from_file)
                 .transpose()?;
-            receipt.verify_with_policy(
+            receipt.verify_with_policy_at_stream_output(
                 &policy,
                 plan.as_ref(),
                 std::path::Path::new(receipt_path),
                 root,
+                stream_output,
             )?
         }
         _ => return Err("receipt verification authority changed after validation".into()),
@@ -2398,13 +2422,15 @@ fn execution_plan_usage() -> &'static str {
     "\
 USAGE:
     denoize plan <INPUT> <OUTPUT> [PROCESSING OPTIONS] [--pretty]
+    denoize plan <INPUT|-> <OUTPUT|-> --stream [STREAM OPTIONS] [--pretty]
     denoize plan <INPUT_DIR> <OUTPUT_DIR> --batch [BATCH OPTIONS] [--pretty]
 
 The command performs the same bounded decode, model verification, backend
 preparation, resource admission, recipe hashing, and destination validation as
 execution, but never creates output, lock, journal, checkpoint, or model state.
-It emits denoize-execution-plan-v1 JSON to stdout. Paths are portable relative
-locators, never absolute paths. Stdin/stdout and --stream plans arrive in Stage 12.
+It emits v1 file/batch or v2 bounded-stream execution-plan JSON to stdout. Paths
+are portable relative locators, never absolute paths; `-` identifies stdin or
+stdout only in a v2 stream plan. Planning stdin consumes it into a bounded spool.
 "
 }
 
@@ -2432,17 +2458,6 @@ fn run_execution_plan(args: &[String]) -> Result<(), String> {
         }
     }
     let (input, output, options) = parse_args(&parseable)?;
-    if input == "-" || output == "-" {
-        return Err(
-            "plan requires regular-file paths; bounded stdin/stdout plans are Stage 12".into(),
-        );
-    }
-    if options.stream {
-        return Err(
-            "read-only --stream plans are delivered with bounded non-seekable streams in Stage 12"
-                .into(),
-        );
-    }
     if options.report {
         return Err("plan cannot be combined with --report".into());
     }
@@ -2454,13 +2469,21 @@ fn run_execution_plan(args: &[String]) -> Result<(), String> {
             "plan cannot publish a receipt; pass --receipt and --receipt-key to execution".into(),
         );
     }
+    if options.batch && options.stream {
+        return Err("plan cannot combine --batch and --stream".into());
+    }
     let plan = if options.batch {
         build_batch_execution_plan(
             std::path::Path::new(&input),
             std::path::Path::new(&output),
             &options,
         )?
+    } else if options.stream {
+        build_stream_execution_plan(&input, &output, &options)?
     } else {
+        if input == "-" || output == "-" {
+            return Err("stdin/stdout execution plans require --stream".into());
+        }
         build_single_execution_plan(
             std::path::Path::new(&input),
             std::path::Path::new(&output),
@@ -2634,6 +2657,433 @@ fn build_batch_execution_plan_from_planned(
         options.deterministic,
         metadata_policy_name(metadata_policy),
         plan_items,
+    )
+}
+
+fn build_stream_execution_plan(
+    input: &str,
+    output: &str,
+    options: &Overrides,
+) -> Result<ExecutionPlan, String> {
+    validate_effective_options(options, VALIDATION_SAMPLE_RATE)?;
+    let standard_input = input == "-";
+    let standard_output = output == "-";
+    if options.resume && (standard_input || standard_output) {
+        return Err(
+            "--resume requires durable regular-file stream input and output; stdin/stdout spools are intentionally ephemeral"
+                .into(),
+        );
+    }
+    let input_path = std::path::Path::new(input);
+    let output_path = std::path::Path::new(output);
+    let output_format = if standard_output {
+        match options.output_format.as_deref() {
+            Some(extension) => {
+                OutputFormat::from_path(&std::path::PathBuf::from(format!("output.{extension}")))?
+            }
+            None => OutputFormat::Wav,
+        }
+    } else {
+        OutputFormat::from_path(output_path)?
+    };
+    let encode_options = build_encode_options(options)?;
+    validate_encode_preflight(encode_options, [output_format])?;
+    let governor = resource_governor(options, 1)?;
+    let configured_temporary_limit = governor.limits().max_temporary_bytes();
+    let stdio_spool_limits = StreamSpoolLimits::new(
+        configured_temporary_limit.unwrap_or_else(|| StreamSpoolLimits::default().max_bytes()),
+    );
+    let stdio_request = if standard_input || standard_output {
+        ResourceRequest::new().with_temporary_bytes(stdio_spool_limits.max_bytes())
+    } else {
+        ResourceRequest::new()
+    };
+    let _stdio_permit = if standard_input || standard_output {
+        Some(governor.acquire(stdio_request)?)
+    } else {
+        None
+    };
+
+    let backend = if options.auto_backend {
+        service::select_live_backend()
+    } else {
+        options.backend.unwrap_or(Backend::Classical)
+    };
+    if !StreamingBackendSession::supports(backend) {
+        return Err(format!(
+            "backend {} does not support --stream",
+            service::backend_name(backend)
+        ));
+    }
+    let preflight_cfg = build_config(options, VALIDATION_SAMPLE_RATE);
+    if preflight_cfg.vad {
+        return Err("--stream does not support VAD; omit --mode speech or --vad".into());
+    }
+    if options.loudness_lufs.is_some() || options.true_peak_dbtp.is_some() {
+        return Err("--stream does not support loudness normalization".into());
+    }
+    let backend_options =
+        service::resolve_backend_options_read_only(backend, build_backend_options(options))?;
+    let accelerator = denoize::select_accelerator(
+        backend,
+        backend_options.accelerator,
+        backend_options.deterministic,
+    )?;
+    let initial_publication = if options.resume {
+        None
+    } else if standard_output {
+        Some(("stdout", "non-seekable"))
+    } else {
+        Some(planned_publication(output_path, options.force)?)
+    };
+
+    let mut input_session = if standard_input {
+        let stdin = std::io::stdin();
+        AudioInputSession::from_reader_with_limits(stdin.lock(), stdio_spool_limits)?
+    } else {
+        AudioInputSession::open(input_path)?
+    };
+    let input_spool_bytes = if standard_input {
+        input_session.len()
+    } else {
+        0
+    };
+    let remaining_stdio_spool_bytes = stdio_spool_limits
+        .max_bytes()
+        .checked_sub(input_spool_bytes)
+        .ok_or_else(|| "stdin spool exceeded the shared non-seekable spool limit".to_string())?;
+    let effective_memory_mb = effective_input_memory_mb(options);
+    let effective_memory_bytes = effective_input_memory_limit_bytes(options)?;
+    let initial_metadata_limits = metadata_limits_for_available_bytes(effective_memory_bytes);
+    let initial_decode_limits = DecodeLimits::new(initial_metadata_limits, effective_memory_bytes);
+    let stream_info = inspect_audio_stream_session(&mut input_session, initial_decode_limits)?;
+    let spec = stream_info.output_spec;
+    let encode_spec =
+        StreamEncodeSpec::new(spec, stream_info.channel_mask, stream_info.total_frames);
+    output_format.validate_stream_config(encode_spec, encode_options)?;
+    let effective_temporary_limit = if standard_input || standard_output {
+        Some(remaining_stdio_spool_bytes)
+    } else {
+        configured_temporary_limit
+    };
+    let auxiliary_limit = match (stream_info.total_frames, effective_temporary_limit) {
+        (None, Some(limit)) => limit / 3,
+        (_, Some(limit)) => limit,
+        (_, None) => StreamEncodeLimits::default().max_auxiliary_temporary_bytes(),
+    };
+    let encode_limits = StreamEncodeLimits::new(auxiliary_limit);
+    validate_effective_options(options, spec.sample_rate)?;
+    let cfg = build_config(options, spec.sample_rate);
+    let block_frames = options.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
+    let base_stream_working_set = estimate_stream_memory_bytes_checked(
+        spec.channels as usize,
+        block_frames,
+        cfg.frame_size,
+        spec.sample_rate,
+        cfg.profile_ms,
+    )
+    .map_err(|error| error.to_string())?;
+    let backend_stream_state = StreamingBackendSession::estimate_additional_bytes(
+        backend,
+        spec.sample_rate,
+        spec.channels as usize,
+        backend_options.channel_mode,
+    )
+    .map_err(|error| error.to_string())?;
+    let encoder_stream_state = denoize::estimate_stream_encode_additional_bytes(
+        output_format,
+        encode_spec,
+        block_frames,
+        encode_options,
+    )?;
+    let stream_working_set = base_stream_working_set
+        .checked_add(backend_stream_state)
+        .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(encoder_stream_state))
+        .and_then(|bytes| {
+            bytes.checked_add(if options.resume {
+                batch_resume::STREAM_CHECKPOINT_SCRATCH_BYTES
+            } else {
+                0
+            })
+        })
+        .ok_or_else(|| "stream plan working-set estimate overflow".to_string())?;
+    let verification_block_frames = block_frames.min(STREAM_BLOCK_FRAMES);
+    let initial_verification_working_set = denoize::estimate_stream_output_verification_bytes(
+        output_format,
+        encode_spec,
+        verification_block_frames,
+        encode_options,
+        encode_limits,
+        initial_decode_limits,
+    )?;
+    let initial_worker_memory = stream_working_set.max(initial_verification_working_set);
+    ensure_memory_limit(
+        initial_worker_memory,
+        effective_memory_mb,
+        "stream plan working set",
+    )?;
+    let metadata_limits = retained_metadata_limits(effective_memory_mb, initial_worker_memory)?;
+    let decode_limits = DecodeLimits::new(metadata_limits, effective_memory_bytes);
+    let final_info = inspect_audio_stream_session(&mut input_session, decode_limits)?;
+    if final_info.format != stream_info.format
+        || final_info.codec != stream_info.codec
+        || final_info.output_spec != stream_info.output_spec
+        || final_info.channel_mask != stream_info.channel_mask
+        || final_info.total_frames != stream_info.total_frames
+        || final_info.max_decoder_frames != stream_info.max_decoder_frames
+    {
+        return Err("stream input geometry changed during read-only planning".into());
+    }
+    let verification_working_set = denoize::estimate_stream_output_verification_bytes(
+        output_format,
+        encode_spec,
+        verification_block_frames,
+        encode_options,
+        encode_limits,
+        decode_limits,
+    )?;
+    ensure_memory_limit(
+        stream_working_set.max(verification_working_set),
+        effective_memory_mb,
+        "stream plan working set",
+    )?;
+    let metadata_policy = if options.no_metadata || standard_output {
+        MetadataPolicy::Drop
+    } else {
+        MetadataPolicy::Preserve
+    };
+    let metadata_bytes = if metadata_policy == MetadataPolicy::Preserve {
+        input_session
+            .read_metadata_with_limits(metadata_limits)?
+            .as_ref()
+            .map(denoize::metadata::Metadata::estimated_memory_bytes)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let worker_memory_bytes = stream_working_set
+        .checked_add(metadata_bytes)
+        .ok_or_else(|| "stream plan memory reservation overflow".to_string())?
+        .max(verification_working_set);
+    let temporary_reservation = if standard_output {
+        let auxiliary = denoize::estimate_stream_encode_temporary_bytes(
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+        )?;
+        let total = denoize::estimate_spooled_stream_output_bytes(
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+        )?
+        .unwrap_or(remaining_stdio_spool_bytes);
+        if total > remaining_stdio_spool_bytes {
+            return Err(format!(
+                "non-seekable output requires {total} bytes, but stdin and output share only {remaining_stdio_spool_bytes} remaining spool bytes"
+            ));
+        }
+        StreamTemporaryReservation {
+            total_bytes: total,
+            encoder_auxiliary_bytes: auxiliary,
+            checkpoint_limit: None,
+        }
+    } else {
+        stream_temporary_reservation_bytes(
+            final_info,
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+            effective_temporary_limit,
+            options.resume,
+            metadata_bytes,
+        )?
+    };
+    let admitted_temporary_bytes = if standard_input || standard_output {
+        0
+    } else {
+        temporary_reservation.total_bytes
+    };
+    let mut worker_request = ResourceRequest::worker(worker_memory_bytes, admitted_temporary_bytes);
+    if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
+        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
+            stream_working_set
+                .checked_mul(2)
+                .ok_or_else(|| "stream plan GPU reservation overflow".to_string())?,
+        );
+    }
+    let admission_request = worker_request.checked_add(backend_resource_request(
+        backend,
+        &backend_options,
+        accelerator,
+    )?)?;
+    drop(governor.try_acquire(admission_request)?.ok_or_else(|| {
+        "stream execution plan cannot be admitted under the configured resource limits".to_string()
+    })?);
+    let reported_request = admission_request.checked_add(stdio_request)?;
+
+    let resolved = service::ResolvedProcessingOptions {
+        backend,
+        denoiser: cfg.clone(),
+        backend_options: backend_options.clone(),
+        accelerator,
+        loudness_lufs: None,
+        true_peak_dbtp: -1.0,
+    };
+    resolved.validate_config()?;
+    let model = match batch_resume::consumed_model_config(&resolved)? {
+        Some(config) if options.resume => Some(batch_resume::fingerprint_resumable_model(config)?),
+        Some(config) => Some(batch_resume::fingerprint_consumed_model(config)?),
+        None => None,
+    };
+    let _processor = StreamingBackendSession::new_with_accelerator(
+        backend,
+        spec.sample_rate,
+        spec.channels as usize,
+        cfg,
+        backend_options,
+        accelerator,
+    )?;
+    if let Some(model) = &model {
+        if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
+            return Err(format!(
+                "selected streaming model changed during read-only planning: {}",
+                model.path.display()
+            ));
+        }
+    }
+    let base_recipe = batch_resume::recipe_digest(
+        &resolved,
+        spec.channels as usize,
+        output_format,
+        encode_options,
+        metadata_policy,
+        model
+            .as_ref()
+            .map(|model| (&model.fingerprint, model.sample_rate)),
+    )?;
+    let recipe = batch_resume::stream_recipe_digest(base_recipe, block_frames, final_info)?;
+
+    let mut reader = AudioStreamReader::from_session(input_session, decode_limits)?;
+    let input_fingerprint = reader.fingerprint_input()?;
+    let mut frames = 0_u64;
+    while let Some(block) = reader.next_block(block_frames)? {
+        frames = frames
+            .checked_add(block.first().map(Vec::len).unwrap_or(0) as u64)
+            .ok_or_else(|| "stream plan frame count overflows".to_string())?;
+    }
+    if reader.fingerprint_input()? != input_fingerprint {
+        return Err("stream input changed while it was planned".into());
+    }
+    if !standard_input && batch_resume::fingerprint_file(input_path)? != input_fingerprint {
+        return Err(format!(
+            "stream input path changed during read-only planning: {}",
+            input_path.display()
+        ));
+    }
+    if frames == 0 {
+        return Err("stream execution plan input contains no presentation frames".into());
+    }
+    let input_locator = if standard_input {
+        "-".to_string()
+    } else {
+        denoize::portable_file_locator(input_path)?
+    };
+    let output_locator = if standard_output {
+        "-".to_string()
+    } else {
+        denoize::portable_file_locator(output_path)?
+    };
+    let (publication, action, reason, existing_fingerprint, planned_request) = if options.resume {
+        let decision = batch_resume::inspect_stream_checkpoint_decision(
+            output_path,
+            input_fingerprint,
+            recipe,
+            spec,
+            block_frames,
+            temporary_reservation.checkpoint_limit,
+            options.force,
+        )?;
+        if decision
+            .checkpoint()
+            .is_some_and(|checkpoint| checkpoint.input_frames() > frames)
+        {
+            return Err("stream checkpoint exceeds the current input presentation length".into());
+        }
+        match decision {
+            batch_resume::StreamCheckpointDecision::Skip { checkpoint, output } => {
+                if checkpoint.input_frames() != frames || checkpoint.output_frames() != frames {
+                    return Err(
+                        "completed stream checkpoint length differs from the current input".into(),
+                    );
+                }
+                (
+                    "none",
+                    "skip",
+                    "completed",
+                    Some(output),
+                    ResourceRequest::new(),
+                )
+            }
+            batch_resume::StreamCheckpointDecision::Process { checkpoint, reset } => {
+                let (publication, publication_reason) =
+                    planned_publication(output_path, options.force)?;
+                let reason = if reset {
+                    "forced"
+                } else if checkpoint.is_some() {
+                    "checkpoint"
+                } else {
+                    publication_reason
+                };
+                (publication, "process", reason, None, reported_request)
+            }
+        }
+    } else {
+        let (publication, reason) =
+            initial_publication.ok_or("stream publication decision is missing after preflight")?;
+        (publication, "process", reason, None, reported_request)
+    };
+    let item_id = denoize::execution_item_id(input_fingerprint, &output_locator, recipe)?;
+    let planned_model = model
+        .as_ref()
+        .map(|model| {
+            Ok::<PlannedArtifact, String>(PlannedArtifact {
+                path: denoize::portable_file_locator(&model.path)?,
+                fingerprint: model.fingerprint,
+            })
+        })
+        .transpose()?;
+    ExecutionPlan::new_stream(
+        resolved.backend_options.deterministic,
+        metadata_policy_name(metadata_policy),
+        vec![ExecutionPlanItem {
+            item_id,
+            input: PlannedArtifact {
+                path: input_locator,
+                fingerprint: input_fingerprint,
+            },
+            output: PlannedOutput {
+                path: output_locator,
+                format: output_format_name(output_format).into(),
+                publication: publication.into(),
+                action: action.into(),
+                reason: reason.into(),
+                existing_fingerprint,
+            },
+            model: planned_model,
+            recipe,
+            backend: service::backend_name(backend).into(),
+            accelerator: accelerator.effective().name().into(),
+            input_format: audio_format_name(final_info.format).into(),
+            input_codec: audio_codec_name(final_info.codec).into(),
+            channels: u64::from(spec.channels),
+            frames,
+            sample_rate: spec.sample_rate,
+            resources: planned_resources(planned_request),
+        }],
     )
 }
 
@@ -2981,10 +3431,7 @@ fn parse_recommendation_args(
     }
     let input = input.ok_or("recommend requires INPUT")?;
     if input == "-" {
-        return Err(
-            "recommend requires a regular-file INPUT; bounded stdin analysis is planned for Stage 12"
-                .into(),
-        );
+        return Err("recommend requires a regular-file INPUT; stdin is supported only by --stream processing".into());
     }
     let maximum = checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
     let maximum_gpu = checked_mib_limit_bytes(max_gpu_memory_mb, "--max-gpu-memory")?;
@@ -3273,6 +3720,25 @@ struct StagedExecutionEvidence {
     resources: ResourceRequest,
 }
 
+struct PreparedStreamReceipt {
+    path: std::path::PathBuf,
+    key: ReceiptSecretKey,
+}
+
+#[derive(Clone)]
+struct StreamExecutionEvidence {
+    input_fingerprint: FileFingerprint,
+    stream_info: denoize::AudioStreamInfo,
+    model: Option<ConsumedModel>,
+    recipe: Digest,
+    output_format: OutputFormat,
+    resources: ResourceRequest,
+    backend: Backend,
+    accelerator: AcceleratorSelection,
+    deterministic: bool,
+    metadata_policy: MetadataPolicy,
+}
+
 fn run_one_with_output_format(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -3438,6 +3904,63 @@ fn preflight_receipt_paths(
     Ok(())
 }
 
+fn prepare_stream_receipt(
+    input: &str,
+    output: &str,
+    options: &Overrides,
+) -> Result<Option<PreparedStreamReceipt>, String> {
+    let (Some(receipt), Some(secret_key)) = (&options.receipt, &options.receipt_key) else {
+        return Ok(None);
+    };
+    let receipt = std::path::PathBuf::from(receipt);
+    let secret_key = std::path::PathBuf::from(secret_key);
+    match std::fs::symlink_metadata(&receipt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(format!(
+                "execution receipt already exists: {} (refusing to replace it)",
+                receipt.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect execution receipt destination {}: {error}",
+                receipt.display()
+            ));
+        }
+    }
+    let mut paths = Vec::with_capacity(4);
+    if input != "-" {
+        paths.push(("input", std::path::Path::new(input)));
+    }
+    if output != "-" {
+        paths.push(("output", std::path::Path::new(output)));
+    }
+    paths.push(("receipt", receipt.as_path()));
+    paths.push(("receipt key", secret_key.as_path()));
+    let mut normalized = Vec::with_capacity(paths.len());
+    for (label, path) in paths {
+        normalized.push((label, normalize_batch_path(path)?));
+    }
+    for left in 0..normalized.len() {
+        for right in left + 1..normalized.len() {
+            if batch_collision_key(&normalized[left].1) == batch_collision_key(&normalized[right].1)
+            {
+                return Err(format!(
+                    "{} and {} must use distinct paths: {}",
+                    normalized[left].0,
+                    normalized[right].0,
+                    normalized[left].1.display()
+                ));
+            }
+        }
+    }
+    Ok(Some(PreparedStreamReceipt {
+        path: receipt,
+        key: ReceiptSecretKey::from_file(secret_key)?,
+    }))
+}
+
 fn preflight_batch_receipt_paths(
     input_dir: &std::path::Path,
     output_dir: &std::path::Path,
@@ -3511,6 +4034,149 @@ fn build_single_execution_plan_from_staged(
             resources: planned_resources(evidence.resources),
         }],
     )
+}
+
+fn build_stream_execution_plan_from_evidence(
+    input: &str,
+    output: &str,
+    evidence: &StreamExecutionEvidence,
+    frames: u64,
+    publication: &str,
+    action: &str,
+    reason: &str,
+    existing_fingerprint: Option<FileFingerprint>,
+) -> Result<ExecutionPlan, String> {
+    let input_locator = if input == "-" {
+        "-".to_string()
+    } else {
+        denoize::portable_file_locator(std::path::Path::new(input))?
+    };
+    let output_locator = if output == "-" {
+        "-".to_string()
+    } else {
+        denoize::portable_file_locator(std::path::Path::new(output))?
+    };
+    let item_id =
+        denoize::execution_item_id(evidence.input_fingerprint, &output_locator, evidence.recipe)?;
+    let model = evidence
+        .model
+        .as_ref()
+        .map(|model| {
+            Ok::<PlannedArtifact, String>(PlannedArtifact {
+                path: denoize::portable_file_locator(&model.path)?,
+                fingerprint: model.fingerprint,
+            })
+        })
+        .transpose()?;
+    ExecutionPlan::new_stream(
+        evidence.deterministic,
+        metadata_policy_name(evidence.metadata_policy),
+        vec![ExecutionPlanItem {
+            item_id,
+            input: PlannedArtifact {
+                path: input_locator,
+                fingerprint: evidence.input_fingerprint,
+            },
+            output: PlannedOutput {
+                path: output_locator,
+                format: output_format_name(evidence.output_format).into(),
+                publication: publication.into(),
+                action: action.into(),
+                reason: reason.into(),
+                existing_fingerprint,
+            },
+            model,
+            recipe: evidence.recipe,
+            backend: service::backend_name(evidence.backend).into(),
+            accelerator: evidence.accelerator.effective().name().into(),
+            input_format: audio_format_name(evidence.stream_info.format).into(),
+            input_codec: audio_codec_name(evidence.stream_info.codec).into(),
+            channels: u64::from(evidence.stream_info.output_spec.channels),
+            frames,
+            sample_rate: evidence.stream_info.output_spec.sample_rate,
+            resources: planned_resources(evidence.resources),
+        }],
+    )
+}
+
+fn stage_stream_signed_receipt(
+    input: &str,
+    output: &str,
+    receipt: &PreparedStreamReceipt,
+    evidence: &StreamExecutionEvidence,
+    frames: u64,
+    output_fingerprint: FileFingerprint,
+    publication: &str,
+    action: &str,
+    reason: &str,
+    existing_fingerprint: Option<FileFingerprint>,
+) -> Result<AtomicOutput, String> {
+    let plan = build_stream_execution_plan_from_evidence(
+        input,
+        output,
+        evidence,
+        frames,
+        publication,
+        action,
+        reason,
+        existing_fingerprint,
+    )?;
+    let plan_item = plan
+        .items
+        .first()
+        .ok_or("stream execution plan unexpectedly contains no items")?;
+    let outcome = match action {
+        "process" => "succeeded",
+        "skip" => "skipped",
+        value => return Err(format!("unsupported stream receipt action: {value}")),
+    };
+    let item = ReceiptItem::from_plan_item(plan_item, output_fingerprint, outcome)?;
+    let payload = ExecutionReceiptPayload::new(&plan, vec![item])?;
+    let signed = receipt.key.sign(payload)?;
+    stage_signed_receipt(&receipt.path, &signed)
+}
+
+fn commit_stream_receipt_after_output(
+    receipt: &PreparedStreamReceipt,
+    staged: AtomicOutput,
+    output: &str,
+) -> Result<(), String> {
+    staged.commit(CommitMode::NoClobber).map_err(|error| {
+        format!(
+            "stream output was published to {output}, but its signed receipt could not be published to {}: {error}",
+            receipt.path.display()
+        )
+    })
+}
+
+fn verify_stream_receipt_sources(
+    reader: &AudioStreamReader,
+    input: &str,
+    evidence: Option<&StreamExecutionEvidence>,
+) -> Result<(), String> {
+    let Some(evidence) = evidence else {
+        return Ok(());
+    };
+    if reader.fingerprint_input()? != evidence.input_fingerprint {
+        return Err("stream receipt input changed while it was processed".into());
+    }
+    if input != "-"
+        && batch_resume::fingerprint_file(std::path::Path::new(input))?
+            != evidence.input_fingerprint
+    {
+        return Err(format!(
+            "stream receipt input path changed while it was processed: {input}"
+        ));
+    }
+    if let Some(model) = &evidence.model {
+        if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
+            return Err(format!(
+                "stream receipt model changed while it was processed: {}",
+                model.path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn stage_signed_receipt(
@@ -3881,23 +4547,76 @@ fn process_one_to_staged_output(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StreamTemporaryReservation {
+    total_bytes: u64,
+    encoder_auxiliary_bytes: u64,
+    checkpoint_limit: Option<u64>,
+}
+
+fn virtual_wav_bytes(info: denoize::AudioStreamInfo, frames: u64) -> Result<u64, String> {
+    frames
+        .checked_mul(u64::from(info.output_spec.channels))
+        .and_then(|samples| samples.checked_mul(u64::from(info.output_spec.bits_per_sample / 8)))
+        .and_then(|bytes| bytes.checked_add(68))
+        .ok_or_else(|| "stream virtual WAV byte count overflows".to_string())
+}
+
 fn stream_temporary_reservation_bytes(
     info: denoize::AudioStreamInfo,
+    output_format: OutputFormat,
+    encode_spec: StreamEncodeSpec,
+    encode_options: EncodeOptions,
+    encode_limits: StreamEncodeLimits,
     configured_limit: Option<u64>,
     checkpointed: bool,
     metadata_allowance_bytes: u64,
-) -> Result<u64, String> {
+) -> Result<StreamTemporaryReservation, String> {
     const MAX_WAV_FILE_BYTES: u64 = u32::MAX as u64 + 8;
+    let encoder_auxiliary_bytes = denoize::estimate_stream_encode_temporary_bytes(
+        output_format,
+        encode_spec,
+        encode_options,
+        encode_limits,
+    )?;
+    let staged_output_bytes = denoize::estimate_stream_encode_output_bytes(
+        output_format,
+        encode_spec,
+        encode_options,
+        encode_limits,
+    )?;
+
     let Some(frames) = info.total_frames else {
-        // Ogg does not expose the terminal granule until packets have been
-        // consumed. Reserve the complete configured temporary budget when it
-        // is finite; without a cap, reserve the largest RIFF file that the
-        // writer can ever publish.
+        // Ogg and raw ADTS do not expose their presentation length before the
+        // terminal packet has been consumed. A configured cap is therefore
+        // the complete transaction budget. Without one, preserve the previous
+        // finite 4-GiB staged-file ceiling and additionally reserve the M4A
+        // sample-table ceiling plus the checkpoint PCM spool when requested.
         if let Some(limit) = configured_limit {
-            return Ok(limit);
+            let unavailable = encoder_auxiliary_bytes
+                .checked_add(metadata_allowance_bytes)
+                .ok_or_else(|| "stream temporary reservation overflows".to_string())?;
+            if unavailable >= limit {
+                return Err(format!(
+                    "stream encoder auxiliary data and metadata require {unavailable} bytes, leaving no staged-output capacity under --max-temp-space ({limit} bytes)"
+                ));
+            }
+            return Ok(StreamTemporaryReservation {
+                total_bytes: limit,
+                encoder_auxiliary_bytes,
+                checkpoint_limit: checkpointed.then_some(limit - unavailable),
+            });
         }
         if !checkpointed {
-            return Ok(MAX_WAV_FILE_BYTES);
+            let total_bytes = MAX_WAV_FILE_BYTES
+                .checked_add(encoder_auxiliary_bytes)
+                .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
+                .ok_or_else(|| "stream temporary reservation overflows".to_string())?;
+            return Ok(StreamTemporaryReservation {
+                total_bytes,
+                encoder_auxiliary_bytes,
+                checkpoint_limit: None,
+            });
         }
         let data_limit = MAX_WAV_FILE_BYTES.saturating_sub(68);
         let output_sample_bytes = u64::from(info.output_spec.bits_per_sample / 8);
@@ -3905,34 +4624,64 @@ fn stream_temporary_reservation_bytes(
         let spool_bytes = max_samples
             .checked_mul(std::mem::size_of::<f64>() as u64)
             .ok_or_else(|| "stream checkpoint spool reservation overflows".to_string())?;
-        return MAX_WAV_FILE_BYTES
+        let checkpoint_limit = MAX_WAV_FILE_BYTES
             .checked_add(spool_bytes)
             .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string());
+        let checkpoint_limit = checkpoint_limit?;
+        let total_bytes = checkpoint_limit
+            .checked_add(encoder_auxiliary_bytes)
+            .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
+            .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string())?;
+        return Ok(StreamTemporaryReservation {
+            total_bytes,
+            encoder_auxiliary_bytes,
+            checkpoint_limit: Some(checkpoint_limit),
+        });
     };
-    let bytes_per_sample = u64::from(info.output_spec.bits_per_sample / 8);
-    let data_bytes = frames
-        .checked_mul(u64::from(info.output_spec.channels))
-        .and_then(|samples| samples.checked_mul(bytes_per_sample))
-        .ok_or_else(|| "stream output byte count overflows".to_string())?;
-    let file_bytes = data_bytes
-        .checked_add(68)
+    let staged_output_bytes = staged_output_bytes
+        .ok_or_else(|| "known stream duration has no staged-output estimate".to_string())?;
+    let base_bytes = staged_output_bytes
+        .checked_add(encoder_auxiliary_bytes)
         .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
         .ok_or_else(|| "stream output file size overflows".to_string())?;
-    if file_bytes > MAX_WAV_FILE_BYTES {
-        return Err(format!(
-            "streamed WAV would require {file_bytes} bytes, exceeding the RIFF container limit"
-        ));
-    }
     if !checkpointed {
-        return Ok(file_bytes);
+        if configured_limit.is_some_and(|limit| base_bytes > limit) {
+            return Err(format!(
+                "staged stream output, encoder auxiliary data, and metadata require {base_bytes} bytes, exceeding --max-temp-space ({} bytes)",
+                configured_limit.unwrap_or(0)
+            ));
+        }
+        return Ok(StreamTemporaryReservation {
+            total_bytes: base_bytes,
+            encoder_auxiliary_bytes,
+            checkpoint_limit: None,
+        });
     }
     let spool_bytes = frames
         .checked_mul(u64::from(info.output_spec.channels))
         .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
         .ok_or_else(|| "stream checkpoint spool reservation overflows".to_string())?;
-    file_bytes
+    let total_bytes = base_bytes
         .checked_add(spool_bytes)
-        .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string())
+        .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string())?;
+    if configured_limit.is_some_and(|limit| total_bytes > limit) {
+        return Err(format!(
+            "stream checkpoint, staged output, encoder auxiliary data, and metadata require {total_bytes} bytes, exceeding --max-temp-space ({} bytes)",
+            configured_limit.unwrap_or(0)
+        ));
+    }
+    // The checkpoint implementation historically models its staged peer as a
+    // WAV of the same PCM geometry. Give it that virtual bound plus the exact
+    // spool bound; the process-wide permit separately reserves the selected
+    // encoded format's bound above.
+    let checkpoint_limit = virtual_wav_bytes(info, frames)?
+        .checked_add(spool_bytes)
+        .ok_or_else(|| "stream checkpoint temporary reservation overflows".to_string())?;
+    Ok(StreamTemporaryReservation {
+        total_bytes,
+        encoder_auxiliary_bytes,
+        checkpoint_limit: Some(checkpoint_limit),
+    })
 }
 
 fn replay_stream_checkpoint(
@@ -3978,24 +4727,97 @@ fn replay_stream_checkpoint(
     Ok(input_frames)
 }
 
+fn process_stream_blocks(
+    reader: &mut AudioStreamReader,
+    processor: &mut StreamingBackendSession,
+    block_frames: usize,
+    mut write_block: impl FnMut(&[Vec<f64>]) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut input_frames = 0usize;
+    let mut output_frames = 0usize;
+    while let Some(block) = reader.next_block(block_frames)? {
+        if CANCELLED.load(Ordering::Relaxed) {
+            return Err("streaming cancelled".into());
+        }
+        let block_frames = block.first().map(Vec::len).unwrap_or(0);
+        let enhanced = processor.process_block(&block)?;
+        let enhanced_frames = enhanced.first().map(Vec::len).unwrap_or(0);
+        write_block(&enhanced)?;
+        input_frames = input_frames
+            .checked_add(block_frames)
+            .ok_or_else(|| "streaming frame count overflows".to_string())?;
+        output_frames = output_frames
+            .checked_add(enhanced_frames)
+            .ok_or_else(|| "streaming output frame count overflows".to_string())?;
+    }
+    let tail = processor.finish()?;
+    let tail_frames = tail.first().map(Vec::len).unwrap_or(0);
+    write_block(&tail)?;
+    output_frames = output_frames
+        .checked_add(tail_frames)
+        .ok_or_else(|| "streaming output frame count overflows".to_string())?;
+    if output_frames != input_frames {
+        return Err(format!(
+            "streaming backend produced {output_frames} frames from {input_frames} input frames"
+        ));
+    }
+    Ok(input_frames)
+}
+
 fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
-    let resource_governor = resource_governor(&ov, 1)?;
-    let effective_memory_mb = effective_input_memory_mb(&ov);
-    if input == "-" || output == "-" {
-        return Err("--stream requires filesystem audio input and WAV output paths".into());
+    let standard_input = input == "-";
+    let standard_output = output == "-";
+    if (standard_input || standard_output) && ov.resume {
+        return Err(
+            "--resume requires durable regular-file stream input and output; stdin/stdout spools are intentionally ephemeral"
+                .into(),
+        );
     }
+    if standard_output && ov.json && !ov.report {
+        return Err("--json cannot share stdout with encoded audio output".into());
+    }
+    let stream_receipt = prepare_stream_receipt(input, output, &ov)?;
     let input_path = std::path::Path::new(input);
     let output_path = std::path::Path::new(output);
-    let is_wav = |path: &std::path::Path| {
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.eq_ignore_ascii_case("wav"))
-            .unwrap_or(false)
+    let output_format = if standard_output {
+        match ov.output_format.as_deref() {
+            Some(extension) => {
+                let path = std::path::PathBuf::from(format!("output.{extension}"));
+                OutputFormat::from_path(&path)?
+            }
+            None => OutputFormat::Wav,
+        }
+    } else {
+        OutputFormat::from_path(output_path)?
     };
-    if !is_wav(output_path) {
-        return Err("--stream currently requires a WAV output path".into());
-    }
+    let receipt_publication = if stream_receipt.is_some() && !ov.resume {
+        Some(if standard_output {
+            ("stdout", "non-seekable")
+        } else {
+            planned_publication(output_path, ov.force)?
+        })
+    } else {
+        None
+    };
+    let encode_options = build_encode_options(&ov)?;
+    validate_encode_preflight(encode_options, [output_format])?;
+    let resource_governor = resource_governor(&ov, 1)?;
+    let configured_temporary_limit = resource_governor.limits().max_temporary_bytes();
+    let stdio_spool_limits = StreamSpoolLimits::new(
+        configured_temporary_limit.unwrap_or_else(|| StreamSpoolLimits::default().max_bytes()),
+    );
+    let stdio_request = if standard_input || standard_output {
+        ResourceRequest::new().with_temporary_bytes(stdio_spool_limits.max_bytes())
+    } else {
+        ResourceRequest::new()
+    };
+    let _stdio_temporary_permit = if standard_input || standard_output {
+        Some(resource_governor.acquire(stdio_request)?)
+    } else {
+        None
+    };
+    let effective_memory_mb = effective_input_memory_mb(&ov);
     let backend = if ov.auto_backend {
         service::select_live_backend()
     } else {
@@ -4020,17 +4842,44 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         backend_options.accelerator,
         backend_options.deterministic,
     )?;
-    if !ov.resume {
+    if !ov.resume && !standard_output {
         ensure_output_available(output_path, ov.force)?;
     }
 
-    let mut input_session = AudioInputSession::open(input_path)?;
+    let mut input_session = if standard_input {
+        let stdin = std::io::stdin();
+        AudioInputSession::from_reader_with_limits(stdin.lock(), stdio_spool_limits)?
+    } else {
+        AudioInputSession::open(input_path)?
+    };
+    let input_spool_bytes = if standard_input {
+        input_session.len()
+    } else {
+        0
+    };
+    let remaining_stdio_spool_bytes = stdio_spool_limits
+        .max_bytes()
+        .checked_sub(input_spool_bytes)
+        .ok_or_else(|| "stdin spool exceeded the shared non-seekable spool limit".to_string())?;
     let effective_memory_bytes = effective_input_memory_limit_bytes(&ov)?;
     let initial_metadata_limits = metadata_limits_for_available_bytes(effective_memory_bytes);
     let initial_decode_limits = DecodeLimits::new(initial_metadata_limits, effective_memory_bytes);
     let stream_info = inspect_audio_stream_session(&mut input_session, initial_decode_limits)?;
     let spec = stream_info.output_spec;
     let channel_mask = stream_info.channel_mask;
+    let encode_spec = StreamEncodeSpec::new(spec, channel_mask, stream_info.total_frames);
+    output_format.validate_stream_config(encode_spec, encode_options)?;
+    let effective_temporary_limit = if standard_input || standard_output {
+        Some(remaining_stdio_spool_bytes)
+    } else {
+        configured_temporary_limit
+    };
+    let auxiliary_limit = match (stream_info.total_frames, effective_temporary_limit) {
+        (None, Some(limit)) => limit / 3,
+        (_, Some(limit)) => limit,
+        (_, None) => StreamEncodeLimits::default().max_auxiliary_temporary_bytes(),
+    };
+    let encode_limits = StreamEncodeLimits::new(auxiliary_limit);
     validate_effective_options(&ov, spec.sample_rate)?;
     let cfg = build_config(&ov, spec.sample_rate);
     let block_frames = ov.stream_frames.unwrap_or(STREAM_BLOCK_FRAMES);
@@ -4049,6 +4898,12 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         backend_options.channel_mode,
     )
     .map_err(|error| error.to_string())?;
+    let encoder_stream_state = denoize::estimate_stream_encode_additional_bytes(
+        output_format,
+        encode_spec,
+        block_frames,
+        encode_options,
+    )?;
     let checkpoint_scratch = if ov.resume {
         batch_resume::STREAM_CHECKPOINT_SCRATCH_BYTES
     } else {
@@ -4057,15 +4912,25 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let initial_stream_working_set = base_stream_working_set
         .checked_add(backend_stream_state)
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
         .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
+    let verification_block_frames = block_frames.min(STREAM_BLOCK_FRAMES);
+    let initial_verification_working_set = denoize::estimate_stream_output_verification_bytes(
+        output_format,
+        encode_spec,
+        verification_block_frames,
+        encode_options,
+        encode_limits,
+        initial_decode_limits,
+    )?;
+    let initial_worker_memory = initial_stream_working_set.max(initial_verification_working_set);
     ensure_memory_limit(
-        initial_stream_working_set,
+        initial_worker_memory,
         effective_memory_mb,
         "streaming working set",
     )?;
-    let metadata_limits =
-        retained_metadata_limits(effective_memory_mb, initial_stream_working_set)?;
+    let metadata_limits = retained_metadata_limits(effective_memory_mb, initial_worker_memory)?;
     let decode_limits = DecodeLimits::new(metadata_limits, effective_memory_bytes);
     let final_stream_info = inspect_audio_stream_session(&mut input_session, decode_limits)?;
     if final_stream_info.format != stream_info.format
@@ -4081,10 +4946,19 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let stream_working_set = base_stream_working_set
         .checked_add(backend_stream_state)
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
+        .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
         .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
+    let verification_working_set = denoize::estimate_stream_output_verification_bytes(
+        output_format,
+        encode_spec,
+        verification_block_frames,
+        encode_options,
+        encode_limits,
+        decode_limits,
+    )?;
     ensure_memory_limit(
-        stream_working_set,
+        stream_working_set.max(verification_working_set),
         effective_memory_mb,
         "streaming working set",
     )?;
@@ -4093,13 +4967,14 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             ensure_output_available(output_path, ov.force)?;
         }
         println!(
-            "input      : {input}\ncontainer  : {:?} / {:?}\nformat     : {}ch, {} Hz, {}-bit {:?}\nbackend    : {}\naccelerator: {}\nstream     : enabled ({} frames/block)",
+            "input      : {input}\ncontainer  : {:?} / {:?}\nformat     : {}ch, {} Hz, {}-bit {:?}\noutput     : {}\nbackend    : {}\naccelerator: {}\nstream     : enabled ({} frames/block)",
             stream_info.format,
             stream_info.codec,
             spec.channels,
             spec.sample_rate,
             spec.bits_per_sample,
             spec.sample_format,
+            output_format_name(output_format),
             service::backend_name(backend),
             accelerator_description(accelerator),
             block_frames
@@ -4107,7 +4982,12 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         return Ok(());
     }
 
-    let resume_identity = if ov.resume {
+    let stream_metadata_policy = if ov.no_metadata || standard_output {
+        MetadataPolicy::Drop
+    } else {
+        MetadataPolicy::Preserve
+    };
+    let execution_identity = if ov.resume || stream_receipt.is_some() {
         let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
         let resolved = service::ResolvedProcessingOptions {
             backend,
@@ -4119,19 +4999,16 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         };
         resolved.validate_config()?;
         let model = match batch_resume::consumed_model_config(&resolved)? {
-            Some(config) => Some(batch_resume::fingerprint_resumable_model(config)?),
+            Some(config) if ov.resume => Some(batch_resume::fingerprint_resumable_model(config)?),
+            Some(config) => Some(batch_resume::fingerprint_consumed_model(config)?),
             None => None,
         };
         let base_recipe = batch_resume::recipe_digest(
             &resolved,
             spec.channels as usize,
-            OutputFormat::Wav,
-            EncodeOptions::default(),
-            if ov.no_metadata {
-                MetadataPolicy::Drop
-            } else {
-                MetadataPolicy::Preserve
-            },
+            output_format,
+            encode_options,
+            stream_metadata_policy,
             model
                 .as_ref()
                 .map(|model| (&model.fingerprint, model.sample_rate)),
@@ -4142,7 +5019,9 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         None
     };
 
-    let metadata = if !ov.no_metadata {
+    // Metadata parity for non-seekable output belongs to Stage 15. Filesystem
+    // output, including spooled stdin, retains the existing preservation path.
+    let metadata = if stream_metadata_policy == MetadataPolicy::Preserve {
         input_session.read_metadata_with_limits(metadata_limits)?
     } else {
         None
@@ -4151,17 +5030,57 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         .as_ref()
         .map(denoize::metadata::Metadata::estimated_memory_bytes)
         .unwrap_or(0);
-    let worker_memory_bytes = stream_working_set
+    let encode_phase_memory = stream_working_set
         .checked_add(metadata_bytes)
         .ok_or_else(|| "streaming memory reservation overflow".to_string())?;
-
-    let temporary_bytes = stream_temporary_reservation_bytes(
-        stream_info,
-        resource_governor.limits().max_temporary_bytes(),
-        ov.resume,
-        metadata_bytes,
-    )?;
-    let mut worker_request = ResourceRequest::worker(worker_memory_bytes, temporary_bytes);
+    let worker_memory_bytes = encode_phase_memory.max(verification_working_set);
+    let temporary_reservation = if standard_output {
+        let encoder_auxiliary_bytes = denoize::estimate_stream_encode_temporary_bytes(
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+        )?;
+        let total_bytes = denoize::estimate_spooled_stream_output_bytes(
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+        )?
+        .unwrap_or(remaining_stdio_spool_bytes);
+        if total_bytes > remaining_stdio_spool_bytes {
+            return Err(format!(
+                "non-seekable output requires {total_bytes} bytes, but stdin and output share only {} remaining spool bytes",
+                remaining_stdio_spool_bytes
+            ));
+        }
+        StreamTemporaryReservation {
+            total_bytes,
+            encoder_auxiliary_bytes,
+            checkpoint_limit: None,
+        }
+    } else {
+        stream_temporary_reservation_bytes(
+            stream_info,
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+            effective_temporary_limit,
+            ov.resume,
+            metadata_bytes,
+        )?
+    };
+    let temporary_bytes = temporary_reservation.total_bytes;
+    // Stdio acquired the complete shared spool allowance before reading a byte,
+    // so the worker must not reserve the same temporary bytes a second time.
+    let admitted_worker_temporary_bytes = if standard_input || standard_output {
+        0
+    } else {
+        temporary_bytes
+    };
+    let mut worker_request =
+        ResourceRequest::worker(worker_memory_bytes, admitted_worker_temporary_bytes);
     if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
         worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
             stream_working_set
@@ -4174,7 +5093,42 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         &backend_options,
         accelerator,
     )?)?;
+    let reported_request = request.checked_add(stdio_request)?;
     let _resource_permit = resource_governor.acquire(request)?;
+    let stream_evidence = match (&stream_receipt, &execution_identity) {
+        (Some(_), Some((input_fingerprint, recipe, model))) => Some(StreamExecutionEvidence {
+            input_fingerprint: *input_fingerprint,
+            stream_info,
+            model: model.clone(),
+            recipe: *recipe,
+            output_format,
+            resources: reported_request,
+            backend,
+            accelerator,
+            deterministic: backend_options.deterministic,
+            metadata_policy: stream_metadata_policy,
+        }),
+        (Some(_), None) => {
+            return Err("stream receipt evidence is missing after successful preflight".into());
+        }
+        (None, _) => None,
+    };
+    let inspected_resume = if ov.resume && stream_receipt.is_some() {
+        let (input_fingerprint, recipe, _) = execution_identity
+            .as_ref()
+            .ok_or("stream receipt resume identity is missing after preflight")?;
+        Some(batch_resume::inspect_stream_checkpoint_decision(
+            output_path,
+            *input_fingerprint,
+            *recipe,
+            spec,
+            block_frames,
+            temporary_reservation.checkpoint_limit,
+            ov.force,
+        )?)
+    } else {
+        None
+    };
 
     // Construct every allocation-sensitive processor before opening the
     // transactional output. Invalid or hostile resource plans therefore leave
@@ -4194,7 +5148,10 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     } else {
         CommitMode::NoClobber
     };
-    let frames = if let Some((input_fingerprint, recipe, model)) = resume_identity {
+    let frames = if ov.resume {
+        let (input_fingerprint, recipe, model) = execution_identity
+            .clone()
+            .ok_or("stream resume identity is missing after successful preflight")?;
         if let Some(model) = model.as_ref() {
             let current = batch_resume::fingerprint_file(&model.path)?;
             if current != model.fingerprint {
@@ -4210,15 +5167,40 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             recipe,
             spec,
             block_frames,
-            Some(temporary_bytes),
+            temporary_reservation.checkpoint_limit,
             ov.force,
         )?;
         match acquired {
             batch_resume::StreamCheckpointAcquire::Completed(completed) => {
+                if completed.input_frames() != completed.output_frames() {
+                    return Err(
+                        "completed stream checkpoint has mismatched input/output length".into(),
+                    );
+                }
+                verify_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+                if let (Some(receipt), Some(evidence)) = (&stream_receipt, &stream_evidence) {
+                    let output_fingerprint = batch_resume::fingerprint_file(output_path)?;
+                    let mut skipped_evidence = evidence.clone();
+                    skipped_evidence.resources = ResourceRequest::new();
+                    let staged = stage_stream_signed_receipt(
+                        input,
+                        output,
+                        receipt,
+                        &skipped_evidence,
+                        completed.input_frames(),
+                        output_fingerprint,
+                        "none",
+                        "skip",
+                        "completed",
+                        Some(output_fingerprint),
+                    )?;
+                    commit_stream_receipt_after_output(receipt, staged, output)?;
+                }
                 usize::try_from(completed.input_frames())
                     .map_err(|_| "streaming frame count does not fit this platform".to_string())?
             }
             batch_resume::StreamCheckpointAcquire::Active(mut checkpoint, loaded) => {
+                let loaded_checkpoint = loaded;
                 let mut input_frames = match loaded {
                     Some(saved) => replay_stream_checkpoint(
                         &mut reader,
@@ -4267,21 +5249,40 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                     );
                 }
 
+                let output_frames = checkpoint.output_frames();
+                if output_frames != input_frames {
+                    return Err(format!(
+                        "streaming backend produced {output_frames} frames from {input_frames} input frames"
+                    ));
+                }
+                verify_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+                drop(reader);
+                drop(processor);
+
                 checkpoint.prepare_spool_read()?;
+                let mut final_encode_spec = encode_spec;
+                final_encode_spec.total_frames = Some(output_frames);
                 let mut transaction = AtomicOutput::new(output_path)?;
                 {
-                    let sink = std::io::BufWriter::new(transaction.file_mut());
-                    let mut writer = WavStreamWriter::from_sink(sink, spec)?;
+                    let mut writer = AudioStreamWriter::new_with_limits(
+                        transaction.file_mut(),
+                        output_format,
+                        final_encode_spec,
+                        encode_options,
+                        encode_limits,
+                    )?;
                     while let Some(block) = checkpoint.next_spool_block(block_frames)? {
                         writer.write_block(&block)?;
                     }
                     writer.finalize()?;
                 }
-                write_wav_channel_mask_to_file(
-                    transaction.file_mut(),
-                    spec.channels as usize,
-                    channel_mask,
-                )?;
+                if output_format == OutputFormat::Wav {
+                    write_wav_channel_mask_to_file(
+                        transaction.file_mut(),
+                        spec.channels as usize,
+                        channel_mask,
+                    )?;
+                }
                 if let Some(metadata) = metadata {
                     denoize::metadata::write_extended_to_file_with_limits(
                         metadata,
@@ -4296,6 +5297,9 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                     .len();
                 let combined_bytes = staged_bytes
                     .checked_add(checkpoint.spool_len())
+                    .and_then(|bytes| {
+                        bytes.checked_add(temporary_reservation.encoder_auxiliary_bytes)
+                    })
                     .ok_or_else(|| {
                         "stream checkpoint temporary byte count overflows".to_string()
                     })?;
@@ -4304,12 +5308,54 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                         "checkpoint spool and staged output require {combined_bytes} bytes, exceeding their {temporary_bytes}-byte temporary reservation"
                     ));
                 }
+                inject_stream_output_corruption(transaction.file_mut())?;
+                verify_stream_output_file(
+                    transaction.file_mut(),
+                    output_path,
+                    output_format,
+                    final_encode_spec,
+                    output_frames,
+                    encode_options,
+                    decode_limits,
+                    verification_block_frames,
+                )?;
                 let output_fingerprint =
                     batch_resume::fingerprint_open_file_at(transaction.file_mut(), output_path)?;
+                let staged_receipt = match (&stream_receipt, &stream_evidence) {
+                    (Some(receipt), Some(evidence)) => {
+                        let (publication, publication_reason) =
+                            planned_publication(output_path, ov.force)?;
+                        let reset = inspected_resume.is_some_and(|decision| decision.reset());
+                        let reason = if reset {
+                            "forced"
+                        } else if loaded_checkpoint.is_some() {
+                            "checkpoint"
+                        } else {
+                            publication_reason
+                        };
+                        Some(stage_stream_signed_receipt(
+                            input,
+                            output,
+                            receipt,
+                            evidence,
+                            input_frames,
+                            output_fingerprint,
+                            publication,
+                            "process",
+                            reason,
+                            None,
+                        )?)
+                    }
+                    (None, None) => None,
+                    _ => return Err("stream receipt state changed after preflight".into()),
+                };
                 checkpoint.prepare_publish(input_frames, output_fingerprint)?;
                 transaction.commit(commit_mode)?;
                 if injected_stop_after_stream_commit() {
                     return Err("injected stop after committed stream output".into());
+                }
+                if let (Some(receipt), Some(staged)) = (&stream_receipt, staged_receipt) {
+                    commit_stream_receipt_after_output(receipt, staged, output)?;
                 }
                 if let Err(error) = checkpoint.cleanup() {
                     eprintln!(
@@ -4320,33 +5366,77 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                     .map_err(|_| "streaming frame count does not fit this platform".to_string())?
             }
         }
+    } else if standard_output {
+        let stdout = std::io::stdout();
+        let mut writer = SpooledAudioStreamWriter::new_with_limits(
+            stdout.lock(),
+            output_format,
+            encode_spec,
+            encode_options,
+            encode_limits,
+            decode_limits,
+            StreamSpoolLimits::new(temporary_bytes),
+            verification_block_frames,
+        )?;
+        let frames = process_stream_blocks(&mut reader, &mut processor, block_frames, |block| {
+            writer.write_block(block)
+        })?;
+        verify_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+        drop(reader);
+        drop(processor);
+        // `process_stream_blocks` validates the backend presentation length
+        // before finalize publishes the first caller-visible byte.
+        let (_stdout, output_fingerprint) = writer.finalize_with_fingerprint()?;
+        if let (Some(receipt), Some(evidence)) = (&stream_receipt, &stream_evidence) {
+            let (publication, reason) = receipt_publication
+                .ok_or("stdout stream receipt publication is missing after preflight")?;
+            let staged = stage_stream_signed_receipt(
+                input,
+                output,
+                receipt,
+                evidence,
+                frames as u64,
+                output_fingerprint,
+                publication,
+                "process",
+                reason,
+                None,
+            )
+            .map_err(|error| {
+                format!(
+                    "stream output was published to stdout, but its signed receipt could not be staged: {error}"
+                )
+            })?;
+            commit_stream_receipt_after_output(receipt, staged, "stdout")?;
+        }
+        frames
     } else {
         let mut transaction = AtomicOutput::new(output_path)?;
         let frames = (|| -> Result<usize, String> {
-            let sink = std::io::BufWriter::new(transaction.file_mut());
-            let mut writer = WavStreamWriter::from_sink(sink, spec)?;
-            let mut frames = 0usize;
-            while let Some(block) = reader.next_block(block_frames)? {
-                if CANCELLED.load(Ordering::Relaxed) {
-                    return Err("streaming cancelled".into());
-                }
-                let block_frames = block.first().map(Vec::len).unwrap_or(0);
-                let enhanced = processor.process_block(&block)?;
-                writer.write_block(&enhanced)?;
-                frames = frames
-                    .checked_add(block_frames)
-                    .ok_or_else(|| "streaming frame count overflows".to_string())?;
-            }
-            let tail = processor.finish()?;
-            writer.write_block(&tail)?;
+            let mut writer = AudioStreamWriter::new_with_limits(
+                transaction.file_mut(),
+                output_format,
+                encode_spec,
+                encode_options,
+                encode_limits,
+            )?;
+            let frames =
+                process_stream_blocks(&mut reader, &mut processor, block_frames, |block| {
+                    writer.write_block(block)
+                })?;
             writer.finalize()?;
             Ok(frames)
         })()?;
-        write_wav_channel_mask_to_file(
-            transaction.file_mut(),
-            spec.channels as usize,
-            channel_mask,
-        )?;
+        verify_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+        drop(reader);
+        drop(processor);
+        if output_format == OutputFormat::Wav {
+            write_wav_channel_mask_to_file(
+                transaction.file_mut(),
+                spec.channels as usize,
+                channel_mask,
+            )?;
+        }
         if let Some(metadata) = metadata {
             denoize::metadata::write_extended_to_file_with_limits(
                 metadata,
@@ -4359,12 +5449,51 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             .metadata()
             .map_err(|error| format!("inspect staged stream output: {error}"))?
             .len();
-        if staged_bytes > temporary_bytes {
+        let combined_bytes = staged_bytes
+            .checked_add(temporary_reservation.encoder_auxiliary_bytes)
+            .ok_or_else(|| "stream temporary byte count overflows".to_string())?;
+        if combined_bytes > temporary_bytes {
             return Err(format!(
-                "staged stream output requires {staged_bytes} bytes, exceeding its {temporary_bytes}-byte temporary reservation"
+                "staged stream output and encoder auxiliary data require {combined_bytes} bytes, exceeding their {temporary_bytes}-byte temporary reservation"
             ));
         }
+        inject_stream_output_corruption(transaction.file_mut())?;
+        verify_stream_output_file(
+            transaction.file_mut(),
+            output_path,
+            output_format,
+            encode_spec,
+            frames as u64,
+            encode_options,
+            decode_limits,
+            verification_block_frames,
+        )?;
+        let staged_receipt = match (&stream_receipt, &stream_evidence) {
+            (Some(receipt), Some(evidence)) => {
+                let (publication, reason) = receipt_publication
+                    .ok_or("stream receipt publication is missing after preflight")?;
+                let output_fingerprint =
+                    batch_resume::fingerprint_open_file_at(transaction.file_mut(), output_path)?;
+                Some(stage_stream_signed_receipt(
+                    input,
+                    output,
+                    receipt,
+                    evidence,
+                    frames as u64,
+                    output_fingerprint,
+                    publication,
+                    "process",
+                    reason,
+                    None,
+                )?)
+            }
+            (None, None) => None,
+            _ => return Err("stream receipt state changed after preflight".into()),
+        };
         transaction.commit(commit_mode)?;
+        if let (Some(receipt), Some(staged)) = (&stream_receipt, staged_receipt) {
+            commit_stream_receipt_after_output(receipt, staged, output)?;
+        }
         frames
     };
     if ov.json {
@@ -4388,8 +5517,9 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             );
         }
         eprintln!(
-            "denoize: streaming {} WAV complete: {}ch x {} frames",
+            "denoize: streaming {} {} complete: {}ch x {} frames",
             service::backend_name(backend),
+            output_format_name(output_format),
             spec.channels,
             frames
         );
@@ -6093,6 +7223,10 @@ mod streaming_tests {
         OperatorSetIdProto, TensorShapeProto, TypeProto, ValueInfoProto,
     };
 
+    const SILENT_STEREO_ADTS: [u8; 13] = [
+        0xff, 0xf1, 0x50, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x00, 0x00, 0x00, 0x00, 0x1c,
+    ];
+
     struct ResetCheckpointHooks;
 
     impl Drop for ResetCheckpointHooks {
@@ -6100,6 +7234,7 @@ mod streaming_tests {
             TEST_STREAM_CHECKPOINT_FRAMES.with(|value| value.set(None));
             TEST_STOP_AFTER_STREAM_CHECKPOINT.with(|value| value.set(false));
             TEST_STOP_AFTER_STREAM_COMMIT.with(|value| value.set(false));
+            TEST_CORRUPT_STREAM_OUTPUT_BEFORE_VERIFY.with(|value| value.set(false));
         }
     }
 
@@ -6111,6 +7246,11 @@ mod streaming_tests {
 
     fn stop_after_stream_commit() -> ResetCheckpointHooks {
         TEST_STOP_AFTER_STREAM_COMMIT.with(|value| value.set(true));
+        ResetCheckpointHooks
+    }
+
+    fn corrupt_stream_output_before_verify() -> ResetCheckpointHooks {
+        TEST_CORRUPT_STREAM_OUTPUT_BEFORE_VERIFY.with(|value| value.set(true));
         ResetCheckpointHooks
     }
 
@@ -6195,6 +7335,159 @@ mod streaming_tests {
         assert_eq!(exhausted.max_ogg_pages, 256);
     }
 
+    fn write_stream_output_fixture(path: &std::path::Path, frames: usize) -> denoize::Audio {
+        let sample_rate = 48_000;
+        let left = (0..frames)
+            .map(|frame| {
+                let phase = std::f64::consts::TAU * 431.0 * frame as f64 / sample_rate as f64;
+                phase.sin() * 0.23 + (phase * 0.37).cos() * 0.04
+            })
+            .collect::<Vec<_>>();
+        let audio = denoize::Audio {
+            sample_rate,
+            channels: vec![left],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: denoize::ChannelLayout::Mono.mask(),
+        };
+        denoize::write_audio(path, &audio, EncodeOptions::default()).unwrap();
+        audio
+    }
+
+    #[test]
+    fn streams_wav_to_each_builtin_encoded_output() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let input_frames = 5_001usize;
+        let audio = write_stream_output_fixture(&input, input_frames);
+
+        for (extension, expected_frames) in [
+            ("wav", input_frames),
+            ("flac", input_frames),
+            ("opus", input_frames),
+            ("mp3", input_frames.div_ceil(1_152) * 1_152),
+        ] {
+            let output = root.path().join(format!("output.{extension}"));
+            run_streaming_wav(
+                input.to_str().unwrap(),
+                output.to_str().unwrap(),
+                Overrides {
+                    stream: true,
+                    no_metadata: true,
+                    stream_frames: Some(317),
+                    max_memory_mb: Some(128),
+                    ..Overrides::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("stream WAV to {extension}: {error}"));
+
+            let decoded = read_audio(&output)
+                .unwrap_or_else(|error| panic!("decode streamed {extension}: {error}"));
+            assert_eq!(decoded.sample_rate, audio.sample_rate, "{extension}");
+            assert_eq!(decoded.channels(), audio.channels(), "{extension}");
+            assert_eq!(decoded.frames(), expected_frames, "{extension}");
+        }
+    }
+
+    #[test]
+    fn corrupt_stream_output_is_rejected_before_atomic_publication() {
+        let _reset = corrupt_stream_output_before_verify();
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let output = root.path().join("output.flac");
+        write_stream_output_fixture(&input, 5_001);
+
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(317),
+                max_memory_mb: Some(128),
+                ..Overrides::default()
+            },
+        )
+        .expect_err("corrupt staged FLAC must fail verification");
+
+        assert!(
+            error.contains("FLAC"),
+            "unexpected verification error: {error}"
+        );
+        assert!(!output.exists());
+        let remaining = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![input.file_name().unwrap()]);
+    }
+
+    #[cfg(feature = "m4a-encode")]
+    #[test]
+    fn streams_wav_to_native_aac_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let input_frames = 5_001usize;
+        let audio = write_stream_output_fixture(&input, input_frames);
+
+        for (extension, expected_frames) in [
+            ("m4a", input_frames),
+            // Raw ADTS has no edit-list or end-granule field. The Oxide AAC
+            // encoder emits one delayed access unit in addition to the padded
+            // source access units, so its physical decode timeline is explicit.
+            ("aac", (input_frames.div_ceil(1_024) + 1) * 1_024),
+        ] {
+            let output = root.path().join(format!("output.{extension}"));
+            run_streaming_wav(
+                input.to_str().unwrap(),
+                output.to_str().unwrap(),
+                Overrides {
+                    stream: true,
+                    no_metadata: true,
+                    stream_frames: Some(317),
+                    max_memory_mb: Some(256),
+                    ..Overrides::default()
+                },
+            )
+            .unwrap_or_else(|error| panic!("stream WAV to {extension}: {error}"));
+
+            let decoded = read_audio(&output)
+                .unwrap_or_else(|error| panic!("decode streamed {extension}: {error}"));
+            assert_eq!(decoded.sample_rate, audio.sample_rate, "{extension}");
+            assert_eq!(decoded.channels(), audio.channels(), "{extension}");
+            assert_eq!(decoded.frames(), expected_frames, "{extension}");
+        }
+    }
+
+    #[cfg(feature = "fdk-aac-encoder")]
+    #[test]
+    fn streams_wav_to_gapless_fdk_m4a() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let output = root.path().join("output.m4a");
+        let input_frames = 5_001usize;
+        let audio = write_stream_output_fixture(&input, input_frames);
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(317),
+                max_memory_mb: Some(256),
+                aac_encoder: Some(AacEncoder::Fdk),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+
+        let decoded = read_audio(&output).unwrap();
+        assert_eq!(decoded.sample_rate, audio.sample_rate);
+        assert_eq!(decoded.channels(), audio.channels());
+        assert_eq!(decoded.frames(), input_frames);
+    }
+
     #[test]
     fn streams_wav_without_loading_the_complete_audio() {
         let root = std::env::temp_dir().join(format!(
@@ -6277,8 +7570,8 @@ mod streaming_tests {
         let _reset = stop_after_checkpoint(300);
         let root = tempfile::tempdir().unwrap();
         let input = root.path().join("input.flac");
-        let resumed_output = root.path().join("resumed.wav");
-        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        let resumed_output = root.path().join("resumed.flac");
+        let uninterrupted_output = root.path().join("uninterrupted.flac");
         let frames = 2_000;
         let audio = denoize::Audio {
             sample_rate: 24_000,
@@ -6299,7 +7592,7 @@ mod streaming_tests {
             resume: true,
             no_metadata: true,
             stream_frames: Some(73),
-            max_memory_mb: Some(32),
+            max_memory_mb: Some(64),
             ..Overrides::default()
         };
         let error = run_streaming_wav(
@@ -6308,7 +7601,10 @@ mod streaming_tests {
             options.clone(),
         )
         .unwrap_err();
-        assert!(error.contains("injected stop after durable stream checkpoint"));
+        assert!(
+            error.contains("injected stop after durable stream checkpoint"),
+            "unexpected checkpoint error: {error}"
+        );
         assert!(!resumed_output.exists());
         let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
             .expect("resolve checkpoint sidecars");
@@ -6331,7 +7627,7 @@ mod streaming_tests {
                 stream: true,
                 no_metadata: true,
                 stream_frames: Some(73),
-                max_memory_mb: Some(32),
+                max_memory_mb: Some(64),
                 ..Overrides::default()
             },
         )
@@ -6340,6 +7636,67 @@ mod streaming_tests {
             std::fs::read(&resumed_output).unwrap(),
             std::fs::read(&uninterrupted_output).unwrap()
         );
+        assert_eq!(read_audio(&resumed_output).unwrap().frames(), frames);
+    }
+
+    #[test]
+    fn resumed_stream_plan_is_read_only_and_matches_its_signed_receipt() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.flac");
+        let output = root.path().join("output.flac");
+        let receipt = root.path().join("output.receipt.json");
+        let secret = root.path().join("receipt-secret.json");
+        let public = root.path().join("receipt-public.json");
+        write_stream_output_fixture(&input, 2_000);
+        denoize::write_new_receipt_keypair(&secret, &public).unwrap();
+        let mut options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(73),
+            max_memory_mb: Some(64),
+            ..Overrides::default()
+        };
+
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected stop after durable stream checkpoint"));
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&output).unwrap();
+        let state_before = std::fs::read(&state).unwrap();
+        let spool_before = std::fs::read(&spool).unwrap();
+
+        let plan = build_stream_execution_plan(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(plan.kind, ExecutionKind::Stream);
+        assert_eq!(plan.items[0].output.action, "process");
+        assert_eq!(plan.items[0].output.reason, "checkpoint");
+        assert_eq!(std::fs::read(&state).unwrap(), state_before);
+        assert_eq!(std::fs::read(&spool).unwrap(), spool_before);
+        assert!(!output.exists());
+
+        options.receipt = Some(receipt.to_string_lossy().into_owned());
+        options.receipt_key = Some(secret.to_string_lossy().into_owned());
+        run_streaming_wav(input.to_str().unwrap(), output.to_str().unwrap(), options).unwrap();
+
+        let signed = SignedExecutionReceipt::from_file(&receipt).unwrap();
+        let key = ReceiptPublicKey::from_file(&public).unwrap();
+        let report = signed
+            .verify_with_key(&key, Some(&plan), &receipt, Some(root.path()))
+            .unwrap();
+        assert_eq!(report.kind, ExecutionKind::Stream);
+        assert_eq!(report.verified_items[0].outcome, "succeeded");
+        assert!(output.is_file());
+        assert!(!state.exists());
+        assert!(!spool.exists());
     }
 
     #[test]
@@ -6385,6 +7742,71 @@ mod streaming_tests {
         assert!(!state.exists());
         assert!(!spool.exists());
         assert_eq!(read_audio(&output).unwrap().frames(), frames);
+    }
+
+    #[test]
+    fn committed_stream_plan_skips_and_receipt_reconciles_after_cleanup_crash() {
+        let _reset = stop_after_stream_commit();
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.flac");
+        let output = root.path().join("output.wav");
+        let receipt = root.path().join("output.receipt.json");
+        let secret = root.path().join("receipt-secret.json");
+        let public = root.path().join("receipt-public.json");
+        write_stream_output_fixture(&input, 1_111);
+        denoize::write_new_receipt_keypair(&secret, &public).unwrap();
+        let mut options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(97),
+            max_memory_mb: Some(32),
+            receipt: Some(receipt.to_string_lossy().into_owned()),
+            receipt_key: Some(secret.to_string_lossy().into_owned()),
+            ..Overrides::default()
+        };
+
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains("injected stop after committed stream output"));
+        assert!(output.is_file());
+        assert!(!receipt.exists());
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&output).unwrap();
+        let state_before = std::fs::read(&state).unwrap();
+        let spool_before = std::fs::read(&spool).unwrap();
+        options.receipt = None;
+        options.receipt_key = None;
+
+        let plan = build_stream_execution_plan(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(plan.items[0].output.action, "skip");
+        assert_eq!(plan.items[0].output.publication, "none");
+        assert_eq!(plan.items[0].output.reason, "completed");
+        assert!(plan.items[0].output.existing_fingerprint.is_some());
+        assert_eq!(std::fs::read(&state).unwrap(), state_before);
+        assert_eq!(std::fs::read(&spool).unwrap(), spool_before);
+
+        options.receipt = Some(receipt.to_string_lossy().into_owned());
+        options.receipt_key = Some(secret.to_string_lossy().into_owned());
+        run_streaming_wav(input.to_str().unwrap(), output.to_str().unwrap(), options).unwrap();
+
+        let signed = SignedExecutionReceipt::from_file(&receipt).unwrap();
+        let key = ReceiptPublicKey::from_file(&public).unwrap();
+        let report = signed
+            .verify_with_key(&key, Some(&plan), &receipt, Some(root.path()))
+            .unwrap();
+        assert_eq!(report.kind, ExecutionKind::Stream);
+        assert_eq!(report.verified_items[0].outcome, "skipped");
+        assert!(!state.exists());
+        assert!(!spool.exists());
     }
 
     #[test]
@@ -6441,7 +7863,10 @@ mod streaming_tests {
             options.clone(),
         )
         .unwrap_err();
-        assert!(error.contains("injected stop after durable stream checkpoint"));
+        assert!(
+            error.contains("injected stop after durable stream checkpoint"),
+            "unexpected Ogg Vorbis checkpoint error: {error}"
+        );
         assert!(!resumed_output.exists());
 
         run_streaming_wav(
@@ -6465,6 +7890,294 @@ mod streaming_tests {
         assert_eq!(
             std::fs::read(&resumed_output).unwrap(),
             std::fs::read(&uninterrupted_output).unwrap()
+        );
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
+            .expect("resolve checkpoint sidecars");
+        assert!(!state.exists());
+        assert!(!spool.exists());
+    }
+
+    #[test]
+    fn resumes_mp3_stream_from_a_durable_checkpoint_byte_exactly() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.mp3");
+        let resumed_output = root.path().join("resumed.wav");
+        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        let input_frames = 5_001;
+        let audio = denoize::Audio {
+            sample_rate: 44_100,
+            channels: vec![(0..input_frames)
+                .map(|frame| {
+                    let phase = std::f64::consts::TAU * 330.0 * frame as f64 / 44_100.0;
+                    phase.sin() * 0.27
+                })
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: denoize::ChannelLayout::Mono.mask(),
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+        let expected_frames = read_audio(&input).unwrap().frames();
+
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(127),
+            max_memory_mb: Some(32),
+            ..Overrides::default()
+        };
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("injected stop after durable stream checkpoint"),
+            "unexpected MP3 checkpoint error: {error}"
+        );
+        assert!(!resumed_output.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            uninterrupted_output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(127),
+                max_memory_mb: Some(32),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&resumed_output).unwrap(),
+            std::fs::read(&uninterrupted_output).unwrap()
+        );
+        assert_eq!(
+            read_audio(&resumed_output).unwrap().frames(),
+            expected_frames
+        );
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
+            .expect("resolve checkpoint sidecars");
+        assert!(!state.exists());
+        assert!(!spool.exists());
+    }
+
+    #[test]
+    fn resumes_granule_aware_opus_stream_from_a_durable_checkpoint_byte_exactly() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.opus");
+        let resumed_output = root.path().join("resumed.wav");
+        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        let input_frames = 5_001;
+        let audio = denoize::Audio {
+            sample_rate: 48_000,
+            channels: vec![(0..input_frames)
+                .map(|frame| {
+                    let phase = std::f64::consts::TAU * 510.0 * frame as f64 / 48_000.0;
+                    phase.sin() * 0.23
+                })
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: denoize::ChannelLayout::Mono.mask(),
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+        let expected_frames = read_audio(&input).unwrap().frames();
+
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(127),
+            max_memory_mb: Some(64),
+            ..Overrides::default()
+        };
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("injected stop after durable stream checkpoint"),
+            "unexpected Ogg Opus checkpoint error: {error}"
+        );
+        assert!(!resumed_output.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            uninterrupted_output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(127),
+                max_memory_mb: Some(64),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&resumed_output).unwrap(),
+            std::fs::read(&uninterrupted_output).unwrap()
+        );
+        assert_eq!(
+            read_audio(&resumed_output).unwrap().frames(),
+            expected_frames
+        );
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
+            .expect("resolve checkpoint sidecars");
+        assert!(!state.exists());
+        assert!(!spool.exists());
+    }
+
+    #[test]
+    fn resumes_frame_aware_adts_aac_stream_from_a_durable_checkpoint_byte_exactly() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.aac");
+        let resumed_output = root.path().join("resumed.wav");
+        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        std::fs::write(&input, SILENT_STEREO_ADTS.repeat(3)).unwrap();
+        let expected_frames = read_audio(&input).unwrap().frames();
+
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(127),
+            max_memory_mb: Some(256),
+            ..Overrides::default()
+        };
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("injected stop after durable stream checkpoint"),
+            "unexpected ADTS AAC checkpoint error: {error}"
+        );
+        assert!(!resumed_output.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            uninterrupted_output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(127),
+                max_memory_mb: Some(256),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&resumed_output).unwrap(),
+            std::fs::read(&uninterrupted_output).unwrap()
+        );
+        assert_eq!(
+            read_audio(&resumed_output).unwrap().frames(),
+            expected_frames
+        );
+        let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
+            .expect("resolve checkpoint sidecars");
+        assert!(!state.exists());
+        assert!(!spool.exists());
+    }
+
+    #[cfg(feature = "m4a-encode")]
+    #[test]
+    fn resumes_m4a_aac_stream_from_a_durable_checkpoint_byte_exactly() {
+        let _reset = stop_after_checkpoint(300);
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.m4a");
+        let resumed_output = root.path().join("resumed.wav");
+        let uninterrupted_output = root.path().join("uninterrupted.wav");
+        let input_frames = 5_001;
+        let audio = denoize::Audio {
+            sample_rate: 48_000,
+            channels: vec![(0..input_frames)
+                .map(|frame| {
+                    let phase = std::f64::consts::TAU * 470.0 * frame as f64 / 48_000.0;
+                    phase.sin() * 0.21
+                })
+                .collect()],
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+            channel_mask: denoize::ChannelLayout::Mono.mask(),
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+        let expected_frames = read_audio(&input).unwrap().frames();
+
+        let options = Overrides {
+            stream: true,
+            resume: true,
+            no_metadata: true,
+            stream_frames: Some(127),
+            max_memory_mb: Some(256),
+            ..Overrides::default()
+        };
+        let error = run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("injected stop after durable stream checkpoint"),
+            "unexpected M4A AAC checkpoint error: {error}"
+        );
+        assert!(!resumed_output.exists());
+
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            resumed_output.to_str().unwrap(),
+            options,
+        )
+        .unwrap();
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            uninterrupted_output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_metadata: true,
+                stream_frames: Some(127),
+                max_memory_mb: Some(256),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&resumed_output).unwrap(),
+            std::fs::read(&uninterrupted_output).unwrap()
+        );
+        assert_eq!(
+            read_audio(&resumed_output).unwrap().frames(),
+            expected_frames
         );
         let (state, spool, _) = batch_resume::stream_checkpoint_sidecar_paths(&resumed_output)
             .expect("resolve checkpoint sidecars");
@@ -8912,10 +10625,10 @@ mod model_command_tests {
     }
 
     #[test]
-    fn recommendation_keeps_nonseekable_input_for_stage_twelve() {
+    fn recommendation_rejects_nonseekable_input_explicitly() {
         let error = parse_recommendation_args(&["-".into()]).unwrap_err();
         assert!(error.contains("regular-file INPUT"));
-        assert!(error.contains("Stage 12"));
+        assert!(error.contains("--stream"));
     }
 }
 

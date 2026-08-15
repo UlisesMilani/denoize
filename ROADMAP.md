@@ -245,16 +245,17 @@ unreviewable release.
 | 10 | Release SBOMs, build provenance, and asset-to-source verification | Released in v0.58.0 |
 | 11 | Read-only execution plans, signed receipts, and offline result verification | Released in v0.59.0 |
 | 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Planned |
-| 13 | Parser fuzzing, deterministic fault injection, and crash/power-loss simulation | Planned |
-| 14 | Desktop isolation, recovery, redacted diagnostics, accessibility, and localization | Planned |
+| 13 | Parser and resource-amplification fuzzing, deterministic fault injection, and crash/power-loss simulation | Planned |
+| 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Planned |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Planned |
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Planned |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
-| 19 | Local authenticated IPC and control API with bounded requests, capability-scoped authorization, and stable automation contracts | Planned |
+| 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Planned |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
-| 21 | Reproducible licensed-corpus quality, performance, and regression evaluation with publishable evidence manifests | Planned |
+| 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Planned |
 | 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Planned |
+| 23 | Portable projects and sample-accurate region/timeline workflows with bounded edit graphs, deterministic assembly, and signed provenance | Planned |
 
 Stage 8 accepts regular-file WAV, FLAC, and Ogg Vorbis input, writes an atomic
 WAV, and supports the stateful Classical, RNNoise, and GTCRN backends. Its
@@ -262,9 +263,12 @@ checkpoint binds the input, effective recipe, model, decoder geometry, and
 block size; it synchronizes a bounded journal and PCM spool, replays backend
 state deterministically, and records the staged output fingerprint before
 publication. A restart therefore resumes an incomplete stream or reconciles a
-completed commit whose data sidecars were not yet removed. MP3, Ogg Opus,
-M4A/ALAC, and ADTS AAC remain in Stage 12 until their presentation-timeline
-semantics can be retained without whole-file decoding.
+completed commit whose data sidecars were not yet removed. Stage 12 extends the
+same contract to gapless MP3, granule-aware Ogg Opus, frame-aware ADTS AAC, and
+edit-aware M4A AAC/ALAC; it adds encoded output, complete pre-publication decode
+verification, bounded stdin/stdout and library `Read`/`Write` spools, and v2
+stream plans and signed receipts. Checkpoints persist presentation PCM only
+after codec delay, granule, or edit-list mapping has been applied.
 
 Stage 9 keeps recommendation read-only and network-free. It analyzes a bounded
 signal prefix, considers compiled backends, verified local managed models,
@@ -275,12 +279,22 @@ evidence; backend headroom is an explainable cost-class estimate, not a claim
 that every neural candidate was executed or that wall-clock time is
 deterministic.
 
-Every remaining stage also carries an upgrade-compatibility gate: persisted
-presets, journals, checkpoints, receipts, and automation schemas must migrate
-from at least the two preceding releases or reject an unknown future format
-without modifying it. Stage 12 includes bounded stdin/stdout and library
-`Read`/`Write` streaming; atomic publication and restart guarantees apply only
-when a seekable filesystem transaction or an explicit input spool exists.
+Every stage from Stage 12 onward also carries an upgrade-compatibility gate:
+persisted presets, journals, checkpoints, receipts, and automation schemas must
+migrate from at least the two preceding releases or reject an unknown future
+format without modifying it. Stage 12 preserves the v0.58/v0.59 v1 checkpoint,
+v3 batch-journal, and v1 execution-document contracts while adding separate v2
+stream schemas. Anonymous `Read`/`Write` spools are finite but ephemeral:
+atomic publication applies only to a filesystem transaction, and restart
+requires durable regular-file input and output.
+
+Stage 14 adds a bounded, non-destructive audition path rather than a second
+processing engine. Users can select a short region, render candidate recipes,
+switch between loudness-matched original and processed audio, run a blind A/B
+comparison, and persist the chosen recipe. Preview work uses the same backend,
+resource admission, and source fingerprint as the final job. Its bounded region
+locator is versioned so Stage 23 can reuse it without changing presentation
+time; cancelling a preview leaves no output or durable state.
 
 Stage 19 exposes only local, authenticated control surfaces and reuses the
 bounded JSON contracts, resource admission, signed receipts, and regular-file
@@ -295,12 +309,17 @@ ship with deterministic preset/session round trips, latency reporting, channel
 layout negotiation, bypass/tail behavior, and host-level regression fixtures;
 additional platform formats follow only when they preserve the same contract.
 
-Stage 21 turns model-quality and speed claims into reproducible release
-evidence. Corpus manifests pin licenses, source revisions, checksums, signal
-preparation, metrics, hardware/runtime context, and accepted thresholds while
-keeping restricted audio out of the repository and release artifacts. Local
-and CI runners consume the same manifest, emit machine-readable results, and
-fail closed on missing provenance or incomparable configurations.
+Stage 21 turns model-quality, output-integrity, and speed claims into
+reproducible release evidence. Corpus manifests pin licenses, source revisions,
+checksums, signal preparation, objective and perceptual metrics, listening-test
+protocol where automation cannot substitute for human judgment,
+hardware/runtime context, and accepted thresholds while keeping restricted
+audio out of the repository and release artifacts. Output-quality reports add
+duration and channel-layout agreement, clipping and true peak, DC offset,
+unexpected silence or dropouts, loudness, decode integrity, and the output
+fingerprint. Local and CI runners consume the same manifest, emit
+machine-readable signed results, and fail closed on missing provenance or
+incomparable configurations.
 
 Stage 22 makes application updates an explicit recoverable transaction rather
 than an in-place replacement. Signed manifests bind the release channel,
@@ -313,3 +332,14 @@ surfaces expose read-only check and dry-run reports, explicit `apply`, `status`,
 and `recover` operations, and durable redacted diagnostics; they never silently
 downgrade, delete the only recoverable installation, or require a network for
 recovery.
+
+Stage 23 makes partial-file processing an explicit timeline contract instead
+of an ad hoc trim. Region locators bind the source fingerprint, presentation
+timebase, channel map, ordered selections, padding, and crossfades; bounded edit
+graphs compose those regions without whole-file PCM retention. A versioned,
+portable project manifest records source locators and fingerprints, timelines,
+models, presets, plans, and receipts without embedding source audio by default;
+relocation and missing-source recovery require an exact fingerprint match. CLI,
+desktop, plans, receipts, and batch/watch automation share the same
+deterministic assembly semantics, and unsupported overlapping or future edit
+records fail closed without changing source, project, or existing output.

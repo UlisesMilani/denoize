@@ -140,12 +140,12 @@ type LiveEvent = {
   accelerator?: AcceleratorSelection | null;
 };
 type ExecutionPlan = {
-  schema: string; schema_version: number; denoize_version: string; kind: "file" | "batch";
+  schema: string; schema_version: number; denoize_version: string; kind: "file" | "batch" | "stream";
   deterministic: boolean; metadata_policy: string; items: Array<Record<string, unknown>>;
 };
 type ReceiptVerificationReport = {
   schema: string; schema_version: number; receipt_schema: string; key_id: string;
-  plan_digest: string; kind: "file" | "batch"; verified_items: Array<Record<string, unknown>>;
+  plan_digest: string; kind: "file" | "batch" | "stream"; verified_items: Array<Record<string, unknown>>;
 };
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
@@ -253,7 +253,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               <label>サラウンド出力<select id="downmix"><option value="preserve" selected>レイアウトを保持（非対応時は停止）</option><option value="stereo">明示的にステレオへダウンミックス</option></select></label>
               <div class="form-grid two"><label>MP3 kbps<input id="mp3-bitrate" type="number" value="192" min="32"></label><label>AAC kbps<input id="aac-bitrate" type="number" value="192" min="32"></label></div>
               <label>AACエンコーダー<select id="aac-encoder"><option value="oxide">OxideAV</option></select></label>
-              <div class="toggle-grid"><label class="toggle"><input id="file-stream" type="checkbox"><span></span><div><b>長時間ストリーム</b><small>WAV / FLAC / Ogg Vorbis → WAV</small></div></label><label class="toggle"><input id="file-stream-resume" type="checkbox" disabled><span></span><div><b>中断から再開</b><small>耐久チェックポイントを使用</small></div></label></div>
+              <div class="toggle-grid"><label class="toggle"><input id="file-stream" type="checkbox"><span></span><div><b>長時間ストリーム</b><small>圧縮入力・WAVからWAV / FLAC / Opus / MP3 / M4A / AACへ</small></div></label><label class="toggle"><input id="file-stream-resume" type="checkbox" disabled><span></span><div><b>中断から再開</b><small>耐久チェックポイントを使用</small></div></label></div>
               <label>ストリームブロック frames<input id="file-stream-frames" type="number" value="8192" min="1" max="1048576" disabled></label>
               <label class="toggle inline"><input id="loudness-enabled" type="checkbox"><span></span><div><b>ラウドネス正規化</b></div></label>
               <div class="form-grid two muted-fields" id="loudness-fields"><label>目標 LUFS<input id="loudness" type="number" value="-16" min="-70" max="0" step="0.5"></label><label>True Peak<input id="true-peak" type="number" value="-1" min="-20" max="0" step="0.1"></label></div>

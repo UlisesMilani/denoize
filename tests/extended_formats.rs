@@ -1,4 +1,7 @@
-use denoize::{decode_file, AudioFormat};
+use denoize::{
+    decode_file, inspect_audio_stream_session, AudioCodec, AudioFormat, AudioInputSession,
+    AudioStreamReader, DecodeLimits,
+};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -43,6 +46,19 @@ fn assert_pcm(path: &Path, expected_rate: u32) {
     assert_eq!(decoded.n_channels(), 1);
     assert_eq!(decoded.frames(), pcm_samples().len());
     assert!((decoded.channels[0][1] - 0.25).abs() < 0.01);
+}
+
+fn collect_stream(path: &Path, block_frames: usize) -> Result<Vec<Vec<f64>>, String> {
+    let session = AudioInputSession::open(path)?;
+    let mut reader = AudioStreamReader::from_session(session, DecodeLimits::default())?;
+    let mut output = vec![Vec::new(); reader.info().channels()];
+    while let Some(block) = reader.next_block(block_frames)? {
+        assert!(block[0].len() <= block_frames);
+        for (destination, source) in output.iter_mut().zip(block) {
+            destination.extend(source);
+        }
+    }
+    Ok(output)
 }
 
 fn rf64_without_payload(declared_data_size: u64) -> Vec<u8> {
@@ -185,6 +201,64 @@ fn alac_fallback_applies_non_identity_edit_list_exactly() {
     assert_eq!(control.frames(), 160);
     assert_eq!(edited.frames(), 80);
     assert_eq!(edited.channels[0], control.channels[0][40..120]);
+}
+
+#[test]
+fn alac_bounded_stream_matches_whole_decode_with_and_without_edits() {
+    let workspace = TestWorkspace::new();
+    for (name, bytes, block_frames) in [
+        ("alac-no-edit.m4a", alac_m4a_without_edit_list(), 37),
+        ("alac-edited.m4a", alac_m4a_with_non_identity_edit(), 13),
+    ] {
+        let path = workspace.file(name);
+        std::fs::write(&path, bytes).expect("write ALAC stream fixture");
+        let session = AudioInputSession::open(&path).expect("open ALAC stream session");
+        let reader = AudioStreamReader::from_session(session, DecodeLimits::default())
+            .expect("open bounded ALAC reader");
+        assert_eq!(reader.info().format, AudioFormat::M4a);
+        assert_eq!(reader.info().codec, AudioCodec::Alac);
+        let streamed = collect_stream(&path, block_frames).expect("collect ALAC stream");
+        let whole = decode_file(&path).expect("decode whole ALAC fixture");
+        assert_eq!(streamed, whole.channels, "{name}");
+    }
+}
+
+#[test]
+fn alac_bounded_stream_validates_the_complete_edit_active_timeline() {
+    let workspace = TestWorkspace::new();
+    let path = workspace.file("alac-mismatched-stts.m4a");
+    std::fs::write(&path, alac_m4a_with_mismatched_stts())
+        .expect("write malformed ALAC stream fixture");
+    let error = collect_stream(&path, 17).expect_err("mismatched stts must fail streaming");
+    assert!(error.contains("stts"), "unexpected error: {error}");
+}
+
+#[test]
+fn alac_bounded_stream_decoder_allowance_has_an_exact_limit_boundary() {
+    let workspace = TestWorkspace::new();
+    let path = workspace.file("alac-budget.m4a");
+    std::fs::write(&path, alac_m4a_with_non_identity_edit()).expect("write ALAC budget fixture");
+    let mut session = AudioInputSession::open(&path).expect("open ALAC budget session");
+    let info = inspect_audio_stream_session(&mut session, DecodeLimits::default())
+        .expect("inspect uncapped ALAC stream");
+    let mut exact_session = AudioInputSession::open(&path).expect("open exact ALAC session");
+    inspect_audio_stream_session(
+        &mut exact_session,
+        DecodeLimits::default().with_max_working_set_bytes(Some(info.decoder_additional_bytes)),
+    )
+    .expect("accept exact ALAC decoder allowance");
+    let mut short_session = AudioInputSession::open(&path).expect("open short ALAC session");
+    let error = inspect_audio_stream_session(
+        &mut short_session,
+        DecodeLimits::default().with_max_working_set_bytes(Some(
+            info.decoder_additional_bytes
+                .checked_sub(1)
+                .expect("ALAC allowance is nonzero"),
+        )),
+    )
+    .expect_err("reject one byte below the ALAC decoder allowance");
+    assert!(error.contains("M4A/ALAC stream decoder"), "{error}");
+    assert!(error.contains("working-set limit"), "{error}");
 }
 
 #[test]

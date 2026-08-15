@@ -22,8 +22,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 /// Stable schema identifier for read-only execution plans.
 pub const EXECUTION_PLAN_SCHEMA: &str = "denoize-execution-plan-v1";
+/// Stable schema identifier for bounded streaming execution plans.
+pub const STREAM_EXECUTION_PLAN_SCHEMA: &str = "denoize-execution-plan-v2";
 /// Stable schema identifier for signed execution receipts.
 pub const EXECUTION_RECEIPT_SCHEMA: &str = "denoize-execution-receipt-v1";
+/// Stable schema identifier for bounded streaming execution receipts.
+pub const STREAM_EXECUTION_RECEIPT_SCHEMA: &str = "denoize-execution-receipt-v2";
 /// Stable schema identifier for receipt public keys.
 pub const RECEIPT_PUBLIC_KEY_SCHEMA: &str = "denoize-receipt-public-key-v1";
 /// Stable schema identifier for receipt secret keys.
@@ -32,12 +36,17 @@ pub const RECEIPT_SECRET_KEY_SCHEMA: &str = "denoize-receipt-secret-key-v1";
 pub const RECEIPT_TRUST_POLICY_SCHEMA: &str = "denoize-receipt-trust-policy-v1";
 /// Stable schema identifier for successful offline verification reports.
 pub const RECEIPT_VERIFICATION_SCHEMA: &str = "denoize-receipt-verification-v1";
+/// Stable schema identifier for bounded streaming verification reports.
+pub const STREAM_RECEIPT_VERIFICATION_SCHEMA: &str = "denoize-receipt-verification-v2";
 /// Current version shared by the Stage 11 schemas.
 pub const EXECUTION_SCHEMA_VERSION: u32 = 1;
+/// Version used only by the additive Stage 12 streaming schemas.
+pub const STREAM_EXECUTION_SCHEMA_VERSION: u32 = 2;
 
 const ED25519_ALGORITHM: &str = "ed25519";
 const PLAN_DIGEST_DOMAIN: &[u8] = b"denoize-execution-plan-digest-v1";
 const RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"denoize-execution-receipt-signature-v1";
+const STREAM_RECEIPT_SIGNATURE_DOMAIN: &[u8] = b"denoize-execution-receipt-signature-v2";
 const RECEIPT_KEY_ID_DOMAIN: &[u8] = b"denoize-execution-receipt-key-id-v1";
 const EXECUTION_ITEM_ID_DOMAIN: &[u8] = b"denoize-execution-item-id-v1";
 const MAX_JSON_BYTES: u64 = 64 * 1024 * 1024;
@@ -54,6 +63,7 @@ const MAX_TEXT_BYTES: usize = 1_024;
 pub enum ExecutionKind {
     File,
     Batch,
+    Stream,
 }
 
 /// A regular input or model artifact bound by length and SHA-256.
@@ -125,12 +135,49 @@ impl ExecutionPlan {
         kind: ExecutionKind,
         deterministic: bool,
         metadata_policy: impl Into<String>,
+        items: Vec<ExecutionPlanItem>,
+    ) -> Result<Self, String> {
+        if kind == ExecutionKind::Stream {
+            return Err("stream execution plans must use ExecutionPlan::new_stream".into());
+        }
+        Self::new_with_schema(
+            EXECUTION_PLAN_SCHEMA,
+            EXECUTION_SCHEMA_VERSION,
+            kind,
+            deterministic,
+            metadata_policy,
+            items,
+        )
+    }
+
+    /// Construct a canonical bounded-stream plan using the additive v2 schema.
+    pub fn new_stream(
+        deterministic: bool,
+        metadata_policy: impl Into<String>,
+        items: Vec<ExecutionPlanItem>,
+    ) -> Result<Self, String> {
+        Self::new_with_schema(
+            STREAM_EXECUTION_PLAN_SCHEMA,
+            STREAM_EXECUTION_SCHEMA_VERSION,
+            ExecutionKind::Stream,
+            deterministic,
+            metadata_policy,
+            items,
+        )
+    }
+
+    fn new_with_schema(
+        schema: &str,
+        schema_version: u32,
+        kind: ExecutionKind,
+        deterministic: bool,
+        metadata_policy: impl Into<String>,
         mut items: Vec<ExecutionPlanItem>,
     ) -> Result<Self, String> {
         items.sort_by_key(|item| item.item_id);
         let plan = Self {
-            schema: EXECUTION_PLAN_SCHEMA.into(),
-            schema_version: EXECUTION_SCHEMA_VERSION,
+            schema: schema.into(),
+            schema_version,
             denoize_version: env!("CARGO_PKG_VERSION").into(),
             kind,
             deterministic,
@@ -170,10 +217,12 @@ impl ExecutionPlan {
 
     /// Validate schema identity, bounds, ordering, and portable locators.
     pub fn validate(&self) -> Result<(), String> {
-        require_schema(
+        require_execution_schema(
             &self.schema,
             self.schema_version,
+            self.kind,
             EXECUTION_PLAN_SCHEMA,
+            STREAM_EXECUTION_PLAN_SCHEMA,
             "execution plan",
         )?;
         validate_text("denoize version", &self.denoize_version)?;
@@ -196,7 +245,7 @@ impl ExecutionPlan {
                 );
             }
             previous = Some(item.item_id);
-            validate_plan_item(item)?;
+            validate_plan_item(self.kind, item)?;
             if !output_paths.insert(item.output.path.as_str()) {
                 return Err(format!(
                     "execution plan contains duplicate output locator: {}",
@@ -213,12 +262,16 @@ fn validate_plan(plan: ExecutionPlan) -> Result<ExecutionPlan, String> {
     Ok(plan)
 }
 
-fn validate_plan_item(item: &ExecutionPlanItem) -> Result<(), String> {
+fn validate_plan_item(kind: ExecutionKind, item: &ExecutionPlanItem) -> Result<(), String> {
     validate_artifact("plan input", &item.input)?;
     validate_locator(&item.output.path)?;
+    if kind != ExecutionKind::Stream && (item.input.path == "-" || item.output.path == "-") {
+        return Err("stdin/stdout locators require a stream execution plan".into());
+    }
     validate_text("output format", &item.output.format)?;
     match item.output.publication.as_str() {
         "no-clobber" | "replace" | "none" => {}
+        "stdout" if kind == ExecutionKind::Stream && item.output.path == "-" => {}
         value => return Err(format!("unknown plan publication mode: {value}")),
     }
     match item.output.action.as_str() {
@@ -228,12 +281,21 @@ fn validate_plan_item(item: &ExecutionPlanItem) -> Result<(), String> {
         "process" if item.output.publication == "none" => {
             return Err("a processing plan must publish its output".into());
         }
+        "process" if item.output.path == "-" && item.output.publication != "stdout" => {
+            return Err("a stdout stream plan must use stdout publication".into());
+        }
+        "process" if item.output.path != "-" && item.output.publication == "stdout" => {
+            return Err("stdout publication requires the stdout locator".into());
+        }
         "process" => {}
         "skip" if item.output.existing_fingerprint.is_none() => {
             return Err("a skipped plan item must bind its existing output fingerprint".into());
         }
         "skip" if item.output.publication != "none" => {
             return Err("a skipped plan item must not publish an output".into());
+        }
+        "skip" if item.output.path == "-" => {
+            return Err("stdout stream output cannot be represented as a skipped item".into());
         }
         "skip"
             if item.resources.memory_bytes != 0
@@ -533,7 +595,7 @@ impl SignedExecutionReceipt {
         if signature.len() != 64 {
             return Err("receipt signature must contain exactly 64 bytes".into());
         }
-        let message = receipt_signature_message(&self.payload)?;
+        let message = receipt_signature_message(self.signature_domain()?, &self.payload)?;
         UnparsedPublicKey::new(&ED25519, public)
             .verify(&message, &signature)
             .map_err(|_| "execution receipt signature verification failed".to_string())
@@ -562,11 +624,24 @@ impl SignedExecutionReceipt {
         receipt_path: &Path,
         output_root: Option<&Path>,
     ) -> Result<ReceiptVerificationReport, String> {
+        self.verify_with_key_at_stream_output(key, plan, receipt_path, output_root, None)
+    }
+
+    /// Authenticate with one public key and optionally map the `-` locator in a
+    /// v2 stream receipt to an exact file that captured stdout.
+    pub fn verify_with_key_at_stream_output(
+        &self,
+        key: &ReceiptPublicKey,
+        plan: Option<&ExecutionPlan>,
+        receipt_path: &Path,
+        output_root: Option<&Path>,
+        stream_output: Option<&Path>,
+    ) -> Result<ReceiptVerificationReport, String> {
         self.verify_signature(key)?;
         if let Some(plan) = plan {
             self.verify_plan(plan)?;
         }
-        self.verify_authenticated_outputs(receipt_path, output_root)
+        self.verify_authenticated_outputs(receipt_path, output_root, stream_output)
     }
 
     /// Authenticate through a rotation/revocation policy, optionally bind a
@@ -578,11 +653,24 @@ impl SignedExecutionReceipt {
         receipt_path: &Path,
         output_root: Option<&Path>,
     ) -> Result<ReceiptVerificationReport, String> {
+        self.verify_with_policy_at_stream_output(policy, plan, receipt_path, output_root, None)
+    }
+
+    /// Authenticate through a trust policy and optionally map the `-` locator
+    /// in a v2 stream receipt to an exact file that captured stdout.
+    pub fn verify_with_policy_at_stream_output(
+        &self,
+        policy: &ReceiptTrustPolicy,
+        plan: Option<&ExecutionPlan>,
+        receipt_path: &Path,
+        output_root: Option<&Path>,
+        stream_output: Option<&Path>,
+    ) -> Result<ReceiptVerificationReport, String> {
         self.verify_policy(policy)?;
         if let Some(plan) = plan {
             self.verify_plan(plan)?;
         }
-        self.verify_authenticated_outputs(receipt_path, output_root)
+        self.verify_authenticated_outputs(receipt_path, output_root, stream_output)
     }
 
     /// Verify every output after authentication by a public entry point.
@@ -592,6 +680,7 @@ impl SignedExecutionReceipt {
         &self,
         receipt_path: &Path,
         output_root: Option<&Path>,
+        stream_output: Option<&Path>,
     ) -> Result<ReceiptVerificationReport, String> {
         self.validate_structure()?;
         let default_root = receipt_path
@@ -608,10 +697,33 @@ impl SignedExecutionReceipt {
             ));
         }
         let mut verified = Vec::with_capacity(self.payload.items.len());
+        let mut used_stream_output = false;
         for item in &self.payload.items {
-            let resolved = resolve_locator(&root, &item.output.path)?;
+            let resolved = if self.payload.kind == ExecutionKind::Stream && item.output.path == "-"
+            {
+                let stream_output = stream_output.ok_or(
+                    "stdout stream receipt verification requires --output with the exact captured audio file",
+                )?;
+                used_stream_output = true;
+                std::fs::canonicalize(stream_output).map_err(|error| {
+                    format!(
+                        "resolve captured stdout stream output {}: {error}",
+                        stream_output.display()
+                    )
+                })?
+            } else {
+                resolve_locator(&root, &item.output.path)?
+            };
             let observed = batch_resume::fingerprint_file(&resolved)?;
-            let resolved_after = resolve_locator(&root, &item.output.path)?;
+            let resolved_after =
+                if self.payload.kind == ExecutionKind::Stream && item.output.path == "-" {
+                    std::fs::canonicalize(
+                        stream_output.expect("stdout capture was required before fingerprinting"),
+                    )
+                    .map_err(|error| format!("re-resolve captured stdout stream output: {error}"))?
+                } else {
+                    resolve_locator(&root, &item.output.path)?
+                };
             if resolved_after != resolved {
                 return Err(format!(
                     "receipt output changed location while it was verified: {}",
@@ -631,9 +743,13 @@ impl SignedExecutionReceipt {
                 outcome: item.outcome.clone(),
             });
         }
+        if stream_output.is_some() && !used_stream_output {
+            return Err("--output is only valid for a v2 stdout stream receipt".into());
+        }
+        let (schema, schema_version) = verification_schema(self.payload.kind);
         Ok(ReceiptVerificationReport {
-            schema: RECEIPT_VERIFICATION_SCHEMA.into(),
-            schema_version: EXECUTION_SCHEMA_VERSION,
+            schema: schema.into(),
+            schema_version,
             receipt_schema: self.schema.clone(),
             key_id: self.signature.key_id.clone(),
             plan_digest: self.payload.plan_digest,
@@ -643,10 +759,12 @@ impl SignedExecutionReceipt {
     }
 
     fn validate_structure(&self) -> Result<(), String> {
-        require_schema(
+        require_execution_schema(
             &self.schema,
             self.schema_version,
+            self.payload.kind,
             EXECUTION_RECEIPT_SCHEMA,
+            STREAM_EXECUTION_RECEIPT_SCHEMA,
             "execution receipt",
         )?;
         self.payload.validate()?;
@@ -662,6 +780,24 @@ impl SignedExecutionReceipt {
             return Err("receipt signature must contain exactly 64 bytes".into());
         }
         ensure_serialized_json_size(self, false, false, "execution receipt", MAX_JSON_BYTES - 1)
+    }
+
+    fn signature_domain(&self) -> Result<&'static [u8], String> {
+        if self.payload.kind == ExecutionKind::Stream {
+            if self.schema == STREAM_EXECUTION_RECEIPT_SCHEMA
+                && self.schema_version == STREAM_EXECUTION_SCHEMA_VERSION
+            {
+                Ok(STREAM_RECEIPT_SIGNATURE_DOMAIN)
+            } else {
+                Err("stream receipt is not encoded with the v2 streaming schema".into())
+            }
+        } else if self.schema == EXECUTION_RECEIPT_SCHEMA
+            && self.schema_version == EXECUTION_SCHEMA_VERSION
+        {
+            Ok(RECEIPT_SIGNATURE_DOMAIN)
+        } else {
+            Err("file/batch receipt is not encoded with the v1 execution schema".into())
+        }
     }
 }
 
@@ -796,11 +932,12 @@ impl ReceiptSecretKey {
             .map_err(|error| format!("parse receipt secret key: {error}"));
         secret.zeroize();
         let key_pair = key_pair?;
-        let message = receipt_signature_message(&payload)?;
+        let (schema, schema_version, signature_domain) = receipt_schema(payload.kind);
+        let message = receipt_signature_message(signature_domain, &payload)?;
         let signature = key_pair.sign(&message);
         let receipt = SignedExecutionReceipt {
-            schema: EXECUTION_RECEIPT_SCHEMA.into(),
-            schema_version: EXECUTION_SCHEMA_VERSION,
+            schema: schema.into(),
+            schema_version,
             payload,
             signature: ReceiptSignature {
                 algorithm: ED25519_ALGORITHM.into(),
@@ -1095,13 +1232,20 @@ pub struct ReceiptVerificationReport {
 impl ReceiptVerificationReport {
     /// Validate the exact successful-verification JSON contract.
     pub fn validate(&self) -> Result<(), String> {
-        require_schema(
+        require_execution_schema(
             &self.schema,
             self.schema_version,
+            self.kind,
             RECEIPT_VERIFICATION_SCHEMA,
+            STREAM_RECEIPT_VERIFICATION_SCHEMA,
             "receipt verification report",
         )?;
-        if self.receipt_schema != EXECUTION_RECEIPT_SCHEMA {
+        let expected_receipt_schema = if self.kind == ExecutionKind::Stream {
+            STREAM_EXECUTION_RECEIPT_SCHEMA
+        } else {
+            EXECUTION_RECEIPT_SCHEMA
+        };
+        if self.receipt_schema != expected_receipt_schema {
             return Err(format!(
                 "unsupported verified receipt schema: {}",
                 self.receipt_schema
@@ -1319,10 +1463,40 @@ fn resolve_locator(root: &Path, locator: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn receipt_signature_message(payload: &ExecutionReceiptPayload) -> Result<Vec<u8>, String> {
+fn receipt_signature_message(
+    domain: &[u8],
+    payload: &ExecutionReceiptPayload,
+) -> Result<Vec<u8>, String> {
     let encoded = serde_json::to_vec(payload)
         .map_err(|error| format!("serialize receipt payload for signing: {error}"))?;
-    domain_message(RECEIPT_SIGNATURE_DOMAIN, &encoded)
+    domain_message(domain, &encoded)
+}
+
+fn receipt_schema(kind: ExecutionKind) -> (&'static str, u32, &'static [u8]) {
+    if kind == ExecutionKind::Stream {
+        (
+            STREAM_EXECUTION_RECEIPT_SCHEMA,
+            STREAM_EXECUTION_SCHEMA_VERSION,
+            STREAM_RECEIPT_SIGNATURE_DOMAIN,
+        )
+    } else {
+        (
+            EXECUTION_RECEIPT_SCHEMA,
+            EXECUTION_SCHEMA_VERSION,
+            RECEIPT_SIGNATURE_DOMAIN,
+        )
+    }
+}
+
+fn verification_schema(kind: ExecutionKind) -> (&'static str, u32) {
+    if kind == ExecutionKind::Stream {
+        (
+            STREAM_RECEIPT_VERIFICATION_SCHEMA,
+            STREAM_EXECUTION_SCHEMA_VERSION,
+        )
+    } else {
+        (RECEIPT_VERIFICATION_SCHEMA, EXECUTION_SCHEMA_VERSION)
+    }
 }
 
 fn domain_digest(domain: &[u8], value: &[u8]) -> Digest {
@@ -1389,6 +1563,30 @@ fn require_schema(actual: &str, version: u32, expected: &str, label: &str) -> Re
     if version != EXECUTION_SCHEMA_VERSION {
         return Err(format!(
             "unsupported {label} schema version {version}; expected {EXECUTION_SCHEMA_VERSION}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_execution_schema(
+    actual: &str,
+    version: u32,
+    kind: ExecutionKind,
+    legacy: &str,
+    stream: &str,
+    label: &str,
+) -> Result<(), String> {
+    let (expected_schema, expected_version) = if kind == ExecutionKind::Stream {
+        (stream, STREAM_EXECUTION_SCHEMA_VERSION)
+    } else {
+        (legacy, EXECUTION_SCHEMA_VERSION)
+    };
+    if actual != expected_schema {
+        return Err(format!("unsupported {label} schema: {actual}"));
+    }
+    if version != expected_version {
+        return Err(format!(
+            "unsupported {label} schema version {version}; expected {expected_version}"
         ));
     }
     Ok(())
@@ -1707,6 +1905,47 @@ mod tests {
         .unwrap()
     }
 
+    fn stdout_stream_plan(output: FileFingerprint) -> (ExecutionPlan, ReceiptItem) {
+        let plan = ExecutionPlan::new_stream(
+            true,
+            "drop",
+            vec![ExecutionPlanItem {
+                item_id: Digest::from_bytes([11; 32]),
+                input: PlannedArtifact {
+                    path: "-".into(),
+                    fingerprint: fingerprint(12),
+                },
+                output: PlannedOutput {
+                    path: "-".into(),
+                    format: "flac".into(),
+                    publication: "stdout".into(),
+                    action: "process".into(),
+                    reason: "non-seekable".into(),
+                    existing_fingerprint: None,
+                },
+                model: None,
+                recipe: Digest::from_bytes([13; 32]),
+                backend: "classical".into(),
+                accelerator: "cpu".into(),
+                input_format: "flac".into(),
+                input_codec: "flac".into(),
+                channels: 1,
+                frames: 480,
+                sample_rate: 48_000,
+                resources: PlannedResources {
+                    memory_bytes: 1_048_576,
+                    temporary_bytes: 1_048_576,
+                    cpu_jobs: 1,
+                    gpu_jobs: 0,
+                    gpu_memory_bytes: 0,
+                },
+            }],
+        )
+        .unwrap();
+        let item = ReceiptItem::from_plan_item(&plan.items[0], output, "succeeded").unwrap();
+        (plan, item)
+    }
+
     #[test]
     fn keypair_signs_and_wrong_key_or_tampering_fails() {
         let plan = plan();
@@ -1729,6 +1968,147 @@ mod tests {
             .to_json()
             .unwrap_err()
             .contains("decode receipt signature"));
+    }
+
+    #[test]
+    fn v2_stdout_stream_receipt_requires_and_verifies_an_exact_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let captured = root.path().join("captured.flac");
+        std::fs::write(&captured, b"verified encoded stdout bytes").unwrap();
+        let output = batch_resume::fingerprint_file(&captured).unwrap();
+        let (plan, item) = stdout_stream_plan(output);
+        assert_eq!(plan.schema, STREAM_EXECUTION_PLAN_SCHEMA);
+        assert_eq!(plan.schema_version, STREAM_EXECUTION_SCHEMA_VERSION);
+        assert_eq!(plan.kind, ExecutionKind::Stream);
+
+        let payload = ExecutionReceiptPayload::new(&plan, vec![item]).unwrap();
+        let (secret, public) = generate_receipt_keypair().unwrap();
+        let receipt = secret.sign(payload).unwrap();
+        assert_eq!(receipt.schema, STREAM_EXECUTION_RECEIPT_SCHEMA);
+        receipt.verify_signature(&public).unwrap();
+        receipt.verify_plan(&plan).unwrap();
+        let missing = receipt
+            .verify_with_key(
+                &public,
+                Some(&plan),
+                &root.path().join("receipt.json"),
+                None,
+            )
+            .unwrap_err();
+        assert!(missing.contains("requires --output"), "{missing}");
+
+        let report = receipt
+            .verify_with_key_at_stream_output(
+                &public,
+                Some(&plan),
+                &root.path().join("receipt.json"),
+                None,
+                Some(&captured),
+            )
+            .unwrap();
+        assert_eq!(report.schema, STREAM_RECEIPT_VERIFICATION_SCHEMA);
+        assert_eq!(report.schema_version, STREAM_EXECUTION_SCHEMA_VERSION);
+        assert_eq!(report.kind, ExecutionKind::Stream);
+        assert_eq!(report.verified_items[0].output, output);
+
+        let legacy_error =
+            ExecutionPlan::new(ExecutionKind::Stream, true, "drop", plan.items.clone())
+                .unwrap_err();
+        assert!(legacy_error.contains("new_stream"));
+    }
+
+    #[test]
+    fn v059_v1_plan_and_receipt_remain_parseable_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let plan_path = root.path().join("v0.59-plan.json");
+        let receipt_path = root.path().join("v0.59-receipt.json");
+        let mut previous_plan = plan();
+        previous_plan.denoize_version = "0.59.0".into();
+        previous_plan.validate().unwrap();
+        let item =
+            ReceiptItem::from_plan_item(&previous_plan.items[0], fingerprint(4), "succeeded")
+                .unwrap();
+        let payload = ExecutionReceiptPayload {
+            denoize_version: previous_plan.denoize_version.clone(),
+            kind: previous_plan.kind,
+            plan_digest: previous_plan.digest().unwrap(),
+            items: vec![item],
+        };
+        payload.validate().unwrap();
+        payload.matches_plan(&previous_plan).unwrap();
+        let (secret, public) = generate_receipt_keypair().unwrap();
+        let previous_receipt = secret.sign(payload).unwrap();
+        assert_eq!(previous_receipt.schema, EXECUTION_RECEIPT_SCHEMA);
+
+        std::fs::write(&plan_path, previous_plan.to_pretty_json().unwrap()).unwrap();
+        std::fs::write(&receipt_path, previous_receipt.to_pretty_json().unwrap()).unwrap();
+        let plan_before = std::fs::read(&plan_path).unwrap();
+        let receipt_before = std::fs::read(&receipt_path).unwrap();
+
+        let parsed_plan = ExecutionPlan::from_file(&plan_path).unwrap();
+        let parsed_receipt = SignedExecutionReceipt::from_file(&receipt_path).unwrap();
+        parsed_receipt.verify_signature(&public).unwrap();
+        parsed_receipt.verify_plan(&parsed_plan).unwrap();
+        assert_eq!(parsed_plan, previous_plan);
+        assert_eq!(parsed_receipt, previous_receipt);
+        assert_eq!(std::fs::read(&plan_path).unwrap(), plan_before);
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_before);
+    }
+
+    #[test]
+    fn future_stream_documents_are_rejected_without_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let plan_path = root.path().join("future-stream-plan.json");
+        let receipt_path = root.path().join("future-stream-receipt.json");
+        let (plan, item) = stdout_stream_plan(fingerprint(14));
+        let payload = ExecutionReceiptPayload::new(&plan, vec![item]).unwrap();
+        let (secret, _) = generate_receipt_keypair().unwrap();
+        let receipt = secret.sign(payload).unwrap();
+
+        let mut future_plan = serde_json::to_value(&plan).unwrap();
+        future_plan["schema_version"] = serde_json::Value::from(3);
+        let plan_bytes = serde_json::to_vec_pretty(&future_plan).unwrap();
+        std::fs::write(&plan_path, &plan_bytes).unwrap();
+        let error = ExecutionPlan::from_file(&plan_path).unwrap_err();
+        assert!(error.contains("unsupported execution plan schema version 3"));
+        assert_eq!(std::fs::read(&plan_path).unwrap(), plan_bytes);
+
+        let mut future_receipt = serde_json::to_value(&receipt).unwrap();
+        future_receipt["schema_version"] = serde_json::Value::from(3);
+        let receipt_bytes = serde_json::to_vec_pretty(&future_receipt).unwrap();
+        std::fs::write(&receipt_path, &receipt_bytes).unwrap();
+        let error = SignedExecutionReceipt::from_file(&receipt_path).unwrap_err();
+        assert!(error.contains("unsupported execution receipt schema version 3"));
+        assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes);
+    }
+
+    #[test]
+    fn stream_schema_assets_match_the_public_v2_discriminators() {
+        for (source, schema, version, kind_pointer) in [
+            (
+                include_str!("../schemas/denoize-execution-plan-v2.schema.json"),
+                STREAM_EXECUTION_PLAN_SCHEMA,
+                STREAM_EXECUTION_SCHEMA_VERSION,
+                "/properties/kind/const",
+            ),
+            (
+                include_str!("../schemas/denoize-execution-receipt-v2.schema.json"),
+                STREAM_EXECUTION_RECEIPT_SCHEMA,
+                STREAM_EXECUTION_SCHEMA_VERSION,
+                "/$defs/payload/properties/kind/const",
+            ),
+            (
+                include_str!("../schemas/denoize-receipt-verification-v2.schema.json"),
+                STREAM_RECEIPT_VERIFICATION_SCHEMA,
+                STREAM_EXECUTION_SCHEMA_VERSION,
+                "/properties/kind/const",
+            ),
+        ] {
+            let document: serde_json::Value = serde_json::from_str(source).unwrap();
+            assert_eq!(document["properties"]["schema"]["const"], schema);
+            assert_eq!(document["properties"]["schema_version"]["const"], version);
+            assert_eq!(document.pointer(kind_pointer).unwrap(), "stream");
+        }
     }
 
     #[test]

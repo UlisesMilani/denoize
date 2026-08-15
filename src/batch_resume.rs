@@ -22,9 +22,9 @@ use std::sync::Mutex;
 
 mod stream_checkpoint;
 pub use stream_checkpoint::{
-    stream_checkpoint_sidecar_paths, stream_recipe_digest, StreamCheckpoint,
-    StreamCheckpointAcquire, StreamCheckpointSession, StreamPcmDigest,
-    STREAM_CHECKPOINT_SCRATCH_BYTES,
+    inspect_stream_checkpoint_decision, stream_checkpoint_sidecar_paths, stream_recipe_digest,
+    StreamCheckpoint, StreamCheckpointAcquire, StreamCheckpointDecision, StreamCheckpointSession,
+    StreamPcmDigest, STREAM_CHECKPOINT_SCRATCH_BYTES,
 };
 
 /// Canonical v3 journal name shared by the CLI and desktop application.
@@ -4672,11 +4672,13 @@ mod tests {
     fn future_and_orphan_records_fail_closed() {
         let directory = tempdir().unwrap();
         let state = directory.path().join(STATE_FILE_NAME);
-        write(&state, b"{\"version\":4,\"kind\":\"prepare\"}\n");
+        let future = b"{\"version\":4,\"kind\":\"prepare\"}\n";
+        write(&state, future);
         assert!(BatchSession::acquire(directory.path(), true)
             .err()
             .unwrap()
             .contains("unsupported"));
+        assert_eq!(std::fs::read(&state).unwrap(), future);
         write(
             &state,
             format!(

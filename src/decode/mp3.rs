@@ -14,7 +14,8 @@ use nanomp3::{Decoder, FrameInfo, MAX_SAMPLES_PER_FRAME};
 
 use super::budget::DecodeBudget;
 use super::pcm::DecodedPcm;
-use super::DecodeLimits;
+use super::stream::AudioStreamInfo;
+use super::{AudioCodec, AudioFormat, DecodeLimits};
 
 /// Refill below this threshold so the bounded carry normally holds several
 /// complete MPEG frames before each exact-frame decode.
@@ -109,6 +110,297 @@ fn contains_timing_tag(bytes: &[u8]) -> bool {
     [b"Xing".as_slice(), b"Info".as_slice(), b"VBRI".as_slice()]
         .into_iter()
         .any(|tag| bytes.windows(tag.len()).any(|window| window == tag))
+}
+
+struct RawMp3FrameInput {
+    input: File,
+    encoded: Vec<u8>,
+    start: usize,
+    end: usize,
+    eof: bool,
+    frames_seen: u64,
+    previous_header: Option<MpegFrameHeader>,
+}
+
+impl RawMp3FrameInput {
+    fn new(mut input: File, budget: DecodeBudget) -> Result<Self, String> {
+        seek_past_id3v2(&mut input)?;
+        budget.check_peak(0, INPUT_BUFFER_BYTES as u64, "MP3 fallback input")?;
+        let mut encoded = Vec::new();
+        encoded
+            .try_reserve_exact(INPUT_BUFFER_BYTES)
+            .map_err(|error| format!("reserve MP3 fallback input: {error}"))?;
+        encoded.resize(INPUT_BUFFER_BYTES, 0);
+        Ok(Self {
+            input,
+            encoded,
+            start: 0,
+            end: 0,
+            eof: false,
+            frames_seen: 0,
+            previous_header: None,
+        })
+    }
+
+    fn next_header(&mut self) -> Result<Option<MpegFrameHeader>, String> {
+        while !self.eof && self.end - self.start < MIN_DECODE_WINDOW_BYTES {
+            if self.start == self.end {
+                self.start = 0;
+                self.end = 0;
+            } else if self.end == self.encoded.len() {
+                self.encoded.copy_within(self.start..self.end, 0);
+                self.end -= self.start;
+                self.start = 0;
+            }
+            let read = self
+                .input
+                .read(&mut self.encoded[self.end..])
+                .map_err(|error| format!("read MP3 fallback stream: {error}"))?;
+            if read == 0 {
+                self.eof = true;
+            } else {
+                self.end += read;
+            }
+        }
+        if self.start == self.end {
+            return Ok(None);
+        }
+        let buffered = &self.encoded[self.start..self.end];
+        if self.eof && recognized_trailing_metadata(buffered) {
+            self.start = self.end;
+            return Ok(None);
+        }
+        let header = buffered.get(..4).and_then(parse_frame_header).ok_or_else(|| {
+            let prefix = buffered
+                .get(..4.min(buffered.len()))
+                .map(|bytes| format!("{bytes:02x?}"))
+                .unwrap_or_else(|| "[]".into());
+            let next_sync = buffered
+                .windows(4)
+                .enumerate()
+                .skip(1)
+                .find_map(|(offset, bytes)| parse_frame_header(bytes).map(|_| offset));
+            format!(
+                "MP3 fallback only accepts contiguous MPEG Layer III frames (or recognised trailing metadata); invalid frame {} begins with {prefix}, has {} buffered bytes, the previous header was {:?}, and the next candidate header is at offset {next_sync:?}",
+                self.frames_seen + 1,
+                buffered.len(),
+                self.previous_header,
+            )
+        })?;
+        if header.frame_bytes > buffered.len() {
+            if self.eof {
+                return Err(format!(
+                    "truncated final MP3 frame: expected {} bytes, found {}",
+                    header.frame_bytes,
+                    buffered.len()
+                ));
+            }
+            return Err(format!(
+                "MP3 frame exceeds the {INPUT_BUFFER_BYTES}-byte fallback input window"
+            ));
+        }
+        if self.frames_seen == 0 && contains_timing_tag(&buffered[..header.frame_bytes]) {
+            return Err("MP3 fallback first frame contains Xing/Info/VBRI timing metadata".into());
+        }
+        Ok(Some(header))
+    }
+
+    fn current_frame(&self, header: MpegFrameHeader) -> &[u8] {
+        &self.encoded[self.start..self.start + header.frame_bytes]
+    }
+
+    fn advance(&mut self, header: MpegFrameHeader) -> Result<(), String> {
+        self.start = self
+            .start
+            .checked_add(header.frame_bytes)
+            .ok_or_else(|| "MP3 fallback input position overflows".to_string())?;
+        self.frames_seen = self
+            .frames_seen
+            .checked_add(1)
+            .ok_or_else(|| "MP3 fallback frame count overflows".to_string())?;
+        self.previous_header = Some(header);
+        Ok(())
+    }
+}
+
+impl MpegFrameHeader {
+    const fn samples_per_frame(self) -> usize {
+        if self.version == 3 {
+            1_152
+        } else {
+            576
+        }
+    }
+}
+
+/// Inspect a contiguous raw Layer III stream when Symphonia cannot identify
+/// it. Gapless timing headers are intentionally ineligible because only the
+/// primary decoder applies their encoder-delay and padding contract.
+pub(super) fn inspect_raw_mp3_stream(
+    input: File,
+    limits: DecodeLimits,
+) -> Result<AudioStreamInfo, String> {
+    let budget = DecodeBudget::new(limits);
+    let decoder_additional_bytes = mp3_scratch_bytes()?;
+    budget.check_peak(0, decoder_additional_bytes, "MP3 fallback stream decoder")?;
+    let mut input = RawMp3FrameInput::new(input, budget)?;
+    let mut sample_rate = None;
+    let mut channel_count = None;
+    let mut total_frames = 0_u64;
+    while let Some(header) = input.next_header()? {
+        match (sample_rate, channel_count) {
+            (None, None) => {
+                sample_rate = Some(header.sample_rate);
+                channel_count = Some(header.channel_count);
+            }
+            (Some(rate), Some(channels))
+                if rate == header.sample_rate && channels == header.channel_count => {}
+            (Some(_), Some(_)) => {
+                return Err("MP3 fallback stream geometry changes between frames".into());
+            }
+            _ => unreachable!("MP3 fallback geometry is set atomically"),
+        }
+        total_frames = total_frames
+            .checked_add(header.samples_per_frame() as u64)
+            .ok_or_else(|| "MP3 fallback presentation frame count overflows".to_string())?;
+        input.advance(header)?;
+    }
+    let sample_rate = sample_rate.ok_or_else(|| "no valid MP3 frames found".to_string())?;
+    let channel_count = channel_count.expect("sample rate and channel count are set together");
+    Ok(AudioStreamInfo {
+        format: AudioFormat::Mp3,
+        codec: AudioCodec::Mp3,
+        output_spec: hound::WavSpec {
+            channels: u16::try_from(channel_count)
+                .map_err(|_| "MP3 fallback channel count does not fit in WAV".to_string())?,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+        channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(channel_count)
+            .mask(),
+        total_frames: Some(total_frames),
+        max_decoder_frames: 1_152,
+        decoder_additional_bytes,
+    })
+}
+
+pub(super) struct RawMp3StreamReader {
+    input: RawMp3FrameInput,
+    decoder: Decoder,
+    pcm: Vec<f32>,
+    info: AudioStreamInfo,
+    pending_frames: usize,
+    pending_offset: usize,
+    decoded_frames: u64,
+    eof: bool,
+}
+
+impl RawMp3StreamReader {
+    pub(super) fn new(
+        input: File,
+        info: AudioStreamInfo,
+        limits: DecodeLimits,
+    ) -> Result<Self, String> {
+        let budget = DecodeBudget::new(limits);
+        let scratch_bytes = mp3_scratch_bytes()?;
+        budget.check_peak(0, scratch_bytes, "MP3 fallback stream decoder")?;
+        let input = RawMp3FrameInput::new(input, budget)?;
+        let mut pcm = Vec::new();
+        pcm.try_reserve_exact(MAX_SAMPLES_PER_FRAME)
+            .map_err(|error| format!("reserve MP3 fallback stream PCM: {error}"))?;
+        pcm.resize(MAX_SAMPLES_PER_FRAME, 0.0);
+        Ok(Self {
+            input,
+            decoder: Decoder::new(),
+            pcm,
+            info,
+            pending_frames: 0,
+            pending_offset: 0,
+            decoded_frames: 0,
+            eof: false,
+        })
+    }
+
+    fn decode_next_frame(&mut self) -> Result<bool, String> {
+        let Some(header) = self.input.next_header()? else {
+            self.eof = true;
+            if self.info.total_frames != Some(self.decoded_frames) {
+                return Err("MP3 fallback decoded frame count changed after inspection".into());
+            }
+            return Ok(false);
+        };
+        let (consumed, frame_info) = self
+            .decoder
+            .decode(self.input.current_frame(header), &mut self.pcm);
+        let frame_info = frame_info.ok_or_else(|| {
+            "MP3 fallback could not decode a complete contiguous MPEG frame".to_string()
+        })?;
+        if consumed != header.frame_bytes
+            || frame_info.sample_rate != self.info.sample_rate()
+            || usize::from(frame_info.channels.num()) != self.info.channels()
+            || frame_info.samples_produced != header.samples_per_frame()
+        {
+            return Err("MP3 fallback decoder disagrees with the inspected MPEG stream".into());
+        }
+        let samples = frame_info
+            .samples_produced
+            .checked_mul(self.info.channels())
+            .ok_or_else(|| "MP3 fallback stream sample count overflows".to_string())?;
+        if samples > self.pcm.len() {
+            return Err("MP3 fallback stream decoder exceeded its PCM buffer".into());
+        }
+        self.pending_frames = frame_info.samples_produced;
+        self.pending_offset = 0;
+        self.decoded_frames = self
+            .decoded_frames
+            .checked_add(frame_info.samples_produced as u64)
+            .ok_or_else(|| "MP3 fallback decoded frame count overflows".to_string())?;
+        self.input.advance(header)?;
+        Ok(true)
+    }
+
+    pub(super) fn next_block(
+        &mut self,
+        max_frames: usize,
+    ) -> Result<Option<Vec<Vec<f64>>>, String> {
+        if self.eof {
+            return Ok(None);
+        }
+        let channels = self.info.channels();
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(channels)
+            .map_err(|error| format!("reserve MP3 fallback output channels: {error}"))?;
+        for _ in 0..channels {
+            let mut channel = Vec::new();
+            channel
+                .try_reserve_exact(max_frames)
+                .map_err(|error| format!("reserve MP3 fallback output block: {error}"))?;
+            output.push(channel);
+        }
+        while output[0].len() < max_frames {
+            if self.pending_offset == self.pending_frames && !self.decode_next_frame()? {
+                break;
+            }
+            let take =
+                (self.pending_frames - self.pending_offset).min(max_frames - output[0].len());
+            for frame in self.pending_offset..self.pending_offset + take {
+                let start = frame * channels;
+                for (destination, &sample) in
+                    output.iter_mut().zip(&self.pcm[start..start + channels])
+                {
+                    destination.push(crate::audio::sanitize_sample(f64::from(sample)));
+                }
+            }
+            self.pending_offset += take;
+        }
+        if output[0].is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(output))
+        }
+    }
 }
 
 /// Decode a raw MPEG stream without materialising the encoded file in memory.
