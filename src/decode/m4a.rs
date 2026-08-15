@@ -10,10 +10,20 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use mp4::{ChannelConfig, MediaType, Mp4Reader, Mp4Track, TrackType};
 use oxideav_aac::decode::{DecodedFrame, StreamDecoder};
+use symphonia::core::codecs::audio::well_known::CODEC_ID_ALAC;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, FormatReader, TrackType as SymphoniaTrackType};
+use symphonia::core::io::MediaSourceStream;
 
 use super::budget::{channel_descriptor_bytes, DecodeBudget};
 use super::pcm::DecodedPcm;
-use super::DecodeLimits;
+use super::stream::{
+    channel_descriptor_bytes as stream_channel_descriptor_bytes, float_output_spec, planar_bytes,
+    symphonia_metadata_options, validate_stream_geometry, AudioStreamInfo,
+};
+use super::{AudioCodec, AudioFormat, DecodeLimits};
 
 /// MPEG-4 `bufferSizeDB` is 24 bits. Using the same finite ceiling for MP4 AAC
 /// samples prevents a corrupt `stsz` from requesting an unbounded access-unit
@@ -23,6 +33,9 @@ const MAX_AAC_ACCESS_UNIT_SIZE: u32 = 0x00ff_ffff;
 const MAX_MP4_BOX_DEPTH: usize = 32;
 const MAX_EMPTY_TRUN_SAMPLES: u64 = 10_000_000;
 const MAX_EDIT_WORKING_BYTES: u128 = 512 * 1024 * 1024;
+const M4A_AAC_MAX_DECODED_FRAMES: usize = oxideav_aac::decode::FRAME_LEN * 2;
+const ALAC_MAX_FRAME_LENGTH: usize = 4096 * 16;
+const SYMPHONIA_M4A_FIXED_BYTES: u64 = 128 * 1024;
 // `oxideav-aac` keeps at most one decoder state per 4-bit element slot and
 // bounds every transform/QMF dimension to AAC's fixed 1024-line geometry.
 // This allowance covers all 48 possible SCE/LFE/CPE slots, SBR/PS state, and
@@ -1566,6 +1579,1205 @@ struct ValidatedSampleTable {
     sample_count: u32,
 }
 
+#[derive(Debug)]
+struct StreamTimelineSpec {
+    entries: Vec<RawSttsEntry>,
+    sample_count: u32,
+    media_timescale: u32,
+}
+
+impl StreamTimelineSpec {
+    fn from_edit_context(mut context: EditContext) -> Self {
+        Self {
+            entries: std::mem::take(&mut context.stts_entries),
+            sample_count: context.sample_count,
+            media_timescale: context.media_timescale,
+        }
+    }
+
+    fn capacity_bytes(&self) -> Result<u64, String> {
+        allocation_capacity_bytes::<RawSttsEntry>(self.entries.capacity(), "M4A stream timeline")
+    }
+}
+
+#[derive(Debug)]
+struct StreamTimeline {
+    spec: StreamTimelineSpec,
+    entry_index: usize,
+    remaining_in_entry: u32,
+    current_delta: u32,
+    observed_packets: u32,
+    cumulative_media_units: u128,
+    actual_frames: u128,
+    sample_rate: Option<u32>,
+}
+
+impl StreamTimeline {
+    fn new(spec: StreamTimelineSpec) -> Self {
+        Self {
+            spec,
+            entry_index: 0,
+            remaining_in_entry: 0,
+            current_delta: 0,
+            observed_packets: 0,
+            cumulative_media_units: 0,
+            actual_frames: 0,
+            sample_rate: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.entry_index = 0;
+        self.remaining_in_entry = 0;
+        self.current_delta = 0;
+        self.observed_packets = 0;
+        self.cumulative_media_units = 0;
+        self.actual_frames = 0;
+        self.sample_rate = None;
+    }
+
+    fn observe(&mut self, decoded_frames: usize, sample_rate: u32) -> Result<(), String> {
+        if self.observed_packets >= self.spec.sample_count {
+            return Err(format!(
+                "M4A stream decoded an extra packet beyond the {} samples declared by stts",
+                self.spec.sample_count
+            ));
+        }
+        if decoded_frames == 0 {
+            return Err(format!(
+                "M4A stream packet {} decoded to zero frames while an edit list is active",
+                self.observed_packets + 1
+            ));
+        }
+        if sample_rate == 0 {
+            return Err("M4A stream decoded at a zero sample rate".into());
+        }
+        if let Some(expected) = self.sample_rate {
+            if sample_rate != expected {
+                return Err(format!(
+                    "M4A stream sample rate changed from {expected} to {sample_rate}"
+                ));
+            }
+        } else {
+            self.sample_rate = Some(sample_rate);
+        }
+
+        if self.remaining_in_entry == 0 {
+            let entry = self.spec.entries.get(self.entry_index).ok_or_else(|| {
+                format!(
+                    "M4A stream stts ended before packet {}",
+                    self.observed_packets + 1
+                )
+            })?;
+            self.entry_index = self
+                .entry_index
+                .checked_add(1)
+                .ok_or("M4A stream stts entry index overflows")?;
+            self.remaining_in_entry = entry.sample_count;
+            self.current_delta = entry.sample_delta;
+        }
+        self.remaining_in_entry -= 1;
+        self.observed_packets = self
+            .observed_packets
+            .checked_add(1)
+            .ok_or("M4A stream packet count overflows")?;
+        self.cumulative_media_units = self
+            .cumulative_media_units
+            .checked_add(u128::from(self.current_delta))
+            .ok_or("M4A stream stts cumulative duration overflows")?;
+        self.actual_frames = self
+            .actual_frames
+            .checked_add(decoded_frames as u128)
+            .ok_or("M4A stream decoded-frame total overflows")?;
+
+        let nominal_frames = round_rescaled(
+            self.cumulative_media_units,
+            u128::from(sample_rate),
+            u128::from(self.spec.media_timescale),
+            "M4A stream stts timeline",
+        )?;
+        if self.observed_packets < self.spec.sample_count {
+            if self.actual_frames != nominal_frames {
+                return Err(format!(
+                    "M4A stream packet {} cumulative decode is {} frames, but stts requires {nominal_frames}",
+                    self.observed_packets, self.actual_frames
+                ));
+            }
+        } else if self.actual_frames < nominal_frames {
+            return Err(format!(
+                "M4A stream final decode is {} frames, shorter than the stts timeline {nominal_frames}",
+                self.actual_frames
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if self.observed_packets != self.spec.sample_count {
+            return Err(format!(
+                "M4A stream decoded {} packets, but stts declares {}",
+                self.observed_packets, self.spec.sample_count
+            ));
+        }
+        if self.remaining_in_entry != 0 || self.entry_index != self.spec.entries.len() {
+            return Err("M4A stream did not consume its complete stts timeline".into());
+        }
+        Ok(())
+    }
+}
+
+struct AacStreamPlan {
+    descriptors: Vec<SampleDescriptor>,
+    aot: u8,
+    fs_index: u8,
+    chan_conf: u8,
+    timeline: Option<StreamTimelineSpec>,
+}
+
+struct AlacStreamPlan {
+    track_id: u32,
+    maximum_packet_bytes: usize,
+    timeline: Option<StreamTimelineSpec>,
+}
+
+enum M4aStreamCodecPlan {
+    Aac(AacStreamPlan),
+    Alac(AlacStreamPlan),
+}
+
+struct M4aStreamPlan {
+    info: AudioStreamInfo,
+    edits: Option<Vec<PlannedEdit>>,
+    codec: M4aStreamCodecPlan,
+}
+
+/// Inspect a regular M4A input and build the bounded decoder geometry without
+/// retaining decoded PCM.
+pub(super) fn inspect_m4a_stream(
+    source: File,
+    limits: DecodeLimits,
+) -> Result<AudioStreamInfo, String> {
+    build_m4a_stream_plan(source, limits).map(|plan| plan.info)
+}
+
+fn clone_rewound_stream_file(source: &mut File, context: &str) -> Result<File, String> {
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind {context}: {error}"))?;
+    source
+        .try_clone()
+        .map_err(|error| format!("clone {context}: {error}"))
+}
+
+fn nominal_edit_frames(context: &EditContext, sample_rate: u32) -> Result<usize, String> {
+    let frames = round_rescaled(
+        stts_total_media_units(context)?,
+        u128::from(sample_rate),
+        u128::from(context.media_timescale),
+        "M4A stream stts frame boundary",
+    )?;
+    usize::try_from(frames)
+        .map_err(|_| "M4A stream frame count cannot be represented on this platform".to_string())
+}
+
+fn checked_add_stream_bytes(total: u64, bytes: u64, context: &str) -> Result<u64, String> {
+    total
+        .checked_add(bytes)
+        .ok_or_else(|| format!("{context} byte count overflows"))
+}
+
+fn build_m4a_stream_plan(mut source: File, limits: DecodeLimits) -> Result<M4aStreamPlan, String> {
+    let budget = DecodeBudget::new(limits);
+    let file_size = source
+        .metadata()
+        .map_err(|error| format!("stat M4A stream: {error}"))?
+        .len();
+    let mut structure_file = clone_rewound_stream_file(&mut source, "M4A stream structure")?;
+    let parser_retained_bytes = preflight_mp4_parser(&mut structure_file, file_size, budget)
+        .map_err(|error| format!("M4A stream structure: {error}"))?;
+    let header_file = clone_rewound_stream_file(&mut source, "M4A stream header")?;
+    let mp4 = Mp4Reader::read_header(BufReader::new(header_file), file_size)
+        .map_err(|error| format!("parse M4A stream header: {error}"))?;
+
+    if let Some(track) = select_aac_track(&mp4)? {
+        return build_aac_stream_plan(&mp4, track, file_size, parser_retained_bytes, budget);
+    }
+
+    let track = select_first_audio_track(&mp4)?
+        .ok_or_else(|| "M4A stream has no audio track".to_string())?;
+    if !track.trafs.is_empty() {
+        return Err(format!(
+            "fragmented M4A track {} is not supported by bounded streaming",
+            track.track_id()
+        ));
+    }
+    let validated = validate_table_with_sample_limit(track, file_size, None, "M4A")?;
+    let selected_maximum_packet = maximum_sample_size(track, validated.sample_count)?;
+    let maximum_packet = maximum_mp4_packet_size(&mp4, file_size)?.max(selected_maximum_packet);
+    let edit_clone_bytes = edit_context_requested_bytes(track)?;
+    budget.check_peak(
+        0,
+        checked_add_stream_bytes(
+            parser_retained_bytes,
+            edit_clone_bytes,
+            "M4A/ALAC edit metadata",
+        )?,
+        "M4A/ALAC edit metadata",
+    )?;
+    let edit = extract_edit_context(&mp4, track)?;
+    let edit_context_bytes = edit
+        .as_ref()
+        .map(edit_context_capacity_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let selected_track_id = track.track_id();
+    drop(mp4);
+
+    let alac_source = clone_rewound_stream_file(&mut source, "M4A/ALAC stream probe")?;
+    let alac = inspect_alac_parameters(alac_source, limits, selected_track_id)?;
+    let retained_for_plan = checked_add_stream_bytes(
+        parser_retained_bytes,
+        edit_context_bytes,
+        "M4A/ALAC retained metadata",
+    )?;
+    let (edits, total_frames, timeline) = if let Some(context) = edit {
+        let raw_frames = nominal_edit_frames(&context, alac.sample_rate)?;
+        let (edits, output_frames) = plan_stream_edits(
+            &context,
+            alac.sample_rate,
+            raw_frames,
+            alac.channels,
+            budget,
+            retained_for_plan,
+        )?;
+        let timeline = StreamTimelineSpec::from_edit_context(context);
+        (Some(edits), Some(output_frames as u64), Some(timeline))
+    } else {
+        // Without an edit list, preserve the historical tolerant fallback:
+        // some ALAC files contain decoder tail padding beyond their nominal
+        // media duration. Do not promise an exact playable count up front.
+        (None, None, None)
+    };
+    let plan_bytes = edits
+        .as_ref()
+        .map(|planned| {
+            allocation_capacity_bytes::<PlannedEdit>(planned.capacity(), "M4A stream edit plan")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let timeline_bytes = timeline
+        .as_ref()
+        .map(StreamTimelineSpec::capacity_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let decoded_packet_bytes = planar_bytes(
+        alac.channels,
+        alac.maximum_frames,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    let descriptors = stream_channel_descriptor_bytes(alac.channels)?;
+    let mut decoder_additional_bytes = parser_retained_bytes;
+    for bytes in [
+        plan_bytes,
+        timeline_bytes,
+        maximum_packet as u64,
+        decoded_packet_bytes,
+        decoded_packet_bytes,
+        descriptors,
+        SYMPHONIA_M4A_FIXED_BYTES,
+    ] {
+        decoder_additional_bytes =
+            checked_add_stream_bytes(decoder_additional_bytes, bytes, "M4A/ALAC stream decoder")?;
+    }
+    budget.check_peak(0, decoder_additional_bytes, "M4A/ALAC stream decoder")?;
+    let info = AudioStreamInfo {
+        format: AudioFormat::M4a,
+        codec: AudioCodec::Alac,
+        output_spec: float_output_spec(alac.channels, alac.sample_rate)?,
+        channel_mask: alac.channel_mask,
+        total_frames,
+        max_decoder_frames: alac.maximum_frames,
+        decoder_additional_bytes,
+    };
+    Ok(M4aStreamPlan {
+        info,
+        edits,
+        codec: M4aStreamCodecPlan::Alac(AlacStreamPlan {
+            track_id: selected_track_id,
+            maximum_packet_bytes: usize::try_from(maximum_packet)
+                .map_err(|_| "M4A/ALAC packet size does not fit in memory")?,
+            timeline,
+        }),
+    })
+}
+
+fn build_aac_stream_plan<R: Read + Seek>(
+    mp4: &Mp4Reader<R>,
+    track: &Mp4Track,
+    file_size: u64,
+    parser_retained_bytes: u64,
+    budget: DecodeBudget,
+) -> Result<M4aStreamPlan, String> {
+    if !track.trafs.is_empty() {
+        return Err(format!(
+            "fragmented AAC track {} is not supported by bounded streaming",
+            track.track_id()
+        ));
+    }
+    if track
+        .audio_profile()
+        .map_err(|error| format!("AAC profile: {error}"))?
+        != mp4::AudioObjectType::AacLowComplexity
+    {
+        return Err("bounded M4A streaming supports AAC-LC only".into());
+    }
+    let validated = validate_sample_table(track, file_size)
+        .map_err(|error| format!("AAC track {} sample table: {error}", track.track_id()))?;
+    let edit_clone_bytes = edit_context_requested_bytes(track)?;
+    let descriptor_requested_bytes = allocation_bytes::<SampleDescriptor>(
+        usize::try_from(validated.sample_count)
+            .map_err(|_| "M4A/AAC sample count does not fit in memory")?,
+        "M4A/AAC sample descriptors",
+    )?;
+    let requested_metadata = parser_retained_bytes
+        .checked_add(edit_clone_bytes)
+        .and_then(|bytes| bytes.checked_add(descriptor_requested_bytes))
+        .ok_or("M4A/AAC stream metadata byte count overflows")?;
+    budget.check_peak(0, requested_metadata, "M4A/AAC stream metadata")?;
+    let edit = extract_edit_context(mp4, track)?;
+    let (descriptors, maximum_access_unit) =
+        collect_sample_descriptors(track, validated.sample_count)?;
+    let descriptor_bytes = allocation_capacity_bytes::<SampleDescriptor>(
+        descriptors.capacity(),
+        "M4A/AAC sample descriptors",
+    )?;
+    let edit_context_bytes = edit
+        .as_ref()
+        .map(edit_context_capacity_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let freq_index = track
+        .sample_freq_index()
+        .map_err(|error| format!("AAC sample rate: {error}"))?;
+    let channel_config = track
+        .channel_config()
+        .map_err(|error| format!("AAC channels: {error}"))?;
+    let channels = channel_config_to_count(channel_config);
+    let sample_rate = freq_index.freq();
+    validate_stream_geometry(channels, sample_rate, "M4A/AAC stream")?;
+    let retained_for_plan = parser_retained_bytes
+        .checked_add(descriptor_bytes)
+        .and_then(|bytes| bytes.checked_add(edit_context_bytes))
+        .ok_or("M4A/AAC retained metadata byte count overflows")?;
+    let (edits, total_frames, timeline) = if let Some(context) = edit {
+        let raw_frames = nominal_edit_frames(&context, sample_rate)?;
+        let (edits, output_frames) = plan_stream_edits(
+            &context,
+            sample_rate,
+            raw_frames,
+            channels,
+            budget,
+            retained_for_plan,
+        )?;
+        let timeline = StreamTimelineSpec::from_edit_context(context);
+        (Some(edits), Some(output_frames as u64), Some(timeline))
+    } else {
+        (None, None, None)
+    };
+    let plan_bytes = edits
+        .as_ref()
+        .map(|planned| {
+            allocation_capacity_bytes::<PlannedEdit>(planned.capacity(), "M4A stream edit plan")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let timeline_bytes = timeline
+        .as_ref()
+        .map(StreamTimelineSpec::capacity_bytes)
+        .transpose()?
+        .unwrap_or(0);
+    let maximum_frame_bytes = maximum_aac_frame_bytes(channels)?;
+    let decoded_packet_bytes = planar_bytes(
+        channels,
+        M4A_AAC_MAX_DECODED_FRAMES,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    let mut decoder_additional_bytes = parser_retained_bytes;
+    for bytes in [
+        descriptor_bytes,
+        plan_bytes,
+        timeline_bytes,
+        u64::from(maximum_access_unit),
+        maximum_frame_bytes,
+        decoded_packet_bytes,
+        stream_channel_descriptor_bytes(channels)?,
+        aac_decoder_retained_bytes(channels)?,
+        aac_access_unit_decoder_bytes(maximum_access_unit)?,
+    ] {
+        decoder_additional_bytes =
+            checked_add_stream_bytes(decoder_additional_bytes, bytes, "M4A/AAC stream decoder")?;
+    }
+    budget.check_peak(0, decoder_additional_bytes, "M4A/AAC stream decoder")?;
+    let info = AudioStreamInfo {
+        format: AudioFormat::M4a,
+        codec: AudioCodec::Aac,
+        output_spec: float_output_spec(channels, sample_rate)?,
+        channel_mask: crate::channel_layout::ChannelLayout::from_channel_count(channels).mask(),
+        total_frames,
+        max_decoder_frames: M4A_AAC_MAX_DECODED_FRAMES,
+        decoder_additional_bytes,
+    };
+    Ok(M4aStreamPlan {
+        info,
+        edits,
+        codec: M4aStreamCodecPlan::Aac(AacStreamPlan {
+            descriptors,
+            aot: track
+                .audio_profile()
+                .map_err(|error| format!("AAC profile: {error}"))? as u8,
+            fs_index: freq_index as u8,
+            chan_conf: channel_config as u8,
+            timeline,
+        }),
+    })
+}
+
+struct AlacParameters {
+    channels: usize,
+    sample_rate: u32,
+    maximum_frames: usize,
+    channel_mask: Option<crate::ChannelMask>,
+}
+
+fn inspect_alac_parameters(
+    source: File,
+    limits: DecodeLimits,
+    expected_track_id: u32,
+) -> Result<AlacParameters, String> {
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp4");
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            symphonia_metadata_options(limits),
+        )
+        .map_err(|error| format!("probe M4A/ALAC stream: {error}"))?;
+    let track = format
+        .default_track(SymphoniaTrackType::Audio)
+        .ok_or_else(|| "M4A/ALAC stream has no audio track".to_string())?;
+    if track.id != expected_track_id {
+        return Err(format!(
+            "M4A/ALAC stream selected track {}, but MP4 metadata selected {expected_track_id}",
+            track.id
+        ));
+    }
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| "M4A/ALAC stream has no audio codec parameters".to_string())?;
+    if params.codec != CODEC_ID_ALAC {
+        return Err("M4A stream is neither supported AAC-LC nor ALAC".into());
+    }
+    let channels = params
+        .channels
+        .as_ref()
+        .map(|channels| channels.count())
+        .ok_or_else(|| "M4A/ALAC stream has no channel geometry".to_string())?;
+    let sample_rate = params
+        .sample_rate
+        .ok_or_else(|| "M4A/ALAC stream has no sample rate".to_string())?;
+    validate_stream_geometry(channels, sample_rate, "M4A/ALAC stream")?;
+    let cookie = params
+        .extra_data
+        .as_deref()
+        .ok_or_else(|| "M4A/ALAC stream has no magic cookie".to_string())?;
+    if cookie.len() < 24 {
+        return Err("M4A/ALAC magic cookie is truncated".into());
+    }
+    let maximum_frames = usize::try_from(u32::from_be_bytes(
+        cookie[..4]
+            .try_into()
+            .expect("ALAC frame length is four bytes"),
+    ))
+    .map_err(|_| "M4A/ALAC frame length does not fit in memory")?;
+    if maximum_frames == 0 || maximum_frames > ALAC_MAX_FRAME_LENGTH {
+        return Err(format!(
+            "M4A/ALAC frame length must be between 1 and {ALAC_MAX_FRAME_LENGTH}"
+        ));
+    }
+    let channel_mask = params
+        .channels
+        .as_ref()
+        .and_then(|channels| match channels {
+            symphonia::core::audio::Channels::Positioned(position) => {
+                u32::try_from(position.bits())
+                    .ok()
+                    .and_then(crate::ChannelMask::from_bits)
+            }
+            _ => None,
+        })
+        .or_else(|| crate::channel_layout::ChannelLayout::from_channel_count(channels).mask());
+    Ok(AlacParameters {
+        channels,
+        sample_rate,
+        maximum_frames,
+        channel_mask,
+    })
+}
+
+fn empty_stream_packet(
+    channels: usize,
+    frames: usize,
+    context: &str,
+) -> Result<Vec<Vec<f64>>, String> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(channels)
+        .map_err(|error| format!("reserve {context} channel list: {error}"))?;
+    for _ in 0..channels {
+        let mut channel = Vec::new();
+        channel
+            .try_reserve_exact(frames)
+            .map_err(|error| format!("reserve {context} samples: {error}"))?;
+        output.push(channel);
+    }
+    Ok(output)
+}
+
+struct AacRawStream {
+    source: File,
+    descriptors: Vec<SampleDescriptor>,
+    descriptor_index: usize,
+    decoder: StreamDecoder,
+    access_unit: Vec<u8>,
+    aot: u8,
+    fs_index: u8,
+    chan_conf: u8,
+    info: AudioStreamInfo,
+    limits: DecodeLimits,
+    timeline: Option<StreamTimeline>,
+    eof: bool,
+}
+
+impl AacRawStream {
+    fn new(
+        source: File,
+        plan: AacStreamPlan,
+        info: AudioStreamInfo,
+        limits: DecodeLimits,
+    ) -> Result<Self, String> {
+        DecodeBudget::new(limits).check_peak(
+            0,
+            info.decoder_additional_bytes,
+            "M4A/AAC stream decoder",
+        )?;
+        let maximum_access_unit = plan
+            .descriptors
+            .iter()
+            .map(|descriptor| descriptor.size)
+            .max()
+            .unwrap_or(0);
+        let mut access_unit = Vec::new();
+        access_unit
+            .try_reserve_exact(
+                usize::try_from(maximum_access_unit)
+                    .map_err(|_| "M4A/AAC access-unit size does not fit in memory")?,
+            )
+            .map_err(|error| format!("reserve M4A/AAC access-unit buffer: {error}"))?;
+        Ok(Self {
+            source,
+            descriptors: plan.descriptors,
+            descriptor_index: 0,
+            decoder: StreamDecoder::new(),
+            access_unit,
+            aot: plan.aot,
+            fs_index: plan.fs_index,
+            chan_conf: plan.chan_conf,
+            info,
+            limits,
+            timeline: plan.timeline.map(StreamTimeline::new),
+            eof: false,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.descriptor_index = 0;
+        self.decoder = StreamDecoder::new();
+        self.access_unit.clear();
+        if let Some(timeline) = &mut self.timeline {
+            timeline.reset();
+        }
+        self.eof = false;
+    }
+
+    fn next_packet(&mut self) -> Result<Option<Vec<Vec<f64>>>, String> {
+        if self.eof {
+            return Ok(None);
+        }
+        loop {
+            let Some(descriptor) = self.descriptors.get(self.descriptor_index).copied() else {
+                if let Some(timeline) = &self.timeline {
+                    timeline.finish()?;
+                }
+                self.eof = true;
+                return Ok(None);
+            };
+            self.descriptor_index = self
+                .descriptor_index
+                .checked_add(1)
+                .ok_or("M4A/AAC stream sample index overflows")?;
+            if descriptor.size == 0 {
+                if self.timeline.is_some() {
+                    return Err(format!(
+                        "AAC sample {} has zero size while an edit list is active",
+                        descriptor.index
+                    ));
+                }
+                continue;
+            }
+            DecodeBudget::new(self.limits).check_peak(
+                0,
+                self.info.decoder_additional_bytes,
+                "M4A/AAC stream packet",
+            )?;
+            let size = usize::try_from(descriptor.size)
+                .map_err(|_| "M4A/AAC sample size does not fit in memory")?;
+            if self.access_unit.capacity() < size {
+                return Err(format!(
+                    "AAC sample {} grew beyond its inspected access-unit bound",
+                    descriptor.index
+                ));
+            }
+            self.access_unit.clear();
+            self.access_unit.resize(size, 0);
+            self.source
+                .seek(SeekFrom::Start(descriptor.offset))
+                .map_err(|error| format!("seek AAC sample {}: {error}", descriptor.index))?;
+            self.source
+                .read_exact(&mut self.access_unit)
+                .map_err(|error| format!("read AAC sample {}: {error}", descriptor.index))?;
+            let frame = self
+                .decoder
+                .decode_raw_data_block(
+                    self.aot,
+                    self.fs_index,
+                    self.info.sample_rate(),
+                    self.chan_conf,
+                    1,
+                    &self.access_unit,
+                )
+                .map_err(|error| format!("decode AAC sample {}: {error}", descriptor.index))?;
+            if frame.channels == 0 && frame.pcm.is_empty() && self.timeline.is_none() {
+                continue;
+            }
+            if frame.channels != self.info.channels() {
+                return Err(format!(
+                    "AAC sample {} decoded {} channels, expected {}",
+                    descriptor.index,
+                    frame.channels,
+                    self.info.channels()
+                ));
+            }
+            if frame.sample_rate != self.info.sample_rate() {
+                return Err(format!(
+                    "AAC sample {} decoded at {} Hz, expected {} Hz",
+                    descriptor.index,
+                    frame.sample_rate,
+                    self.info.sample_rate()
+                ));
+            }
+            if frame.pcm.len() % self.info.channels() != 0 {
+                return Err(format!(
+                    "AAC sample {} decoded PCM is not divisible by its channel count",
+                    descriptor.index
+                ));
+            }
+            let frames = frame.pcm.len() / self.info.channels();
+            if frames == 0 {
+                if self.timeline.is_some() {
+                    return Err(format!(
+                        "AAC sample {} decoded to zero frames while an edit list is active",
+                        descriptor.index
+                    ));
+                }
+                continue;
+            }
+            if frames > self.info.max_decoder_frames {
+                return Err(format!(
+                    "AAC sample {} decoded {frames} frames, exceeding the {}-frame bounded stream limit",
+                    descriptor.index, self.info.max_decoder_frames
+                ));
+            }
+            if let Some(timeline) = &mut self.timeline {
+                timeline.observe(frames, frame.sample_rate)?;
+            }
+            let mut output =
+                empty_stream_packet(self.info.channels(), frames, "M4A/AAC stream packet")?;
+            for samples in frame.pcm.chunks_exact(self.info.channels()) {
+                for (destination, sample) in output.iter_mut().zip(samples) {
+                    destination.push(crate::audio::sanitize_sample(f64::from(*sample) / 32768.0));
+                }
+            }
+            return Ok(Some(output));
+        }
+    }
+}
+
+struct AlacRuntime {
+    format: Box<dyn FormatReader>,
+    decoder: Box<dyn AudioDecoder>,
+}
+
+fn open_alac_runtime(
+    source: &mut File,
+    info: AudioStreamInfo,
+    limits: DecodeLimits,
+    track_id: u32,
+) -> Result<AlacRuntime, String> {
+    let runtime_source = clone_rewound_stream_file(source, "M4A/ALAC stream decoder")?;
+    let stream = MediaSourceStream::new(Box::new(runtime_source), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp4");
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            symphonia_metadata_options(limits),
+        )
+        .map_err(|error| format!("probe M4A/ALAC stream decoder: {error}"))?;
+    let track = format
+        .default_track(SymphoniaTrackType::Audio)
+        .ok_or_else(|| "M4A/ALAC stream decoder has no audio track".to_string())?;
+    if track.id != track_id {
+        return Err("M4A/ALAC selected track changed after inspection".into());
+    }
+    let params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| "M4A/ALAC stream decoder has no audio parameters".to_string())?;
+    if params.codec != CODEC_ID_ALAC
+        || params.sample_rate != Some(info.sample_rate())
+        || params.channels.as_ref().map(|channels| channels.count()) != Some(info.channels())
+    {
+        return Err("M4A/ALAC codec geometry changed after inspection".into());
+    }
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
+        .map_err(|error| format!("open M4A/ALAC decoder: {error}"))?;
+    Ok(AlacRuntime { format, decoder })
+}
+
+struct AlacRawStream {
+    source: File,
+    runtime: Option<AlacRuntime>,
+    track_id: u32,
+    maximum_packet_bytes: usize,
+    info: AudioStreamInfo,
+    limits: DecodeLimits,
+    timeline: Option<StreamTimeline>,
+    eof: bool,
+}
+
+impl AlacRawStream {
+    fn new(
+        mut source: File,
+        plan: AlacStreamPlan,
+        info: AudioStreamInfo,
+        limits: DecodeLimits,
+    ) -> Result<Self, String> {
+        DecodeBudget::new(limits).check_peak(
+            0,
+            info.decoder_additional_bytes,
+            "M4A/ALAC stream decoder",
+        )?;
+        let runtime = open_alac_runtime(&mut source, info, limits, plan.track_id)?;
+        Ok(Self {
+            source,
+            runtime: Some(runtime),
+            track_id: plan.track_id,
+            maximum_packet_bytes: plan.maximum_packet_bytes,
+            info,
+            limits,
+            timeline: plan.timeline.map(StreamTimeline::new),
+            eof: false,
+        })
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        self.runtime = None;
+        self.runtime = Some(open_alac_runtime(
+            &mut self.source,
+            self.info,
+            self.limits,
+            self.track_id,
+        )?);
+        if let Some(timeline) = &mut self.timeline {
+            timeline.reset();
+        }
+        self.eof = false;
+        Ok(())
+    }
+
+    fn next_packet(&mut self) -> Result<Option<Vec<Vec<f64>>>, String> {
+        if self.eof {
+            return Ok(None);
+        }
+        loop {
+            DecodeBudget::new(self.limits).check_peak(
+                0,
+                self.info.decoder_additional_bytes,
+                "M4A/ALAC stream packet read",
+            )?;
+            let runtime = self
+                .runtime
+                .as_mut()
+                .expect("M4A/ALAC runtime is initialized");
+            let packet = match runtime.format.next_packet() {
+                Ok(Some(packet)) => packet,
+                Ok(None) => {
+                    if let Some(timeline) = &self.timeline {
+                        timeline.finish()?;
+                    }
+                    self.eof = true;
+                    return Ok(None);
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    return Err("M4A/ALAC demuxer requested an unsupported reset".into())
+                }
+                Err(error) => return Err(format!("read M4A/ALAC packet: {error}")),
+            };
+            if packet.data.len() > self.maximum_packet_bytes {
+                return Err(format!(
+                    "M4A/ALAC packet is {} bytes, exceeding its inspected {}-byte bound",
+                    packet.data.len(),
+                    self.maximum_packet_bytes
+                ));
+            }
+            if packet.track_id != self.track_id {
+                continue;
+            }
+            let decoded = match runtime.decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_))
+                    if self.timeline.is_none() =>
+                {
+                    continue;
+                }
+                Err(SymphoniaError::ResetRequired) => {
+                    return Err("M4A/ALAC decoder requested an unsupported reset".into())
+                }
+                Err(error) => return Err(format!("decode M4A/ALAC packet: {error}")),
+            };
+            if decoded.spec().rate() != self.info.sample_rate()
+                || decoded.num_planes() != self.info.channels()
+            {
+                return Err("M4A/ALAC geometry changed while streaming".into());
+            }
+            let frames = decoded.frames();
+            if frames == 0 {
+                if self.timeline.is_some() {
+                    return Err("M4A/ALAC edit-active packet decoded to zero frames".into());
+                }
+                continue;
+            }
+            if frames > self.info.max_decoder_frames
+                || decoded.capacity() > self.info.max_decoder_frames
+            {
+                return Err(format!(
+                    "M4A/ALAC packet exceeds the {}-frame bounded stream limit",
+                    self.info.max_decoder_frames
+                ));
+            }
+            let mut output =
+                empty_stream_packet(self.info.channels(), frames, "M4A/ALAC stream packet")?;
+            for destination in &mut output {
+                destination.resize(frames, 0.0);
+            }
+            let mut destinations = output.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
+            decoded.copy_to_slice_planar::<f64, _>(&mut destinations);
+            drop(destinations);
+            for channel in &mut output {
+                for sample in channel {
+                    *sample = crate::audio::sanitize_sample(*sample);
+                }
+            }
+            if let Some(timeline) = &mut self.timeline {
+                timeline.observe(frames, self.info.sample_rate())?;
+            }
+            return Ok(Some(output));
+        }
+    }
+}
+
+enum M4aRawStream {
+    Aac(AacRawStream),
+    Alac(AlacRawStream),
+}
+
+impl M4aRawStream {
+    fn reset(&mut self) -> Result<(), String> {
+        match self {
+            Self::Aac(reader) => {
+                reader.reset();
+                Ok(())
+            }
+            Self::Alac(reader) => reader.reset(),
+        }
+    }
+
+    fn next_packet(&mut self) -> Result<Option<Vec<Vec<f64>>>, String> {
+        match self {
+            Self::Aac(reader) => reader.next_packet(),
+            Self::Alac(reader) => reader.next_packet(),
+        }
+    }
+}
+
+/// Edit-aware, bounded-memory M4A AAC/ALAC reader.
+pub(super) struct M4aStreamReader {
+    info: AudioStreamInfo,
+    raw: M4aRawStream,
+    edits: Option<Vec<PlannedEdit>>,
+    edit_index: usize,
+    edit_offset: usize,
+    pending: Option<Vec<Vec<f64>>>,
+    pending_offset: usize,
+    raw_next_frame: usize,
+    saw_decoded_frame: bool,
+    source_validated: bool,
+}
+
+impl M4aStreamReader {
+    pub(super) fn new(
+        mut source: File,
+        expected_info: AudioStreamInfo,
+        limits: DecodeLimits,
+    ) -> Result<Self, String> {
+        let plan_source = clone_rewound_stream_file(&mut source, "M4A stream plan")?;
+        let plan = build_m4a_stream_plan(plan_source, limits)?;
+        if plan.info != expected_info {
+            return Err("M4A stream geometry changed between inspection and decode".into());
+        }
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| format!("rewind M4A stream payload: {error}"))?;
+        let raw = match plan.codec {
+            M4aStreamCodecPlan::Aac(aac) => {
+                M4aRawStream::Aac(AacRawStream::new(source, aac, plan.info, limits)?)
+            }
+            M4aStreamCodecPlan::Alac(alac) => {
+                M4aRawStream::Alac(AlacRawStream::new(source, alac, plan.info, limits)?)
+            }
+        };
+        Ok(Self {
+            info: plan.info,
+            raw,
+            edits: plan.edits,
+            edit_index: 0,
+            edit_offset: 0,
+            pending: None,
+            pending_offset: 0,
+            raw_next_frame: 0,
+            saw_decoded_frame: false,
+            source_validated: false,
+        })
+    }
+
+    fn reset_raw(&mut self) -> Result<(), String> {
+        self.raw.reset()?;
+        self.pending = None;
+        self.pending_offset = 0;
+        self.raw_next_frame = 0;
+        Ok(())
+    }
+
+    fn ensure_pending(&mut self) -> Result<bool, String> {
+        if self.pending.is_some() {
+            return Ok(true);
+        }
+        let Some(packet) = self.raw.next_packet()? else {
+            return Ok(false);
+        };
+        if packet.len() != self.info.channels()
+            || packet.first().is_none_or(Vec::is_empty)
+            || packet
+                .iter()
+                .any(|channel| channel.len() != packet[0].len())
+        {
+            return Err("M4A stream decoder returned invalid planar geometry".into());
+        }
+        self.saw_decoded_frame = true;
+        self.pending = Some(packet);
+        self.pending_offset = 0;
+        Ok(true)
+    }
+
+    fn position_raw(&mut self, target: usize) -> Result<(), String> {
+        if target < self.raw_next_frame {
+            self.reset_raw()?;
+        }
+        while self.raw_next_frame < target {
+            if !self.ensure_pending()? {
+                return Err(format!(
+                    "M4A edit source ends at frame {}, before requested frame {target}",
+                    self.raw_next_frame
+                ));
+            }
+            let available =
+                self.pending.as_ref().expect("pending packet")[0].len() - self.pending_offset;
+            let discard = available.min(target - self.raw_next_frame);
+            self.pending_offset += discard;
+            self.raw_next_frame = self
+                .raw_next_frame
+                .checked_add(discard)
+                .ok_or("M4A stream frame position overflows")?;
+            if self.pending_offset == self.pending.as_ref().expect("pending packet")[0].len() {
+                self.pending = None;
+                self.pending_offset = 0;
+            }
+        }
+        Ok(())
+    }
+
+    fn copy_raw_frames(&mut self, output: &mut [Vec<f64>], frames: usize) -> Result<usize, String> {
+        if frames == 0 {
+            return Ok(0);
+        }
+        if !self.ensure_pending()? {
+            return Ok(0);
+        }
+        let pending = self.pending.as_ref().expect("pending packet");
+        let available = pending[0].len() - self.pending_offset;
+        let take = available.min(frames);
+        for (destination, source) in output.iter_mut().zip(pending) {
+            destination.extend_from_slice(
+                &source[self.pending_offset..self.pending_offset.saturating_add(take)],
+            );
+        }
+        self.pending_offset += take;
+        self.raw_next_frame = self
+            .raw_next_frame
+            .checked_add(take)
+            .ok_or("M4A stream frame position overflows")?;
+        if self.pending_offset == pending[0].len() {
+            self.pending = None;
+            self.pending_offset = 0;
+        }
+        Ok(take)
+    }
+
+    fn validate_complete_source(&mut self) -> Result<(), String> {
+        if self.source_validated {
+            return Ok(());
+        }
+        self.reset_raw()?;
+        while self.raw.next_packet()?.is_some() {
+            // The final validation pass deliberately bypasses `ensure_pending`
+            // so it does not retain a packet that will never be presented.
+            // Still record that the source produced audio: a sub-sample final
+            // media edit can round to zero copied frames even though the
+            // underlying track is valid and must be decoded to completion.
+            self.saw_decoded_frame = true;
+        }
+        if !self.saw_decoded_frame {
+            return Err("M4A stream decode produced no samples".into());
+        }
+        self.pending = None;
+        self.pending_offset = 0;
+        self.source_validated = true;
+        Ok(())
+    }
+
+    fn next_unedited_block(&mut self, max_frames: usize) -> Result<Option<Vec<Vec<f64>>>, String> {
+        let mut output =
+            empty_stream_packet(self.info.channels(), max_frames, "M4A stream output block")?;
+        while output[0].len() < max_frames {
+            let remaining = max_frames - output[0].len();
+            let copied = self.copy_raw_frames(&mut output, remaining)?;
+            if copied == 0 {
+                self.source_validated = true;
+                break;
+            }
+        }
+        if output[0].is_empty() {
+            if self.saw_decoded_frame {
+                Ok(None)
+            } else {
+                Err("M4A stream decode produced no samples".into())
+            }
+        } else {
+            Ok(Some(output))
+        }
+    }
+
+    pub(super) fn next_block(
+        &mut self,
+        max_frames: usize,
+    ) -> Result<Option<Vec<Vec<f64>>>, String> {
+        if self.edits.is_none() {
+            return self.next_unedited_block(max_frames);
+        }
+        let mut output = empty_stream_packet(
+            self.info.channels(),
+            max_frames,
+            "edited M4A stream output block",
+        )?;
+        while output[0].len() < max_frames {
+            let Some(edit) = self
+                .edits
+                .as_ref()
+                .and_then(|edits| edits.get(self.edit_index))
+                .copied()
+            else {
+                self.validate_complete_source()?;
+                break;
+            };
+            if self.edit_offset >= edit.frames {
+                self.edit_index += 1;
+                self.edit_offset = 0;
+                continue;
+            }
+            let block_remaining = max_frames - output[0].len();
+            if self.edit_offset < edit.copy_frames {
+                let source_start = edit
+                    .source_start
+                    .expect("non-empty planned edit has a source range");
+                let target = source_start
+                    .checked_add(self.edit_offset)
+                    .ok_or("M4A edit source position overflows")?;
+                self.position_raw(target)?;
+                let remaining_copy = edit.copy_frames - self.edit_offset;
+                let requested = block_remaining.min(remaining_copy);
+                let copied = self.copy_raw_frames(&mut output, requested)?;
+                if copied == 0 {
+                    return Err(format!(
+                        "M4A edit source ends before frame {}",
+                        target.saturating_add(requested)
+                    ));
+                }
+                self.edit_offset += copied;
+            } else {
+                let zeros = block_remaining.min(edit.frames - self.edit_offset);
+                for channel in &mut output {
+                    channel.resize(channel.len() + zeros, 0.0);
+                }
+                self.edit_offset += zeros;
+            }
+        }
+        if output[0].is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(output))
+        }
+    }
+}
+
 /// Decode M4A/MP4-AAC from an already-open input.
 pub(super) fn decode_m4a(
     mut payload_reader: File,
@@ -1827,6 +3039,47 @@ fn select_aac_track<R: Read + Seek>(mp4: &Mp4Reader<R>) -> Result<Option<&Mp4Tra
     }
 
     Ok(None)
+}
+
+fn select_first_audio_track<R: Read + Seek>(
+    mp4: &Mp4Reader<R>,
+) -> Result<Option<&Mp4Track>, String> {
+    if mp4.tracks().len() != mp4.moov.traks.len() {
+        return Err("duplicate MP4 track IDs in moov".into());
+    }
+    for trak in &mp4.moov.traks {
+        let track_id = trak.tkhd.track_id;
+        let track = mp4
+            .tracks()
+            .get(&track_id)
+            .ok_or_else(|| format!("MP4 track {track_id} metadata missing"))?;
+        if track.track_type().ok() == Some(TrackType::Audio) {
+            return Ok(Some(track));
+        }
+    }
+    Ok(None)
+}
+
+fn maximum_mp4_packet_size<R: Read + Seek>(
+    mp4: &Mp4Reader<R>,
+    file_size: u64,
+) -> Result<u32, String> {
+    let mut maximum = 0u32;
+    for track in mp4.tracks().values() {
+        if !track.trafs.is_empty() {
+            return Err(format!(
+                "fragmented MP4 track {} is not supported by bounded streaming",
+                track.track_id()
+            ));
+        }
+        if track.stsz_fields().sample_count == 0 {
+            continue;
+        }
+        let validated = validate_table_with_sample_limit(track, file_size, None, "MP4")
+            .map_err(|error| format!("MP4 track {} sample table: {error}", track.track_id()))?;
+        maximum = maximum.max(maximum_sample_size(track, validated.sample_count)?);
+    }
+    Ok(maximum)
 }
 
 fn fallback_track_edits<R: Read + Seek>(
@@ -2337,6 +3590,12 @@ struct PlannedEdit {
     copy_frames: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditPlanUse {
+    WholeFile,
+    BoundedStream,
+}
+
 #[cfg(test)]
 fn plan_edits(
     context: &EditContext,
@@ -2351,6 +3610,27 @@ fn plan_edits(
         &vec![Vec::new(); channel_count],
         DecodeBudget::new(DecodeLimits::default()),
         0,
+        EditPlanUse::WholeFile,
+    )
+}
+
+fn plan_stream_edits(
+    context: &EditContext,
+    sample_rate: u32,
+    raw_frames: usize,
+    channel_count: usize,
+    budget: DecodeBudget,
+    retained_temporary_bytes: u64,
+) -> Result<(Vec<PlannedEdit>, usize), String> {
+    let empty_channels = vec![Vec::new(); channel_count];
+    plan_edits_with_budget(
+        context,
+        sample_rate,
+        raw_frames,
+        &empty_channels,
+        budget,
+        retained_temporary_bytes,
+        EditPlanUse::BoundedStream,
     )
 }
 
@@ -2361,6 +3641,7 @@ fn plan_edits_with_budget(
     channels: &[Vec<f64>],
     budget: DecodeBudget,
     retained_temporary_bytes: u64,
+    use_case: EditPlanUse,
 ) -> Result<(Vec<PlannedEdit>, usize), String> {
     let channel_count = channels.len();
     validate_raw_edit_list(&context.edit_list)?;
@@ -2395,13 +3676,20 @@ fn plan_edits_with_budget(
     let planning_temporary = retained_temporary_bytes
         .checked_add(plan_bytes)
         .ok_or("M4A edit planning byte count overflows")?;
-    budget.check_planar_frames(
-        channel_count,
-        raw_frames,
-        planning_temporary,
-        "M4A edit plan",
-    )?;
-    budget.check_planar_capacities(channels, planning_temporary, "M4A edit plan")?;
+    match use_case {
+        EditPlanUse::WholeFile => {
+            budget.check_planar_frames(
+                channel_count,
+                raw_frames,
+                planning_temporary,
+                "M4A edit plan",
+            )?;
+            budget.check_planar_capacities(channels, planning_temporary, "M4A edit plan")?;
+        }
+        EditPlanUse::BoundedStream => {
+            budget.check_peak(0, planning_temporary, "M4A stream edit plan")?;
+        }
+    }
     let mut planned = Vec::new();
     planned
         .try_reserve_exact(context.edit_list.entries.len())
@@ -2411,7 +3699,14 @@ fn plan_edits_with_budget(
     let actual_planning_temporary = retained_temporary_bytes
         .checked_add(actual_plan_bytes)
         .ok_or("M4A edit planning byte count overflows")?;
-    budget.check_planar_capacities(channels, actual_planning_temporary, "M4A edit plan")?;
+    match use_case {
+        EditPlanUse::WholeFile => {
+            budget.check_planar_capacities(channels, actual_planning_temporary, "M4A edit plan")?
+        }
+        EditPlanUse::BoundedStream => {
+            budget.check_peak(0, actual_planning_temporary, "M4A stream edit plan")?;
+        }
+    }
     let mut cumulative_duration = 0u128;
     let mut previous_boundary = 0u128;
     let mut output_frames = 0usize;
@@ -2514,7 +3809,7 @@ fn plan_edits_with_budget(
 
     let is_single_in_place =
         planned.len() == 1 && planned[0].source_start.is_some() && output_frames <= raw_frames;
-    if !is_single_in_place {
+    if use_case == EditPlanUse::WholeFile && !is_single_in_place {
         let working_bytes = (raw_frames as u128)
             .checked_add(output_frames as u128)
             .and_then(|frames| frames.checked_mul(channel_count as u128))
@@ -2571,6 +3866,7 @@ fn apply_edit_to_channels_with_budget(
         channels,
         budget,
         retained_temporary_bytes,
+        EditPlanUse::WholeFile,
     )?;
     let plan_bytes = allocation_capacity_bytes::<PlannedEdit>(planned.capacity(), "M4A edit plan")?;
     let source_temporary = retained_temporary_bytes
@@ -2850,14 +4146,24 @@ pub(super) fn apply_fallback_track_edit(
 }
 
 fn validate_sample_table(track: &Mp4Track, file_size: u64) -> Result<ValidatedSampleTable, String> {
-    validate_table(track, file_size)
+    validate_table_with_sample_limit(track, file_size, Some(MAX_AAC_ACCESS_UNIT_SIZE), "AAC")
 }
 
 /// Validate every table relationship and byte range before allocating an AAC
 /// access-unit buffer. The success path of this pass performs no allocation.
+#[cfg(test)]
 fn validate_table<T: SampleTable + ?Sized>(
     table: &T,
     file_size: u64,
+) -> Result<ValidatedSampleTable, String> {
+    validate_table_with_sample_limit(table, file_size, Some(MAX_AAC_ACCESS_UNIT_SIZE), "AAC")
+}
+
+fn validate_table_with_sample_limit<T: SampleTable + ?Sized>(
+    table: &T,
+    file_size: u64,
+    maximum_sample_size: Option<u32>,
+    sample_label: &str,
 ) -> Result<ValidatedSampleTable, String> {
     let stsz = table.stsz_fields();
     if stsz.sample_count == 0 {
@@ -2990,19 +4296,25 @@ fn validate_table<T: SampleTable + ?Sized>(
     }
 
     visit_sample_descriptors(table, stsz.sample_count, |descriptor| {
-        if descriptor.size > MAX_AAC_ACCESS_UNIT_SIZE {
+        if maximum_sample_size.is_some_and(|maximum| descriptor.size > maximum) {
+            let maximum = maximum_sample_size.expect("checked sample-size limit");
             return Err(format!(
-                "AAC sample {} is {} bytes, exceeding the {}-byte safety limit",
-                descriptor.index, descriptor.size, MAX_AAC_ACCESS_UNIT_SIZE
+                "{sample_label} sample {} is {} bytes, exceeding the {}-byte safety limit",
+                descriptor.index, descriptor.size, maximum
             ));
         }
         let end = descriptor
             .offset
             .checked_add(u64::from(descriptor.size))
-            .ok_or_else(|| format!("AAC sample {} byte range overflows", descriptor.index))?;
+            .ok_or_else(|| {
+                format!(
+                    "{sample_label} sample {} byte range overflows",
+                    descriptor.index
+                )
+            })?;
         if descriptor.offset > file_size || end > file_size {
             return Err(format!(
-                "AAC sample {} byte range {}..{} exceeds file size {}",
+                "{sample_label} sample {} byte range {}..{} exceeds file size {}",
                 descriptor.index, descriptor.offset, end, file_size
             ));
         }
@@ -3108,6 +4420,37 @@ where
         ));
     }
     Ok(())
+}
+
+fn maximum_sample_size<T: SampleTable + ?Sized>(
+    table: &T,
+    sample_count: u32,
+) -> Result<u32, String> {
+    let mut maximum = 0u32;
+    visit_sample_descriptors(table, sample_count, |descriptor| {
+        maximum = maximum.max(descriptor.size);
+        Ok(())
+    })?;
+    Ok(maximum)
+}
+
+fn collect_sample_descriptors<T: SampleTable + ?Sized>(
+    table: &T,
+    sample_count: u32,
+) -> Result<(Vec<SampleDescriptor>, u32), String> {
+    let requested =
+        usize::try_from(sample_count).map_err(|_| "M4A/AAC sample count does not fit in memory")?;
+    let mut descriptors = Vec::new();
+    descriptors
+        .try_reserve_exact(requested)
+        .map_err(|error| format!("reserve M4A/AAC sample descriptors: {error}"))?;
+    let mut maximum = 0u32;
+    visit_sample_descriptors(table, sample_count, |descriptor| {
+        maximum = maximum.max(descriptor.size);
+        descriptors.push(descriptor);
+        Ok(())
+    })?;
+    Ok((descriptors, maximum))
 }
 
 fn channel_config_to_count(cfg: ChannelConfig) -> usize {
@@ -3947,6 +5290,7 @@ mod tests {
             &channels,
             DecodeBudget::new(DecodeLimits::default().with_max_working_set_bytes(Some(exact_peak))),
             RETAINED_TEMPORARY_BYTES,
+            EditPlanUse::WholeFile,
         )
         .expect("exact source and requested plan boundary");
         let error = plan_edits_with_budget(
@@ -3958,6 +5302,7 @@ mod tests {
                 DecodeLimits::default().with_max_working_set_bytes(Some(exact_peak - 1)),
             ),
             RETAINED_TEMPORARY_BYTES,
+            EditPlanUse::WholeFile,
         )
         .expect_err("spare source plus requested plan must fail before plan reserve");
         assert!(error.contains("M4A edit plan"), "{error}");

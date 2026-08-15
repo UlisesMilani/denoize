@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,6 +61,23 @@ fn denoize(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("run denoize")
+}
+
+fn denoize_with_stdin(args: &[&str], input: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_denoize"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn denoize with stdin");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input)
+        .expect("write denoize stdin");
+    child.wait_with_output().expect("collect denoize output")
 }
 
 fn denoize_with_timeout(args: &[&str], timeout: Duration) -> Output {
@@ -173,6 +191,255 @@ fn single_plan_receipt_and_offline_verification_match() {
         public.to_str().unwrap(),
         "--output-root",
         root.path.to_str().unwrap(),
+    ]);
+    assert!(!tampered.status.success());
+    assert!(String::from_utf8_lossy(&tampered.stderr).contains("fingerprint mismatch"));
+}
+
+#[test]
+fn bounded_stream_plans_use_v2_for_files_stdin_and_stdout_without_publication() {
+    let root = TestDirectory::create();
+    let input = root.join("input.wav");
+    let file_output = root.join("output.flac");
+    let stdin_output = root.join("stdin-output.wav");
+    write_test_wav(&input);
+
+    let file_plan = denoize(&[
+        "plan",
+        input.to_str().unwrap(),
+        file_output.to_str().unwrap(),
+        "--stream",
+        "--stream-frames",
+        "257",
+        "--no-metadata",
+    ]);
+    assert_success(&file_plan);
+    let file_json: Value = serde_json::from_slice(&file_plan.stdout).expect("stream plan JSON");
+    assert_eq!(file_json["schema"], "denoize-execution-plan-v2");
+    assert_eq!(file_json["schema_version"], 2);
+    assert_eq!(file_json["kind"], "stream");
+    assert_eq!(file_json["items"][0]["input"]["path"], "input.wav");
+    assert_eq!(file_json["items"][0]["output"]["path"], "output.flac");
+    assert_eq!(file_json["items"][0]["output"]["publication"], "no-clobber");
+    assert_eq!(file_json["items"][0]["frames"], 1_600);
+    assert!(!file_output.exists());
+
+    let stdout_plan = denoize(&[
+        "plan",
+        input.to_str().unwrap(),
+        "-",
+        "--stream",
+        "--output-format",
+        "flac",
+        "--no-metadata",
+        "--max-temp-space",
+        "64",
+    ]);
+    assert_success(&stdout_plan);
+    let stdout_json: Value =
+        serde_json::from_slice(&stdout_plan.stdout).expect("stdout stream plan JSON");
+    assert_eq!(stdout_json["kind"], "stream");
+    assert_eq!(stdout_json["items"][0]["output"]["path"], "-");
+    assert_eq!(stdout_json["items"][0]["output"]["format"], "flac");
+    assert_eq!(stdout_json["items"][0]["output"]["publication"], "stdout");
+    assert_eq!(stdout_json["metadata_policy"], "drop");
+
+    let wav = std::fs::read(&input).expect("read stdin fixture");
+    let stdin_plan = denoize_with_stdin(
+        &[
+            "plan",
+            "-",
+            stdin_output.to_str().unwrap(),
+            "--stream",
+            "--no-metadata",
+            "--max-temp-space",
+            "64",
+        ],
+        &wav,
+    );
+    assert_success(&stdin_plan);
+    let stdin_json: Value =
+        serde_json::from_slice(&stdin_plan.stdout).expect("stdin stream plan JSON");
+    assert_eq!(stdin_json["items"][0]["input"]["path"], "-");
+    assert_eq!(stdin_json["items"][0]["output"]["path"], "stdin-output.wav");
+    assert_eq!(stdin_json["items"][0]["frames"], 1_600);
+    assert!(!stdin_output.exists());
+    assert!(std::fs::read_dir(&root.path).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("denoize-stream")));
+}
+
+#[test]
+fn bounded_stream_receipts_cover_files_spooled_stdin_and_captured_stdout() {
+    let root = TestDirectory::create();
+    let input = root.join("input.wav");
+    let file_output = root.join("file-output.flac");
+    let stdin_output = root.join("stdin-output.flac");
+    let secret = root.join("secret.json");
+    let public = root.join("public.json");
+    write_test_wav(&input);
+    let wav = std::fs::read(&input).unwrap();
+    assert_success(&denoize(&[
+        "receipts",
+        "keygen",
+        secret.to_str().unwrap(),
+        public.to_str().unwrap(),
+    ]));
+
+    let file_plan_path = root.join("file-plan.json");
+    let file_receipt = root.join("file-receipt.json");
+    let file_plan = denoize(&[
+        "plan",
+        input.to_str().unwrap(),
+        file_output.to_str().unwrap(),
+        "--stream",
+        "--stream-frames",
+        "257",
+        "--no-metadata",
+    ]);
+    assert_success(&file_plan);
+    std::fs::write(&file_plan_path, &file_plan.stdout).unwrap();
+    assert_success(&denoize(&[
+        input.to_str().unwrap(),
+        file_output.to_str().unwrap(),
+        "--stream",
+        "--stream-frames",
+        "257",
+        "--no-metadata",
+        "--receipt",
+        file_receipt.to_str().unwrap(),
+        "--receipt-key",
+        secret.to_str().unwrap(),
+    ]));
+    let file_receipt_json: Value =
+        serde_json::from_slice(&std::fs::read(&file_receipt).unwrap()).unwrap();
+    assert_eq!(file_receipt_json["schema"], "denoize-execution-receipt-v2");
+    assert_eq!(file_receipt_json["payload"]["kind"], "stream");
+    assert_success(&denoize(&[
+        "receipts",
+        "verify",
+        file_receipt.to_str().unwrap(),
+        "--key",
+        public.to_str().unwrap(),
+        "--plan",
+        file_plan_path.to_str().unwrap(),
+        "--output-root",
+        root.path.to_str().unwrap(),
+    ]));
+
+    let stdin_plan_path = root.join("stdin-plan.json");
+    let stdin_receipt = root.join("stdin-receipt.json");
+    let stdin_plan = denoize_with_stdin(
+        &[
+            "plan",
+            "-",
+            stdin_output.to_str().unwrap(),
+            "--stream",
+            "--stream-frames",
+            "257",
+            "--no-metadata",
+            "--max-temp-space",
+            "64",
+        ],
+        &wav,
+    );
+    assert_success(&stdin_plan);
+    std::fs::write(&stdin_plan_path, &stdin_plan.stdout).unwrap();
+    let stdin_run = denoize_with_stdin(
+        &[
+            "-",
+            stdin_output.to_str().unwrap(),
+            "--stream",
+            "--stream-frames",
+            "257",
+            "--no-metadata",
+            "--max-temp-space",
+            "64",
+            "--receipt",
+            stdin_receipt.to_str().unwrap(),
+            "--receipt-key",
+            secret.to_str().unwrap(),
+        ],
+        &wav,
+    );
+    assert_success(&stdin_run);
+    assert_success(&denoize(&[
+        "receipts",
+        "verify",
+        stdin_receipt.to_str().unwrap(),
+        "--key",
+        public.to_str().unwrap(),
+        "--plan",
+        stdin_plan_path.to_str().unwrap(),
+        "--output-root",
+        root.path.to_str().unwrap(),
+    ]));
+
+    let stdout_plan_path = root.join("stdout-plan.json");
+    let stdout_receipt = root.join("stdout-receipt.json");
+    let captured = root.join("captured.flac");
+    let stdout_plan = denoize(&[
+        "plan",
+        input.to_str().unwrap(),
+        "-",
+        "--stream",
+        "--stream-frames",
+        "257",
+        "--output-format",
+        "flac",
+        "--no-metadata",
+        "--max-temp-space",
+        "64",
+    ]);
+    assert_success(&stdout_plan);
+    std::fs::write(&stdout_plan_path, &stdout_plan.stdout).unwrap();
+    let stdout_run = denoize(&[
+        input.to_str().unwrap(),
+        "-",
+        "--stream",
+        "--stream-frames",
+        "257",
+        "--output-format",
+        "flac",
+        "--no-metadata",
+        "--max-temp-space",
+        "64",
+        "--receipt",
+        stdout_receipt.to_str().unwrap(),
+        "--receipt-key",
+        secret.to_str().unwrap(),
+    ]);
+    assert_success(&stdout_run);
+    assert!(stdout_run.stdout.starts_with(b"fLaC"));
+    std::fs::write(&captured, &stdout_run.stdout).unwrap();
+    let verified = denoize(&[
+        "receipts",
+        "verify",
+        stdout_receipt.to_str().unwrap(),
+        "--key",
+        public.to_str().unwrap(),
+        "--plan",
+        stdout_plan_path.to_str().unwrap(),
+        "--output",
+        captured.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_success(&verified);
+    let report: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(report["schema"], "denoize-receipt-verification-v2");
+    assert_eq!(report["verified_items"][0]["output_path"], "-");
+
+    std::fs::write(&captured, b"tampered").unwrap();
+    let tampered = denoize(&[
+        "receipts",
+        "verify",
+        stdout_receipt.to_str().unwrap(),
+        "--key",
+        public.to_str().unwrap(),
+        "--output",
+        captured.to_str().unwrap(),
     ]);
     assert!(!tampered.status.success());
     assert!(String::from_utf8_lossy(&tampered.stderr).contains("fingerprint mismatch"));

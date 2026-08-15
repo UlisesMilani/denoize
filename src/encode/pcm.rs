@@ -1,7 +1,7 @@
 //! PCM conversion helpers for lossy encoders (MP3 / M4A).
 
 use crate::audio::{sanitize_sample, Audio};
-use crate::channel_layout::{ChannelLayout, ChannelPosition};
+use crate::channel_layout::{ChannelLayout, ChannelMask, ChannelPosition};
 
 use super::DownmixMode;
 
@@ -12,130 +12,233 @@ pub struct EncodeChannels {
     pub is_stereo: bool,
 }
 
+/// Reusable channel conversion plan for block-oriented lossy encoders.
+///
+/// The plan resolves speaker positions once during preflight. Each subsequent
+/// block is validated and converted without retaining audio from earlier
+/// calls, so the encoder's memory use is independent of stream duration.
+#[derive(Clone, Debug)]
+pub(crate) struct StreamPcmLayout {
+    input_channels: usize,
+    output: EncodeChannels,
+    positions: Option<Vec<ChannelPosition>>,
+}
+
+impl StreamPcmLayout {
+    pub(crate) fn new(
+        input_channels: usize,
+        channel_mask: Option<ChannelMask>,
+        downmix: DownmixMode,
+    ) -> Result<Self, String> {
+        let output = match input_channels {
+            0 => return Err("no audio channels".into()),
+            1 => EncodeChannels {
+                count: 1,
+                is_stereo: false,
+            },
+            2 => EncodeChannels {
+                count: 2,
+                is_stereo: true,
+            },
+            channels => {
+                if downmix != DownmixMode::Stereo {
+                    return Err(format!(
+                        "{channels}-channel {} input cannot be written to a stereo-only lossy codec without mixing; use a lossless output or pass --downmix stereo",
+                        ChannelLayout::from_channel_count(channels)
+                    ));
+                }
+                EncodeChannels {
+                    count: 2,
+                    is_stereo: true,
+                }
+            }
+        };
+
+        let positions = if input_channels > 2 {
+            let mask = match channel_mask {
+                Some(mask) if mask.bits() != 0 && mask.channels() != input_channels => {
+                    return Err(format!(
+                        "channel mask describes {} channels, but PCM has {input_channels}",
+                        mask.channels()
+                    ));
+                }
+                Some(mask) if mask.bits() != 0 => Some(mask),
+                _ => ChannelLayout::from_channel_count(input_channels).mask(),
+            }
+            .ok_or_else(|| {
+                format!(
+                    "cannot safely downmix unknown {input_channels}-channel layout; use a lossless output"
+                )
+            })?;
+            let positions = mask.positions();
+            if positions.len() != input_channels {
+                return Err(format!(
+                    "channel mask describes {} channels, but PCM has {input_channels}",
+                    positions.len()
+                ));
+            }
+            for position in &positions {
+                position_downmix_gains(*position).ok_or_else(|| {
+                    format!(
+                        "cannot safely downmix {} channel position",
+                        position.label()
+                    )
+                })?;
+            }
+            Some(positions)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            input_channels,
+            output,
+            positions,
+        })
+    }
+
+    pub(crate) const fn output(&self) -> EncodeChannels {
+        self.output
+    }
+
+    pub(crate) fn validate_block(&self, channels: &[Vec<f64>]) -> Result<usize, String> {
+        if channels.len() != self.input_channels {
+            return Err(format!(
+                "stream encoder expected {} channels, received {}",
+                self.input_channels,
+                channels.len()
+            ));
+        }
+        let frames = channels.first().map_or(0, Vec::len);
+        if channels.iter().any(|channel| channel.len() != frames) {
+            return Err("stream encode blocks must have equal channel lengths".into());
+        }
+        Ok(frames)
+    }
+
+    pub(crate) fn fill_interleaved_i16(
+        &self,
+        channels: &[Vec<f64>],
+        output: &mut Vec<i16>,
+    ) -> Result<usize, String> {
+        let frames = self.validate_block(channels)?;
+        let samples = frames
+            .checked_mul(self.output.count as usize)
+            .ok_or_else(|| "stream encode block sample count overflows".to_string())?;
+        output.clear();
+        output
+            .try_reserve(samples.saturating_sub(output.capacity()))
+            .map_err(|error| format!("reserve stream encoder PCM: {error}"))?;
+        for frame in 0..frames {
+            if self.output.is_stereo {
+                let (left, right) = self.stereo_frame(channels, frame)?;
+                output.push(f64_to_i16(left));
+                output.push(f64_to_i16(right));
+            } else {
+                output.push(f64_to_i16(channels[0][frame]));
+            }
+        }
+        Ok(frames)
+    }
+
+    pub(crate) fn convert_planar_f64(
+        &self,
+        channels: &[Vec<f64>],
+    ) -> Result<Vec<Vec<f64>>, String> {
+        let frames = self.validate_block(channels)?;
+        let output_channels = self.output.count as usize;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_channels)
+            .map_err(|error| format!("reserve stream encoder channels: {error}"))?;
+        for _ in 0..output_channels {
+            let mut channel = Vec::new();
+            channel
+                .try_reserve_exact(frames)
+                .map_err(|error| format!("reserve stream encoder samples: {error}"))?;
+            output.push(channel);
+        }
+        for frame in 0..frames {
+            if self.output.is_stereo {
+                let (left, right) = self.stereo_frame(channels, frame)?;
+                output[0].push(left);
+                output[1].push(right);
+            } else {
+                output[0].push(sanitize_sample(channels[0][frame]));
+            }
+        }
+        Ok(output)
+    }
+
+    fn stereo_frame(&self, channels: &[Vec<f64>], frame: usize) -> Result<(f64, f64), String> {
+        if self.input_channels == 2 {
+            return Ok((
+                sanitize_sample(channels[0][frame]),
+                sanitize_sample(channels[1][frame]),
+            ));
+        }
+        let positions = self
+            .positions
+            .as_ref()
+            .ok_or_else(|| "stream downmix speaker positions are missing".to_string())?;
+        let mut left = 0.0;
+        let mut right = 0.0;
+        for (channel, position) in channels.iter().zip(positions) {
+            let (left_gain, right_gain) = position_downmix_gains(*position).ok_or_else(|| {
+                format!(
+                    "cannot safely downmix {} channel position",
+                    position.label()
+                )
+            })?;
+            let sample = sanitize_sample(channel[frame]);
+            left += sample * left_gain;
+            right += sample * right_gain;
+        }
+        Ok((sanitize_sample(left), sanitize_sample(right)))
+    }
+}
+
 /// Reduce channel count to 1 or 2 for MP3/AAC encoders.
 ///
 /// Surround input is rejected unless the caller explicitly opts into a stereo
 /// downmix.  This keeps a 5.1/7.1 file from losing its center, surround, or LFE
 /// channels as a side effect of choosing a lossy output extension.
 pub fn lossy_channel_layout(audio: &Audio, downmix: DownmixMode) -> Result<EncodeChannels, String> {
-    let n = audio.channels();
-    match n {
-        0 => Err("no audio channels".into()),
-        1 => Ok(EncodeChannels {
-            count: 1,
-            is_stereo: false,
-        }),
-        2 => Ok(EncodeChannels {
-            count: 2,
-            is_stereo: true,
-        }),
-        _ => {
-            if downmix != DownmixMode::Stereo {
-                return Err(format!(
-                    "{}-channel {} input cannot be written to a stereo-only lossy codec without mixing; use a lossless output or pass --downmix stereo",
-                    n,
-                    audio.channel_layout()
-                ));
-            }
-            let has_explicit_positions = audio
-                .channel_mask
-                .is_some_and(|mask| mask.bits() != 0 && mask.channels() == n);
-            if matches!(audio.channel_layout(), ChannelLayout::Unknown(_))
-                && !has_explicit_positions
-            {
-                return Err(format!(
-                    "cannot safely downmix unknown {}-channel layout; use a lossless output",
-                    n
-                ));
-            }
-            Ok(EncodeChannels {
-                count: 2,
-                is_stereo: true,
-            })
-        }
-    }
+    StreamPcmLayout::new(audio.channels(), audio.channel_mask, downmix).map(|plan| plan.output())
 }
 
 /// Planar `f64` [-1, 1] → interleaved `i16` for shine / fdk-aac.
+#[cfg(test)]
 pub fn planar_f64_to_interleaved_i16(
     audio: &Audio,
     layout: EncodeChannels,
 ) -> Result<Vec<i16>, String> {
-    let frames = audio.frames();
-    let n_in = audio.channels();
-    let out_ch = layout.count as usize;
-    let mut out = Vec::with_capacity(frames * out_ch);
-
-    for f in 0..frames {
-        if layout.is_stereo {
-            let (l, r) = if n_in > 2 {
-                downmix_frame(audio, f)?
-            } else {
-                (sample_at(audio, f, 0, n_in), sample_at(audio, f, 1, n_in))
-            };
-            out.push(f64_to_i16(l));
-            out.push(f64_to_i16(r));
+    let plan = StreamPcmLayout::new(
+        audio.channels(),
+        audio.channel_mask,
+        if audio.channels() > 2 {
+            DownmixMode::Stereo
         } else {
-            let m = sample_at(audio, f, 0, n_in);
-            out.push(f64_to_i16(m));
-        }
+            DownmixMode::Preserve
+        },
+    )?;
+    if plan.output() != layout {
+        return Err("lossy channel layout changed before PCM conversion".into());
     }
+    let mut out = Vec::new();
+    plan.fill_interleaved_i16(&audio.channels, &mut out)?;
     Ok(out)
 }
 
 /// Render a standard multichannel layout to planar stereo without quantizing
 /// through the integer encoder representation.
+#[cfg(test)]
 pub(crate) fn downmix_to_stereo(audio: &Audio) -> Result<Vec<Vec<f64>>, String> {
     if audio.channels() < 3 {
         return Ok(audio.channels.clone());
     }
-    let frames = audio.frames();
-    let mut left = Vec::with_capacity(frames);
-    let mut right = Vec::with_capacity(frames);
-    for frame in 0..frames {
-        let (l, r) = downmix_frame(audio, frame)?;
-        left.push(l);
-        right.push(r);
-    }
-    Ok(vec![left, right])
-}
-
-/// Render one standard surround frame to stereo using conservative ITU-style
-/// centre/surround coefficients.  LFE is intentionally omitted: duplicating a
-/// low-frequency effects channel into full-range stereo is a common source of
-/// clipping and an unintended tonal change.
-fn downmix_frame(audio: &Audio, frame: usize) -> Result<(f64, f64), String> {
-    let mask = audio.effective_channel_mask().ok_or_else(|| {
-        format!(
-            "cannot safely downmix unknown {}-channel layout; use a lossless output",
-            audio.channels()
-        )
-    })?;
-    let positions = mask.positions();
-    if positions.len() != audio.channels() {
-        return Err(format!(
-            "channel mask describes {} channels, but PCM has {}",
-            positions.len(),
-            audio.channels()
-        ));
-    }
-    let mut left = 0.0;
-    let mut right = 0.0;
-    let mut add = |index: usize, left_gain: f64, right_gain: f64| {
-        let sample = sanitize_sample(audio.channels[index].get(frame).copied().unwrap_or(0.0));
-        left += sample * left_gain;
-        right += sample * right_gain;
-    };
-    for (index, position) in positions.into_iter().enumerate() {
-        let (left_gain, right_gain) = position_downmix_gains(position).ok_or_else(|| {
-            format!(
-                "cannot safely downmix {} channel position",
-                position.label()
-            )
-        })?;
-        add(index, left_gain, right_gain);
-    }
-    Ok((sanitize_sample(left), sanitize_sample(right)))
+    StreamPcmLayout::new(audio.channels(), audio.channel_mask, DownmixMode::Stereo)?
+        .convert_planar_f64(&audio.channels)
 }
 
 /// Conservative ITU-style gains for a WAVE speaker position. LFE is omitted
@@ -158,19 +261,6 @@ fn position_downmix_gains(position: ChannelPosition) -> Option<(f64, f64)> {
         ChannelPosition::TopFrontRight | ChannelPosition::TopRearRight => (0.0, SURROUND_GAIN),
         ChannelPosition::TopFrontCenter => (SURROUND_GAIN, SURROUND_GAIN),
     })
-}
-
-#[inline]
-fn sample_at(audio: &Audio, frame: usize, ch: usize, n_in: usize) -> f64 {
-    if n_in == 1 {
-        return audio.channels[0].get(frame).copied().unwrap_or(0.0);
-    }
-    if n_in == 2 {
-        return audio.channels[ch].get(frame).copied().unwrap_or(0.0);
-    }
-    // Surround input is validated by `lossy_channel_layout` and converted by
-    // `downmix_frame` before this helper is called.
-    0.0
 }
 
 #[inline]

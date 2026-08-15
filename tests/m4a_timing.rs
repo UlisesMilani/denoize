@@ -1,6 +1,9 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use denoize::{decode_file, probe_file, AudioCodec, AudioFormat, ChannelLayout, DecodedPcm};
+use denoize::{
+    decode_file, inspect_audio_stream_session, probe_file, AudioCodec, AudioFormat,
+    AudioInputSession, AudioStreamReader, ChannelLayout, DecodeLimits, DecodedPcm,
+};
 use sha2::{Digest, Sha256};
 
 // These synthetic fixtures were generated twice and compared byte-for-byte with
@@ -399,6 +402,29 @@ fn assert_head_and_tail_energy(decoded: &DecodedPcm) {
     }
 }
 
+fn collect_bounded_stream(path: &std::path::Path, block_frames: usize) -> Vec<Vec<f64>> {
+    let session = AudioInputSession::open(path).expect("open M4A stream session");
+    let reader = AudioStreamReader::from_session(session, DecodeLimits::default())
+        .expect("open bounded M4A reader");
+    collect_bounded_reader(reader, block_frames)
+}
+
+fn collect_bounded_reader(mut reader: AudioStreamReader, block_frames: usize) -> Vec<Vec<f64>> {
+    assert_eq!(reader.info().format, AudioFormat::M4a);
+    assert_eq!(reader.info().codec, AudioCodec::Aac);
+    let mut output = vec![Vec::new(); reader.info().channels()];
+    while let Some(block) = reader
+        .next_block(block_frames)
+        .expect("decode bounded M4A block")
+    {
+        assert!(block[0].len() <= block_frames);
+        for (destination, source) in output.iter_mut().zip(block) {
+            destination.extend(source);
+        }
+    }
+    output
+}
+
 #[test]
 fn mono_edit_list_selects_the_exact_aac_presentation_span() {
     let directory = tempfile::tempdir().expect("create mono M4A fixture directory");
@@ -442,6 +468,67 @@ fn stereo_edit_list_scales_movie_time_and_selects_the_exact_pcm_span() {
         assert_eq!(timed_channel.as_slice(), &control_channel[1_024..2_031]);
     }
     assert_head_and_tail_energy(&timed);
+}
+
+#[test]
+fn bounded_aac_stream_matches_whole_decode_for_edit_and_no_edit_timelines() {
+    let directory = tempfile::tempdir().expect("create bounded M4A fixture directory");
+    for (timed, control, block_frames) in [
+        (&MONO_TIMED_FIXTURE, &MONO_CONTROL_FIXTURE, 257),
+        (&STEREO_TIMED_FIXTURE, &STEREO_CONTROL_FIXTURE, 113),
+        (&LEADING_EMPTY_FIXTURE, &LEADING_EMPTY_CONTROL_FIXTURE, 509),
+    ] {
+        for fixture in [timed, control] {
+            let path = write_fixture(&directory, fixture);
+            let whole = decode_file(&path).expect("decode whole M4A fixture");
+            let streamed = collect_bounded_stream(&path, block_frames);
+            assert_eq!(streamed, whole.channels, "{}", fixture.name);
+        }
+    }
+}
+
+#[test]
+fn bounded_aac_stream_decoder_allowance_has_an_exact_limit_boundary() {
+    let directory = tempfile::tempdir().expect("create M4A budget fixture directory");
+    let path = write_fixture(&directory, &STEREO_TIMED_FIXTURE);
+    let mut session = AudioInputSession::open(&path).expect("open M4A budget session");
+    let info = inspect_audio_stream_session(&mut session, DecodeLimits::default())
+        .expect("inspect uncapped M4A stream");
+    let exact =
+        DecodeLimits::default().with_max_working_set_bytes(Some(info.decoder_additional_bytes));
+    let mut exact_session = AudioInputSession::open(&path).expect("open exact M4A budget session");
+    inspect_audio_stream_session(&mut exact_session, exact)
+        .expect("accept exact M4A decoder allowance");
+
+    let mut short_session = AudioInputSession::open(&path).expect("open short M4A budget session");
+    let error = inspect_audio_stream_session(
+        &mut short_session,
+        DecodeLimits::default().with_max_working_set_bytes(Some(
+            info.decoder_additional_bytes
+                .checked_sub(1)
+                .expect("M4A allowance is nonzero"),
+        )),
+    )
+    .expect_err("reject one byte below the M4A decoder allowance");
+    assert!(error.contains("M4A/AAC stream decoder"), "{error}");
+    assert!(error.contains("working-set limit"), "{error}");
+}
+
+#[test]
+fn bounded_aac_stream_keeps_using_the_opened_inode_after_path_replacement() {
+    let directory = tempfile::tempdir().expect("create M4A inode fixture directory");
+    let path = write_fixture(&directory, &MONO_TIMED_FIXTURE);
+    let moved = directory.path().join("opened-original.m4a");
+    let session = AudioInputSession::open(&path).expect("open original M4A session");
+    std::fs::rename(&path, &moved).expect("move opened M4A pathname");
+    std::fs::write(&path, fixture_bytes(&STEREO_CONTROL_FIXTURE))
+        .expect("write replacement M4A pathname");
+
+    let reader = AudioStreamReader::from_session(session, DecodeLimits::default())
+        .expect("open held M4A inode as a bounded stream");
+    let streamed = collect_bounded_reader(reader, 211);
+    let original = decode_file(&moved).expect("decode moved original M4A");
+    assert_eq!(streamed, original.channels);
 }
 
 #[test]

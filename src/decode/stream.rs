@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use claxon::{Block, FlacReader, FlacReaderOptions};
 use hound::{SampleFormat, WavSpec};
-use symphonia::core::codecs::audio::well_known::CODEC_ID_VORBIS;
-use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_MP3, CODEC_ID_VORBIS};
+use symphonia::core::codecs::audio::{AudioCodecId, AudioDecoder, AudioDecoderOptions};
+use symphonia::core::common::Limit;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
@@ -21,6 +22,9 @@ use crate::{AudioInputSession, ChannelMask, WavStreamReader};
 const F64_BYTES: u64 = std::mem::size_of::<f64>() as u64;
 const I32_BYTES: u64 = std::mem::size_of::<i32>() as u64;
 const FLAC_ABSOLUTE_MAX_BLOCK_FRAMES: usize = u16::MAX as usize;
+const MP3_MAX_DECODED_FRAMES: usize = 1_152;
+const MP3_MAX_PACKET_BYTES: usize = 2 * 1_024;
+const SYMPHONIA_STREAM_FIXED_BYTES: u64 = 128 * 1_024;
 
 /// Geometry and conservative decoder accounting for a bounded input stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,9 +61,10 @@ impl AudioStreamInfo {
 
 /// Inspect one already-open regular input without decoding its audio frames.
 ///
-/// WAV, native FLAC, and Ogg Vorbis are accepted. Metadata structures are
-/// validated with the supplied finite limits before a compressed parser is
-/// constructed.
+/// WAV, native FLAC, Ogg Vorbis, granule-aware Ogg Opus, gapless MP3,
+/// frame-aware ADTS AAC, and edit-aware M4A AAC/ALAC are accepted. Metadata
+/// structures are validated with the supplied finite limits before a
+/// compressed parser is constructed.
 pub fn inspect_audio_stream_session(
     session: &mut AudioInputSession,
     limits: DecodeLimits,
@@ -85,13 +90,146 @@ pub fn inspect_audio_stream_session(
         }
         AudioFormat::Flac => inspect_flac(source, limits),
         AudioFormat::OggVorbis => inspect_ogg_vorbis(source, limits),
+        AudioFormat::OggOpus => super::opus::inspect_ogg_opus_stream(source, limits),
+        AudioFormat::Mp3 => inspect_mp3(&path, source, limits),
+        AudioFormat::AacAdts => super::aac::inspect_adts_stream(source, limits),
+        AudioFormat::M4a => super::m4a::inspect_m4a_stream(source, limits),
         other => Err(format!(
-            "--stream does not support {other:?} input yet; use WAV, FLAC, or Ogg Vorbis"
+            "--stream does not support {other:?} input yet; use WAV, FLAC, Ogg Vorbis, Ogg Opus, MP3, ADTS AAC, or M4A AAC/ALAC"
         )),
     }
 }
 
-fn validate_stream_geometry(
+pub(super) fn symphonia_metadata_options(limits: DecodeLimits) -> MetadataOptions {
+    MetadataOptions::default()
+        .limit_tag_bytes(Limit::Maximum(limits.metadata.max_total_bytes))
+        .limit_visual_bytes(Limit::Maximum(limits.metadata.max_item_bytes))
+}
+
+fn inspect_mp3(
+    path: &Path,
+    mut source: File,
+    limits: DecodeLimits,
+) -> Result<AudioStreamInfo, String> {
+    let primary = source
+        .try_clone()
+        .map_err(|error| format!("clone MP3 stream {}: {error}", path.display()))?;
+    match inspect_mp3_symphonia(path, primary, limits) {
+        Ok(info) => Ok(info),
+        Err(primary_error) => {
+            source.seek(SeekFrom::Start(0)).map_err(|error| {
+                format!("rewind MP3 fallback stream {}: {error}", path.display())
+            })?;
+            super::mp3::inspect_raw_mp3_stream(source, limits).map_err(|fallback_error| {
+                format!("probe MP3 stream: {primary_error}; bounded raw fallback: {fallback_error}")
+            })
+        }
+    }
+}
+
+fn inspect_mp3_symphonia(
+    path: &Path,
+    mut source: File,
+    limits: DecodeLimits,
+) -> Result<AudioStreamInfo, String> {
+    let file_len = source
+        .metadata()
+        .map_err(|error| format!("inspect MP3 stream {}: {error}", path.display()))?
+        .len();
+    let mut header = [0_u8; super::ID3V2_HEADER_BYTES];
+    let header_len = source
+        .read(&mut header)
+        .map_err(|error| format!("read MP3 stream header {}: {error}", path.display()))?;
+    let id3_bytes = super::id3v2_payload_offset(&header[..header_len], file_len)?.unwrap_or(0);
+    let id3_payload_bytes = id3_bytes.saturating_sub(super::ID3V2_HEADER_BYTES as u64);
+    if id3_payload_bytes > limits.metadata.max_total_bytes as u64 {
+        return Err(format!(
+            "MP3 ID3v2 tag requires {id3_payload_bytes} bytes, exceeding its {}-byte metadata limit",
+            limits.metadata.max_total_bytes
+        ));
+    }
+    // ID3 text may expand while it is converted to UTF-8 and represented by
+    // Symphonia. Keep the parser-owned representation bounded relative to the
+    // structurally declared tag rather than the complete input length.
+    let id3_retained_bytes = id3_bytes
+        .checked_mul(4)
+        .ok_or_else(|| "MP3 ID3v2 retained byte count overflows".to_string())?;
+
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("rewind MP3 stream {}: {error}", path.display()))?;
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let format = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            stream,
+            FormatOptions::default(),
+            symphonia_metadata_options(limits),
+        )
+        .map_err(|error| format!("probe MP3 stream: {error}"))?;
+    let track = format
+        .default_track(TrackType::Audio)
+        .ok_or_else(|| "MP3 stream has no audio track".to_string())?;
+    let codec_params = track
+        .codec_params
+        .as_ref()
+        .and_then(|params| params.audio())
+        .ok_or_else(|| "MP3 stream has no audio codec parameters".to_string())?;
+    if codec_params.codec != CODEC_ID_MP3 {
+        return Err("MP3 stream probe selected a non-MP3 codec".into());
+    }
+    let channels = codec_params
+        .channels
+        .as_ref()
+        .map(|channels| channels.count())
+        .ok_or_else(|| "MP3 stream has no channel geometry".to_string())?;
+    let sample_rate = codec_params
+        .sample_rate
+        .ok_or_else(|| "MP3 stream has no sample rate".to_string())?;
+    validate_stream_geometry(channels, sample_rate, "MP3 stream")?;
+    let declared_frames = codec_params
+        .max_frames_per_packet
+        .unwrap_or(MP3_MAX_DECODED_FRAMES as u64);
+    if declared_frames == 0 || declared_frames > MP3_MAX_DECODED_FRAMES as u64 {
+        return Err(format!(
+            "MP3 stream declares an unsupported {declared_frames}-frame packet"
+        ));
+    }
+    let decoded = planar_bytes(channels, MP3_MAX_DECODED_FRAMES, F64_BYTES)?;
+    let decoder_additional_bytes = decoded
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(MP3_MAX_PACKET_BYTES as u64))
+        .and_then(|bytes| bytes.checked_add(SYMPHONIA_STREAM_FIXED_BYTES))
+        .and_then(|bytes| bytes.checked_add(id3_retained_bytes))
+        .and_then(|bytes| bytes.checked_add(channel_descriptor_bytes(channels).ok()?))
+        .ok_or_else(|| "MP3 stream decoder byte count overflows".to_string())?;
+    DecodeBudget::new(limits).check_peak(0, decoder_additional_bytes, "MP3 stream decoder")?;
+    let channel_mask = codec_params
+        .channels
+        .as_ref()
+        .and_then(|channels| match channels {
+            symphonia::core::audio::Channels::Positioned(position) => {
+                u32::try_from(position.bits())
+                    .ok()
+                    .and_then(ChannelMask::from_bits)
+            }
+            _ => None,
+        })
+        .or_else(|| crate::channel_layout::ChannelLayout::from_channel_count(channels).mask());
+    Ok(AudioStreamInfo {
+        format: AudioFormat::Mp3,
+        codec: AudioCodec::Mp3,
+        output_spec: float_output_spec(channels, sample_rate)?,
+        channel_mask,
+        total_frames: track.num_frames,
+        max_decoder_frames: MP3_MAX_DECODED_FRAMES,
+        decoder_additional_bytes,
+    })
+}
+
+pub(super) fn validate_stream_geometry(
     channels: usize,
     sample_rate: u32,
     context: &str,
@@ -109,7 +247,11 @@ fn validate_stream_geometry(
     Ok(())
 }
 
-fn planar_bytes(channels: usize, frames: usize, bytes_per_sample: u64) -> Result<u64, String> {
+pub(super) fn planar_bytes(
+    channels: usize,
+    frames: usize,
+    bytes_per_sample: u64,
+) -> Result<u64, String> {
     u64::try_from(channels)
         .ok()
         .and_then(|channels| channels.checked_mul(u64::try_from(frames).ok()?))
@@ -117,14 +259,14 @@ fn planar_bytes(channels: usize, frames: usize, bytes_per_sample: u64) -> Result
         .ok_or_else(|| "stream decoder byte count overflows".to_string())
 }
 
-fn channel_descriptor_bytes(channels: usize) -> Result<u64, String> {
+pub(super) fn channel_descriptor_bytes(channels: usize) -> Result<u64, String> {
     u64::try_from(channels)
         .ok()
         .and_then(|channels| channels.checked_mul(std::mem::size_of::<Vec<f64>>() as u64))
         .ok_or_else(|| "stream decoder channel descriptor count overflows".to_string())
 }
 
-fn float_output_spec(channels: usize, sample_rate: u32) -> Result<WavSpec, String> {
+pub(super) fn float_output_spec(channels: usize, sample_rate: u32) -> Result<WavSpec, String> {
     validate_stream_geometry(channels, sample_rate, "stream input")?;
     Ok(WavSpec {
         channels: u16::try_from(channels)
@@ -255,7 +397,8 @@ fn inspect_ogg_vorbis(mut source: File, limits: DecodeLimits) -> Result<AudioStr
     })
 }
 
-/// A block-oriented decoder for WAV, FLAC, and Ogg Vorbis regular files.
+/// A block-oriented decoder for WAV, FLAC, Ogg Vorbis, Ogg Opus, MP3, ADTS
+/// AAC, and M4A AAC/ALAC regular files.
 pub struct AudioStreamReader {
     path: PathBuf,
     identity: File,
@@ -266,10 +409,37 @@ pub struct AudioStreamReader {
 enum StreamReader {
     Wav(WavStreamReader<BufReader<File>>),
     Flac(FlacStreamReader),
-    Vorbis(VorbisStreamReader),
+    Opus(super::opus::OpusStreamReader),
+    Adts(super::aac::AdtsStreamReader),
+    M4a(super::m4a::M4aStreamReader),
+    Mp3Fallback(super::mp3::RawMp3StreamReader),
+    Symphonia(SymphoniaStreamReader),
 }
 
 impl AudioStreamReader {
+    /// Spool and open one non-seekable source with finite default limits.
+    ///
+    /// Encoded bytes are copied to an anonymous regular file before container
+    /// inspection. This keeps memory independent of input duration while
+    /// giving seek-based codecs one authoritative object.
+    pub fn from_reader<R: Read>(reader: R) -> Result<Self, String> {
+        Self::from_reader_with_limits(
+            reader,
+            DecodeLimits::default(),
+            crate::StreamSpoolLimits::default(),
+        )
+    }
+
+    /// Spool and open one non-seekable source with caller-selected limits.
+    pub fn from_reader_with_limits<R: Read>(
+        reader: R,
+        decode_limits: DecodeLimits,
+        spool_limits: crate::StreamSpoolLimits,
+    ) -> Result<Self, String> {
+        let session = AudioInputSession::from_reader_with_limits(reader, spool_limits)?;
+        Self::from_session(session, decode_limits)
+    }
+
     /// Open and consume a validated regular-file session.
     pub fn from_session(
         mut session: AudioInputSession,
@@ -284,8 +454,44 @@ impl AudioStreamReader {
         let inner = match info.format {
             AudioFormat::Wav => StreamReader::Wav(WavStreamReader::from_file(source)?),
             AudioFormat::Flac => StreamReader::Flac(FlacStreamReader::new(source, info, limits)?),
-            AudioFormat::OggVorbis => {
-                StreamReader::Vorbis(VorbisStreamReader::new(&path, source, info, limits)?)
+            AudioFormat::OggOpus => {
+                StreamReader::Opus(super::opus::OpusStreamReader::new(source, info, limits)?)
+            }
+            AudioFormat::AacAdts => {
+                StreamReader::Adts(super::aac::AdtsStreamReader::new(source, info, limits)?)
+            }
+            AudioFormat::M4a => {
+                StreamReader::M4a(super::m4a::M4aStreamReader::new(source, info, limits)?)
+            }
+            AudioFormat::OggVorbis => StreamReader::Symphonia(SymphoniaStreamReader::new(
+                &path,
+                source,
+                info,
+                limits,
+                CODEC_ID_VORBIS,
+                "Ogg Vorbis",
+            )?),
+            AudioFormat::Mp3 => {
+                let mut fallback = source
+                    .try_clone()
+                    .map_err(|error| format!("clone MP3 fallback stream: {error}"))?;
+                match SymphoniaStreamReader::new(&path, source, info, limits, CODEC_ID_MP3, "MP3") {
+                    Ok(reader) => StreamReader::Symphonia(reader),
+                    Err(primary_error) => {
+                        fallback
+                            .seek(SeekFrom::Start(0))
+                            .map_err(|error| format!("rewind MP3 fallback stream: {error}"))?;
+                        StreamReader::Mp3Fallback(
+                            super::mp3::RawMp3StreamReader::new(fallback, info, limits).map_err(
+                                |fallback_error| {
+                                    format!(
+                                        "open MP3 stream: {primary_error}; bounded raw fallback: {fallback_error}"
+                                    )
+                                },
+                            )?,
+                        )
+                    }
+                }
             }
             _ => unreachable!("stream inspection rejected unsupported input"),
         };
@@ -312,7 +518,11 @@ impl AudioStreamReader {
         match &mut self.inner {
             StreamReader::Wav(reader) => reader.next_block(max_frames),
             StreamReader::Flac(reader) => reader.next_block(max_frames),
-            StreamReader::Vorbis(reader) => reader.next_block(max_frames),
+            StreamReader::Opus(reader) => reader.next_block(max_frames),
+            StreamReader::Adts(reader) => reader.next_block(max_frames),
+            StreamReader::M4a(reader) => reader.next_block(max_frames),
+            StreamReader::Mp3Fallback(reader) => reader.next_block(max_frames),
+            StreamReader::Symphonia(reader) => reader.next_block(max_frames),
         }
     }
 
@@ -473,7 +683,7 @@ impl FlacStreamReader {
     }
 }
 
-struct VorbisStreamReader {
+struct SymphoniaStreamReader {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
@@ -481,7 +691,9 @@ struct VorbisStreamReader {
     limits: DecodeLimits,
     pending: Vec<Vec<f64>>,
     pending_offset: usize,
+    decoder_temporary_bytes: u64,
     eof: bool,
+    context: &'static str,
 }
 
 #[cfg(test)]
@@ -489,6 +701,10 @@ mod tests {
     use super::*;
     use crate::{decode_file, Audio, EncodeOptions};
     use base64::Engine as _;
+
+    const SILENT_STEREO_ADTS: [u8; 13] = [
+        0xff, 0xf1, 0x50, 0x80, 0x01, 0xbf, 0xfc, 0x21, 0x00, 0x00, 0x00, 0x00, 0x1c,
+    ];
 
     fn fixture(frames: usize) -> Audio {
         let left = (0..frames)
@@ -597,15 +813,58 @@ mod tests {
     }
 
     #[test]
+    fn adts_aac_stream_matches_whole_file_decode_across_frame_boundaries() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("input.aac");
+        let encoded = SILENT_STEREO_ADTS.repeat(3);
+        std::fs::write(&path, encoded).expect("write ADTS AAC fixture");
+
+        let session = AudioInputSession::open(&path).expect("open ADTS AAC session");
+        let reader = AudioStreamReader::from_session(session, DecodeLimits::default())
+            .expect("open ADTS AAC stream");
+        assert_eq!(reader.info().format, AudioFormat::AacAdts);
+        assert_eq!(reader.info().codec, AudioCodec::Aac);
+        assert_eq!(reader.info().sample_rate(), 44_100);
+        assert_eq!(reader.info().channels(), 2);
+        assert_eq!(reader.info().total_frames, None);
+        let streamed = collect(reader, 173);
+        let whole = decode_file(&path).expect("decode whole ADTS AAC fixture");
+        assert_eq!(streamed, whole.channels);
+        assert_eq!(streamed[0].len(), 3 * 1_024);
+    }
+
+    #[test]
+    fn adts_aac_stream_decoder_allowance_has_an_exact_boundary() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("input.aac");
+        std::fs::write(&path, SILENT_STEREO_ADTS).expect("write ADTS AAC fixture");
+        let mut session = AudioInputSession::open(&path).expect("open ADTS AAC session");
+        let info = inspect_audio_stream_session(&mut session, DecodeLimits::default())
+            .expect("inspect ADTS AAC stream");
+        let exact =
+            DecodeLimits::default().with_max_working_set_bytes(Some(info.decoder_additional_bytes));
+        inspect_audio_stream_session(&mut session, exact)
+            .expect("accept exact ADTS AAC decoder allowance");
+        let error = inspect_audio_stream_session(
+            &mut session,
+            DecodeLimits::default()
+                .with_max_working_set_bytes(Some(info.decoder_additional_bytes - 1)),
+        )
+        .expect_err("reject one byte below ADTS AAC decoder allowance");
+        assert!(error.contains("ADTS AAC stream decoder"), "{error}");
+    }
+
+    #[test]
     fn unsupported_compressed_stream_is_rejected_during_inspection() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("input.opus");
-        crate::encode::write_audio(&path, &fixture(960), EncodeOptions::default())
-            .expect("encode Ogg Opus fixture");
-        let mut session = AudioInputSession::open(&path).expect("open Ogg Opus session");
+        let path = directory.path().join("input.aiff");
+        std::fs::write(&path, b"FORM\0\0\0\x04AIFF").expect("write AIFF signature");
+        let mut session = AudioInputSession::open(&path).expect("open AIFF session");
         let error = inspect_audio_stream_session(&mut session, DecodeLimits::default())
-            .expect_err("Ogg Opus stream must remain unsupported until granule semantics land");
-        assert!(error.contains("use WAV, FLAC, or Ogg Vorbis"));
+            .expect_err("AIFF stream must remain unsupported until its bounded reader lands");
+        assert!(
+            error.contains("use WAV, FLAC, Ogg Vorbis, Ogg Opus, MP3, ADTS AAC, or M4A AAC/ALAC")
+        );
     }
 
     #[cfg(unix)]
@@ -628,19 +887,51 @@ mod tests {
         assert_eq!(streamed[0].len(), original.frames());
         assert_eq!(streamed[1].len(), original.frames());
     }
+
+    #[test]
+    fn public_reader_streams_from_a_bounded_read_source() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("input.flac");
+        let input = fixture(4_321);
+        crate::encode::write_audio(&path, &input, EncodeOptions::default())
+            .expect("encode FLAC fixture");
+        let bytes = std::fs::read(&path).expect("read FLAC fixture");
+
+        let reader = AudioStreamReader::from_reader_with_limits(
+            std::io::Cursor::new(bytes.clone()),
+            DecodeLimits::default(),
+            crate::StreamSpoolLimits::new(bytes.len() as u64),
+        )
+        .expect("open bounded Read stream");
+        let streamed = collect(reader, 113);
+        assert_eq!(streamed[0].len(), input.frames());
+        assert_eq!(streamed[1].len(), input.frames());
+
+        let error = match AudioStreamReader::from_reader_with_limits(
+            std::io::Cursor::new(bytes.clone()),
+            DecodeLimits::default(),
+            crate::StreamSpoolLimits::new(bytes.len() as u64 - 1),
+        ) {
+            Ok(_) => panic!("one byte below the encoded stream must fail before parsing"),
+            Err(error) => error,
+        };
+        assert!(error.contains("spool limit"), "{error}");
+    }
 }
 
-impl VorbisStreamReader {
+impl SymphoniaStreamReader {
     fn new(
         path: &Path,
         source: File,
         info: AudioStreamInfo,
         limits: DecodeLimits,
+        expected_codec: AudioCodecId,
+        context: &'static str,
     ) -> Result<Self, String> {
         DecodeBudget::new(limits).check_peak(
             0,
             info.decoder_additional_bytes,
-            "Ogg Vorbis stream decoder",
+            &format!("{context} stream decoder"),
         )?;
         let stream = MediaSourceStream::new(Box::new(source), Default::default());
         let mut hint = Hint::new();
@@ -652,32 +943,42 @@ impl VorbisStreamReader {
                 &hint,
                 stream,
                 FormatOptions::default(),
-                MetadataOptions::default(),
+                symphonia_metadata_options(limits),
             )
-            .map_err(|error| format!("probe Ogg Vorbis stream: {error}"))?;
+            .map_err(|error| format!("probe {context} stream: {error}"))?;
         let track = format
             .default_track(TrackType::Audio)
-            .ok_or_else(|| "Ogg Vorbis stream has no audio track".to_string())?;
+            .ok_or_else(|| format!("{context} stream has no audio track"))?;
         let codec_params = track
             .codec_params
             .as_ref()
             .and_then(|params| params.audio())
-            .ok_or_else(|| "Ogg Vorbis stream has no audio codec parameters".to_string())?;
-        if codec_params.codec != CODEC_ID_VORBIS
+            .ok_or_else(|| format!("{context} stream has no audio codec parameters"))?;
+        if codec_params.codec != expected_codec
             || codec_params.sample_rate != Some(info.sample_rate())
             || codec_params.channels.as_ref().map(|value| value.count()) != Some(info.channels())
         {
-            return Err("Ogg Vorbis codec geometry changed after native inspection".into());
+            return Err(format!(
+                "{context} codec geometry changed after native inspection"
+            ));
         }
         let track_id = track.id;
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(codec_params, &AudioDecoderOptions::default())
-            .map_err(|error| format!("open Ogg Vorbis decoder: {error}"))?;
+            .map_err(|error| format!("open {context} decoder: {error}"))?;
         let pending = empty_planar(
             info.channels(),
             info.max_decoder_frames,
-            "Ogg Vorbis packet",
+            &format!("{context} packet"),
         )?;
+        let requested_pending_bytes =
+            planar_bytes(info.channels(), info.max_decoder_frames, F64_BYTES)?
+                .checked_add(channel_descriptor_bytes(info.channels())?)
+                .ok_or_else(|| format!("{context} pending byte count overflows"))?;
+        let decoder_temporary_bytes = info
+            .decoder_additional_bytes
+            .checked_sub(requested_pending_bytes)
+            .ok_or_else(|| format!("{context} decoder accounting is inconsistent"))?;
         Ok(Self {
             format,
             decoder,
@@ -686,7 +987,9 @@ impl VorbisStreamReader {
             limits,
             pending,
             pending_offset: 0,
+            decoder_temporary_bytes,
             eof: false,
+            context,
         })
     }
 
@@ -694,12 +997,12 @@ impl VorbisStreamReader {
         let samples = self.pending.iter().try_fold(0_u64, |total, channel| {
             total
                 .checked_add(channel.capacity() as u64)
-                .ok_or_else(|| "Ogg Vorbis pending capacity overflows".to_string())
+                .ok_or_else(|| format!("{} pending capacity overflows", self.context))
         })?;
         samples
             .checked_mul(F64_BYTES)
             .and_then(|bytes| bytes.checked_add(channel_descriptor_bytes(self.pending.len()).ok()?))
-            .ok_or_else(|| "Ogg Vorbis pending byte count overflows".to_string())
+            .ok_or_else(|| format!("{} pending byte count overflows", self.context))
     }
 
     fn decode_next_packet(&mut self) -> Result<bool, String> {
@@ -709,8 +1012,8 @@ impl VorbisStreamReader {
         loop {
             DecodeBudget::new(self.limits).check_peak(
                 self.pending_capacity_bytes()?,
-                self.info.decoder_additional_bytes,
-                "Ogg Vorbis packet read",
+                self.decoder_temporary_bytes,
+                &format!("{} packet read", self.context),
             )?;
             let packet = match self.format.next_packet() {
                 Ok(Some(packet)) => packet,
@@ -719,28 +1022,46 @@ impl VorbisStreamReader {
                     return Ok(false);
                 }
                 Err(SymphoniaError::ResetRequired) => {
-                    return Err("Ogg Vorbis stream requires an unsupported decoder reset".into())
+                    return Err(format!(
+                        "{} stream requires an unsupported decoder reset",
+                        self.context
+                    ))
                 }
-                Err(error) => return Err(format!("read Ogg Vorbis packet: {error}")),
+                Err(error) => return Err(format!("read {} packet: {error}", self.context)),
             };
-            if packet.data.len() > self.limits.metadata.max_ogg_packet_bytes {
-                return Err("Ogg Vorbis packet exceeds the configured packet limit".into());
+            let packet_limit = if self.info.format == AudioFormat::OggVorbis {
+                self.limits.metadata.max_ogg_packet_bytes
+            } else {
+                MP3_MAX_PACKET_BYTES
+            };
+            if packet.data.len() > packet_limit {
+                return Err(format!(
+                    "{} packet exceeds the configured packet limit",
+                    self.context
+                ));
             }
             if packet.track_id != self.track_id {
                 continue;
             }
             let decoded = match self.decoder.decode(&packet) {
                 Ok(decoded) => decoded,
-                Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_)) => continue,
-                Err(SymphoniaError::ResetRequired) => {
-                    return Err("Ogg Vorbis decoder requested an unsupported reset".into())
+                Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_))
+                    if self.info.format == AudioFormat::OggVorbis =>
+                {
+                    continue;
                 }
-                Err(error) => return Err(format!("decode Ogg Vorbis packet: {error}")),
+                Err(SymphoniaError::ResetRequired) => {
+                    return Err(format!(
+                        "{} decoder requested an unsupported reset",
+                        self.context
+                    ))
+                }
+                Err(error) => return Err(format!("decode {} packet: {error}", self.context)),
             };
             if decoded.spec().rate() != self.info.sample_rate()
                 || decoded.num_planes() != self.info.channels()
             {
-                return Err("Ogg Vorbis geometry changed while streaming".into());
+                return Err(format!("{} geometry changed while streaming", self.context));
             }
             let frames = decoded.frames();
             if frames == 0 {
@@ -750,8 +1071,8 @@ impl VorbisStreamReader {
                 || decoded.capacity() > self.info.max_decoder_frames
             {
                 return Err(format!(
-                    "Ogg Vorbis decoder packet exceeds the {}-frame bounded stream limit",
-                    self.info.max_decoder_frames
+                    "{} decoder packet exceeds the {}-frame bounded stream limit",
+                    self.context, self.info.max_decoder_frames
                 ));
             }
             for channel in &mut self.pending {
@@ -775,7 +1096,11 @@ impl VorbisStreamReader {
     }
 
     fn next_block(&mut self, max_frames: usize) -> Result<Option<Vec<Vec<f64>>>, String> {
-        let mut output = empty_planar(self.info.channels(), max_frames, "Ogg Vorbis stream block")?;
+        let mut output = empty_planar(
+            self.info.channels(),
+            max_frames,
+            &format!("{} stream block", self.context),
+        )?;
         while output[0].len() < max_frames {
             let pending_frames = self.pending.first().map(Vec::len).unwrap_or(0);
             if self.pending_offset == pending_frames && !self.decode_next_packet()? {

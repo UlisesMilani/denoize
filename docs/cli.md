@@ -67,7 +67,7 @@ OPTIONS:
         --deterministic       serialize processing for reproducible audio output
         --seed <N>            SGMSE sampler seed (implies --deterministic)
         --batch               process files in INPUT directory into OUTPUT directory
-        --stream              bounded-memory WAV/FLAC/Vorbis-to-WAV processing
+        --stream              bounded WAV/FLAC/Vorbis/Opus/MP3/ADTS-AAC/M4A-to-WAV processing
         --stream-frames <N>   block size in 1..1048576 frames (default: 8192)
         --max-memory <MB>     per-input denoize allocation/metadata cap in MiB (regular files; min: 1)
         --max-process-memory <MB> aggregate denoize RAM reservations across workers (min: 1)
@@ -171,13 +171,15 @@ ENVIRONMENT:
 ```text
 USAGE:
     denoize plan <INPUT> <OUTPUT> [PROCESSING OPTIONS] [--pretty]
+    denoize plan <INPUT|-> <OUTPUT|-> --stream [STREAM OPTIONS] [--pretty]
     denoize plan <INPUT_DIR> <OUTPUT_DIR> --batch [BATCH OPTIONS] [--pretty]
 
 The command performs the same bounded decode, model verification, backend
 preparation, resource admission, recipe hashing, and destination validation as
 execution, but never creates output, lock, journal, checkpoint, or model state.
-It emits denoize-execution-plan-v1 JSON to stdout. Paths are portable relative
-locators, never absolute paths. Stdin/stdout and --stream plans arrive in Stage 12.
+It emits v1 file/batch or v2 bounded-stream execution-plan JSON to stdout. Paths
+are portable relative locators, never absolute paths; `-` identifies stdin or
+stdout only in a v2 stream plan. Planning stdin consumes it into a bounded spool.
 ```
 
 ## Signed execution receipts
@@ -192,12 +194,14 @@ USAGE:
 VERIFY OPTIONS:
         --plan <PLAN.json>   require exact correspondence to a read-only plan
         --output-root <DIR> anchor portable output locators below DIR
-        --json               emit compact denoize-receipt-verification-v1 JSON
+        --output <FILE>      exact file that captured a v2 stdout stream
+        --json               emit compact verification JSON
         --pretty             emit indented verification JSON
 
 Secret keys are unencrypted and generated owner-only. Receipts never embed a
 trust key: verification requires an explicit public key or a rotation/revocation
-policy. Without --output-root, output locators are anchored beside the receipt.
+policy. Without --output-root, file locators are anchored beside the receipt.
+Stdout stream receipts use the `-` locator and require --output during verification.
 ```
 
 `plan` performs bounded input decoding, metadata and encoder validation,
@@ -206,14 +210,20 @@ does not create an output, batch directory, journal, lock, model-cache update,
 or catalog state. Portable relative locators replace absolute paths in the
 result; batch plans include exact process/skip decisions and reasons.
 Each skipped item also binds the existing output fingerprint that justified
-the skip, so later receipt construction rejects changed skipped bytes.
+the skip, so later receipt construction rejects changed skipped bytes. File
+and batch plans use the v1 schema. Bounded stream plans use the additive v2
+schema, may name stdin/stdout with `-`, and inspect durable resume checkpoints
+without creating, truncating, repairing, or locking their sidecars.
 
-`--receipt` and `--receipt-key` are accepted together for finite regular-file
-or batch output. The receipt is staged before audio publication and committed
-only after every planned output succeeds or is exactly skipped. If a receipt
-destination race occurs after audio commits, denoize preserves the audio and
-reports that the separate receipt could not be published. A failure or
-cancellation never emits a successful receipt.
+`--receipt` and `--receipt-key` are accepted together for file, batch, and
+bounded stream output. Stream receipts use v2 and authenticate the verified
+encoded bytes. A stdout receipt is published only after every byte is accepted
+by stdout and must later be verified against the exact captured file with
+`receipts verify --output`. The receipt is staged before filesystem audio
+publication and committed only after every planned output succeeds or is
+exactly skipped. If a receipt destination race occurs after audio commits,
+denoize preserves the audio and reports that the separate receipt could not be
+published. A failure or cancellation never emits a successful receipt.
 
 The unencrypted Ed25519 secret key is created without clobbering and must stay
 on a private local filesystem. Unix keys require effective-user ownership,
@@ -227,8 +237,8 @@ one independently distributed public key or trust policy. Signature and
 optional plan identity are checked before rooted output paths are resolved and
 rehashed. The report proves the signed recipe/input/model/output identities; it
 does not prove wall-clock time, duration, host, or user identity. Stage 11 JSON
-files reject unknown fields and future schema versions. Streaming/stdin plans
-and receipts arrive with Stage 12.
+v1 files remain accepted; the additive bounded-stream v2 files reject unknown
+fields and unsupported future schema versions without modifying them.
 
 ## Stable JSON automation
 
@@ -330,8 +340,9 @@ model sessions; the effective per-input cap is the smaller of the two limits.
 `--max-temp-space` admits aggregate staged-output reservations and verifies the
 staged length, but is not a filesystem quota. `--max-gpu-jobs` and
 `--max-gpu-memory` bound conservative accelerator reservations rather than
-driver-reported VRAM. Standard-input WAV uses its separate bounded buffering
-path.
+driver-reported VRAM. Non-stream standard-input WAV uses its existing bounded
+memory buffer. With `--stream`, stdin and stdout instead share one finite
+anonymous spool bounded by `--max-temp-space` (1 GiB by default).
 
 `--isolate` runs file, batch, stream, or live processing in a child. With
 `--max-process-memory`, Unix applies an `RLIMIT_AS` address-space ceiling and
@@ -342,11 +353,23 @@ isolation when those allocations require a hard process boundary.
 
 ## Bounded streaming and restart checkpoints
 
-`--stream` accepts regular-file WAV, FLAC, and Ogg Vorbis input and publishes an
-atomic WAV output with a compiled streaming backend. Ogg Opus, MP3, M4A/ALAC,
-and ADTS AAC remain on the normal path until their gapless, granule, or edit-list
-semantics can be preserved by a bounded decoder. `--stream-frames` controls the
-bounded input block and participates in restart identity.
+`--stream` accepts content-detected WAV, FLAC, Ogg Vorbis, granule-aware Ogg
+Opus, gapless MP3, frame-aware ADTS AAC, and edit-aware M4A AAC/ALAC input. It
+can encode WAV, FLAC, Ogg Opus, MP3, M4A AAC, or ADTS AAC output with a compiled
+streaming backend. `--stream-frames` controls the bounded input block and
+participates in restart identity. A regular-file destination is staged,
+decoded end-to-end for codec/geometry/presentation-length verification, and
+atomically published; supported metadata is preserved unless `--no-metadata`
+is selected.
+
+Use `-` for stdin or stdout. Stdin is copied into an anonymous bounded regular
+file before parsing so one authoritative seekable object can be inspected and
+decoded. Stdout retains PCM and encoded output in finite anonymous spools,
+validates the complete encoded result, then copies it to the sink; a sink error
+can leave a partial external stream because stdout has no atomic rename.
+Stdin and stdout share the `--max-temp-space` allowance, stdout intentionally
+drops metadata, and `--resume` rejects either endpoint because their spools do
+not survive a process restart.
 
 With `--stream --resume`, denoize periodically synchronizes a private
 append-only journal and interleaved `f64` PCM spool beside the destination. A
@@ -354,14 +377,17 @@ restart deterministically replays the same opened input to the last durable
 boundary, verifies the saved PCM digest, reconstructs backend state, and then
 continues. Checkpoints bind the input bytes, effective recipe, model bytes,
 source format, channel geometry, and block size. Mismatches are preserved and
-rejected unless `--force` explicitly resets them. Final output remains atomic;
+rejected unless `--force` explicitly resets them. The checkpoint stores
+presentation-timeline PCM, so codec delay, Ogg granules, and M4A edit lists are
+applied before each durable boundary. Final encoded output remains atomic;
 success removes the state journal and PCM spool but retains the reusable lock.
-The exact staged WAV fingerprint is recorded before publication. If the process
-exits after commit but before cleanup, the next identical resume verifies the
-destination and removes the stale data sidecars without reprocessing; a changed
-destination is preserved and rejected unless `--force` resets the checkpoint.
-The spool and staged WAV coexist during publication and both count toward
-`--max-temp-space`.
+The exact verified staged-output fingerprint is recorded before publication.
+If the process exits after commit but before receipt publication or cleanup,
+the next identical resume verifies the destination, emits a matching `skip`
+plan/receipt when requested, and removes the stale data sidecars without
+reprocessing. A changed destination is preserved and rejected unless `--force`
+resets the checkpoint. The PCM spool, staged encoded output, encoder auxiliary
+data, and retained metadata all count toward `--max-temp-space`.
 
 On Unix, the batch output root must be owned by the current user and must not be
 group/world writable. On Windows, use an ACL-capable local filesystem and an

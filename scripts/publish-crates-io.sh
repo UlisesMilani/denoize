@@ -155,12 +155,15 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-execution-plan-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-execution-receipt-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-hardware-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-public-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-secret-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-trust-policy-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-receipt-verification-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-recommendation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-release-evidence-v1.schema.json" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"

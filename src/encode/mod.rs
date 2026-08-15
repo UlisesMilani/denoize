@@ -1,13 +1,16 @@
-//! Audio encode layer — WAV / MP3 / M4A output.
+//! Audio encode layer for bounded WAV, FLAC, Ogg Opus, MP3, M4A, and ADTS AAC output.
 //!
 //! | Format | Backend |
 //! |--------|---------|
 //! | WAV | `hound` (lossless, preserves bit depth) |
+//! | FLAC | `flacenc` (lossless) |
+//! | Ogg Opus | `audiopus` + `ogg` |
 //! | MP3 | `shine-rs` (Pure Rust) |
-//! | M4A | `oxideav-aac` + `mp4` mux (Pure-Rust AAC-LC) |
+//! | M4A / ADTS AAC | `oxideav-aac` (Pure-Rust AAC-LC) |
 
 #[cfg(feature = "m4a-encode")]
 mod aac;
+mod flac;
 #[cfg(feature = "m4a-encode")]
 mod m4a;
 #[cfg(feature = "fdk-aac-encoder")]
@@ -15,6 +18,7 @@ mod m4a_fdk;
 mod mp3;
 mod opus;
 mod pcm;
+mod stream;
 
 #[cfg(feature = "m4a-encode")]
 pub use aac::{write_adts_aac, write_adts_aac_with_downmix};
@@ -24,6 +28,12 @@ pub use m4a::{write_m4a, write_m4a_with_downmix};
 pub use m4a_fdk::{write_m4a_fdk, write_m4a_fdk_with_downmix};
 pub(crate) use mp3::effective_mp3_bitrate_kbps;
 pub use mp3::{write_mp3, write_mp3_with_downmix, DEFAULT_MP3_BITRATE};
+pub use stream::{
+    estimate_spooled_stream_output_bytes, estimate_stream_encode_additional_bytes,
+    estimate_stream_encode_output_bytes, estimate_stream_encode_temporary_bytes,
+    estimate_stream_output_verification_bytes, verify_stream_output_file, AudioStreamWriter,
+    SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamOutputVerification,
+};
 
 /// Default AAC bitrate (bps, not kbps).
 pub const DEFAULT_M4A_BITRATE: u32 = 192_000;
@@ -74,7 +84,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::atomic_output::{AtomicOutput, CommitMode};
-use crate::audio::{sanitize_sample, write_wav_to_file, Audio};
+use crate::audio::{write_wav_to_file, Audio};
 use crate::config::MAX_SAMPLE_RATE;
 
 const AAC_ENCODER_SAMPLE_RATES: [u32; 12] = [
@@ -172,6 +182,16 @@ impl OutputFormat {
     /// output file.
     pub fn validate_config(self, audio: &Audio, options: &EncodeOptions) -> Result<(), String> {
         options.validate_config(self, audio)
+    }
+
+    /// Validate a block-oriented encode request before touching an output
+    /// sink or constructing a codec.
+    pub fn validate_stream_config(
+        self,
+        spec: StreamEncodeSpec,
+        options: EncodeOptions,
+    ) -> Result<(), String> {
+        stream::validate_stream_config(self, spec, options)
     }
 }
 
@@ -465,7 +485,7 @@ pub fn write_audio_to_file(
 
     match format {
         OutputFormat::Wav => write_wav_to_file(file, audio),
-        OutputFormat::Flac => write_flac_to_writer(&mut *file, audio),
+        OutputFormat::Flac => flac::write_flac_to_writer(&mut *file, audio),
         OutputFormat::OggOpus => {
             opus::write_ogg_opus_to_writer(&mut *file, audio, 128_000, options.downmix)
         }
@@ -532,48 +552,6 @@ pub fn write_audio_to_file(
 
     file.flush()
         .map_err(|error| format!("flush output: {error}"))
-}
-
-fn write_flac_to_writer<W: Write>(mut output: W, audio: &Audio) -> Result<(), String> {
-    if audio.channels() == 0 {
-        return Err("FLAC output requires at least one channel".into());
-    }
-    if audio.frames() == 0 {
-        return Err("FLAC output requires at least one frame".into());
-    }
-    use flacenc::component::BitRepr;
-    use flacenc::error::Verify;
-    let bits = audio.bits_per_sample.clamp(8, 24) as usize;
-    let scale = (1_i64 << (bits - 1)) as f64;
-    let mut samples = Vec::with_capacity(audio.frames() * audio.channels());
-    for frame in 0..audio.frames() {
-        for channel in &audio.channels {
-            samples.push(
-                (sanitize_sample(channel[frame]) * scale)
-                    .round()
-                    .clamp(-scale, scale - 1.0) as i32,
-            );
-        }
-    }
-    let config = flacenc::config::Encoder::default()
-        .into_verified()
-        .map_err(|e| format!("FLAC config: {:?}", e.1))?;
-    let source = flacenc::source::MemSource::from_samples(
-        &samples,
-        audio.channels(),
-        bits,
-        audio.sample_rate as usize,
-    );
-    let stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
-        .map_err(|e| format!("FLAC encode: {e}"))?;
-    let mut sink = flacenc::bitsink::ByteSink::new();
-    stream
-        .write(&mut sink)
-        .map_err(|e| format!("FLAC serialize: {e}"))?;
-    output
-        .write_all(sink.as_slice())
-        .map_err(|e| format!("FLAC write: {e}"))?;
-    output.flush().map_err(|e| format!("FLAC flush: {e}"))
 }
 
 #[cfg(test)]
