@@ -77,8 +77,10 @@ jobs:
             scripts/verify-release-evidence.sh \
             scripts/verify-release-version.sh
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
-          jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
-            schemas/denoize-release-evidence-v1.schema.json >/dev/null
+          for schema in schemas/*.schema.json; do
+            jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
+              "$schema" >/dev/null
+          done
 
       - name: Test release evidence generation and offline verification
         run: bash scripts/test-release-evidence.sh

@@ -54,7 +54,13 @@ expected_assets=(
   "denoize-model-trust-root-v1.json"
   "denoize-automation-v1.schema.json"
   "denoize-cli-output-v1.schema.json"
+  "denoize-execution-plan-v1.schema.json"
+  "denoize-execution-receipt-v1.schema.json"
   "denoize-hardware-v1.schema.json"
+  "denoize-receipt-public-key-v1.schema.json"
+  "denoize-receipt-secret-key-v1.schema.json"
+  "denoize-receipt-trust-policy-v1.schema.json"
+  "denoize-receipt-verification-v1.schema.json"
   "denoize-recommendation-v1.schema.json"
   "denoize-release-evidence-v1.schema.json"
   "denoize-models-${tag}.dmb"
@@ -136,7 +142,13 @@ gh release download "$tag" \
   --pattern 'denoize-model-trust-root-v1.json' \
   --pattern 'denoize-automation-v1.schema.json' \
   --pattern 'denoize-cli-output-v1.schema.json' \
+  --pattern 'denoize-execution-plan-v1.schema.json' \
+  --pattern 'denoize-execution-receipt-v1.schema.json' \
   --pattern 'denoize-hardware-v1.schema.json' \
+  --pattern 'denoize-receipt-public-key-v1.schema.json' \
+  --pattern 'denoize-receipt-secret-key-v1.schema.json' \
+  --pattern 'denoize-receipt-trust-policy-v1.schema.json' \
+  --pattern 'denoize-receipt-verification-v1.schema.json' \
   --pattern 'denoize-recommendation-v1.schema.json' \
   --pattern 'denoize-release-evidence-v1.schema.json' \
   --pattern 'latest.json' \
@@ -168,7 +180,13 @@ fi
 for schema in \
   denoize-automation-v1.schema.json \
   denoize-cli-output-v1.schema.json \
+  denoize-execution-plan-v1.schema.json \
+  denoize-execution-receipt-v1.schema.json \
   denoize-hardware-v1.schema.json \
+  denoize-receipt-public-key-v1.schema.json \
+  denoize-receipt-secret-key-v1.schema.json \
+  denoize-receipt-trust-policy-v1.schema.json \
+  denoize-receipt-verification-v1.schema.json \
   denoize-recommendation-v1.schema.json \
   denoize-release-evidence-v1.schema.json; do
   if ! cmp -s "schemas/$schema" "$tmp_dir/$schema"; then

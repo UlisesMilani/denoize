@@ -82,8 +82,10 @@ jobs:
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
-          jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
-            schemas/denoize-release-evidence-v1.schema.json >/dev/null
+          for schema in schemas/*.schema.json; do
+            jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
+              "$schema" >/dev/null
+          done
           bash scripts/test-release-evidence.sh
 
       - name: Verify crates.io package
@@ -317,6 +319,12 @@ jobs:
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
           recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
           release_evidence_schema="$asset_dir/denoize-release-evidence-v1.schema.json"
+          execution_plan_schema="$asset_dir/denoize-execution-plan-v1.schema.json"
+          execution_receipt_schema="$asset_dir/denoize-execution-receipt-v1.schema.json"
+          receipt_public_key_schema="$asset_dir/denoize-receipt-public-key-v1.schema.json"
+          receipt_secret_key_schema="$asset_dir/denoize-receipt-secret-key-v1.schema.json"
+          receipt_trust_policy_schema="$asset_dir/denoize-receipt-trust-policy-v1.schema.json"
+          receipt_verification_schema="$asset_dir/denoize-receipt-verification-v1.schema.json"
           bundle="$asset_dir/denoize-models-${GITHUB_REF_NAME}.dmb"
           bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
@@ -326,6 +334,12 @@ jobs:
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
           cp schemas/denoize-recommendation-v1.schema.json "$recommendation_schema"
           cp schemas/denoize-release-evidence-v1.schema.json "$release_evidence_schema"
+          cp schemas/denoize-execution-plan-v1.schema.json "$execution_plan_schema"
+          cp schemas/denoize-execution-receipt-v1.schema.json "$execution_receipt_schema"
+          cp schemas/denoize-receipt-public-key-v1.schema.json "$receipt_public_key_schema"
+          cp schemas/denoize-receipt-secret-key-v1.schema.json "$receipt_secret_key_schema"
+          cp schemas/denoize-receipt-trust-policy-v1.schema.json "$receipt_trust_policy_schema"
+          cp schemas/denoize-receipt-verification-v1.schema.json "$receipt_verification_schema"
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -338,6 +352,9 @@ jobs:
             "$asset" "$asset.sig" "$trust_asset" \
             "$automation_schema" "$cli_schema" "$hardware_schema" \
             "$recommendation_schema" "$release_evidence_schema" \
+            "$execution_plan_schema" "$execution_receipt_schema" \
+            "$receipt_public_key_schema" "$receipt_secret_key_schema" \
+            "$receipt_trust_policy_schema" "$receipt_verification_schema" \
             "$bundle" "$bundle_checksum" --clobber
 
   release-evidence:

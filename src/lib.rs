@@ -47,6 +47,7 @@ pub mod config;
 pub mod decode;
 pub mod denoiser;
 pub mod encode;
+pub mod execution;
 pub mod fft;
 pub mod gain;
 pub mod hardware;
@@ -101,6 +102,16 @@ pub use decode::{
 };
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
 pub use encode::{AacEncoder, DownmixMode, EncodeOptions, OutputFormat};
+pub use execution::{
+    execution_item_id, export_receipt_public_key, generate_receipt_keypair, portable_file_locator,
+    portable_locator, write_execution_plan, write_new_receipt_keypair, write_receipt_trust_policy,
+    write_signed_receipt, ExecutionKind, ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload,
+    PlannedArtifact, PlannedOutput, PlannedResources, ReceiptItem, ReceiptOutput, ReceiptPublicKey,
+    ReceiptSecretKey, ReceiptSignature, ReceiptTrustPolicy, ReceiptVerificationReport,
+    SignedExecutionReceipt, VerifiedReceiptItem, EXECUTION_PLAN_SCHEMA, EXECUTION_RECEIPT_SCHEMA,
+    EXECUTION_SCHEMA_VERSION, RECEIPT_PUBLIC_KEY_SCHEMA, RECEIPT_SECRET_KEY_SCHEMA,
+    RECEIPT_TRUST_POLICY_SCHEMA, RECEIPT_VERIFICATION_SCHEMA,
+};
 pub use gain::{Algorithm, SpecSubLaw};
 pub use hardware::{
     backend_supports_acceleration, hardware_capabilities, select_accelerator, AcceleratorFallback,

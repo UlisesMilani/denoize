@@ -251,6 +251,10 @@ unreviewable release.
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Planned |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
+| 19 | Local authenticated IPC and control API with bounded requests, capability-scoped authorization, and stable automation contracts | Planned |
+| 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
+| 21 | Reproducible licensed-corpus quality, performance, and regression evaluation with publishable evidence manifests | Planned |
+| 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Planned |
 
 Stage 8 accepts regular-file WAV, FLAC, and Ogg Vorbis input, writes an atomic
 WAV, and supports the stateful Classical, RNNoise, and GTCRN backends. Its
@@ -277,3 +281,35 @@ from at least the two preceding releases or reject an unknown future format
 without modifying it. Stage 12 includes bounded stdin/stdout and library
 `Read`/`Write` streaming; atomic publication and restart guarantees apply only
 when a seekable filesystem transaction or an explicit input spool exists.
+
+Stage 19 exposes only local, authenticated control surfaces and reuses the
+bounded JSON contracts, resource admission, signed receipts, and regular-file
+publication rules rather than creating a second execution model. Capability
+grants are explicit and revocable; discovery, transport, request size, timeout,
+and concurrency limits are part of the public contract.
+
+Stage 20 brings the existing causal/live backends into DAW hosts without
+allocating, blocking, performing filesystem or network I/O, or changing model
+state on the real-time audio thread. The first portable plug-in format must
+ship with deterministic preset/session round trips, latency reporting, channel
+layout negotiation, bypass/tail behavior, and host-level regression fixtures;
+additional platform formats follow only when they preserve the same contract.
+
+Stage 21 turns model-quality and speed claims into reproducible release
+evidence. Corpus manifests pin licenses, source revisions, checksums, signal
+preparation, metrics, hardware/runtime context, and accepted thresholds while
+keeping restricted audio out of the repository and release artifacts. Local
+and CI runners consume the same manifest, emit machine-readable results, and
+fail closed on missing provenance or incomparable configurations.
+
+Stage 22 makes application updates an explicit recoverable transaction rather
+than an in-place replacement. Signed manifests bind the release channel,
+platform artifact, SBOM, provenance, compatibility range, and rollback policy;
+the updater downloads or imports an offline bundle into a bounded staging area,
+verifies it before activation, and retains the last known-good installation.
+Startup health checks either confirm the new version or atomically restore that
+known-good version without weakening anti-rollback policy. CLI and desktop
+surfaces expose read-only check and dry-run reports, explicit `apply`, `status`,
+and `recover` operations, and durable redacted diagnostics; they never silently
+downgrade, delete the only recoverable installation, or require a network for
+recovery.

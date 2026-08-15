@@ -363,9 +363,12 @@ mod windows_security {
         SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorLength, ACL,
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
-        SE_DACL_PROTECTED, UNPROTECTED_DACL_SECURITY_INFORMATION,
+        CreateWellKnownSid, EqualSid, GetAce, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorLength, WinBuiltinAdministratorsSid,
+        WinCreatorOwnerRightsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileDispositionInfo, FileRenameInfo, SetFileInformationByHandle, CREATE_NEW,
@@ -581,6 +584,167 @@ mod windows_security {
         )
     }
 
+    fn well_known_sid(kind: i32) -> io::Result<Vec<usize>> {
+        let words = (SECURITY_MAX_SID_SIZE as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut sid = vec![0usize; words];
+        let mut bytes = SECURITY_MAX_SID_SIZE;
+        if unsafe { CreateWellKnownSid(kind, null_mut(), sid.as_mut_ptr().cast(), &mut bytes) } == 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(sid)
+        }
+    }
+
+    pub(super) fn require_private_dacl(file: &File) -> io::Result<()> {
+        let mut owner: PSID = null_mut();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor = null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let _descriptor = LocalMemory(descriptor);
+        if descriptor.is_null() || owner.is_null() || dacl.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "receipt key has a missing Windows owner or DACL",
+            ));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if control & SE_DACL_PROTECTED == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "receipt key DACL must be protected from inherited access",
+            ));
+        }
+        let owner_rights = well_known_sid(WinCreatorOwnerRightsSid)?;
+        let system = well_known_sid(WinLocalSystemSid)?;
+        let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
+        let approved = [
+            owner,
+            owner_rights.as_ptr().cast_mut().cast(),
+            system.as_ptr().cast_mut().cast(),
+            administrators.as_ptr().cast_mut().cast(),
+        ];
+        let mut owner_has_access = false;
+        for index in 0..unsafe { (*dacl).AceCount } as u32 {
+            let mut raw_ace = null_mut();
+            if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if raw_ace.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "receipt key DACL contains a null ACE",
+                ));
+            }
+            let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+            // A generated key uses only ordinary ACCESS_ALLOWED_ACE records.
+            // Reject inherited, callback, object, or unknown ACE forms rather
+            // than trying to prove their conditions safe.
+            if unsafe { (*ace).Header.AceType } != 0
+                || unsafe { (*ace).Header.AceFlags } & 0x10 != 0
+                || usize::from(unsafe { (*ace).Header.AceSize })
+                    < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "receipt key DACL contains an unsupported or inherited ACE",
+                ));
+            }
+            let sid: PSID = std::ptr::addr_of_mut!((*ace).SidStart).cast();
+            let mut accepted = false;
+            for approved_sid in approved {
+                if unsafe { EqualSid(sid, approved_sid) } != 0 {
+                    accepted = true;
+                    if unsafe { EqualSid(sid, owner) } != 0
+                        || unsafe { EqualSid(sid, owner_rights.as_ptr().cast_mut().cast()) } != 0
+                    {
+                        owner_has_access = true;
+                    }
+                    break;
+                }
+            }
+            if !accepted {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "receipt key DACL grants access outside its owner, LocalSystem, and administrators",
+                ));
+            }
+        }
+        if !owner_has_access {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "receipt key DACL does not grant its owner or OWNER RIGHTS access",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_test_dacl(file: &File, sddl: &str) -> io::Result<()> {
+        let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let _descriptor = LocalMemory(descriptor);
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl: *mut ACL = null_mut();
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if present == 0 || dacl.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "test DACL is missing or null",
+            ));
+        }
+        let status = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null(),
+            )
+        };
+        if status == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status as i32))
+        }
+    }
+
     /// Open a destination entry without requesting access to its contents.
     pub(super) fn open_for_security(path: &Path) -> io::Result<File> {
         let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -681,6 +845,11 @@ pub(crate) fn require_windows_acl_capability(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+pub(crate) fn require_windows_private_acl(file: &File) -> io::Result<()> {
+    windows_security::require_private_dacl(file)
+}
+
+#[cfg(windows)]
 fn windows_metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
 
@@ -705,6 +874,7 @@ pub struct AtomicOutput {
     temporary: NamedTempFile,
     destination: PathBuf,
     display_destination: PathBuf,
+    private_destination: bool,
     #[cfg(unix)]
     new_destination_permissions: std::fs::Permissions,
     #[cfg(windows)]
@@ -825,6 +995,7 @@ impl AtomicOutput {
             temporary,
             destination,
             display_destination,
+            private_destination: false,
             #[cfg(unix)]
             new_destination_permissions,
             #[cfg(windows)]
@@ -832,6 +1003,24 @@ impl AtomicOutput {
             #[cfg(windows)]
             private_stage_dacl,
         })
+    }
+
+    /// Create a staged output whose newly published destination remains
+    /// owner-only.
+    ///
+    /// Private outputs may only be committed with [`CommitMode::NoClobber`].
+    /// This is intended for secret key material: the stage is private from its
+    /// creation and the final pathname never temporarily inherits ordinary
+    /// output permissions.
+    pub fn new_private(destination: impl AsRef<Path>) -> Result<Self, String> {
+        let mut output = Self::new(destination)?;
+        output.private_destination = true;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            output.new_destination_permissions = std::fs::Permissions::from_mode(0o600);
+        }
+        Ok(output)
     }
 
     /// Return the open staged file.
@@ -846,6 +1035,12 @@ impl AtomicOutput {
 
     /// Flush and atomically commit the staged file.
     pub fn commit(mut self, mode: CommitMode) -> Result<(), String> {
+        if self.private_destination && mode != CommitMode::NoClobber {
+            return Err(format!(
+                "private output must not replace an existing destination: {}",
+                self.display_destination.display()
+            ));
+        }
         self.temporary.as_file_mut().flush().map_err(|error| {
             format!(
                 "failed to flush temporary output for {}: {error}",
@@ -1087,7 +1282,7 @@ impl AtomicOutput {
             ));
         }
 
-        if mode == CommitMode::NoClobber {
+        if mode == CommitMode::NoClobber && !self.private_destination {
             // A failure leaves the newly-published output protected instead
             // of reporting an error after the atomic commit already happened.
             let _ = self.new_destination_dacl.apply(self.temporary.as_file());
@@ -1316,6 +1511,40 @@ mod tests {
             .unwrap();
         assert_eq!(actual, expected);
         assert_eq!(fs::read(destination).unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_output_uses_an_accepted_protected_windows_dacl() {
+        use super::windows_security;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("receipt-key.json");
+        let mut output = AtomicOutput::new_private(&destination).unwrap();
+        output.file_mut().write_all(b"secret").unwrap();
+        output.commit(CommitMode::NoClobber).unwrap();
+
+        let committed = fs::File::open(&destination).unwrap();
+        windows_security::require_private_dacl(&committed).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_dacl_validation_rejects_a_world_read_ace() {
+        use super::windows_security;
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("receipt-key.json");
+        let mut file = windows_security::create_private(&destination).unwrap();
+        file.write_all(b"secret").unwrap();
+        windows_security::apply_test_dacl(
+            &file,
+            "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)",
+        )
+        .unwrap();
+
+        let error = windows_security::require_private_dacl(&file).unwrap_err();
+        assert!(error.to_string().contains("grants access outside"));
     }
 
     #[test]
