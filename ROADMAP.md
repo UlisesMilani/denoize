@@ -243,7 +243,7 @@ unreviewable release.
 | 8 | Bounded compressed-input streaming with durable restart checkpoints | Released in v0.56.0 |
 | 9 | Network-free backend and preset recommendation with on-device benchmark calibration and an explainable decision report | Released in v0.57.0 |
 | 10 | Release SBOMs, build provenance, and asset-to-source verification | Released in v0.58.0 |
-| 11 | Read-only execution plans, signed receipts, and offline result verification | Planned |
+| 11 | Read-only execution plans, signed receipts, and offline result verification | Released in v0.59.0 |
 | 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Planned |
 | 13 | Parser fuzzing, deterministic fault injection, and crash/power-loss simulation | Planned |
 | 14 | Desktop isolation, recovery, redacted diagnostics, accessibility, and localization | Planned |

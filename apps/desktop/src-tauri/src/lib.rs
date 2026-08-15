@@ -4846,7 +4846,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "b72092dfb305f535078bddce4f0f04bc746bab46c4b49b6174faae53f3fceb60";
+        "3caa4d2f9818f4d588a5899fdecad36a303115ad6ba1924d256f095c02be02fd";
 
     #[test]
     fn recommendation_request_maps_to_bounded_library_options() {

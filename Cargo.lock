@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "denoize"
-version = "0.58.0"
+version = "0.59.0"
 dependencies = [
  "audio_samples",
  "audio_samples_qoe",
