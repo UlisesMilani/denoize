@@ -25,8 +25,8 @@ atomicity, documentation, and release assets are covered by automated tests.
 | 5 | Stable JSON output for catalog/model health, provenance, recipe identity, and automation | Implemented |
 | 6 | Hardware capability discovery, explicit accelerator selection, and deterministic CPU fallback | Implemented |
 | 7 | Process-level RAM/temporary/GPU admission, memory-weighted workers, and opt-in OS child isolation for third-party codec/model failures | Implemented |
-| 8 | Bounded streaming for compressed inputs and restartable processing checkpoints for long-running jobs | Planned |
-| 9 | Input-aware quality/model recommendation with reproducible calibration evidence | Planned |
+| 8 | Bounded streaming for compressed inputs and restartable processing checkpoints for long-running jobs | Implemented |
+| 9 | Input- and device-aware quality/model recommendation with reproducible calibration evidence | Planned |
 | 10 | Reproducible releases with per-artifact SBOMs, signed build provenance, and offline verification for binaries, crates, and converted models | Planned |
 
 Stages 2–5 extend the authenticated distribution system without weakening its
@@ -240,13 +240,13 @@ unreviewable release.
 | 5 | Stable CLI, model, and hardware automation contracts | Released in v0.53.0 |
 | 6 | Explicit CPU/Metal/CUDA discovery and accelerator selection | Released in v0.54.0 |
 | 7 | Process-wide RAM, temporary-space, CPU, GPU, and isolation admission | Released in v0.55.0 |
-| 8 | Bounded compressed-input streaming with durable restart checkpoints | In progress |
-| 9 | Network-free backend and preset recommendation with an explainable decision report | Planned |
+| 8 | Bounded compressed-input streaming with durable restart checkpoints | Released in v0.56.0 |
+| 9 | Network-free backend and preset recommendation with on-device benchmark calibration and an explainable decision report | Planned |
 | 10 | Release SBOMs, build provenance, and asset-to-source verification | Planned |
 | 11 | Read-only execution plans, signed receipts, and offline result verification | Planned |
-| 12 | Native gapless/granule/edit-aware checkpoints and encoded streaming output | Planned |
+| 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Planned |
 | 13 | Parser fuzzing, deterministic fault injection, and crash/power-loss simulation | Planned |
-| 14 | Desktop child isolation, cancellation fences, and restart recovery UX | Planned |
+| 14 | Desktop isolation, recovery, redacted diagnostics, accessibility, and localization | Planned |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Planned |
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Planned |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
@@ -261,3 +261,10 @@ publication. A restart therefore resumes an incomplete stream or reconciles a
 completed commit whose data sidecars were not yet removed. MP3, Ogg Opus,
 M4A/ALAC, and ADTS AAC remain in Stage 12 until their presentation-timeline
 semantics can be retained without whole-file decoding.
+
+Every remaining stage also carries an upgrade-compatibility gate: persisted
+presets, journals, checkpoints, receipts, and automation schemas must migrate
+from at least the two preceding releases or reject an unknown future format
+without modifying it. Stage 12 includes bounded stdin/stdout and library
+`Read`/`Write` streaming; atomic publication and restart guarantees apply only
+when a seekable filesystem transaction or an explicit input spool exists.

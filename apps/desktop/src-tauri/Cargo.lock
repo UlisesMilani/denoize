@@ -998,7 +998,7 @@ dependencies = [
 
 [[package]]
 name = "denoize"
-version = "0.55.0"
+version = "0.56.0"
 dependencies = [
  "audio_samples",
  "audio_samples_qoe",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-desktop"
-version = "0.55.0"
+version = "0.56.0"
 dependencies = [
  "denoize",
  "rayon",
