@@ -56,10 +56,14 @@ expected_assets=(
   "denoize-cli-output-v1.schema.json"
   "denoize-hardware-v1.schema.json"
   "denoize-recommendation-v1.schema.json"
+  "denoize-release-evidence-v1.schema.json"
   "denoize-models-${tag}.dmb"
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
+while IFS= read -r evidence_asset; do
+  expected_assets+=("$evidence_asset")
+done < <(bash scripts/release-evidence-assets.sh evidence "$tag")
 
 has_asset() {
   local name="$1"
@@ -118,14 +122,23 @@ gh release download "$tag" \
   --pattern '*.tar.gz' \
   --pattern '*.sig' \
   --pattern '*.zip' \
+  --pattern '*.AppImage' \
+  --pattern '*.deb' \
+  --pattern '*.dmg' \
+  --pattern '*.exe' \
+  --pattern '*.msi' \
   --pattern '*.sha256' \
   --pattern '*.dmb' \
+  --pattern '*.crate' \
+  --pattern '*.sigstore.json' \
+  --pattern '*.jsonl' \
   --pattern 'denoize-model-catalog-v1.json' \
   --pattern 'denoize-model-trust-root-v1.json' \
   --pattern 'denoize-automation-v1.schema.json' \
   --pattern 'denoize-cli-output-v1.schema.json' \
   --pattern 'denoize-hardware-v1.schema.json' \
   --pattern 'denoize-recommendation-v1.schema.json' \
+  --pattern 'denoize-release-evidence-v1.schema.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -137,6 +150,11 @@ for checksum in "$tmp_dir"/*.sha256; do
   )
 done
 
+bash scripts/verify-release-evidence.sh \
+  "$tag" \
+  "$tmp_dir" \
+  "$tmp_dir/denoize-sigstore-trusted-root.jsonl"
+
 if ! cmp -s models/catalog-v1.json "$tmp_dir/denoize-model-catalog-v1.json"; then
   echo "release model catalog differs from tagged models/catalog-v1.json" >&2
   exit 1
@@ -147,7 +165,12 @@ if ! cmp -s models/trust-root-v1.json "$tmp_dir/denoize-model-trust-root-v1.json
   exit 1
 fi
 
-for schema in denoize-automation-v1.schema.json denoize-cli-output-v1.schema.json denoize-hardware-v1.schema.json denoize-recommendation-v1.schema.json; do
+for schema in \
+  denoize-automation-v1.schema.json \
+  denoize-cli-output-v1.schema.json \
+  denoize-hardware-v1.schema.json \
+  denoize-recommendation-v1.schema.json \
+  denoize-release-evidence-v1.schema.json; do
   if ! cmp -s "schemas/$schema" "$tmp_dir/$schema"; then
     echo "release JSON Schema differs from tagged schemas/$schema" >&2
     exit 1
@@ -324,5 +347,5 @@ while IFS= read -r updater_url; do
   fi
 done < <(jq -r '.platforms[]?.url' "$tmp_dir/latest.json")
 
-printf 'release %s has %d non-empty assets; checksums, notices, and updater metadata verified.\n' \
+printf 'release %s has %d non-empty assets; checksums, SBOMs, provenance, notices, and updater metadata verified.\n' \
   "$tag" "${#expected_assets[@]}"

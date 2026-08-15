@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-release-evidence-v1.schema.json",
+  "title": "denoize release evidence manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "tag",
+    "version",
+    "source",
+    "generator",
+    "artifacts",
+    "evidence_files"
+  ],
+  "properties": {
+    "schema": {
+      "const": "denoize-release-evidence-v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "commit",
+        "ref",
+        "workflow",
+        "source_date_epoch"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "workflow": {
+          "const": ".github/workflows/release.yml"
+        },
+        "source_date_epoch": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "syft_version"],
+      "properties": {
+        "name": {
+          "const": "scripts/generate-release-evidence.py"
+        },
+        "version": {
+          "const": 1
+        },
+        "syft_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "evidence_files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+/-]*$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target", "name", "size_bytes", "sha256", "sbom"],
+      "properties": {
+        "kind": {
+          "enum": ["cli", "desktop", "crate", "model-bundle"]
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"
+        },
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "sbom": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256", "format", "spec_version"],
+          "properties": {
+            "path": {
+              "type": "string",
+              "pattern": "^sbom/[A-Za-z0-9][A-Za-z0-9._+-]*\\.cdx\\.json$"
+            },
+            "sha256": {
+              "$ref": "#/$defs/sha256"
+            },
+            "format": {
+              "const": "CycloneDX"
+            },
+            "spec_version": {
+              "const": "1.7"
+            }
+          }
+        }
+      }
+    }
+  }
+}
