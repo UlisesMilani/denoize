@@ -230,19 +230,45 @@ pub fn select_live_backend() -> Backend {
 /// Fill backend options that can be resolved from the managed model library.
 pub fn resolve_backend_options(
     _backend: Backend,
+    options: BackendOptions,
+) -> Result<BackendOptions, String> {
+    resolve_backend_options_with_mode(_backend, options, false)
+}
+
+/// Resolve managed backend configuration without mutating catalog rollback or
+/// model provenance state.
+pub fn resolve_backend_options_read_only(
+    backend: Backend,
+    options: BackendOptions,
+) -> Result<BackendOptions, String> {
+    resolve_backend_options_with_mode(backend, options, true)
+}
+
+fn resolve_backend_options_with_mode(
+    _backend: Backend,
     #[allow(unused_mut)] mut options: BackendOptions,
+    _read_only: bool,
 ) -> Result<BackendOptions, String> {
     options
         .validate_config(_backend)
         .map_err(|error| error.to_string())?;
     #[cfg(feature = "gtcrn")]
     if _backend == Backend::Gtcrn && options.onnx.is_none() {
-        let catalog = crate::models::active_catalog()?;
+        let catalog = if _read_only {
+            crate::models::active_catalog_read_only()?
+        } else {
+            crate::models::active_catalog()?
+        };
         let model = catalog
             .find("gtcrn")
             .ok_or_else(|| "active model catalog has no unambiguous GTCRN package".to_string())?;
+        let path = if _read_only {
+            crate::models::verify_catalog_model_read_only(model)
+        } else {
+            crate::models::verify_catalog_model(model)
+        };
         options.onnx = Some(OnnxModelConfig {
-            path: crate::models::verify_catalog_model(model).map_err(|error| {
+            path: path.map_err(|error| {
                 format!(
                     "GTCRN managed model is unavailable ({error}); run `denoize models install gtcrn`"
                 )
@@ -273,6 +299,37 @@ pub fn resolve_processing_options(
         .map_err(|error| error.to_string())?;
     let denoiser = denoiser.sanitized();
     let backend_options = resolve_backend_options(backend, options.backend_options)?;
+    let accelerator = select_accelerator(
+        backend,
+        backend_options.accelerator,
+        backend_options.deterministic,
+    )?;
+    Ok(ResolvedProcessingOptions {
+        backend,
+        denoiser,
+        backend_options,
+        accelerator,
+        loudness_lufs: options.loudness_lufs,
+        true_peak_dbtp: options.true_peak_dbtp,
+    })
+}
+
+/// Resolve the exact finite processing configuration without updating model
+/// catalog, rollback, or provenance state.
+pub fn resolve_processing_options_read_only(
+    audio: &Audio,
+    options: ProcessingOptions,
+) -> Result<ResolvedProcessingOptions, String> {
+    let backend = options
+        .validate_config(audio)
+        .map_err(|error| error.to_string())?;
+    let mut denoiser = options.denoiser;
+    denoiser.sample_rate = audio.sample_rate;
+    denoiser
+        .validate_config()
+        .map_err(|error| error.to_string())?;
+    let denoiser = denoiser.sanitized();
+    let backend_options = resolve_backend_options_read_only(backend, options.backend_options)?;
     let accelerator = select_accelerator(
         backend,
         backend_options.accelerator,

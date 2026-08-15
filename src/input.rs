@@ -31,7 +31,7 @@ impl AudioInputSession {
     /// stall the process before the handle type is checked.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         let path = path.as_ref();
-        let (file, len) = open_regular_input(path)?;
+        let (file, len) = open_regular_file(path, "audio input")?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
@@ -98,7 +98,12 @@ impl AudioInputSession {
     }
 }
 
-fn open_regular_input(path: &Path) -> Result<(File, u64), String> {
+/// Open one regular file without allowing a FIFO or device read to block.
+///
+/// Callers retain the returned handle so validation and reads stay bound to
+/// the same filesystem object. `context` is a short noun phrase used only in
+/// diagnostics.
+pub(crate) fn open_regular_file(path: &Path, context: &str) -> Result<(File, u64), String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -120,29 +125,29 @@ fn open_regular_input(path: &Path) -> Result<(File, u64), String> {
 
     let file = options
         .open(path)
-        .map_err(|error| format!("open audio input {}: {error}", path.display()))?;
+        .map_err(|error| format!("open {context} {}: {error}", path.display()))?;
     let metadata = file
         .metadata()
-        .map_err(|error| format!("inspect audio input {}: {error}", path.display()))?;
+        .map_err(|error| format!("inspect {context} {}: {error}", path.display()))?;
 
     #[cfg(windows)]
-    ensure_windows_disk_handle(&file, path)?;
+    ensure_windows_disk_handle(&file, path, context)?;
 
     if !metadata.is_file() {
         return Err(format!(
-            "audio input is not a regular file: {}",
+            "{context} is not a regular file: {}",
             path.display()
         ));
     }
 
     #[cfg(unix)]
-    clear_unix_nonblocking(&file, path)?;
+    clear_unix_nonblocking(&file, path, context)?;
 
     Ok((file, metadata.len()))
 }
 
 #[cfg(unix)]
-fn clear_unix_nonblocking(file: &File, path: &Path) -> Result<(), String> {
+fn clear_unix_nonblocking(file: &File, path: &Path, context: &str) -> Result<(), String> {
     use std::os::fd::AsRawFd as _;
 
     let descriptor = file.as_raw_fd();
@@ -151,7 +156,7 @@ fn clear_unix_nonblocking(file: &File, path: &Path) -> Result<(), String> {
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
     if flags == -1 {
         return Err(format!(
-            "inspect audio input flags {}: {}",
+            "inspect {context} flags {}: {}",
             path.display(),
             std::io::Error::last_os_error()
         ));
@@ -161,7 +166,7 @@ fn clear_unix_nonblocking(file: &File, path: &Path) -> Result<(), String> {
         // above with only O_NONBLOCK cleared.
         if unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
             return Err(format!(
-                "set blocking audio input mode {}: {}",
+                "set blocking {context} mode {}: {}",
                 path.display(),
                 std::io::Error::last_os_error()
             ));
@@ -171,17 +176,14 @@ fn clear_unix_nonblocking(file: &File, path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn ensure_windows_disk_handle(file: &File, path: &Path) -> Result<(), String> {
+fn ensure_windows_disk_handle(file: &File, path: &Path, context: &str) -> Result<(), String> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
 
     // SAFETY: `file` owns a live handle for the duration of this call.
     let file_type = unsafe { GetFileType(file.as_raw_handle()) };
     if file_type != FILE_TYPE_DISK {
-        return Err(format!(
-            "audio input is not a disk file: {}",
-            path.display()
-        ));
+        return Err(format!("{context} is not a disk file: {}", path.display()));
     }
     Ok(())
 }

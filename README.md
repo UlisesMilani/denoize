@@ -766,6 +766,54 @@ have been verified.
 
 ## CLI highlights
 
+### Read-only plans and signed receipts
+
+Preview the exact finite-file or batch work without creating output, state,
+locks, or model-cache updates:
+
+```sh
+denoize plan noisy.wav clean.wav --pretty > plan.json
+denoize plan input-dir output-dir --batch --resume --pretty > batch-plan.json
+```
+
+Plans use portable relative locators rather than absolute paths and bind input
+and model SHA-256 fingerprints, the resolved recipe/backend/accelerator, audio
+geometry, publication decision, and conservative admitted resources. Planning
+performs bounded decode, backend/model preparation, and encoder validation, so
+it can fail before any execution side effect. A skipped batch item also binds
+the exact fingerprint of the existing output whose journal evidence justified
+that decision.
+
+Generate an Ed25519 key and publish a receipt only after successful finite
+output:
+
+```sh
+denoize receipts keygen receipt-secret.json receipt-public.json
+denoize noisy.wav clean.wav \
+  --receipt clean.receipt.json --receipt-key receipt-secret.json
+denoize receipts verify clean.receipt.json \
+  --key receipt-public.json --plan plan.json --output-root . --pretty
+```
+
+The secret JSON is unencrypted and must remain private. denoize creates it
+without clobbering, with Unix owner-only permissions or a protected Windows
+DACL, and rejects keys with broader access. A separately supplied public key
+or rotation/revocation policy is always required: a receipt never trusts an
+embedded signer. Verification authenticates first and then independently
+rehashes every rooted output. Batch receipts require the whole batch to finish
+without failure or cancellation. Output and receipt are distinct atomic files,
+so a final receipt-path race is reported after preserving already committed
+audio rather than silently replacing either file. Streaming and stdin receipts
+arrive with Stage 12's bounded non-seekable/checkpoint contract.
+
+The desktop app exposes the same finite-file and batch plan preview, plan JSON
+export, optional receipt publication, owner-private key generation, public-key
+export, trust-policy creation, and offline receipt/output verification. Secret
+key paths are session-only UI values and are never stored in desktop settings.
+
+See the [stable JSON contracts](docs/json.md) for schema, privacy, verification,
+and key-rotation details.
+
 ### Realtime audio
 
 Build with the optional system-audio integration, list devices, then route a

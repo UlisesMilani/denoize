@@ -9,11 +9,14 @@ if [[ "${1:-}" == "--check" ]]; then
   shift
 fi
 
-binary=${1:-"$repo_dir/target/debug/denoize"}
+default_binary="$repo_dir/target/debug/denoize"
+binary=${1:-"$default_binary"}
 output=${2:-"$repo_dir/docs/cli.md"}
 
-if [[ ! -x "$binary" ]]; then
-  echo "CLI binary not found at $binary; building it first." >&2
+# The generated reference documents the crates.io-compatible no-default CLI.
+# Rebuild that exact feature set even when a prior full-feature command left an
+# executable at the default path; Cargo will reuse the matching dependencies.
+if [[ "$binary" == "$default_binary" ]]; then
   cargo build --locked --no-default-features --bin denoize \
     --manifest-path "$repo_dir/Cargo.toml"
 fi
@@ -39,7 +42,49 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```text'
   "$binary" models --help
   echo '```'
+  echo
+  echo '## Read-only execution plans'
+  echo
+  echo '```text'
+  "$binary" plan --help
+  echo '```'
+  echo
+  echo '## Signed execution receipts'
+  echo
+  echo '```text'
+  "$binary" receipts --help
+  echo '```'
   cat <<'EOF'
+
+`plan` performs bounded input decoding, metadata and encoder validation,
+read-only backend/model resolution and preparation, and resource admission. It
+does not create an output, batch directory, journal, lock, model-cache update,
+or catalog state. Portable relative locators replace absolute paths in the
+result; batch plans include exact process/skip decisions and reasons.
+Each skipped item also binds the existing output fingerprint that justified
+the skip, so later receipt construction rejects changed skipped bytes.
+
+`--receipt` and `--receipt-key` are accepted together for finite regular-file
+or batch output. The receipt is staged before audio publication and committed
+only after every planned output succeeds or is exactly skipped. If a receipt
+destination race occurs after audio commits, denoize preserves the audio and
+reports that the separate receipt could not be published. A failure or
+cancellation never emits a successful receipt.
+
+The unencrypted Ed25519 secret key is created without clobbering and must stay
+on a private local filesystem. Unix keys require effective-user ownership,
+mode without group/other access, and one hard link. Windows keys require a
+protected DACL limited to owner/OWNER RIGHTS, LocalSystem, and built-in
+administrators. `public-key` reconstructs a public companion; `policy create`
+supports rotation and explicit revocation.
+
+Verification never trusts a key embedded beside a signature. Supply exactly
+one independently distributed public key or trust policy. Signature and
+optional plan identity are checked before rooted output paths are resolved and
+rehashed. The report proves the signed recipe/input/model/output identities; it
+does not prove wall-clock time, duration, host, or user identity. Stage 11 JSON
+files reject unknown fields and future schema versions. Streaming/stdin plans
+and receipts arrive with Stage 12.
 
 ## Stable JSON automation
 

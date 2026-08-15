@@ -424,6 +424,33 @@ pub fn active_catalog() -> Result<ModelCatalog, String> {
     }
 }
 
+/// Load the same authenticated catalog without creating locks or advancing
+/// cached rollback metadata.
+///
+/// This is used by read-only execution planning. A concurrent catalog update
+/// may make the snapshot stale, so execution always resolves and fences its
+/// own catalog/model state again before publishing output.
+#[cfg(feature = "gtcrn")]
+pub(crate) fn active_catalog_read_only() -> Result<ModelCatalog, String> {
+    validate_catalog_storage_path()?;
+    let directory = catalog_directory()?;
+    match std::fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() => {
+            let root = trust::load_active_trust_root_read_only()?;
+            load_active_catalog_locked(embedded_catalog(), &root)
+        }
+        Ok(_) => Err(format!(
+            "model catalog path is not a directory: {}",
+            directory.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(embedded_catalog()),
+        Err(error) => Err(format!(
+            "failed to inspect model catalog directory {}: {error}",
+            directory.display()
+        )),
+    }
+}
+
 fn load_active_catalog_locked(
     embedded: ModelCatalog,
     root: &trust::ActiveTrustRoot,

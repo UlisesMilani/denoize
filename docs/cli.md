@@ -13,6 +13,8 @@ USAGE:
     denoize live --list-devices
     denoize hardware [--json|--pretty]
     denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
+    denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
+    denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
@@ -78,6 +80,8 @@ OPTIONS:
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
         --resume              resume a stream checkpoint or verify exact v3 batch outputs
+        --receipt <PATH>      publish a signed execution receipt after finite output succeeds
+        --receipt-key <PATH>  owner-only Ed25519 key used with --receipt
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork/chapters to the output
@@ -161,6 +165,70 @@ ENVIRONMENT:
     DENOIZE_MODEL_BEARER_TOKEN, DENOIZE_MODEL_USERNAME, DENOIZE_MODEL_PASSWORD
     HTTPS_PROXY, HTTP_PROXY, ALL_PROXY, NO_PROXY (and lowercase variants)
 ```
+
+## Read-only execution plans
+
+```text
+USAGE:
+    denoize plan <INPUT> <OUTPUT> [PROCESSING OPTIONS] [--pretty]
+    denoize plan <INPUT_DIR> <OUTPUT_DIR> --batch [BATCH OPTIONS] [--pretty]
+
+The command performs the same bounded decode, model verification, backend
+preparation, resource admission, recipe hashing, and destination validation as
+execution, but never creates output, lock, journal, checkpoint, or model state.
+It emits denoize-execution-plan-v1 JSON to stdout. Paths are portable relative
+locators, never absolute paths. Stdin/stdout and --stream plans arrive in Stage 12.
+```
+
+## Signed execution receipts
+
+```text
+USAGE:
+    denoize receipts keygen <SECRET_KEY.json> <PUBLIC_KEY.json>
+    denoize receipts public-key <SECRET_KEY.json> <PUBLIC_KEY.json>
+    denoize receipts policy create <POLICY.json> <PUBLIC_KEY.json>... [--revoke KEY_ID]...
+    denoize receipts verify <RECEIPT.json> (--key PUBLIC_KEY.json | --policy POLICY.json) [OPTIONS]
+
+VERIFY OPTIONS:
+        --plan <PLAN.json>   require exact correspondence to a read-only plan
+        --output-root <DIR> anchor portable output locators below DIR
+        --json               emit compact denoize-receipt-verification-v1 JSON
+        --pretty             emit indented verification JSON
+
+Secret keys are unencrypted and generated owner-only. Receipts never embed a
+trust key: verification requires an explicit public key or a rotation/revocation
+policy. Without --output-root, output locators are anchored beside the receipt.
+```
+
+`plan` performs bounded input decoding, metadata and encoder validation,
+read-only backend/model resolution and preparation, and resource admission. It
+does not create an output, batch directory, journal, lock, model-cache update,
+or catalog state. Portable relative locators replace absolute paths in the
+result; batch plans include exact process/skip decisions and reasons.
+Each skipped item also binds the existing output fingerprint that justified
+the skip, so later receipt construction rejects changed skipped bytes.
+
+`--receipt` and `--receipt-key` are accepted together for finite regular-file
+or batch output. The receipt is staged before audio publication and committed
+only after every planned output succeeds or is exactly skipped. If a receipt
+destination race occurs after audio commits, denoize preserves the audio and
+reports that the separate receipt could not be published. A failure or
+cancellation never emits a successful receipt.
+
+The unencrypted Ed25519 secret key is created without clobbering and must stay
+on a private local filesystem. Unix keys require effective-user ownership,
+mode without group/other access, and one hard link. Windows keys require a
+protected DACL limited to owner/OWNER RIGHTS, LocalSystem, and built-in
+administrators. `public-key` reconstructs a public companion; `policy create`
+supports rotation and explicit revocation.
+
+Verification never trusts a key embedded beside a signature. Supply exactly
+one independently distributed public key or trust policy. Signature and
+optional plan identity are checked before rooted output paths are resolved and
+rehashed. The report proves the signed recipe/input/model/output identities; it
+does not prove wall-clock time, duration, host, or user identity. Stage 11 JSON
+files reject unknown fields and future schema versions. Streaming/stdin plans
+and receipts arrive with Stage 12.
 
 ## Stable JSON automation
 

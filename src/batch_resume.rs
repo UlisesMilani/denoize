@@ -1116,6 +1116,37 @@ impl ResumeDecision {
     }
 }
 
+/// One resume decision together with the exact existing output it observed.
+///
+/// `existing_output` is present only for [`ResumeDecision::Skip`]. Keeping the
+/// fingerprint beside the decision lets read-only execution plans bind the
+/// bytes that justified a skip without reopening the pathname afterward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ResumeDecisionEvidence {
+    decision: ResumeDecision,
+    existing_output: Option<FileFingerprint>,
+}
+
+impl ResumeDecisionEvidence {
+    fn new(decision: ResumeDecision, existing_output: Option<FileFingerprint>) -> Self {
+        Self {
+            decision,
+            existing_output,
+        }
+    }
+
+    /// Return the process-or-skip decision.
+    pub fn decision(self) -> ResumeDecision {
+        self.decision
+    }
+
+    /// Return the fingerprint observed for a skip, or `None` for processing.
+    pub fn existing_output(self) -> Option<FileFingerprint> {
+        self.existing_output
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct JournalModel {
@@ -1268,6 +1299,17 @@ pub struct BatchSession {
             std::sync::Arc<std::sync::Barrier>,
         )>,
     >,
+}
+
+struct ReadOnlyBatchLock(File);
+
+impl Drop for ReadOnlyBatchLock {
+    fn drop(&mut self) {
+        // A concurrent fork can inherit this open file description before the
+        // child execs. Explicitly release the advisory lease so the inherited
+        // descriptor cannot keep a completed read-only inspection alive.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
 }
 
 impl Drop for BatchSession {
@@ -2366,6 +2408,44 @@ impl BatchSession {
         }
     }
 
+    /// Plan one item and return the exact existing output that justified a skip.
+    ///
+    /// The legacy [`Self::plan`] method remains available for callers that do
+    /// not need to serialize execution evidence.
+    pub fn plan_with_evidence(
+        &self,
+        expectation: &ResumeExpectation,
+        force: bool,
+    ) -> Result<ResumeDecisionEvidence, String> {
+        let decision = self.plan(expectation, force)?;
+        let existing_output = if matches!(decision, ResumeDecision::Skip { .. }) {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| "batch resume session lock poisoned".to_string())?;
+            inner.require_planning()?;
+            Some(
+                inner
+                    .planned_skips
+                    .iter()
+                    .rev()
+                    .find(|planned| {
+                        planned.expectation.item_id == expectation.item_id
+                            && planned.expectation.destination == expectation.destination
+                            && planned.expectation.input_path == expectation.input_path
+                            && planned.expectation.input == expectation.input
+                            && planned.expectation.model == expectation.model
+                            && planned.expectation.recipe == expectation.recipe
+                    })
+                    .map(|planned| planned.output)
+                    .ok_or("resume skip is missing its observed output fingerprint")?,
+            )
+        } else {
+            None
+        };
+        Ok(ResumeDecisionEvidence::new(decision, existing_output))
+    }
+
     /// Finish all planning, repair a torn final record, and synchronously record any
     /// prepare entries recovered from exact current outputs.
     pub fn activate(&self) -> Result<(), String> {
@@ -2601,6 +2681,239 @@ impl BatchSession {
     }
 }
 
+/// Inspect batch resume decisions without creating an output directory, lock,
+/// journal, or recovery record.
+///
+/// This advisory snapshot is used by Stage 11 execution plans. If an existing
+/// lock file is present it is held shared for the inspection; an active writer
+/// is rejected. Execution still repeats every source and destination fence
+/// under the normal exclusive session before publishing bytes.
+pub fn inspect_batch_decisions(
+    output_dir: &Path,
+    resume_enabled: bool,
+    expectations: &[ResumeExpectation],
+    force: bool,
+) -> Result<Vec<ResumeDecision>, String> {
+    inspect_batch_decisions_with_evidence(output_dir, resume_enabled, expectations, force).map(
+        |decisions| {
+            decisions
+                .into_iter()
+                .map(ResumeDecisionEvidence::decision)
+                .collect()
+        },
+    )
+}
+
+/// Inspect batch decisions and retain the output fingerprint behind each skip.
+///
+/// This has the same read-only and locking guarantees as
+/// [`inspect_batch_decisions`], but is suitable for canonical execution plans.
+pub fn inspect_batch_decisions_with_evidence(
+    output_dir: &Path,
+    resume_enabled: bool,
+    expectations: &[ResumeExpectation],
+    force: bool,
+) -> Result<Vec<ResumeDecisionEvidence>, String> {
+    let metadata = match std::fs::symlink_metadata(output_dir) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "inspect batch output directory {}: {error}",
+                output_dir.display()
+            ))
+        }
+    };
+    let Some(metadata) = metadata else {
+        let mut decisions = Vec::with_capacity(expectations.len());
+        for expectation in expectations {
+            expectation.verify_sources()?;
+            decisions.push(ResumeDecisionEvidence::new(
+                ResumeDecision::Process {
+                    commit_mode: if force {
+                        CommitMode::Replace
+                    } else {
+                        CommitMode::NoClobber
+                    },
+                    reason: ResumeReason::Missing,
+                },
+                None,
+            ));
+        }
+        return Ok(decisions);
+    };
+    if !metadata.is_dir() {
+        return Err(format!(
+            "batch output is not a directory: {}",
+            output_dir.display()
+        ));
+    }
+    let output_root = std::fs::canonicalize(output_dir).map_err(|error| {
+        format!(
+            "resolve batch output directory {}: {error}",
+            output_dir.display()
+        )
+    })?;
+    validate_control_root(&output_root)?;
+    let lock_path = output_root.join(LOCK_FILE_NAME);
+    let lock = open_secure_existing(&lock_path, false, true)?;
+    let lock = match lock {
+        Some(file) => {
+            fs2::FileExt::try_lock_shared(&file).map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                {
+                    format!(
+                        "cannot create a read-only plan while another batch holds {}",
+                        lock_path.display()
+                    )
+                } else {
+                    format!("inspect batch output lock {}: {error}", lock_path.display())
+                }
+            })?;
+            Some(ReadOnlyBatchLock(file))
+        }
+        None => None,
+    };
+    let mut index = JournalIndex::default();
+    if resume_enabled {
+        let journal_path = output_root.join(STATE_FILE_NAME);
+        if let Some(mut journal) = open_secure_existing(&journal_path, false, true)? {
+            let (parsed, _, _, _) = parse_journal(&mut journal, &journal_path)?;
+            index = parsed;
+        }
+        let legacy_path = output_root.join(LEGACY_DESKTOP_STATE_FILE_NAME);
+        if let Some(mut legacy) = open_secure_existing(&legacy_path, false, false)? {
+            let _ = parse_journal(&mut legacy, &legacy_path)?;
+            index.legacy = true;
+        }
+    }
+
+    let mut decisions = Vec::with_capacity(expectations.len());
+    for expectation in expectations {
+        let destination = planned_destination_within(&output_root, &expectation.destination)?;
+        expectation.verify_sources()?;
+        let output = inspect_output(&destination)?;
+        decisions.push(inspect_resume_decision_with_evidence(
+            &index,
+            resume_enabled,
+            output,
+            expectation,
+            force,
+        )?);
+    }
+    // A missing lock before inspection must still be missing afterward. Lock
+    // files are durable control files, so observing one now means a writer
+    // raced the snapshot and the caller should retry.
+    if lock.is_none() {
+        match std::fs::symlink_metadata(&lock_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err("batch state changed during read-only planning; retry the plan".into())
+            }
+            Err(error) => {
+                return Err(format!(
+                    "reinspect batch output lock {}: {error}",
+                    lock_path.display()
+                ))
+            }
+        }
+    }
+    Ok(decisions)
+}
+
+fn inspect_resume_decision_with_evidence(
+    index: &JournalIndex,
+    resume_enabled: bool,
+    output: OutputStatus,
+    expectation: &ResumeExpectation,
+    force: bool,
+) -> Result<ResumeDecisionEvidence, String> {
+    let observed_safe_output = match &output {
+        OutputStatus::Safe(fingerprint) => Some(*fingerprint),
+        _ => None,
+    };
+    let decision = inspect_resume_decision(index, resume_enabled, output, expectation, force)?;
+    let existing_output = if matches!(decision, ResumeDecision::Skip { .. }) {
+        Some(observed_safe_output.ok_or("resume skip did not observe a safe output")?)
+    } else {
+        None
+    };
+    Ok(ResumeDecisionEvidence::new(decision, existing_output))
+}
+
+fn inspect_resume_decision(
+    index: &JournalIndex,
+    resume_enabled: bool,
+    output: OutputStatus,
+    expectation: &ResumeExpectation,
+    force: bool,
+) -> Result<ResumeDecision, String> {
+    if !resume_enabled {
+        return match output {
+            OutputStatus::Missing => Ok(ResumeDecision::Process {
+                commit_mode: if force {
+                    CommitMode::Replace
+                } else {
+                    CommitMode::NoClobber
+                },
+                reason: ResumeReason::Missing,
+            }),
+            OutputStatus::Safe(_) | OutputStatus::UnsafeReplaceable if force => {
+                Ok(ResumeDecision::Process {
+                    commit_mode: CommitMode::Replace,
+                    reason: ResumeReason::Untracked,
+                })
+            }
+            OutputStatus::Safe(_) | OutputStatus::UnsafeReplaceable => Err(stale_output_error(
+                &expectation.destination,
+                ResumeReason::Untracked,
+            )),
+            OutputStatus::Unreplaceable(error) => Err(error),
+        };
+    }
+    match output {
+        OutputStatus::Missing => Ok(ResumeDecision::Process {
+            commit_mode: if force {
+                CommitMode::Replace
+            } else {
+                CommitMode::NoClobber
+            },
+            reason: ResumeReason::Missing,
+        }),
+        OutputStatus::UnsafeReplaceable if force => Ok(ResumeDecision::Process {
+            commit_mode: CommitMode::Replace,
+            reason: ResumeReason::Unsafe,
+        }),
+        OutputStatus::UnsafeReplaceable => Err(stale_output_error(
+            &expectation.destination,
+            ResumeReason::Unsafe,
+        )),
+        OutputStatus::Unreplaceable(error) => Err(error),
+        OutputStatus::Safe(output_fingerprint) => {
+            let exact = index.records_for(expectation.item_id).rev().any(|record| {
+                record_matches_expectation(record, expectation)
+                    && record.line.output == output_fingerprint
+            });
+            if exact {
+                return Ok(ResumeDecision::Skip {
+                    reason: ResumeReason::Exact,
+                });
+            }
+            let latest = index.records_for(expectation.item_id).next_back();
+            let reason = stale_reason(latest, index.legacy, expectation);
+            if force {
+                Ok(ResumeDecision::Process {
+                    commit_mode: CommitMode::Replace,
+                    reason,
+                })
+            } else {
+                Err(stale_output_error(&expectation.destination, reason))
+            }
+        }
+    }
+}
+
 fn fingerprint_stage(
     transaction: &mut AtomicOutput,
     display_path: &Path,
@@ -2673,6 +2986,160 @@ mod tests {
         assert_eq!(encoded.parse::<Digest>().unwrap(), digest);
         assert!("00".parse::<Digest>().is_err());
         assert!(["z"; 64].concat().parse::<Digest>().is_err());
+    }
+
+    fn assert_read_only_decision_matches_session(
+        root: &Path,
+        resume_enabled: bool,
+        expectation: &ResumeExpectation,
+        force: bool,
+    ) {
+        let inspected = inspect_batch_decisions(
+            root,
+            resume_enabled,
+            std::slice::from_ref(expectation),
+            force,
+        )
+        .map(|decisions| decisions[0]);
+        let session = BatchSession::acquire(root, resume_enabled).unwrap();
+        let planned = session.plan(expectation, force);
+        match (inspected, planned) {
+            (Ok(inspected), Ok(planned)) => assert_eq!(inspected, planned),
+            (Err(_), Err(_)) => {}
+            (inspected, planned) => panic!(
+                "read-only and execution planning disagree: inspected={inspected:?}, planned={planned:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn read_only_inspector_matches_execution_decisions_across_resume_states() {
+        for (resume_enabled, force) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let directory = tempdir().unwrap();
+            let input = directory.path().join("input.bin");
+            let output = directory.path().join("output.bin");
+            write(&input, b"input");
+            let expected = expectation(&input, &output, 1, 2);
+            assert_read_only_decision_matches_session(
+                directory.path(),
+                resume_enabled,
+                &expected,
+                force,
+            );
+        }
+
+        for force in [false, true] {
+            let directory = tempdir().unwrap();
+            let input = directory.path().join("input.bin");
+            let output = directory.path().join("output.bin");
+            write(&input, b"input");
+            write(&output, b"untracked output");
+            let expected = expectation(&input, &output, 3, 4);
+            assert_read_only_decision_matches_session(directory.path(), true, &expected, force);
+        }
+
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.bin");
+        let output = directory.path().join("output.bin");
+        write(&input, b"input one");
+        let expected = expectation(&input, &output, 5, 6);
+        let session = BatchSession::acquire(directory.path(), true).unwrap();
+        assert!(matches!(
+            session.plan(&expected, false).unwrap(),
+            ResumeDecision::Process { .. }
+        ));
+        session.activate().unwrap();
+        let mut stage = AtomicOutput::new(&output).unwrap();
+        stage.file_mut().write_all(b"tracked output").unwrap();
+        session
+            .publish(&expected, stage, CommitMode::NoClobber)
+            .unwrap();
+        drop(session);
+
+        assert_read_only_decision_matches_session(directory.path(), true, &expected, false);
+        assert_read_only_decision_matches_session(directory.path(), true, &expected, true);
+
+        write(&output, b"changed output");
+        assert_read_only_decision_matches_session(directory.path(), true, &expected, false);
+        assert_read_only_decision_matches_session(directory.path(), true, &expected, true);
+
+        write(&output, b"tracked output");
+        write(&input, b"input two");
+        let changed_input = expectation(&input, &output, 5, 6);
+        assert_read_only_decision_matches_session(directory.path(), true, &changed_input, false);
+        assert_read_only_decision_matches_session(directory.path(), true, &changed_input, true);
+
+        write(&input, b"input one");
+        let changed_recipe = expectation(&input, &output, 5, 7);
+        assert_read_only_decision_matches_session(directory.path(), true, &changed_recipe, false);
+        assert_read_only_decision_matches_session(directory.path(), true, &changed_recipe, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_lock_drop_releases_an_inherited_descriptor() {
+        let directory = tempdir().unwrap();
+        let lock_path = directory.path().join(LOCK_FILE_NAME);
+        let initial = acquire_batch_lock(&lock_path).unwrap();
+        fs2::FileExt::unlock(&initial).unwrap();
+        drop(initial);
+
+        let file = open_secure_existing(&lock_path, false, true)
+            .unwrap()
+            .unwrap();
+        fs2::FileExt::try_lock_shared(&file).unwrap();
+        let guard = ReadOnlyBatchLock(file);
+        let inherited = guard.0.try_clone().unwrap();
+
+        drop(guard);
+        let exclusive = acquire_batch_lock(&lock_path).unwrap();
+        fs2::FileExt::unlock(&exclusive).unwrap();
+        drop(exclusive);
+        drop(inherited);
+    }
+
+    #[test]
+    fn planning_evidence_binds_the_exact_output_behind_a_skip() {
+        let directory = tempdir().unwrap();
+        let input = directory.path().join("input.bin");
+        let output = directory.path().join("output.bin");
+        write(&input, b"input");
+        let expected = expectation(&input, &output, 21, 22);
+
+        let session = BatchSession::acquire(directory.path(), true).unwrap();
+        assert!(matches!(
+            session.plan(&expected, false).unwrap(),
+            ResumeDecision::Process { .. }
+        ));
+        session.activate().unwrap();
+        let mut stage = AtomicOutput::new(&output).unwrap();
+        stage.file_mut().write_all(b"tracked output").unwrap();
+        session
+            .publish(&expected, stage, CommitMode::NoClobber)
+            .unwrap();
+        drop(session);
+
+        let output_fingerprint = fingerprint_file(&output).unwrap();
+        let inspected = inspect_batch_decisions_with_evidence(
+            directory.path(),
+            true,
+            std::slice::from_ref(&expected),
+            false,
+        )
+        .unwrap()[0];
+        assert_eq!(
+            inspected.decision(),
+            ResumeDecision::Skip {
+                reason: ResumeReason::Exact
+            }
+        );
+        assert_eq!(inspected.existing_output(), Some(output_fingerprint));
+
+        let session = BatchSession::acquire(directory.path(), true).unwrap();
+        let planned = session.plan_with_evidence(&expected, false).unwrap();
+        assert_eq!(planned.decision(), inspected.decision());
+        assert_eq!(planned.existing_output(), Some(output_fingerprint));
     }
 
     #[cfg(unix)]

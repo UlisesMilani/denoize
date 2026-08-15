@@ -139,6 +139,14 @@ type LiveEvent = {
   inputLevel: number; outputLevel: number; processedChunks: number; droppedChunks: number;
   accelerator?: AcceleratorSelection | null;
 };
+type ExecutionPlan = {
+  schema: string; schema_version: number; denoize_version: string; kind: "file" | "batch";
+  deterministic: boolean; metadata_policy: string; items: Array<Record<string, unknown>>;
+};
+type ReceiptVerificationReport = {
+  schema: string; schema_version: number; receipt_schema: string; key_id: string;
+  plan_digest: string; kind: "file" | "batch"; verified_items: Array<Record<string, unknown>>;
+};
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
@@ -155,6 +163,8 @@ const previews: { input?: PreviewData; output?: PreviewData } = {};
 let activePreview: "input" | "output" = "input";
 let currentRecommendation: RecommendationReport | null = null;
 let recommendationRunning = false;
+let processPlan: ExecutionPlan | null = null;
+let batchPlan: ExecutionPlan | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <div class="shell">
@@ -166,6 +176,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button class="nav-item" data-page="live"><span>◉</span>リアルタイム</button>
         <button class="nav-item" data-page="compare"><span>◒</span>品質比較</button>
         <button class="nav-item" data-page="models"><span>⬡</span>モデル</button>
+        <button class="nav-item" data-page="receipts"><span>✓</span>実行証明</button>
       </nav>
       <div class="sidebar-foot"><span class="status-dot"></span><span id="engine-label">エンジンを確認中</span><small id="version"></small></div>
     </aside>
@@ -251,6 +262,13 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <article class="card action-card">
               <div id="idle-state"><div class="ready-icon">◎</div><h3>準備ができたら開始</h3><p>処理はすべてこのコンピューター内で行われます。</p></div>
               <div id="job-state" class="hidden"><div class="progress-ring"><span id="progress-percent">0%</span></div><h3 id="progress-message">処理中</h3><p id="progress-meta"></p><div class="progress-track"><i id="progress-bar"></i></div></div>
+              <div class="evidence-options">
+                <div class="file-row"><div><label>署名付き実行証明</label><div id="process-receipt-display" class="path empty">使用しない</div></div><div class="button-row"><button class="secondary" id="clear-process-receipt">解除</button><button class="secondary" id="choose-process-receipt">保存先</button></div></div>
+                <div class="file-row"><div><label>署名鍵</label><div id="process-receipt-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-process-receipt-key">選択</button></div>
+                <input type="hidden" id="process-receipt-path"><input type="hidden" id="process-receipt-key-path">
+                <div class="button-row"><button class="secondary" id="preview-process-plan">実行計画を確認</button><button class="secondary" id="save-process-plan" disabled>計画JSONを保存</button></div>
+                <pre id="process-plan-preview" class="json-preview hidden"></pre>
+              </div>
               <button class="primary wide" id="start-process">ノイズ除去を開始 <span>→</span></button>
               <button class="danger wide hidden" id="cancel-process">キャンセル</button>
             </article>
@@ -261,7 +279,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <section class="page" id="page-batch">
         <div class="grid two-col">
           <article class="card tall" data-drop-zone="batch-input"><div class="card-heading"><div><span class="step">01</span><h2>入力</h2></div><div class="button-row"><button class="secondary" id="choose-batch-folder">フォルダ</button><button class="secondary" id="choose-batch">ファイル追加</button></div></div><div id="batch-files" class="empty-panel">フォルダまたは複数ファイルを選択／ドロップしてください</div><div id="batch-results" class="batch-results hidden"></div></article>
-          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row" data-drop-zone="batch-output"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択／ドロップ</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>同じ入力・設定・モデル・出力だけをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>変更済み・旧形式の出力も置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
+          <div class="stack"><article class="card"><div class="card-heading"><div><span class="step">02</span><h2>出力と実行</h2></div></div><div class="file-row" data-drop-zone="batch-output"><div><label>出力フォルダ</label><div id="batch-output-display" class="path empty">出力フォルダを選択／ドロップ</div></div><button class="secondary" id="choose-batch-output">選択</button></div><div class="form-grid two"><label>形式<select id="batch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>並列数<input id="batch-jobs" type="number" value="2" min="1" max="32"></label></div><div class="toggle-grid"><label class="toggle"><input id="batch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label><label class="toggle"><input id="batch-resume" type="checkbox"><span></span><div><b>中断から再開</b><small>同じ入力・設定・モデル・出力だけをスキップ</small></div></label><label class="toggle"><input id="batch-force" type="checkbox"><span></span><div><b>既存を上書き</b><small>変更済み・旧形式の出力も置換</small></div></label></div></article><article class="card action-card"><h3>一括処理</h3><p id="batch-summary">入力が未選択です</p><div class="evidence-options"><div class="file-row"><div><label>署名付き実行証明</label><div id="batch-receipt-display" class="path empty">使用しない</div></div><div class="button-row"><button class="secondary" id="clear-batch-receipt">解除</button><button class="secondary" id="choose-batch-receipt">保存先</button></div></div><div class="file-row"><div><label>署名鍵</label><div id="batch-receipt-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-batch-receipt-key">選択</button></div><input type="hidden" id="batch-receipt-path"><input type="hidden" id="batch-receipt-key-path"><div class="button-row"><button class="secondary" id="preview-batch-plan">実行計画を確認</button><button class="secondary" id="save-batch-plan" disabled>計画JSONを保存</button></div><pre id="batch-plan-preview" class="json-preview hidden"></pre></div><button class="primary wide" id="start-batch">バッチを開始 <span>→</span></button><button class="danger wide hidden" id="cancel-batch">キャンセル</button></article></div>
         </div>
       </section>
 
@@ -319,6 +337,28 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルも署名カタログ固定のSHA-256で検証されます。ローカルモデル導入時、共有ネットワーク欄はモデル本体には使われず、カタログ更新にだけ使用できます。</p>
         </article>
         <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="model-doctor">診断</button><button class="secondary" id="export-model-json">JSONを書出</button><button class="secondary" id="model-prune-preview">整理確認</button><button class="secondary" id="model-prune">整理実行</button><button class="secondary" id="recover-model-trust-root">信頼ルート復旧</button><button class="secondary" id="reset-model-trust-time">信頼時刻リセット</button><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p id="model-health-status" class="section-copy">モデルキャッシュを診断しています。</p><p class="section-copy">外部モデルは版管理された信頼ルート、カタログ署名、期限、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。期限切れや失効後も検証済みモデルは利用できますが、新規取得は停止します。信頼ルート復旧は破損した同世代のキャッシュだけを、このアプリに埋め込まれたルートへ戻します。信頼時刻リセットは、誤った未来時刻を修正した後にだけ使用します。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
+      </section>
+
+      <section class="page" id="page-receipts">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">KEY</span><h2>署名鍵と信頼ポリシー</h2></div></div>
+              <p class="section-copy">秘密鍵はowner-only権限で保存され、設定や画面状態には保持しません。公開鍵だけを検証側へ配布してください。</p>
+              <div class="button-row"><button class="primary" id="generate-receipt-keypair">鍵ペアを生成</button><button class="secondary" id="export-receipt-public-key">秘密鍵から公開鍵を再出力</button><button class="secondary" id="create-receipt-policy">信頼ポリシーを作成</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">VERIFY</span><h2>実行証明をオフライン検証</h2></div></div>
+              <div class="file-row"><div><label>実行証明</label><div id="verify-receipt-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-verify-receipt">選択</button></div>
+              <div class="file-row"><div><label>公開鍵または信頼ポリシー</label><div id="verify-trust-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="choose-verify-key">公開鍵</button><button class="secondary" id="choose-verify-policy">ポリシー</button></div></div>
+              <div class="file-row"><div><label>実行計画（任意）</label><div id="verify-plan-display" class="path empty">指定なし</div></div><div class="button-row"><button class="secondary" id="clear-verify-plan">解除</button><button class="secondary" id="choose-verify-plan">選択</button></div></div>
+              <div class="file-row"><div><label>出力ルート（任意）</label><div id="verify-output-root-display" class="path empty">証明ファイルの場所を使用</div></div><div class="button-row"><button class="secondary" id="clear-verify-output-root">解除</button><button class="secondary" id="choose-verify-output-root">選択</button></div></div>
+              <input type="hidden" id="verify-receipt-path"><input type="hidden" id="verify-key-path"><input type="hidden" id="verify-policy-path"><input type="hidden" id="verify-plan-path"><input type="hidden" id="verify-output-root-path">
+              <button class="primary wide" id="verify-receipt">署名と出力を検証</button>
+            </article>
+          </div>
+          <article class="card result-card"><div class="card-heading"><div><span class="step">RESULT</span><h2>検証結果</h2></div></div><div id="receipt-verification-empty" class="empty-panel">証明、公開鍵または信頼ポリシーを選んでください</div><pre id="receipt-verification-result" class="json-preview hidden"></pre></article>
+        </div>
       </section>
       <div id="toast" role="status"></div>
       <div id="drop-overlay"><strong>ここにドロップ</strong><span>音声ファイルまたはフォルダ</span></div>
@@ -527,6 +567,23 @@ function options(backend = $<HTMLSelectElement>("#backend").value) {
   };
 }
 
+function processRequest() {
+  const input = $<HTMLInputElement>("#input-path").value;
+  const output = $<HTMLInputElement>("#output-path").value;
+  if (!input || !output) throw new Error("入力と出力を選択してください");
+  const stream = $<HTMLInputElement>("#file-stream").checked;
+  return {
+    input,
+    output,
+    stream,
+    resume: stream && $<HTMLInputElement>("#file-stream-resume").checked,
+    streamFrames: Number($<HTMLInputElement>("#file-stream-frames").value),
+    receipt: $<HTMLInputElement>("#process-receipt-path").value || null,
+    receiptKey: $<HTMLInputElement>("#process-receipt-key-path").value || null,
+    options: options(),
+  };
+}
+
 async function init() {
   appInfo = await invoke<AppInfo>("app_info");
   $("#version").textContent = `v${appInfo.version}`;
@@ -724,6 +781,37 @@ $("#choose-output").addEventListener("click", async () => {
   const path = await save({ filters: audioFilters, defaultPath: $<HTMLInputElement>("#output-path").value || undefined });
   if (path) setPath("#output-path", "#output-display", path);
 });
+$("#choose-process-receipt").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "denoize-execution-receipt.json", filters: [{ name: "Execution receipt", extensions: ["json"] }] });
+  if (path) setPath("#process-receipt-path", "#process-receipt-display", path);
+});
+$("#choose-process-receipt-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Receipt secret key", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#process-receipt-key-path", "#process-receipt-key-display", path);
+});
+$("#clear-process-receipt").addEventListener("click", () => {
+  setPath("#process-receipt-path", "#process-receipt-display", null);
+  setPath("#process-receipt-key-path", "#process-receipt-key-display", null);
+});
+$("#preview-process-plan").addEventListener("click", async () => {
+  try {
+    processPlan = await invoke<ExecutionPlan>("plan_process", { request: processRequest() });
+    $("#process-plan-preview").textContent = JSON.stringify(processPlan, null, 2);
+    $("#process-plan-preview").classList.remove("hidden");
+    $<HTMLButtonElement>("#save-process-plan").disabled = false;
+  } catch (error) { showToast(`実行計画: ${errorText(error)}`, true); }
+});
+$("#save-process-plan").addEventListener("click", async () => {
+  try {
+    const plan = await invoke<ExecutionPlan>("plan_process", { request: processRequest() });
+    const path = await save({ defaultPath: "denoize-execution-plan.json", filters: [{ name: "Execution plan", extensions: ["json"] }] });
+    if (!path) return;
+    await invoke("save_execution_plan", { path, plan });
+    processPlan = plan;
+    $("#process-plan-preview").textContent = JSON.stringify(plan, null, 2);
+    showToast("実行計画を保存しました");
+  } catch (error) { showToast(`実行計画: ${errorText(error)}`, true); }
+});
 async function defaultOutput(input: string) {
   const dot = input.lastIndexOf("."); const separator = Math.max(input.lastIndexOf("/"), input.lastIndexOf("\\"));
   const base = dot > separator ? input.slice(0, dot) : input;
@@ -829,17 +917,7 @@ $("#file-stream").addEventListener("change", updateFileStreamSettings);
 
 $("#start-process").addEventListener("click", async () => {
   try {
-    const input = $<HTMLInputElement>("#input-path").value, output = $<HTMLInputElement>("#output-path").value;
-    if (!input || !output) throw new Error("入力と出力を選択してください");
-    const stream = $<HTMLInputElement>("#file-stream").checked;
-    await beginJob("file", "start_process", {
-      input,
-      output,
-      stream,
-      resume: stream && $<HTMLInputElement>("#file-stream-resume").checked,
-      streamFrames: Number($<HTMLInputElement>("#file-stream-frames").value),
-      options: options(),
-    });
+    await beginJob("file", "start_process", processRequest());
   } catch (error) { showToast(errorText(error), true); }
 });
 $("#cancel-process").addEventListener("click", () => cancelActive());
@@ -848,6 +926,21 @@ let batchInputs: string[] = [];
 let batchInputDir = "";
 let batchOutput = "";
 const batchStatuses = new Map<string, { path: string; status: string; error?: string }>();
+function batchRequest() {
+  if ((!batchInputs.length && !batchInputDir) || !batchOutput) throw new Error("入力と出力フォルダを選択してください");
+  return {
+    inputs: batchInputs,
+    inputDir: batchInputDir || null,
+    outputDir: batchOutput,
+    outputFormat: $<HTMLSelectElement>("#batch-format").value,
+    recursive: $<HTMLInputElement>("#batch-recursive").checked,
+    jobs: Number($<HTMLInputElement>("#batch-jobs").value),
+    resume: $<HTMLInputElement>("#batch-resume").checked,
+    receipt: $<HTMLInputElement>("#batch-receipt-path").value || null,
+    receiptKey: $<HTMLInputElement>("#batch-receipt-key-path").value || null,
+    options: { ...options(), force: $<HTMLInputElement>("#batch-force").checked },
+  };
+}
 $("#choose-batch").addEventListener("click", async () => {
   const paths = await open({ multiple: true, filters: audioFilters }); if (!Array.isArray(paths)) return;
   batchInputs = paths; renderBatch();
@@ -860,11 +953,41 @@ $("#choose-batch-output").addEventListener("click", async () => {
   const path = await open({ directory: true, multiple: false }); if (typeof path !== "string") return;
   batchOutput = path; $("#batch-output-display").textContent = path; $("#batch-output-display").classList.remove("empty");
 });
+$("#choose-batch-receipt").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "denoize-batch-receipt.json", filters: [{ name: "Execution receipt", extensions: ["json"] }] });
+  if (path) setPath("#batch-receipt-path", "#batch-receipt-display", path);
+});
+$("#choose-batch-receipt-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Receipt secret key", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#batch-receipt-key-path", "#batch-receipt-key-display", path);
+});
+$("#clear-batch-receipt").addEventListener("click", () => {
+  setPath("#batch-receipt-path", "#batch-receipt-display", null);
+  setPath("#batch-receipt-key-path", "#batch-receipt-key-display", null);
+});
+$("#preview-batch-plan").addEventListener("click", async () => {
+  try {
+    batchPlan = await invoke<ExecutionPlan>("plan_batch", { request: batchRequest() });
+    $("#batch-plan-preview").textContent = JSON.stringify(batchPlan, null, 2);
+    $("#batch-plan-preview").classList.remove("hidden");
+    $<HTMLButtonElement>("#save-batch-plan").disabled = false;
+  } catch (error) { showToast(`バッチ実行計画: ${errorText(error)}`, true); }
+});
+$("#save-batch-plan").addEventListener("click", async () => {
+  try {
+    const plan = await invoke<ExecutionPlan>("plan_batch", { request: batchRequest() });
+    const path = await save({ defaultPath: "denoize-batch-plan.json", filters: [{ name: "Execution plan", extensions: ["json"] }] });
+    if (!path) return;
+    await invoke("save_execution_plan", { path, plan });
+    batchPlan = plan;
+    $("#batch-plan-preview").textContent = JSON.stringify(plan, null, 2);
+    showToast("バッチ実行計画を保存しました");
+  } catch (error) { showToast(`バッチ実行計画: ${errorText(error)}`, true); }
+});
 $("#start-batch").addEventListener("click", async () => {
   try {
-    if ((!batchInputs.length && !batchInputDir) || !batchOutput) throw new Error("入力と出力フォルダを選択してください");
     batchStatuses.clear(); $("#batch-results").innerHTML = ""; $("#batch-results").classList.remove("hidden");
-    await beginJob("batch", "start_batch", { inputs: batchInputs, inputDir: batchInputDir || null, outputDir: batchOutput, outputFormat: $<HTMLSelectElement>("#batch-format").value, recursive: $<HTMLInputElement>("#batch-recursive").checked, jobs: Number($<HTMLInputElement>("#batch-jobs").value), resume: $<HTMLInputElement>("#batch-resume").checked, options: { ...options(), force: $<HTMLInputElement>("#batch-force").checked } });
+    await beginJob("batch", "start_batch", batchRequest());
   } catch (error) { showToast(errorText(error), true); }
 });
 $("#cancel-batch").addEventListener("click", () => cancelActive());
@@ -874,6 +997,86 @@ function renderBatch() {
   $("#batch-files").classList.toggle("empty-panel", !batchInputDir && !batchInputs.length);
 }
 $("#batch-recursive").addEventListener("change", renderBatch);
+
+$("#generate-receipt-keypair").addEventListener("click", async () => {
+  try {
+    const secret = await save({ defaultPath: "denoize-receipt-secret.json", filters: [{ name: "Receipt secret key", extensions: ["json"] }] });
+    if (!secret) return;
+    const publicPath = await save({ defaultPath: "denoize-receipt-public.json", filters: [{ name: "Receipt public key", extensions: ["json"] }] });
+    if (!publicPath) return;
+    const keyId = await invoke<string>("generate_receipt_key", { secret, public: publicPath });
+    showToast(`署名鍵を生成しました: ${keyId}`);
+  } catch (error) { showToast(`署名鍵: ${errorText(error)}`, true); }
+});
+$("#export-receipt-public-key").addEventListener("click", async () => {
+  try {
+    const secret = await open({ multiple: false, filters: [{ name: "Receipt secret key", extensions: ["json"] }] });
+    if (typeof secret !== "string") return;
+    const publicPath = await save({ defaultPath: "denoize-receipt-public.json", filters: [{ name: "Receipt public key", extensions: ["json"] }] });
+    if (!publicPath) return;
+    const keyId = await invoke<string>("export_receipt_public_key", { secret, public: publicPath });
+    showToast(`公開鍵を書き出しました: ${keyId}`);
+  } catch (error) { showToast(`公開鍵: ${errorText(error)}`, true); }
+});
+$("#create-receipt-policy").addEventListener("click", async () => {
+  try {
+    const selected = await open({ multiple: true, filters: [{ name: "Receipt public keys", extensions: ["json"] }] });
+    const publicKeys = typeof selected === "string" ? [selected] : selected;
+    if (!publicKeys?.length) return;
+    const path = await save({ defaultPath: "denoize-receipt-policy.json", filters: [{ name: "Receipt trust policy", extensions: ["json"] }] });
+    if (!path) return;
+    const revoked = window.prompt("失効させるkey IDをカンマ区切りで入力してください（なければ空欄）", "") ?? "";
+    const revokedKeyIds = revoked.split(",").map((value) => value.trim()).filter(Boolean);
+    await invoke("create_receipt_policy", { path, publicKeys, revokedKeyIds });
+    showToast("信頼ポリシーを作成しました");
+  } catch (error) { showToast(`信頼ポリシー: ${errorText(error)}`, true); }
+});
+
+$("#choose-verify-receipt").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Execution receipt", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#verify-receipt-path", "#verify-receipt-display", path);
+});
+$("#choose-verify-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Receipt public key", extensions: ["json"] }] });
+  if (typeof path !== "string") return;
+  setPath("#verify-key-path", "#verify-trust-display", path);
+  $<HTMLInputElement>("#verify-policy-path").value = "";
+});
+$("#choose-verify-policy").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Receipt trust policy", extensions: ["json"] }] });
+  if (typeof path !== "string") return;
+  setPath("#verify-policy-path", "#verify-trust-display", path);
+  $<HTMLInputElement>("#verify-key-path").value = "";
+});
+$("#choose-verify-plan").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Execution plan", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#verify-plan-path", "#verify-plan-display", path);
+});
+$("#clear-verify-plan").addEventListener("click", () => setPath("#verify-plan-path", "#verify-plan-display", null));
+$("#choose-verify-output-root").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") setPath("#verify-output-root-path", "#verify-output-root-display", path);
+});
+$("#clear-verify-output-root").addEventListener("click", () => setPath("#verify-output-root-path", "#verify-output-root-display", null));
+$("#verify-receipt").addEventListener("click", async () => {
+  try {
+    const receipt = $<HTMLInputElement>("#verify-receipt-path").value;
+    const key = $<HTMLInputElement>("#verify-key-path").value;
+    const policy = $<HTMLInputElement>("#verify-policy-path").value;
+    if (!receipt || (!key && !policy)) throw new Error("実行証明と公開鍵または信頼ポリシーを選択してください");
+    const report = await invoke<ReceiptVerificationReport>("verify_execution_receipt", { request: {
+      receipt,
+      key: key || null,
+      policy: policy || null,
+      plan: $<HTMLInputElement>("#verify-plan-path").value || null,
+      outputRoot: $<HTMLInputElement>("#verify-output-root-path").value || null,
+    } });
+    $("#receipt-verification-empty").classList.add("hidden");
+    $("#receipt-verification-result").textContent = JSON.stringify(report, null, 2);
+    $("#receipt-verification-result").classList.remove("hidden");
+    showToast(`実行証明を検証しました: ${report.key_id}`);
+  } catch (error) { showToast(`実行証明: ${errorText(error)}`, true); }
+});
 
 const comparePaths: Record<string, string> = { clean: "", noisy: "", enhanced: "" };
 function renderCompareInputs() {

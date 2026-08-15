@@ -8,6 +8,8 @@ pub use bundle::{
     build_offline_bundle, import_offline_bundle, import_offline_bundle_if_sha256,
     inspect_offline_bundle, OfflineBundleImportReport, OfflineBundleInfo, OfflineBundleModelInfo,
 };
+#[cfg(feature = "gtcrn")]
+pub(crate) use catalog::active_catalog_read_only;
 pub use catalog::{
     active_catalog, catalog_status, embedded_catalog, import_catalog, import_trust_root,
     recover_embedded_trust_root, reset_trust_time_floor, trust_root_status, update_catalog,

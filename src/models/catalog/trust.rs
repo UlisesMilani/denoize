@@ -269,6 +269,15 @@ pub(super) fn trust_root_with_revocation_for_test(
 }
 
 pub(super) fn load_active_trust_root_locked() -> Result<ActiveTrustRoot, String> {
+    load_active_trust_root(false)
+}
+
+#[cfg(feature = "gtcrn")]
+pub(super) fn load_active_trust_root_read_only() -> Result<ActiveTrustRoot, String> {
+    load_active_trust_root(true)
+}
+
+fn load_active_trust_root(read_only: bool) -> Result<ActiveTrustRoot, String> {
     let embedded = embedded_trust_root();
     let state = load_trust_state()?;
     let chain = load_trust_chain()?;
@@ -283,11 +292,13 @@ pub(super) fn load_active_trust_root_locked() -> Result<ActiveTrustRoot, String>
                 // A newer binary-embedded root is an independent recovery and
                 // upgrade channel. Preserve the monotonic time floor while
                 // replacing obsolete cached chain state.
-                write_trust_state(&embedded, state.highest_observed_unix_seconds)?;
-                write_trust_chain(&TrustChain {
-                    version: TRUST_CHAIN_VERSION,
-                    roots: Vec::new(),
-                })?;
+                if !read_only {
+                    write_trust_state(&embedded, state.highest_observed_unix_seconds)?;
+                    write_trust_chain(&TrustChain {
+                        version: TRUST_CHAIN_VERSION,
+                        roots: Vec::new(),
+                    })?;
+                }
                 return Ok(embedded);
             }
             if state.highest_root_version == embedded.version() {

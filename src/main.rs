@@ -24,9 +24,11 @@ use denoize::AudioInputSession;
 use denoize::{
     AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm, AtomicOutput, Backend,
     BackendOptions, BackendSession, ChannelMode, CommitMode, DownmixMode, EncodeOptions,
-    OnnxModelConfig, OutputFormat, RecommendationGoal, RecommendationOptions, ResourceGovernor,
-    ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile, StreamingBackendSession,
-    WindowType,
+    ExecutionKind, ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, OnnxModelConfig,
+    OutputFormat, PlannedArtifact, PlannedOutput, PlannedResources, ReceiptItem, ReceiptPublicKey,
+    ReceiptSecretKey, ReceiptTrustPolicy, RecommendationGoal, RecommendationOptions,
+    ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile,
+    SignedExecutionReceipt, StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -342,6 +344,8 @@ USAGE:
     denoize live --list-devices
     denoize hardware [--json|--pretty]
     denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
+    denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
+    denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
@@ -407,6 +411,8 @@ OPTIONS:
         --output-format <EXT> convert all batch outputs (required when source codec cannot be preserved)
         --force               allow replacing existing output files
         --resume              resume a stream checkpoint or verify exact v3 batch outputs
+        --receipt <PATH>      publish a signed execution receipt after finite output succeeds
+        --receipt-key <PATH>  owner-only Ed25519 key used with --receipt
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork/chapters to the output
@@ -498,6 +504,8 @@ struct Overrides {
     output_format: Option<String>,
     force: bool,
     resume: bool,
+    receipt: Option<String>,
+    receipt_key: Option<String>,
     no_progress: bool,
     json: bool,
     no_metadata: bool,
@@ -874,6 +882,8 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             }
             "--force" => ov.force = true,
             "--resume" => ov.resume = true,
+            "--receipt" => ov.receipt = Some(parse_value(args, &mut i, a)?),
+            "--receipt-key" => ov.receipt_key = Some(parse_value(args, &mut i, a)?),
             "--no-progress" => ov.no_progress = true,
             "--json" => ov.json = true,
             "--no-metadata" => ov.no_metadata = true,
@@ -1171,6 +1181,7 @@ fn preflight_batch_items(
     options: EncodeOptions,
     pre_resolved_backend_options: Option<&BackendOptions>,
     governor: &ResourceGovernor,
+    read_only: bool,
 ) -> Result<Vec<PreparedBatchItem>, String> {
     let effective_memory_mb = effective_input_memory_mb(ov);
     let metadata_policy = if ov.no_metadata {
@@ -1248,16 +1259,18 @@ fn preflight_batch_items(
                     item.input.display()
                 )
             })?;
-        let resolved_processing = service::resolve_processing_options(
-            &audio,
-            build_processing_options(
-                ov,
-                audio.sample_rate,
-                pre_resolved_backend_options
-                    .cloned()
-                    .unwrap_or_else(|| build_backend_options(ov)),
-            ),
-        )
+        let processing_options = build_processing_options(
+            ov,
+            audio.sample_rate,
+            pre_resolved_backend_options
+                .cloned()
+                .unwrap_or_else(|| build_backend_options(ov)),
+        );
+        let resolved_processing = if read_only {
+            service::resolve_processing_options_read_only(&audio, processing_options)
+        } else {
+            service::resolve_processing_options(&audio, processing_options)
+        }
         .map_err(|error| {
             format!(
                 "batch processing preflight failed for {}: {error}",
@@ -1413,6 +1426,14 @@ fn preflight_batch_items(
             resource_request,
             expectation,
             recipe,
+            channels: audio.channels(),
+            frames: u64::try_from(audio.frames()).map_err(|_| {
+                format!(
+                    "batch input frame count is too large to represent: {}",
+                    item.input.display()
+                )
+            })?,
+            sample_rate: audio.sample_rate,
         });
     }
     // A cached model fingerprint is safe only if the model still matches once
@@ -1537,6 +1558,18 @@ fn resolve_explicit_backend_options(ov: &Overrides) -> Result<Option<BackendOpti
     }
     let backend = ov.backend.unwrap_or(Backend::Classical);
     let options = service::resolve_backend_options(backend, build_backend_options(ov))?;
+    denoize::select_accelerator(backend, options.accelerator, options.deterministic)?;
+    Ok(Some(options))
+}
+
+fn resolve_explicit_backend_options_read_only(
+    ov: &Overrides,
+) -> Result<Option<BackendOptions>, String> {
+    if ov.auto_backend {
+        return Ok(None);
+    }
+    let backend = ov.backend.unwrap_or(Backend::Classical);
+    let options = service::resolve_backend_options_read_only(backend, build_backend_options(ov))?;
     denoize::select_accelerator(backend, options.accelerator, options.deterministic)?;
     Ok(Some(options))
 }
@@ -1823,6 +1856,12 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("recommend") {
         return run_recommend(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("receipts") {
+        return run_receipts(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("plan") {
+        return run_execution_plan(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("live") {
         return run_live(&args[1..]);
     }
@@ -1839,6 +1878,7 @@ fn run(args: &[String]) -> Result<(), String> {
     if ov.resume && !ov.batch && !ov.stream {
         return Err("--resume requires --batch or --stream".into());
     }
+    validate_receipt_cli_options(&input, &output, &ov)?;
     if ov.isolate && std::env::var_os(ISOLATED_CHILD_ENV).is_none() {
         return run_isolated(args, &ov);
     }
@@ -1852,6 +1892,43 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_streaming_wav(&input, &output, ov);
     }
     run_one(&input, &output, ov)
+}
+
+fn validate_receipt_cli_options(
+    input: &str,
+    output: &str,
+    options: &Overrides,
+) -> Result<(), String> {
+    match (&options.receipt, &options.receipt_key) {
+        (None, None) => return Ok(()),
+        (Some(_), Some(_)) => {}
+        _ => return Err("--receipt and --receipt-key must be supplied together".into()),
+    }
+    if input == "-" || output == "-" {
+        return Err(
+            "signed receipts for stdin/stdout arrive with bounded streams in Stage 12".into(),
+        );
+    }
+    if options.stream {
+        return Err("signed --stream receipts arrive with bounded streams in Stage 12".into());
+    }
+    if options.report {
+        return Err(
+            "--receipt cannot be combined with --report because no output is published".into(),
+        );
+    }
+    if options
+        .receipt
+        .as_deref()
+        .is_some_and(|path| path.is_empty())
+        || options
+            .receipt_key
+            .as_deref()
+            .is_some_and(|path| path.is_empty())
+    {
+        return Err("receipt and receipt-key paths must not be empty".into());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -2084,6 +2161,717 @@ fn run_hardware(args: &[String]) -> Result<(), String> {
         println!("  {}", backend.backend());
     }
     Ok(())
+}
+
+fn receipts_usage() -> &'static str {
+    "\
+USAGE:
+    denoize receipts keygen <SECRET_KEY.json> <PUBLIC_KEY.json>
+    denoize receipts public-key <SECRET_KEY.json> <PUBLIC_KEY.json>
+    denoize receipts policy create <POLICY.json> <PUBLIC_KEY.json>... [--revoke KEY_ID]...
+    denoize receipts verify <RECEIPT.json> (--key PUBLIC_KEY.json | --policy POLICY.json) [OPTIONS]
+
+VERIFY OPTIONS:
+        --plan <PLAN.json>   require exact correspondence to a read-only plan
+        --output-root <DIR> anchor portable output locators below DIR
+        --json               emit compact denoize-receipt-verification-v1 JSON
+        --pretty             emit indented verification JSON
+
+Secret keys are unencrypted and generated owner-only. Receipts never embed a
+trust key: verification requires an explicit public key or a rotation/revocation
+policy. Without --output-root, output locators are anchored beside the receipt.
+"
+}
+
+fn run_receipts(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("receipts --help accepts no other arguments".into());
+        }
+        print!("{}", receipts_usage());
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("keygen") => match &args[1..] {
+            [secret, public] => {
+                let key_id = denoize::write_new_receipt_keypair(secret, public)?;
+                println!("generated receipt signing key {key_id}");
+                println!("secret: {secret}");
+                println!("public: {public}");
+                Ok(())
+            }
+            _ => Err("receipts keygen requires SECRET_KEY.json and PUBLIC_KEY.json".into()),
+        },
+        Some("public-key") => match &args[1..] {
+            [secret, public] => {
+                let key_id = denoize::export_receipt_public_key(secret, public)?;
+                println!("exported receipt public key {key_id} to {public}");
+                Ok(())
+            }
+            _ => Err("receipts public-key requires SECRET_KEY.json and PUBLIC_KEY.json".into()),
+        },
+        Some("policy") => run_receipt_policy(&args[1..]),
+        Some("verify") => run_receipt_verify(&args[1..]),
+        Some(command) => Err(format!("unknown receipts command: {command}")),
+        None => Err("receipts requires a command (run `denoize receipts --help`)".into()),
+    }
+}
+
+fn run_receipt_policy(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("create") {
+        return Err("receipts policy supports only `create`".into());
+    }
+    let destination = args
+        .get(1)
+        .ok_or("receipts policy create requires POLICY.json")?;
+    let mut public_paths = Vec::new();
+    let mut revoked = Vec::new();
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--revoke" => {
+                index += 1;
+                let key_id = args
+                    .get(index)
+                    .ok_or("missing key ID for --revoke")?
+                    .clone();
+                revoked.push(key_id);
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown receipts policy option: {value}"));
+            }
+            value => public_paths.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if public_paths.is_empty() {
+        return Err("receipts policy create requires at least one public key".into());
+    }
+    let keys = public_paths
+        .iter()
+        .map(ReceiptPublicKey::from_file)
+        .collect::<Result<Vec<_>, String>>()?;
+    let policy = ReceiptTrustPolicy::new(keys, revoked)?;
+    denoize::write_receipt_trust_policy(destination, &policy)?;
+    println!(
+        "created receipt trust policy with {} trusted key(s) and {} revocation(s): {}",
+        policy.trusted_keys.len(),
+        policy.revoked_key_ids.len(),
+        destination
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptVerificationOutput {
+    Human,
+    Json,
+    PrettyJson,
+}
+
+fn run_receipt_verify(args: &[String]) -> Result<(), String> {
+    let receipt_path = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("receipts verify requires RECEIPT.json")?;
+    let mut public_key = None;
+    let mut policy = None;
+    let mut plan_path = None;
+    let mut output_root = None;
+    let mut output = ReceiptVerificationOutput::Human;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--key" => {
+                index += 1;
+                public_key = Some(
+                    args.get(index)
+                        .ok_or("missing public key path for --key")?
+                        .clone(),
+                );
+            }
+            "--policy" => {
+                index += 1;
+                policy = Some(
+                    args.get(index)
+                        .ok_or("missing trust policy path for --policy")?
+                        .clone(),
+                );
+            }
+            "--plan" => {
+                index += 1;
+                plan_path = Some(
+                    args.get(index)
+                        .ok_or("missing execution plan path for --plan")?
+                        .clone(),
+                );
+            }
+            "--output-root" => {
+                index += 1;
+                output_root = Some(
+                    args.get(index)
+                        .ok_or("missing directory path for --output-root")?
+                        .clone(),
+                );
+            }
+            "--json" => {
+                if output != ReceiptVerificationOutput::Human {
+                    return Err("receipts verify accepts only one of --json or --pretty".into());
+                }
+                output = ReceiptVerificationOutput::Json;
+            }
+            "--pretty" => {
+                if output != ReceiptVerificationOutput::Human {
+                    return Err("receipts verify accepts only one of --json or --pretty".into());
+                }
+                output = ReceiptVerificationOutput::PrettyJson;
+            }
+            value => return Err(format!("unknown receipts verify option: {value}")),
+        }
+        index += 1;
+    }
+    match (&public_key, &policy) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err("receipts verify requires exactly one of --key or --policy".into());
+        }
+        _ => {}
+    }
+
+    let receipt = SignedExecutionReceipt::from_file(receipt_path)?;
+    let root = output_root.as_deref().map(std::path::Path::new);
+    let report = match (public_key, policy) {
+        (Some(path), None) => {
+            let key = ReceiptPublicKey::from_file(path)?;
+            receipt.verify_signature(&key)?;
+            let plan = plan_path
+                .as_deref()
+                .map(ExecutionPlan::from_file)
+                .transpose()?;
+            receipt.verify_with_key(
+                &key,
+                plan.as_ref(),
+                std::path::Path::new(receipt_path),
+                root,
+            )?
+        }
+        (None, Some(path)) => {
+            let policy = ReceiptTrustPolicy::from_file(path)?;
+            receipt.verify_policy(&policy)?;
+            let plan = plan_path
+                .as_deref()
+                .map(ExecutionPlan::from_file)
+                .transpose()?;
+            receipt.verify_with_policy(
+                &policy,
+                plan.as_ref(),
+                std::path::Path::new(receipt_path),
+                root,
+            )?
+        }
+        _ => return Err("receipt verification authority changed after validation".into()),
+    };
+    match output {
+        ReceiptVerificationOutput::Json => println!("{}", report.to_json()?),
+        ReceiptVerificationOutput::PrettyJson => println!("{}", report.to_pretty_json()?),
+        ReceiptVerificationOutput::Human => {
+            println!(
+                "verified receipt: key={} plan={} outputs={}",
+                report.key_id,
+                report.plan_digest,
+                report.verified_items.len()
+            );
+            for item in &report.verified_items {
+                println!(
+                    "  {}  {}  {} bytes  {}",
+                    item.item_id, item.output_path, item.output.len, item.output.digest
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execution_plan_usage() -> &'static str {
+    "\
+USAGE:
+    denoize plan <INPUT> <OUTPUT> [PROCESSING OPTIONS] [--pretty]
+    denoize plan <INPUT_DIR> <OUTPUT_DIR> --batch [BATCH OPTIONS] [--pretty]
+
+The command performs the same bounded decode, model verification, backend
+preparation, resource admission, recipe hashing, and destination validation as
+execution, but never creates output, lock, journal, checkpoint, or model state.
+It emits denoize-execution-plan-v1 JSON to stdout. Paths are portable relative
+locators, never absolute paths. Stdin/stdout and --stream plans arrive in Stage 12.
+"
+}
+
+fn run_execution_plan(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("plan --help accepts no other arguments".into());
+        }
+        print!("{}", execution_plan_usage());
+        return Ok(());
+    }
+    let mut parseable = Vec::with_capacity(args.len());
+    let mut pretty = false;
+    for argument in args {
+        if argument == "--pretty" {
+            if pretty {
+                return Err("plan accepts --pretty only once".into());
+            }
+            pretty = true;
+        } else {
+            parseable.push(argument.clone());
+        }
+    }
+    let (input, output, options) = parse_args(&parseable)?;
+    if input == "-" || output == "-" {
+        return Err(
+            "plan requires regular-file paths; bounded stdin/stdout plans are Stage 12".into(),
+        );
+    }
+    if options.stream {
+        return Err(
+            "read-only --stream plans are delivered with bounded non-seekable streams in Stage 12"
+                .into(),
+        );
+    }
+    if options.report {
+        return Err("plan cannot be combined with --report".into());
+    }
+    if options.isolate {
+        return Err("plan is already read-only and cannot be combined with --isolate".into());
+    }
+    if options.receipt.is_some() || options.receipt_key.is_some() {
+        return Err(
+            "plan cannot publish a receipt; pass --receipt and --receipt-key to execution".into(),
+        );
+    }
+    let plan = if options.batch {
+        build_batch_execution_plan(
+            std::path::Path::new(&input),
+            std::path::Path::new(&output),
+            &options,
+        )?
+    } else {
+        build_single_execution_plan(
+            std::path::Path::new(&input),
+            std::path::Path::new(&output),
+            &options,
+        )?
+    };
+    if pretty {
+        println!("{}", plan.to_pretty_json()?);
+    } else {
+        println!("{}", plan.to_json()?);
+    }
+    Ok(())
+}
+
+fn build_batch_execution_plan(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+    options: &Overrides,
+) -> Result<ExecutionPlan, String> {
+    validate_effective_options(options, VALIDATION_SAMPLE_RATE)?;
+    if !input_dir.is_dir() {
+        return Err(format!(
+            "batch input is not a directory: {}",
+            input_dir.display()
+        ));
+    }
+    validate_batch_directories(input_dir, output_dir)?;
+    let encode_options = build_encode_options(options)?;
+    let resolved_backend_options = resolve_explicit_backend_options_read_only(options)?;
+    let jobs = effective_batch_jobs(options);
+    let governor = resource_governor(options, jobs)?;
+    let output_extension = options
+        .output_format
+        .as_deref()
+        .map(normalize_output_extension)
+        .transpose()?;
+    let files = collect_batch_files(input_dir, options.recursive)?;
+    if files.is_empty() {
+        return Err("batch input contains no supported audio files".into());
+    }
+    let items = plan_batch_files_with_limits(
+        input_dir,
+        output_dir,
+        files,
+        output_extension,
+        decode_limits_for_options(options)?,
+    )?;
+    for (path, name) in [
+        (output_dir.join(STATE_FILE_NAME), STATE_FILE_NAME),
+        (
+            output_dir.join(LEGACY_DESKTOP_STATE_FILE_NAME),
+            LEGACY_DESKTOP_STATE_FILE_NAME,
+        ),
+        (output_dir.join(LOCK_FILE_NAME), LOCK_FILE_NAME),
+    ] {
+        validate_batch_reserved_path(&items, &path, name)?;
+    }
+    validate_encode_preflight(encode_options, items.iter().map(|item| item.output_format))?;
+    let prepared = preflight_batch_items(
+        &items,
+        options,
+        encode_options,
+        resolved_backend_options.as_ref(),
+        &governor,
+        true,
+    )?;
+    let expectations = prepared
+        .iter()
+        .map(|item| item.expectation.clone())
+        .collect::<Vec<_>>();
+    let decisions = batch_resume::inspect_batch_decisions_with_evidence(
+        output_dir,
+        options.resume,
+        &expectations,
+        options.force,
+    )?;
+    if decisions.len() != prepared.len() {
+        return Err("read-only batch decision count does not match the plan".into());
+    }
+    let planned = prepared
+        .into_iter()
+        .zip(decisions)
+        .map(|(prepared, evidence)| PlannedBatchItem {
+            prepared,
+            decision: evidence.decision(),
+            existing_output: evidence.existing_output(),
+        })
+        .collect::<Vec<_>>();
+    for item in &planned {
+        item.prepared.expectation.verify_sources()?;
+    }
+    build_batch_execution_plan_from_planned(input_dir, output_dir, options, &planned)
+}
+
+fn build_batch_execution_plan_from_planned(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+    options: &Overrides,
+    planned: &[PlannedBatchItem],
+) -> Result<ExecutionPlan, String> {
+    let metadata_policy = if options.no_metadata {
+        MetadataPolicy::Drop
+    } else {
+        MetadataPolicy::Preserve
+    };
+    let mut plan_items = Vec::with_capacity(planned.len());
+    for planned in planned {
+        let prepared = &planned.prepared;
+        let decision = planned.decision;
+        prepared.expectation.verify_sources()?;
+        let input_locator = denoize::portable_locator(&prepared.item.input, input_dir)?;
+        let output_locator = denoize::portable_locator(&prepared.item.destination, output_dir)?;
+        let input_fingerprint = prepared.expectation.input_fingerprint();
+        let item_id =
+            denoize::execution_item_id(input_fingerprint, &output_locator, prepared.recipe)?;
+        let (publication, action, resources) = match decision {
+            ResumeDecision::Skip { .. } => {
+                ("none", "skip", planned_resources(ResourceRequest::new()))
+            }
+            ResumeDecision::Process { commit_mode, .. } => {
+                let request = prepared
+                    .resource_request
+                    .checked_add(backend_session_request(&prepared.resolved_processing)?)?;
+                let publication = match commit_mode {
+                    CommitMode::Replace => "replace",
+                    CommitMode::NoClobber => "no-clobber",
+                };
+                (publication, "process", planned_resources(request))
+            }
+        };
+        let model = match prepared.expectation.model() {
+            Some(model) => Some(PlannedArtifact {
+                path: denoize::portable_file_locator(&model.path)?,
+                fingerprint: model.fingerprint,
+            }),
+            None => None,
+        };
+        plan_items.push(ExecutionPlanItem {
+            item_id,
+            input: PlannedArtifact {
+                path: input_locator,
+                fingerprint: input_fingerprint,
+            },
+            output: PlannedOutput {
+                path: output_locator,
+                format: output_format_name(prepared.item.output_format).into(),
+                publication: publication.into(),
+                action: action.into(),
+                reason: decision.reason().as_str().into(),
+                existing_fingerprint: planned.existing_output,
+            },
+            model,
+            recipe: prepared.recipe,
+            backend: service::backend_name(prepared.resolved_processing.backend).into(),
+            accelerator: prepared
+                .resolved_processing
+                .accelerator
+                .effective()
+                .name()
+                .into(),
+            input_format: audio_format_name(prepared.item.probe.format).into(),
+            input_codec: audio_codec_name(prepared.item.probe.codec).into(),
+            channels: prepared.channels as u64,
+            frames: prepared.frames,
+            sample_rate: prepared.sample_rate,
+            resources,
+        });
+    }
+    ExecutionPlan::new(
+        ExecutionKind::Batch,
+        options.deterministic,
+        metadata_policy_name(metadata_policy),
+        plan_items,
+    )
+}
+
+fn build_single_execution_plan(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    options: &Overrides,
+) -> Result<ExecutionPlan, String> {
+    if options.resume {
+        return Err("--resume requires --batch in a read-only execution plan".into());
+    }
+    validate_effective_options(options, VALIDATION_SAMPLE_RATE)?;
+    let encode_options = build_encode_options(options)?;
+    let output_format = OutputFormat::from_path(output)?;
+    validate_encode_preflight(encode_options, Some(output_format))?;
+    let (publication, reason) = planned_publication(output, options.force)?;
+    let governor = resource_governor(options, 1)?;
+    let decode_limits = decode_limits_for_options(options)?;
+    let effective_memory_mb = effective_input_memory_mb(options);
+    let mut input_session = AudioInputSession::open(input)?;
+    let probe = probe_audio_session_with_limits(&mut input_session, decode_limits)?;
+    if probe.audio_tracks != 1 || probe.codec == AudioCodec::Unknown {
+        return Err(format!(
+            "plan input must contain exactly one supported audio track: {}",
+            input.display()
+        ));
+    }
+    let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
+    ensure_memory_limit(
+        estimate_session_memory_bytes(&input_session),
+        effective_memory_mb,
+        "plan input preflight",
+    )?;
+    let audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)?;
+    let decoded_working_set = estimate_audio_working_set_bytes(&audio);
+    ensure_memory_limit(
+        decoded_working_set,
+        effective_memory_mb,
+        "plan decoded audio working set",
+    )?;
+    output_format.validate_config(&audio, &encode_options)?;
+    let metadata_bytes = if options.no_metadata {
+        0
+    } else {
+        let limits = retained_metadata_limits(effective_memory_mb, decoded_working_set)?;
+        input_session
+            .read_metadata_with_limits(limits)?
+            .as_ref()
+            .map(denoize::metadata::Metadata::estimated_memory_bytes)
+            .unwrap_or(0)
+    };
+    let resolved = service::resolve_processing_options_read_only(
+        &audio,
+        build_processing_options(options, audio.sample_rate, build_backend_options(options)),
+    )?;
+    let model = batch_resume::consumed_model_config(&resolved)?
+        .map(batch_resume::fingerprint_consumed_model)
+        .transpose()?;
+    let session_request = backend_session_request(&resolved)?;
+    let worker_request = worker_resource_request(
+        input_session.len(),
+        &audio,
+        metadata_bytes,
+        decode_limits.max_working_set_bytes,
+        &resolved,
+        true,
+    )?;
+    let request = worker_request.checked_add(session_request)?;
+    drop(governor.try_acquire(request)?.ok_or_else(|| {
+        "execution plan cannot be admitted under the configured process resource limits".to_string()
+    })?);
+    let _backend_session = BackendSession::prepare_with_accelerator(
+        resolved.backend,
+        resolved.backend_options.clone(),
+        resolved.accelerator,
+    )?;
+    if let Some(model) = &model {
+        let current = batch_resume::fingerprint_file(&model.path)?;
+        if current != model.fingerprint {
+            return Err(format!(
+                "selected backend model changed during read-only planning: {}",
+                model.path.display()
+            ));
+        }
+    }
+    let current_input = batch_resume::fingerprint_input_session(&mut input_session)?;
+    if current_input != input_fingerprint {
+        return Err(format!(
+            "input changed during read-only planning: {}",
+            input.display()
+        ));
+    }
+    let current_input_path = batch_resume::fingerprint_file(input)?;
+    if current_input_path != input_fingerprint {
+        return Err(format!(
+            "input path changed during read-only planning: {}",
+            input.display()
+        ));
+    }
+    let metadata_policy = if options.no_metadata {
+        MetadataPolicy::Drop
+    } else {
+        MetadataPolicy::Preserve
+    };
+    let recipe = batch_resume::recipe_digest(
+        &resolved,
+        audio.channels(),
+        output_format,
+        encode_options,
+        metadata_policy,
+        model
+            .as_ref()
+            .map(|model| (&model.fingerprint, model.sample_rate)),
+    )?;
+    let output_locator = denoize::portable_file_locator(output)?;
+    let item_id = denoize::execution_item_id(input_fingerprint, &output_locator, recipe)?;
+    let frames = u64::try_from(audio.frames())
+        .map_err(|_| "plan frame count is too large to represent".to_string())?;
+    let item = ExecutionPlanItem {
+        item_id,
+        input: PlannedArtifact {
+            path: denoize::portable_file_locator(input)?,
+            fingerprint: input_fingerprint,
+        },
+        output: PlannedOutput {
+            path: output_locator,
+            format: output_format_name(output_format).into(),
+            publication: publication.into(),
+            action: "process".into(),
+            reason: reason.into(),
+            existing_fingerprint: None,
+        },
+        model: match model.as_ref() {
+            Some(model) => Some(PlannedArtifact {
+                path: denoize::portable_file_locator(&model.path)?,
+                fingerprint: model.fingerprint,
+            }),
+            None => None,
+        },
+        recipe,
+        backend: service::backend_name(resolved.backend).into(),
+        accelerator: resolved.accelerator.effective().name().into(),
+        input_format: audio_format_name(probe.format).into(),
+        input_codec: audio_codec_name(probe.codec).into(),
+        channels: audio.channels() as u64,
+        frames,
+        sample_rate: audio.sample_rate,
+        resources: planned_resources(request),
+    };
+    ExecutionPlan::new(
+        ExecutionKind::File,
+        resolved.backend_options.deterministic,
+        metadata_policy_name(metadata_policy),
+        vec![item],
+    )
+}
+
+fn planned_publication(
+    path: &std::path::Path,
+    force: bool,
+) -> Result<(&'static str, &'static str), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok((if force { "replace" } else { "no-clobber" }, "missing"))
+        }
+        Ok(metadata) if force && (metadata.is_file() || metadata.file_type().is_symlink()) => {
+            Ok(("replace", "untracked"))
+        }
+        Ok(_) if force => Err(format!(
+            "output exists but is not a replaceable file or symlink: {}",
+            path.display()
+        )),
+        Ok(_) => Err(format!(
+            "output already exists: {} (use --force to replace it)",
+            path.display()
+        )),
+        Err(error) => Err(format!(
+            "inspect output destination {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn planned_resources(request: ResourceRequest) -> PlannedResources {
+    PlannedResources {
+        memory_bytes: request.memory_bytes(),
+        temporary_bytes: request.temporary_bytes(),
+        cpu_jobs: request.cpu_jobs() as u64,
+        gpu_jobs: request.gpu_jobs() as u64,
+        gpu_memory_bytes: request.gpu_memory_bytes(),
+    }
+}
+
+fn metadata_policy_name(policy: MetadataPolicy) -> &'static str {
+    match policy {
+        MetadataPolicy::Preserve => "preserve",
+        MetadataPolicy::Drop => "drop",
+    }
+}
+
+fn output_format_name(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Wav => "wav",
+        OutputFormat::Flac => "flac",
+        OutputFormat::OggOpus => "ogg-opus",
+        OutputFormat::Mp3 => "mp3",
+        OutputFormat::M4a => "m4a",
+        OutputFormat::AacAdts => "aac-adts",
+    }
+}
+
+fn audio_format_name(format: AudioFormat) -> &'static str {
+    match format {
+        AudioFormat::Wav => "wav",
+        AudioFormat::Rf64 => "rf64",
+        AudioFormat::Aiff => "aiff",
+        AudioFormat::Caf => "caf",
+        AudioFormat::Flac => "flac",
+        AudioFormat::OggOpus => "ogg-opus",
+        AudioFormat::OggVorbis => "ogg-vorbis",
+        AudioFormat::Mp3 => "mp3",
+        AudioFormat::M4a => "m4a",
+        AudioFormat::AacAdts => "aac-adts",
+        AudioFormat::Unknown => "unknown",
+    }
+}
+
+fn audio_codec_name(codec: AudioCodec) -> &'static str {
+    match codec {
+        AudioCodec::Pcm => "pcm",
+        AudioCodec::Flac => "flac",
+        AudioCodec::Opus => "opus",
+        AudioCodec::Vorbis => "vorbis",
+        AudioCodec::Mp3 => "mp3",
+        AudioCodec::Aac => "aac",
+        AudioCodec::Alac => "alac",
+        AudioCodec::Unknown => "unknown",
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2473,6 +3261,16 @@ struct StagedProcessOutput {
     frames: usize,
     sample_rate: u32,
     elapsed_ms: f64,
+    execution_evidence: Option<StagedExecutionEvidence>,
+}
+
+struct StagedExecutionEvidence {
+    input_fingerprint: FileFingerprint,
+    input_probe: AudioProbe,
+    model: Option<ConsumedModel>,
+    recipe: Digest,
+    output_format: OutputFormat,
+    resources: ResourceRequest,
 }
 
 fn run_one_with_output_format(
@@ -2489,11 +3287,34 @@ fn run_one_with_output_format(
         CommitMode::NoClobber
     };
     let json = ov.json;
-    let recipe_metadata_policy = json.then_some(if ov.no_metadata {
+    let metadata_policy = if ov.no_metadata {
         MetadataPolicy::Drop
     } else {
         MetadataPolicy::Preserve
-    });
+    };
+    let receipt_paths = match (&ov.receipt, &ov.receipt_key) {
+        (Some(receipt), Some(key)) => Some((
+            std::path::PathBuf::from(receipt),
+            std::path::PathBuf::from(key),
+        )),
+        (None, None) => None,
+        _ => return Err("--receipt and --receipt-key must be supplied together".into()),
+    };
+    let receipt_requested = receipt_paths.is_some();
+    let deterministic = ov.deterministic;
+    let (signing_key, planned_publication_mode, planned_reason) =
+        if let Some((receipt_path, key_path)) = &receipt_paths {
+            preflight_receipt_paths(input, output, receipt_path, key_path)?;
+            let (publication, reason) = planned_publication(output, ov.force)?;
+            (
+                Some(ReceiptSecretKey::from_file(key_path)?),
+                publication,
+                reason,
+            )
+        } else {
+            (None, "none", "not-requested")
+        };
+    let recipe_metadata_policy = (json || receipt_requested).then_some(metadata_policy);
     let staged = process_one_to_staged_output(
         input,
         output,
@@ -2507,11 +3328,48 @@ fn run_one_with_output_format(
         None,
         true,
         Some(&governor),
+        receipt_requested,
     )?;
     let Some(staged) = staged else {
         return Ok(());
     };
+    let mut staged = staged;
+    let staged_receipt = if let Some((receipt_path, _)) = &receipt_paths {
+        let plan = build_single_execution_plan_from_staged(
+            input,
+            output,
+            deterministic,
+            metadata_policy,
+            planned_publication_mode,
+            planned_reason,
+            &staged,
+        )?;
+        let output_fingerprint =
+            batch_resume::fingerprint_open_file_at(staged.transaction.file_mut(), output)?;
+        let plan_item = plan
+            .items
+            .first()
+            .ok_or("single execution plan unexpectedly contains no items")?;
+        let item = ReceiptItem::from_plan_item(plan_item, output_fingerprint, "succeeded")?;
+        let payload = ExecutionReceiptPayload::new(&plan, vec![item])?;
+        let receipt = signing_key
+            .as_ref()
+            .ok_or("receipt signing key is missing after successful preflight")?
+            .sign(payload)?;
+        Some(stage_signed_receipt(receipt_path, &receipt)?)
+    } else {
+        None
+    };
     staged.transaction.commit(commit_mode)?;
+    if let (Some((receipt_path, _)), Some(receipt)) = (&receipt_paths, staged_receipt) {
+        receipt.commit(CommitMode::NoClobber).map_err(|error| {
+            format!(
+                "audio output was committed to {}, but its signed receipt could not be published to {}: {error}",
+                output.display(),
+                receipt_path.display()
+            )
+        })?;
+    }
     if json {
         let input = input.to_string_lossy();
         let output = output.to_string_lossy();
@@ -2533,6 +3391,157 @@ fn run_one_with_output_format(
     Ok(())
 }
 
+fn preflight_receipt_paths(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    receipt: &std::path::Path,
+    secret_key: &std::path::Path,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(receipt) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(format!(
+                "execution receipt already exists: {} (refusing to replace it)",
+                receipt.display()
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "inspect execution receipt destination {}: {error}",
+                receipt.display()
+            ))
+        }
+    }
+    let paths = [
+        ("input", input),
+        ("output", output),
+        ("receipt", receipt),
+        ("receipt key", secret_key),
+    ];
+    let mut normalized = Vec::with_capacity(paths.len());
+    for (label, path) in paths {
+        normalized.push((label, normalize_batch_path(path)?));
+    }
+    for left in 0..normalized.len() {
+        for right in left + 1..normalized.len() {
+            if batch_collision_key(&normalized[left].1) == batch_collision_key(&normalized[right].1)
+            {
+                return Err(format!(
+                    "{} and {} must use distinct paths: {}",
+                    normalized[left].0,
+                    normalized[right].0,
+                    normalized[left].1.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn preflight_batch_receipt_paths(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+    receipt: &std::path::Path,
+    secret_key: &std::path::Path,
+) -> Result<(), String> {
+    preflight_receipt_paths(input_dir, output_dir, receipt, secret_key)?;
+    let input_root = normalize_batch_path(input_dir)?;
+    let receipt_path = normalize_batch_path(receipt)?;
+    if receipt_path.starts_with(&input_root) {
+        return Err(format!(
+            "batch execution receipt must be outside the input directory: {}",
+            receipt.display()
+        ));
+    }
+    Ok(())
+}
+
+fn build_single_execution_plan_from_staged(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    deterministic: bool,
+    metadata_policy: MetadataPolicy,
+    publication: &str,
+    reason: &str,
+    staged: &StagedProcessOutput,
+) -> Result<ExecutionPlan, String> {
+    let evidence = staged
+        .execution_evidence
+        .as_ref()
+        .ok_or("receipt-bound output is missing execution evidence")?;
+    let output_locator = denoize::portable_file_locator(output)?;
+    let item_id =
+        denoize::execution_item_id(evidence.input_fingerprint, &output_locator, evidence.recipe)?;
+    let model = match &evidence.model {
+        Some(model) => Some(PlannedArtifact {
+            path: denoize::portable_file_locator(&model.path)?,
+            fingerprint: model.fingerprint,
+        }),
+        None => None,
+    };
+    let frames = u64::try_from(staged.frames)
+        .map_err(|_| "receipt frame count is too large to represent".to_string())?;
+    ExecutionPlan::new(
+        ExecutionKind::File,
+        deterministic,
+        metadata_policy_name(metadata_policy),
+        vec![ExecutionPlanItem {
+            item_id,
+            input: PlannedArtifact {
+                path: denoize::portable_file_locator(input)?,
+                fingerprint: evidence.input_fingerprint,
+            },
+            output: PlannedOutput {
+                path: output_locator,
+                format: output_format_name(evidence.output_format).into(),
+                publication: publication.into(),
+                action: "process".into(),
+                reason: reason.into(),
+                existing_fingerprint: None,
+            },
+            model,
+            recipe: evidence.recipe,
+            backend: service::backend_name(staged.backend).into(),
+            accelerator: staged.accelerator.effective().name().into(),
+            input_format: audio_format_name(evidence.input_probe.format).into(),
+            input_codec: audio_codec_name(evidence.input_probe.codec).into(),
+            channels: staged.channels as u64,
+            frames,
+            sample_rate: staged.sample_rate,
+            resources: planned_resources(evidence.resources),
+        }],
+    )
+}
+
+fn stage_signed_receipt(
+    path: &std::path::Path,
+    receipt: &SignedExecutionReceipt,
+) -> Result<AtomicOutput, String> {
+    let mut output = AtomicOutput::new(path)?;
+    write_signed_receipt_to_stage(&mut output, path, receipt)?;
+    Ok(output)
+}
+
+fn write_signed_receipt_to_stage(
+    output: &mut AtomicOutput,
+    path: &std::path::Path,
+    receipt: &SignedExecutionReceipt,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let mut bytes = receipt.to_pretty_json()?.into_bytes();
+    bytes.push(b'\n');
+    output
+        .file_mut()
+        .write_all(&bytes)
+        .map_err(|error| format!("write staged execution receipt {}: {error}", path.display()))?;
+    output
+        .file_mut()
+        .sync_data()
+        .map_err(|error| format!("sync staged execution receipt {}: {error}", path.display()))?;
+    Ok(())
+}
+
 fn process_one_to_staged_output(
     input: &std::path::Path,
     output: &std::path::Path,
@@ -2546,11 +3555,18 @@ fn process_one_to_staged_output(
     pre_prepared_backend_session: Option<Arc<BackendSession>>,
     inspect_destination: bool,
     governor: Option<&ResourceGovernor>,
+    capture_execution_evidence: bool,
 ) -> Result<Option<StagedProcessOutput>, String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
     let effective_memory_mb = effective_input_memory_mb(&ov);
     let standard_input = input == std::path::Path::new("-");
     let standard_output = output == std::path::Path::new("-");
+    if capture_execution_evidence && (standard_input || standard_output || ov.report) {
+        return Err("execution receipts require finite regular-file input and output".into());
+    }
+    if capture_execution_evidence && recipe_metadata_policy.is_none() {
+        return Err("receipt-bound processing requires an effective recipe policy".into());
+    }
     let encode_options = build_encode_options(&ov)?;
     let output_format = if !ov.report && !standard_output {
         Some(match planned_output_format {
@@ -2596,6 +3612,30 @@ fn process_one_to_staged_output(
             ));
         }
     }
+    let captured_input_probe = if capture_execution_evidence {
+        let session = input_session
+            .as_mut()
+            .ok_or("receipt input session is missing after preflight")?;
+        let probe = probe_audio_session_with_limits(session, decode_limits_for_options(&ov)?)?;
+        if probe.audio_tracks != 1 || probe.codec == AudioCodec::Unknown {
+            return Err(format!(
+                "receipt input must contain exactly one supported audio track: {}",
+                input.display()
+            ));
+        }
+        Some(probe)
+    } else {
+        None
+    };
+    let captured_input_fingerprint = if capture_execution_evidence {
+        Some(batch_resume::fingerprint_input_session(
+            input_session
+                .as_mut()
+                .ok_or("receipt input session is missing before fingerprinting")?,
+        )?)
+    } else {
+        None
+    };
     if let Some(session) = &input_session {
         let estimate = estimate_session_memory_bytes(session);
         ensure_memory_limit(estimate, effective_memory_mb, "input preflight")?;
@@ -2613,7 +3653,7 @@ fn process_one_to_staged_output(
     } else {
         let session = input_session
             .as_mut()
-            .expect("filesystem input session was opened");
+            .ok_or("filesystem input session is missing before decode")?;
         let input_bytes = session.len();
         (
             read_audio_from_session_with_limits(session, decode_limits)?,
@@ -2630,7 +3670,7 @@ fn process_one_to_staged_output(
     let metadata = if !standard_input && !ov.no_metadata {
         input_session
             .as_mut()
-            .expect("filesystem input session was opened")
+            .ok_or("filesystem input session is missing before metadata read")?
             .read_metadata_with_limits(metadata_limits)?
     } else {
         None
@@ -2685,7 +3725,11 @@ fn process_one_to_staged_output(
         input_bytes,
         &audio,
         metadata_bytes,
-        None,
+        if capture_execution_evidence {
+            decode_limits.max_working_set_bytes
+        } else {
+            None
+        },
         &resolved_processing,
         output_format.is_some(),
     )?;
@@ -2698,6 +3742,11 @@ fn process_one_to_staged_output(
         .map(|governor| governor.acquire(request))
         .transpose()?;
 
+    let captured_model = if capture_execution_evidence {
+        batch_resume::consumed_model(&resolved_processing)?
+    } else {
+        None
+    };
     let backend_session = match pre_prepared_backend_session {
         Some(session) => session,
         None => Arc::new(BackendSession::prepare_with_accelerator(
@@ -2721,23 +3770,60 @@ fn process_one_to_staged_output(
     } else if ov.true_peak_dbtp.is_some() {
         return Err("--true-peak requires --loudness".into());
     }
+    if let Some(expected) = captured_input_fingerprint {
+        let observed = batch_resume::fingerprint_input_session(
+            input_session
+                .as_mut()
+                .ok_or("receipt input session closed before the final source fence")?,
+        )?;
+        if observed != expected {
+            return Err(format!(
+                "input changed while receipt-bound processing was running: {}",
+                input.display()
+            ));
+        }
+        let observed_path = batch_resume::fingerprint_file(input)?;
+        if observed_path != expected {
+            return Err(format!(
+                "input path changed while receipt-bound processing was running: {}",
+                input.display()
+            ));
+        }
+    }
+    if let Some(model) = &captured_model {
+        let observed = batch_resume::fingerprint_file(&model.path)?;
+        if observed != model.fingerprint {
+            return Err(format!(
+                "selected backend model changed while receipt-bound processing was running: {}",
+                model.path.display()
+            ));
+        }
+    }
     if standard_output {
         let bytes = write_wav_bytes(&audio)?;
         std::io::Write::write_all(&mut std::io::stdout(), &bytes)
             .map_err(|error| format!("failed to write stdout: {error}"))?;
         Ok(None)
     } else {
-        let output_format = output_format.expect("filesystem output was preflighted");
+        let output_format = output_format.ok_or("filesystem output format is missing")?;
+        let recipe_model = if recipe_metadata_policy.is_some() {
+            if capture_execution_evidence {
+                captured_model.clone()
+            } else {
+                batch_resume::consumed_model(&resolved_processing)?
+            }
+        } else {
+            None
+        };
         let effective_recipe = recipe_metadata_policy
             .map(|metadata_policy| {
-                let model = batch_resume::consumed_model(&resolved_processing)?;
                 batch_resume::recipe_digest(
                     &resolved_processing,
                     audio.channels(),
                     output_format,
                     encode_options,
                     metadata_policy,
-                    model
+                    recipe_model
                         .as_ref()
                         .map(|model| (&model.fingerprint, model.sample_rate)),
                 )
@@ -2778,6 +3864,19 @@ fn process_one_to_staged_output(
             frames: audio.frames(),
             sample_rate: audio.sample_rate,
             elapsed_ms: result.elapsed.as_secs_f64() * 1_000.0,
+            execution_evidence: if capture_execution_evidence {
+                Some(StagedExecutionEvidence {
+                    input_fingerprint: captured_input_fingerprint
+                        .ok_or("receipt input fingerprint is missing")?,
+                    input_probe: captured_input_probe.ok_or("receipt input probe is missing")?,
+                    model: captured_model,
+                    recipe: effective_recipe.ok_or("receipt recipe is missing")?,
+                    output_format,
+                    resources: request,
+                })
+            } else {
+                None
+            },
         }))
     }
 }
@@ -3299,8 +4398,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
 }
 
 enum BatchFileOutcome {
-    Completed,
-    Skipped,
+    Completed(Option<FileFingerprint>),
+    Skipped(FileFingerprint),
     Failed(String),
     Cancelled,
 }
@@ -3317,8 +4416,8 @@ fn count_batch_results(results: &[BatchFileOutcome]) -> BatchCounts {
     let mut counts = BatchCounts::default();
     for result in results {
         match result {
-            BatchFileOutcome::Completed => counts.succeeded += 1,
-            BatchFileOutcome::Skipped => counts.skipped += 1,
+            BatchFileOutcome::Completed(_) => counts.succeeded += 1,
+            BatchFileOutcome::Skipped(_) => counts.skipped += 1,
             BatchFileOutcome::Failed(_) => counts.failed += 1,
             BatchFileOutcome::Cancelled => counts.cancelled += 1,
         }
@@ -3344,12 +4443,16 @@ struct PreparedBatchItem {
     resource_request: ResourceRequest,
     expectation: ResumeExpectation,
     recipe: Digest,
+    channels: usize,
+    frames: u64,
+    sample_rate: u32,
 }
 
 #[derive(Clone)]
 struct PlannedBatchItem {
     prepared: PreparedBatchItem,
     decision: ResumeDecision,
+    existing_output: Option<batch_resume::FileFingerprint>,
 }
 
 fn batch_probe_description(probe: &AudioProbe) -> &'static str {
@@ -3654,12 +4757,31 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     use rayon::prelude::*;
 
     validate_effective_options(ov, VALIDATION_SAMPLE_RATE)?;
+    if ov.report && ov.receipt.is_some() {
+        return Err(
+            "--receipt cannot be combined with --report because no output is published".into(),
+        );
+    }
     let encode_options = build_encode_options(ov)?;
     let resolved_backend_options = resolve_explicit_backend_options(ov)?;
     let jobs = effective_batch_jobs(ov);
     let resource_governor = resource_governor(ov, jobs)?;
     let input_dir = std::path::Path::new(input);
     let output_dir = std::path::Path::new(output);
+    let receipt_paths = match (&ov.receipt, &ov.receipt_key) {
+        (Some(receipt), Some(key)) => Some((
+            std::path::PathBuf::from(receipt),
+            std::path::PathBuf::from(key),
+        )),
+        (None, None) => None,
+        _ => return Err("--receipt and --receipt-key must be supplied together".into()),
+    };
+    let signing_key = if let Some((receipt, key)) = &receipt_paths {
+        preflight_batch_receipt_paths(input_dir, output_dir, receipt, key)?;
+        Some(ReceiptSecretKey::from_file(key)?)
+    } else {
+        None
+    };
     if !input_dir.is_dir() {
         return Err(format!("batch input is not a directory: {input}"));
     }
@@ -3686,6 +4808,10 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     validate_batch_reserved_path(&items, &state_path, STATE_FILE_NAME)?;
     validate_batch_reserved_path(&items, &legacy_state_path, LEGACY_DESKTOP_STATE_FILE_NAME)?;
     validate_batch_reserved_path(&items, &lock_path, LOCK_FILE_NAME)?;
+    if let Some((receipt, key)) = &receipt_paths {
+        validate_batch_reserved_path(&items, receipt, "execution receipt")?;
+        validate_batch_reserved_path(&items, key, "execution receipt key")?;
+    }
     validate_encode_preflight(encode_options, items.iter().map(|item| item.output_format))?;
     let prepared = preflight_batch_items(
         &items,
@@ -3693,6 +4819,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         encode_options,
         resolved_backend_options.as_ref(),
         &resource_governor,
+        false,
     )?;
 
     std::fs::create_dir_all(output_dir).map_err(|e| format!("create batch output: {e}"))?;
@@ -3700,8 +4827,12 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     let planned = prepared
         .into_iter()
         .map(|prepared| {
-            let decision = session.plan(&prepared.expectation, ov.force)?;
-            Ok(PlannedBatchItem { prepared, decision })
+            let evidence = session.plan_with_evidence(&prepared.expectation, ov.force)?;
+            Ok(PlannedBatchItem {
+                prepared,
+                decision: evidence.decision(),
+                existing_output: evidence.existing_output(),
+            })
         })
         .collect::<Result<Vec<_>, String>>()?;
     // Planning can be long for a large output set. Recheck every source after
@@ -3709,6 +4840,14 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
     for item in &planned {
         item.prepared.expectation.verify_sources()?;
     }
+    let receipt_plan = receipt_paths
+        .as_ref()
+        .map(|_| build_batch_execution_plan_from_planned(input_dir, output_dir, ov, &planned))
+        .transpose()?;
+    let mut staged_receipt = receipt_paths
+        .as_ref()
+        .map(|(path, _)| AtomicOutput::new(path))
+        .transpose()?;
     CANCELLED.store(false, Ordering::SeqCst);
     install_cancel_handler()?;
     let finished = AtomicUsize::new(0);
@@ -3735,7 +4874,15 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         };
         let commit_mode = match planned.decision {
             ResumeDecision::Skip { .. } => {
-                return finish(BatchFileOutcome::Skipped, "skipped");
+                let Some(fingerprint) = planned.existing_output else {
+                    return finish(
+                        BatchFileOutcome::Failed(
+                            "resume skip is missing its planned output fingerprint".into(),
+                        ),
+                        "failed",
+                    );
+                };
+                return finish(BatchFileOutcome::Skipped(fingerprint), "skipped");
             }
             ResumeDecision::Process { commit_mode, .. } => commit_mode,
         };
@@ -3780,6 +4927,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
                 .map(|session| Arc::clone(&session.session)),
             false,
             None,
+            false,
         ) {
             Ok(staged) => staged,
             Err(error) => return finish(BatchFileOutcome::Failed(error), "failed"),
@@ -3787,7 +4935,7 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         let Some(staged) = staged else {
             // Batch --report intentionally retains its existing report-only
             // behavior and has no filesystem output to publish.
-            return finish(BatchFileOutcome::Completed, "completed");
+            return finish(BatchFileOutcome::Completed(None), "completed");
         };
         if staged.effective_recipe != Some(planned.prepared.recipe) {
             return finish(
@@ -3805,9 +4953,9 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
                 commit_mode,
             )
         }) {
-            Ok(Some(_)) => {
+            Ok(Some(fingerprint)) => {
                 drop(worker_permit);
-                finish(BatchFileOutcome::Completed, "completed")
+                finish(BatchFileOutcome::Completed(Some(fingerprint)), "completed")
             }
             Ok(None) => finish(BatchFileOutcome::Cancelled, "cancelled"),
             Err(error) => finish(BatchFileOutcome::Failed(error), "failed"),
@@ -3844,6 +4992,32 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
         counts.succeeded + counts.skipped + counts.failed + counts.cancelled,
         items.len()
     );
+    if failures.is_empty() && counts.cancelled == 0 {
+        if let (Some(plan), Some(key), Some((receipt_path, _)), Some(receipt_stage)) = (
+            receipt_plan.as_ref(),
+            signing_key.as_ref(),
+            receipt_paths.as_ref(),
+            staged_receipt.as_mut(),
+        ) {
+            let receipt_items =
+                build_batch_receipt_items(plan, &planned, &results, input_dir, output_dir)?;
+            let payload = ExecutionReceiptPayload::new(plan, receipt_items)?;
+            let receipt = key.sign(payload)?;
+            write_signed_receipt_to_stage(receipt_stage, receipt_path, &receipt)?;
+        }
+        if let (Some((receipt_path, _)), Some(receipt_stage)) =
+            (receipt_paths.as_ref(), staged_receipt.take())
+        {
+            receipt_stage
+                .commit(CommitMode::NoClobber)
+                .map_err(|error| {
+                    format!(
+                        "batch outputs were committed, but their signed receipt could not be published to {}: {error}",
+                        receipt_path.display()
+                    )
+                })?;
+        }
+    }
     if ov.json {
         println!(
             "{}",
@@ -3875,6 +5049,70 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             counts.cancelled
         ))
     }
+}
+
+fn build_batch_receipt_items(
+    plan: &ExecutionPlan,
+    planned: &[PlannedBatchItem],
+    results: &[BatchFileOutcome],
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<Vec<ReceiptItem>, String> {
+    if results.len() != planned.len() {
+        return Err("batch result count does not match its execution plan".into());
+    }
+    let mut items = Vec::with_capacity(planned.len());
+    for (planned_item, result) in planned.iter().zip(results) {
+        planned_item.prepared.expectation.verify_sources()?;
+        let prepared = &planned_item.prepared;
+        let output_locator = denoize::portable_locator(&prepared.item.destination, output_dir)?;
+        let item_id = denoize::execution_item_id(
+            prepared.expectation.input_fingerprint(),
+            &output_locator,
+            prepared.recipe,
+        )?;
+        let index = plan
+            .items
+            .binary_search_by_key(&item_id, |item| item.item_id)
+            .map_err(|_| {
+                format!(
+                    "completed batch item is absent from its execution plan: {}",
+                    prepared.item.input.display()
+                )
+            })?;
+        let plan_item = &plan.items[index];
+        let expected_input_locator = denoize::portable_locator(&prepared.item.input, input_dir)?;
+        if plan_item.input.path != expected_input_locator || plan_item.output.path != output_locator
+        {
+            return Err(format!(
+                "completed batch path differs from its execution plan: {}",
+                prepared.item.input.display()
+            ));
+        }
+        let (fingerprint, outcome) = match result {
+            BatchFileOutcome::Completed(Some(fingerprint)) => (*fingerprint, "succeeded"),
+            BatchFileOutcome::Completed(None) => {
+                return Err("an output-free batch result cannot enter a receipt".into());
+            }
+            BatchFileOutcome::Skipped(fingerprint) => (*fingerprint, "skipped"),
+            BatchFileOutcome::Failed(_) | BatchFileOutcome::Cancelled => {
+                return Err("an unsuccessful batch result cannot enter a receipt".into());
+            }
+        };
+        let current = batch_resume::fingerprint_file(&prepared.item.destination)?;
+        if current != fingerprint {
+            return Err(format!(
+                "batch output changed after publication and cannot enter a receipt: {}",
+                prepared.item.destination.display()
+            ));
+        }
+        items.push(ReceiptItem::from_plan_item(
+            plan_item,
+            fingerprint,
+            outcome,
+        )?);
+    }
+    Ok(items)
 }
 
 fn report_batch_progress(
@@ -4244,6 +5482,7 @@ max_memory_mb = 64
             encode,
             resolve_explicit_backend_options(&options).unwrap().as_ref(),
             &resource_governor(&options, 1).unwrap(),
+            false,
         )
         .unwrap();
         let prepared = &prepared[0];
@@ -4681,8 +5920,14 @@ max_memory_mb = 64
     #[test]
     fn batch_counts_distinguish_completed_skipped_and_failed_results() {
         let results = [
-            BatchFileOutcome::Completed,
-            BatchFileOutcome::Skipped,
+            BatchFileOutcome::Completed(Some(FileFingerprint {
+                len: 1,
+                digest: Digest::from_bytes([1; 32]),
+            })),
+            BatchFileOutcome::Skipped(FileFingerprint {
+                len: 1,
+                digest: Digest::from_bytes([2; 32]),
+            }),
             BatchFileOutcome::Failed("processing failed".into()),
             BatchFileOutcome::Cancelled,
         ];

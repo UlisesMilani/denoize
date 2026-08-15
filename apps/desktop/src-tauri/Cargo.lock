@@ -1029,6 +1029,7 @@ dependencies = [
  "oxideav-aac 0.1.6 (git+https://github.com/OxideAV/oxideav-aac?rev=e8113d5)",
  "percent-encoding",
  "rayon",
+ "ring",
  "rubato 0.16.2",
  "rustfft",
  "serde",
@@ -1044,6 +1045,7 @@ dependencies = [
  "ureq",
  "url",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
