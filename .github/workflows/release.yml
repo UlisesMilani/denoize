@@ -50,6 +50,7 @@ jobs:
         run: |
           cargo audit --file Cargo.lock
           cargo audit --file apps/desktop/src-tauri/Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
           bash scripts/publish-crates-io.sh --audit
 
       - name: Audit frontend dependency lock
@@ -78,6 +79,7 @@ jobs:
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
+            scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh

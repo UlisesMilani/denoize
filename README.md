@@ -1147,10 +1147,13 @@ JSON summaries retain the `cancelled` boolean and also report
 partitions the batch total.
 
 These checks define a non-adversarial local-filesystem, process-crash recovery
-contract. They do not claim protection from a hostile process performing
-precisely timed ABA path swaps, or from power loss and storage-level durability
-failures; file synchronization and atomic rename reduce those risks but do not
-extend this contract. Keep independent backups for those failure classes.
+contract. The deterministic [resilience matrix](docs/resilience.md) exercises
+every acknowledged journal/checkpoint publication prefix with abrupt child
+process exits and simulates power loss at local synchronization boundaries. It
+does not claim protection from a hostile process performing precisely timed ABA
+path swaps, a lying drive cache, faulty hardware, remote-filesystem semantics,
+or a kernel/filesystem that violates its documented durability behavior. Keep
+independent backups for those failure classes.
 
 ```
 -b, --backend <NAME>     classical|rnnoise|deepfilter
@@ -1166,6 +1169,15 @@ extend this contract. Keep independent backups for those failure classes.
 --onnx-model <PATH>       Waveform ONNX model used by the onnx backend
 --onnx-rate <HZ>          Model sample rate in 1..768000 Hz (default: 16000)
 ```
+
+## Resilience testing
+
+Every pull request runs fixed parser mutations and deterministic I/O-error and
+crash-recovery matrices. A scheduled AddressSanitizer/libFuzzer workflow covers
+all supported audio containers, execution documents, signed receipts and keys,
+trust policies, and offline model bundles with finite input, RSS, and per-case
+time limits. See [resilience testing](docs/resilience.md) for the exact commands,
+resource-accounting scope, corpus-promotion rule, and debug-only fault protocol.
 
 ## Library API
 

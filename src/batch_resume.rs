@@ -4,6 +4,7 @@
 //! share one implementation. Its journal representation is deliberately not a
 //! stable public data format beyond the versioned records written here.
 
+use crate::fault_injection;
 use crate::service::ResolvedProcessingOptions;
 use crate::{
     AacEncoder, Algorithm, AtomicOutput, Backend, ChannelMode, CommitMode, EncodeOptions,
@@ -2646,6 +2647,10 @@ impl BatchSession {
                 inner.poison(error.clone());
                 return Err(error);
             }
+            if let Err(error) = fault_injection::hit("batch-journal.after-prepare-sync") {
+                inner.poison(error.clone());
+                return Err(error);
+            }
             #[cfg(test)]
             if inner.publish_crash == Some(InjectedPublishCrash::AfterPrepareSync) {
                 std::process::abort();
@@ -2655,6 +2660,11 @@ impl BatchSession {
         // A failed filesystem commit leaves a synchronized unmatched prepare. It is
         // harmless: a later run accepts it only if the current output hash is exact.
         transaction.commit(commit_mode)?;
+        if let Err(error) = fault_injection::hit("batch-journal.after-output-publish") {
+            let message = format!("output was committed before fault injection: {error}");
+            inner.poison(message.clone());
+            return Err(message);
+        }
         #[cfg(test)]
         if inner.publish_crash == Some(InjectedPublishCrash::AfterCommit) {
             std::process::abort();
@@ -2669,6 +2679,10 @@ impl BatchSession {
                 return Err(message);
             }
             if let Err(error) = inner.index.mark_complete(complete.record_id) {
+                inner.poison(error.clone());
+                return Err(error);
+            }
+            if let Err(error) = fault_injection::hit("batch-journal.after-complete-sync") {
                 inner.poison(error.clone());
                 return Err(error);
             }

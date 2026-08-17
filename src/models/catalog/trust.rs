@@ -5,6 +5,7 @@ use super::{
     read_optional_bounded, sha256_bytes, validate_catalog_source, write_json_atomic,
     LOCAL_IMPORT_SOURCE, MAX_JSON_SAFE_INTEGER, MAX_SIGNATURE_BYTES,
 };
+use crate::fault_injection;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use minisign_verify::{PublicKey, Signature};
 use serde::{Deserialize, Serialize};
@@ -428,7 +429,9 @@ pub fn import_trust_root(
         // Persist the version/digest floor first. A crash can require the same
         // import to be retried, but cannot reactivate an older trust root.
         write_trust_state(&candidate, now)?;
+        fault_injection::hit("model-trust.after-rollback-floor-sync")?;
         write_trust_chain(&chain)?;
+        fault_injection::hit("model-trust.after-chain-publish")?;
         Ok(candidate)
     })();
     drop(lock);

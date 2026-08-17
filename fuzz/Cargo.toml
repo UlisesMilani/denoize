@@ -1,0 +1,31 @@
+[package]
+name = "denoize-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+denoize = { path = "..", default-features = false }
+libfuzzer-sys = "=0.4.13"
+serde_json = "1.0"
+tempfile = "3.27"
+
+[[bin]]
+name = "audio_file"
+path = "fuzz_targets/audio_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "automation_documents"
+path = "fuzz_targets/automation_documents.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

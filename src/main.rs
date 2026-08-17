@@ -5229,6 +5229,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                         .ok_or_else(|| "streaming input frame count overflows".to_string())?;
                     if input_frames >= next_checkpoint {
                         checkpoint.checkpoint(input_frames)?;
+                        denoize::fault_injection::hit("stream-checkpoint.after-periodic-sync")?;
                         if injected_stop_after_stream_checkpoint() {
                             return Err("injected stop after durable stream checkpoint".into());
                         }
@@ -5350,13 +5351,29 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                     _ => return Err("stream receipt state changed after preflight".into()),
                 };
                 checkpoint.prepare_publish(input_frames, output_fingerprint)?;
+                denoize::fault_injection::hit("stream-checkpoint.after-prepare-publish-sync")?;
                 transaction.commit(commit_mode)?;
+                if let Err(error) =
+                    denoize::fault_injection::hit("stream-checkpoint.after-output-publish")
+                {
+                    return Err(format!(
+                        "stream output was committed before fault injection: {error}"
+                    ));
+                }
                 if injected_stop_after_stream_commit() {
                     return Err("injected stop after committed stream output".into());
                 }
                 if let (Some(receipt), Some(staged)) = (&stream_receipt, staged_receipt) {
                     commit_stream_receipt_after_output(receipt, staged, output)?;
+                    if let Err(error) =
+                        denoize::fault_injection::hit("stream-checkpoint.after-receipt-publish")
+                    {
+                        return Err(format!(
+                            "stream output and receipt were committed before fault injection: {error}"
+                        ));
+                    }
                 }
+                denoize::fault_injection::hit("stream-checkpoint.before-cleanup")?;
                 if let Err(error) = checkpoint.cleanup() {
                     eprintln!(
                         "denoize: warning: output committed but checkpoint cleanup failed: {error}"

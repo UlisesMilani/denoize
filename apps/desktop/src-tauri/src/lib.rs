@@ -4906,6 +4906,7 @@ fn process_stream_file(
                 .ok_or_else(|| "ストリーム入力フレーム数が大きすぎます".to_string())?;
             if input_frames >= next_checkpoint {
                 checkpoint.checkpoint(input_frames)?;
+                denoize::fault_injection::hit("stream-checkpoint.after-periodic-sync")?;
                 next_checkpoint = input_frames
                     .checked_div(STREAM_CHECKPOINT_FRAMES)
                     .and_then(|multiple| multiple.checked_add(1))
@@ -5013,11 +5014,19 @@ fn process_stream_file(
             _ => return Err("再開ストリーム実行証明の状態が変化しました".into()),
         }
         checkpoint.prepare_publish(input_frames, output_fingerprint)?;
+        denoize::fault_injection::hit("stream-checkpoint.after-prepare-publish-sync")?;
         progress(4, "出力を確定しています");
         if let Some(receipt_context) = receipt.take() {
             let receipt_path = receipt_context.path;
             control.commit_fence(|| {
                 transaction.commit(commit_mode)?;
+                if let Err(error) =
+                    denoize::fault_injection::hit("stream-checkpoint.after-output-publish")
+                {
+                    return Err(format!(
+                        "ストリーム音声は確定しましたがfault injectionで停止しました: {error}"
+                    ));
+                }
                 if injected_stop_after_desktop_stream_commit() {
                     return Err("injected stop after committed desktop stream output".into());
                 }
@@ -5029,11 +5038,20 @@ fn process_stream_file(
                             "ストリーム音声は確定しましたが、実行証明 {} を公開できませんでした: {error}",
                             receipt_path.display()
                         )
-                    })
+                    })?;
+                denoize::fault_injection::hit("stream-checkpoint.after-receipt-publish")
             })?;
         } else {
             control.commit(transaction, commit_mode)?;
+            if let Err(error) =
+                denoize::fault_injection::hit("stream-checkpoint.after-output-publish")
+            {
+                return Err(format!(
+                    "ストリーム音声は確定しましたがfault injectionで停止しました: {error}"
+                ));
+            }
         }
+        denoize::fault_injection::hit("stream-checkpoint.before-cleanup")?;
         if let Err(error) = checkpoint.cleanup() {
             eprintln!("denoize desktop: checkpoint cleanup failed after commit: {error}");
         }

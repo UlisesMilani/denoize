@@ -52,6 +52,7 @@ include = [
     "/docs/cli.md",
     "/docs/json.md",
     "/docs/models.md",
+    "/docs/resilience.md",
     "/docs/release-evidence.md",
     "/schemas/*.json",
     "/models/*.json",
