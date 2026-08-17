@@ -270,6 +270,29 @@ verification, bounded stdin/stdout and library `Read`/`Write` spools, and v2
 stream plans and signed receipts. Checkpoints persist presentation PCM only
 after codec delay, granule, or edit-list mapping has been applied.
 
+Stage 13 makes robustness failures reproducible instead of treating a long
+random fuzz run as evidence by itself. Checked-in seed cases and a fixed,
+versioned mutator exercise every supported audio container plus the signed and
+durable JSON/bundle formats under explicit input, allocation, iteration, and
+wall-clock ceilings. Nightly coverage-guided fuzzing uses the same entry points;
+every minimized finding becomes a deterministic regression seed before it is
+considered fixed. Resource-amplification assertions distinguish denoize-owned
+capacity, declared codec scratch, and third-party private allocation rather
+than presenting an RSS sample as an exact portable bound.
+
+Fault injection is compiled only into debug/test builds and uses an exact
+point, occurrence, and action (`error` or immediate process exit), so a test
+cannot silently fire at a nearby operation after code is reordered. Injection
+points bracket staged-file synchronization and publication, journal
+prepare/completion, checkpoint spool/state updates, signed-receipt publication,
+and managed-model state changes. Child-process tests enumerate those durable
+prefixes, restart from each abrupt exit, and require an old or fully committed
+output, coherent restart state, reusable locks, no partial automation output,
+and no deletion of an unverified artifact. Power-loss tests simulate loss at
+acknowledged synchronization boundaries on a local filesystem; they do not
+claim to model faulty hardware, remote filesystems, drive write caches, or a
+kernel that violates its documented durability semantics.
+
 Stage 9 keeps recommendation read-only and network-free. It analyzes a bounded
 signal prefix, considers compiled backends, verified local managed models,
 one read-only hardware/runtime snapshot, and CPU/GPU resource limits, then emits

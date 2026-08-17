@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use tempfile::{Builder, NamedTempFile};
 
+use crate::fault_injection;
+
 #[cfg(unix)]
 pub(crate) fn validate_unix_acl(path: &Path, destination: &Path) -> Result<(), String> {
     let unsafe_acl = unix_acl_is_unsafe(path).map_err(|error| {
@@ -1043,12 +1045,20 @@ impl AtomicOutput {
                 self.display_destination.display()
             ));
         }
+        fault_injection::hit("atomic-output.before-stage-sync")?;
         self.temporary.as_file_mut().flush().map_err(|error| {
             format!(
                 "failed to flush temporary output for {}: {error}",
                 self.display_destination.display()
             )
         })?;
+        self.temporary.as_file().sync_all().map_err(|error| {
+            format!(
+                "failed to synchronize temporary output for {}: {error}",
+                self.display_destination.display()
+            )
+        })?;
+        fault_injection::hit("atomic-output.after-stage-sync")?;
 
         #[cfg(unix)]
         let (destination_permissions, destination_ownership) = {
@@ -1126,18 +1136,15 @@ impl AtomicOutput {
             })?;
         }
 
+        fault_injection::hit("atomic-output.before-publish")?;
         #[cfg(windows)]
-        {
-            return self.commit_windows(mode);
-        }
-
-        #[cfg(not(windows))]
-        {
-            #[cfg(unix)]
-            return self.commit_with_tempfile(mode, destination_permissions);
-            #[cfg(not(unix))]
-            return self.commit_with_tempfile(mode);
-        }
+        let result = self.commit_windows(mode);
+        #[cfg(all(not(windows), unix))]
+        let result = self.commit_with_tempfile(mode, destination_permissions);
+        #[cfg(all(not(windows), not(unix)))]
+        let result = self.commit_with_tempfile(mode);
+        result?;
+        fault_injection::hit("atomic-output.after-publish")
     }
 
     #[cfg(unix)]

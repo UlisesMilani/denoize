@@ -35,6 +35,9 @@ jobs:
       - name: Audit desktop dependencies
         run: cargo audit --file apps/desktop/src-tauri/Cargo.lock
 
+      - name: Audit fuzz harness dependencies
+        run: cargo audit --file fuzz/Cargo.lock
+
       - name: Audit crates.io dependencies
         run: bash scripts/publish-crates-io.sh --audit
 
@@ -56,6 +59,12 @@ jobs:
       - name: Test all features
         run: cargo test --locked --all-targets --features full
 
+      - name: Run bounded deterministic resilience matrix
+        env:
+          DENOIZE_RESILIENCE_FEATURES: full
+          DENOIZE_RESILIENCE_TIMEOUT_SECONDS: "180"
+        run: bash scripts/test-resilience.sh
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -72,6 +81,7 @@ jobs:
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
+            scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \

@@ -1,0 +1,57 @@
+name: Parser fuzzing
+
+on:
+  schedule:
+    - cron: "17 3 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: audio_file
+            dictionary: fuzz/audio.dict
+            max_len: 1048577
+          - target: automation_documents
+            dictionary: fuzz/automation.dict
+            max_len: 1048576
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install nightly Rust and cargo-fuzz
+        shell: bash
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Run bounded coverage-guided fuzzing
+        shell: bash
+        run: >-
+          cargo +nightly fuzz run "${{ matrix.target }}" --
+          -dict="${{ matrix.dictionary }}"
+          -max_len=${{ matrix.max_len }}
+          -max_total_time=900
+          -rss_limit_mb=768
+          -timeout=10
+
+      - name: Preserve minimized failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30

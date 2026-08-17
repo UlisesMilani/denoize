@@ -7,6 +7,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 static MODEL_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TRUST_FAULT_CHILD_ROOT_ENV: &str = "DENOIZE_TEST_TRUST_FAULT_CHILD_ROOT";
 
 #[derive(Debug)]
 struct TestRequest {
@@ -271,6 +272,79 @@ fn trust_root_import_repairs_a_floor_first_interrupted_commit() {
 }
 
 #[test]
+fn fault_injected_trust_root_child() {
+    let Some(root) = std::env::var_os(TRUST_FAULT_CHILD_ROOT_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let _environment = lock_model_environment();
+    let _model_dir = ModelDirGuard::set(&root);
+    let candidate = root.join("trust-root-v2.json");
+    let signatures = root.join("trust-root-v2.signatures.json");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(&candidate, include_bytes!("testdata/trust-root-v2.json")).unwrap();
+    std::fs::write(
+        &signatures,
+        include_bytes!("testdata/trust-root-v2.signatures.json"),
+    )
+    .unwrap();
+    assert_eq!(import_trust_root(candidate, signatures).unwrap().version, 2);
+}
+
+#[test]
+fn deterministic_faults_repair_trust_root_floor_first_publication() {
+    for point in [
+        "model-trust.after-rollback-floor-sync",
+        "model-trust.after-chain-publish",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("models");
+        let crashed = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "models::tests::fault_injected_trust_root_child",
+                "--nocapture",
+            ])
+            .env(TRUST_FAULT_CHILD_ROOT_ENV, &cache)
+            .env(
+                crate::fault_injection::ENVIRONMENT_VARIABLE,
+                format!("v1|{point}|1|exit"),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(
+            crashed.status.code(),
+            Some(crate::fault_injection::EXIT_CODE),
+            "unexpected trust fault status at {point}: {:?}\nstdout:\n{}\nstderr:\n{}",
+            crashed.status,
+            String::from_utf8_lossy(&crashed.stdout),
+            String::from_utf8_lossy(&crashed.stderr),
+        );
+        assert!(String::from_utf8_lossy(&crashed.stderr).contains(point));
+
+        let repaired = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "models::tests::fault_injected_trust_root_child",
+                "--nocapture",
+            ])
+            .env(TRUST_FAULT_CHILD_ROOT_ENV, &cache)
+            .output()
+            .unwrap();
+        assert!(
+            repaired.status.success(),
+            "trust publication did not recover at {point}: {}",
+            String::from_utf8_lossy(&repaired.stderr)
+        );
+        for name in ["trust-state.json", "trust-chain.json"] {
+            let bytes = std::fs::read(cache.join(".catalog").join(name))
+                .unwrap_or_else(|error| panic!("read recovered {name}: {error}"));
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|error| panic!("recovered {name} is partial: {error}"));
+        }
+    }
+}
+
+#[test]
 fn emergency_recovery_replaces_corrupt_cache_without_lowering_catalog_state() {
     let _environment = lock_model_environment();
     let directory = tempfile::tempdir().unwrap();
@@ -428,7 +502,10 @@ where
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Full-feature test binaries run hundreds of CPU-heavy cases in
+        // parallel. Keep a finite deadline without letting scheduler delay
+        // close the loopback listener before this test's client gets CPU time.
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut requests = Vec::new();
         while requests.len() < expected_requests && Instant::now() < deadline {
             match listener.accept() {

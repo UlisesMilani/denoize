@@ -48,6 +48,8 @@ pub mod decode;
 pub mod denoiser;
 pub mod encode;
 pub mod execution;
+#[doc(hidden)]
+pub mod fault_injection;
 pub mod fft;
 pub mod gain;
 pub mod hardware;
