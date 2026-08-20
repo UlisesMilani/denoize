@@ -807,19 +807,14 @@ mod tests {
         let root = directory.path().join("recovery");
         let output = directory.path().join("output.wav");
         let tracker = test_tracker(&root, &output);
-        let stage = directory
-            .path()
-            .join(format!(".denoize-{}.part", "b".repeat(16)));
-        std::fs::write(&stage, b"private stage").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let guard = tracker
-            .track_paths(stage.clone(), resolved_destination(&output).unwrap())
-            .unwrap();
+        let mut transaction = AtomicOutput::new(&output).unwrap();
+        transaction.file_mut().write_all(b"private stage").unwrap();
+        let stage = transaction.staged_path().to_path_buf();
+        let guard = tracker.track(&transaction).unwrap();
         std::mem::forget(guard);
+        // Simulate an abrupt owner exit: the recovery store is then solely
+        // responsible for removing the still-recorded private stage.
+        std::mem::forget(transaction);
         let store = RecoveryStore::open(root).unwrap();
         assert_eq!(store.discard(&"a".repeat(64)).unwrap(), 1);
         assert!(!stage.exists());
