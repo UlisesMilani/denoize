@@ -728,8 +728,8 @@ pub(crate) fn process_is_alive(process_id: u32) -> bool {
         return false;
     }
     let mut exit_code = 0;
-    let alive =
-        unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0 && exit_code == STILL_ACTIVE;
+    let alive = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0
+        && exit_code == STILL_ACTIVE as u32;
     unsafe { CloseHandle(process) };
     alive
 }
