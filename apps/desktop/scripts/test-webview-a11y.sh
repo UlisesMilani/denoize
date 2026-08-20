@@ -44,16 +44,30 @@ if [[ "$vite_ready" != true ]]; then
 fi
 
 task_rustc="$(rustup which --toolchain 1.96.0 rustc)"
-set +e
-timeout 120s xvfb-run -a env \
-  WEBKIT_DISABLE_COMPOSITING_MODE=1 \
-  RUSTC="$task_rustc" \
-  rustup run 1.96.0 cargo run \
+task_cargo="$(rustup which --toolchain 1.96.0 cargo)"
+RUSTC="$task_rustc" "$task_cargo" build \
+  --locked \
+  --manifest-path "$desktop_dir/src-tauri/Cargo.toml" \
+  --no-default-features \
+  --features live \
+  --bin denoize-desktop
+target_directory="$({
+  RUSTC="$task_rustc" "$task_cargo" metadata \
     --locked \
-    --manifest-path "$desktop_dir/src-tauri/Cargo.toml" \
-    --no-default-features \
-    --features live \
-    -- \
+    --no-deps \
+    --format-version 1 \
+    --manifest-path "$desktop_dir/src-tauri/Cargo.toml"
+} | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+task_binary="$target_directory/debug/denoize-desktop"
+if [[ ! -x "$task_binary" ]]; then
+  echo "desktop accessibility test binary is missing after build" >&2
+  exit 2
+fi
+
+set +e
+timeout 60s xvfb-run -a env \
+  WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+  "$task_binary" \
     --denoize-desktop-a11y-e2e 2>&1 | tee "$task_log"
 task_status="${PIPESTATUS[0]}"
 set -e
