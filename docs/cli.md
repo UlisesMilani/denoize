@@ -94,11 +94,11 @@ OPTIONS:
 BACKENDS (build with --features full for all):
     classical   Enhanced STFT/IMCRA/OMLSA pipeline (default)
     rnnoise     RNNoise via nnnoiseless (requires --features rnnoise)
-    deepfilter  DeepFilterNet v3 (requires --features deepfilter)
+    deepfilter  DeepFilterNet v3 for files and --stream (requires --features deepfilter)
     onnx        External waveform ONNX model (requires --features onnx)
     mpsenet     MP-SENet magnitude/phase model (requires --features mpsenet)
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
-    mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
+    mossformer2 ClearerVoice MossFormer2 for files and --stream (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
     gtcrn       Official causal GTCRN for files, --stream, and live processing
 
@@ -355,8 +355,11 @@ isolation when those allocations require a hard process boundary.
 
 `--stream` accepts content-detected WAV, FLAC, Ogg Vorbis, granule-aware Ogg
 Opus, gapless MP3, frame-aware ADTS AAC, and edit-aware M4A AAC/ALAC input. It
-can encode WAV, FLAC, Ogg Opus, MP3, M4A AAC, or ADTS AAC output with a compiled
-streaming backend. `--stream-frames` controls the bounded input block and
+can encode WAV, FLAC, Ogg Opus, MP3, M4A AAC, or ADTS AAC output with compiled
+Classical, RNNoise, DeepFilterNet, MossFormer2, and GTCRN stateful backends.
+Bounded VAD preserves presentation length across backend latency. `--loudness`
+uses an anonymous PCM spool for fixed-memory analysis before its verified
+encoding pass. `--stream-frames` controls the bounded input block and
 participates in restart identity. A regular-file destination is staged,
 decoded end-to-end for codec/geometry/presentation-length verification, and
 atomically published; supported metadata is preserved unless `--no-metadata`
@@ -365,11 +368,12 @@ is selected.
 Use `-` for stdin or stdout. Stdin is copied into an anonymous bounded regular
 file before parsing so one authoritative seekable object can be inspected and
 decoded. Stdout retains PCM and encoded output in finite anonymous spools,
-validates the complete encoded result, then copies it to the sink; a sink error
-can leave a partial external stream because stdout has no atomic rename.
-Stdin and stdout share the `--max-temp-space` allowance, stdout intentionally
-drops metadata, and `--resume` rejects either endpoint because their spools do
-not survive a process restart.
+applies metadata and optional two-pass loudness, validates the complete encoded
+result, then copies it to the sink; a sink error can leave a partial external
+stream because stdout has no atomic rename. Stdin and stdout share the
+`--max-temp-space` allowance, preserve supported input metadata unless
+`--no-metadata` is selected, and reject `--resume` because their spools do not
+survive a process restart.
 
 With `--stream --resume`, denoize periodically synchronizes a private
 append-only journal and interleaved `f64` PCM spool beside the destination. A

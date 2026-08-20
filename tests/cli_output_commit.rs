@@ -704,6 +704,65 @@ fn streaming_file_can_publish_verified_stdout() {
 }
 
 #[test]
+fn streaming_stdout_preserves_metadata_and_applies_two_pass_loudness() {
+    use lofty::tag::{Accessor, Tag, TagExt, TagType};
+
+    let directory = TestDirectory::create();
+    let input = directory.join("input.wav");
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&input, spec).expect("create loudness WAV");
+    for frame in 0..32_000 {
+        let phase = std::f64::consts::TAU * 440.0 * frame as f64 / 16_000.0;
+        writer
+            .write_sample((phase.sin() * 9_000.0) as i16)
+            .expect("write loudness sample");
+    }
+    writer.finalize().expect("finalize loudness WAV");
+    let mut tag = Tag::new(TagType::RiffInfo);
+    tag.set_title("Streamed stdout metadata".into());
+    tag.save_to_path(&input, lofty::config::WriteOptions::default())
+        .expect("write input metadata");
+
+    let result = run_stream_file_to_stdout(
+        &input,
+        &[
+            "--output-format",
+            "flac",
+            "--stream-frames",
+            "193",
+            "--loudness",
+            "-24",
+        ],
+    );
+
+    assert_success(&result);
+    let mut session = denoize::AudioInputSession::from_reader(std::io::Cursor::new(result.stdout))
+        .expect("spool stdout FLAC");
+    let metadata = session
+        .read_metadata()
+        .expect("read stdout metadata")
+        .expect("stdout metadata is present");
+    assert_eq!(
+        metadata.tag().title().as_deref(),
+        Some("Streamed stdout metadata")
+    );
+    let decoded = denoize::read_audio_from_session(&mut session).expect("decode stdout FLAC");
+    assert_eq!(decoded.frames(), 32_000);
+    let (integrated_lufs, true_peak_dbtp) =
+        denoize::loudness::measure(&decoded).expect("measure normalized stdout");
+    assert!(
+        (integrated_lufs - -24.0).abs() < 0.25,
+        "unexpected stdout loudness: {integrated_lufs:.3} LUFS"
+    );
+    assert!(true_peak_dbtp <= -1.0 + 0.05);
+}
+
+#[test]
 fn streaming_stdio_shared_spool_limit_fails_before_stdout_bytes() {
     let directory = TestDirectory::create();
     let input = directory.join("large.wav");

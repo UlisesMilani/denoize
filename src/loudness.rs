@@ -5,7 +5,11 @@
 //! momentary, short-term, integrated, and loudness-range measurements as well
 //! as the relative gate threshold and sample/true peaks.
 
-use crate::{channel_layout::ChannelPosition, sanitize_sample, Audio};
+use crate::{
+    channel_layout::{ChannelLayout, ChannelMask, ChannelPosition},
+    config::{checked_resource_add, checked_resource_multiply, ConfigError},
+    sanitize_sample, Audio,
+};
 use ebur128::{Channel as EbuChannel, EbuR128, Mode};
 
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +18,172 @@ pub struct LoudnessReport {
     pub output_lufs: f64,
     pub true_peak_dbtp: f64,
     pub gain_db: f64,
+}
+
+/// Gain calculated by the bounded first pass of stream normalization.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamingLoudnessGain {
+    report: LoudnessReport,
+    linear: f64,
+}
+
+impl StreamingLoudnessGain {
+    #[must_use]
+    pub const fn report(self) -> LoudnessReport {
+        self.report
+    }
+
+    #[must_use]
+    pub const fn linear(self) -> f64 {
+        self.linear
+    }
+
+    /// Apply the measured constant gain without changing block geometry.
+    pub fn apply(self, channels: &mut [Vec<f64>]) {
+        for sample in channels.iter_mut().flatten() {
+            *sample = sanitize_sample(*sample * self.linear);
+        }
+    }
+}
+
+/// Fixed-memory EBU R128 analyzer for the first pass of a long stream.
+///
+/// Histogram mode keeps 1,000 loudness bins instead of retaining one energy
+/// value per programme block. True-peak and K-weighting state are bounded by
+/// channel count and sample rate; `add_block` reuses one caller-sized scratch
+/// allocation.
+pub struct StreamingLoudnessAnalyzer {
+    analyzer: EbuR128,
+    channels: usize,
+    scratch: Vec<f64>,
+    frames: u64,
+}
+
+impl StreamingLoudnessAnalyzer {
+    pub fn new(
+        channels: usize,
+        sample_rate: u32,
+        channel_mask: Option<ChannelMask>,
+    ) -> Result<Self, String> {
+        if channels == 0 {
+            return Err("streaming loudness requires at least one channel".into());
+        }
+        let mut analyzer = EbuR128::new(
+            channels as u32,
+            sample_rate,
+            Mode::I | Mode::TRUE_PEAK | Mode::HISTOGRAM,
+        )
+        .map_err(|error| format!("initialize streaming loudness analyzer: {error}"))?;
+        if let Some(channel_map) = ebur_channel_map_for(channels, channel_mask) {
+            analyzer
+                .set_channel_map(&channel_map)
+                .map_err(|error| format!("configure streaming loudness channel map: {error}"))?;
+        }
+        Ok(Self {
+            analyzer,
+            channels,
+            scratch: Vec::new(),
+            frames: 0,
+        })
+    }
+
+    pub fn add_block(&mut self, channels: &[Vec<f64>]) -> Result<(), String> {
+        if channels.len() != self.channels {
+            return Err(format!(
+                "streaming loudness expected {} channels, got {}",
+                self.channels,
+                channels.len()
+            ));
+        }
+        let frames = channels.first().map(Vec::len).unwrap_or(0);
+        if channels.iter().any(|channel| channel.len() != frames) {
+            return Err("streaming loudness blocks must have equal channel lengths".into());
+        }
+        let samples = frames
+            .checked_mul(self.channels)
+            .ok_or_else(|| "streaming loudness block size overflows".to_string())?;
+        self.scratch.clear();
+        self.scratch.try_reserve_exact(samples).map_err(|_| {
+            ConfigError::allocation_failed("streaming loudness scratch").to_string()
+        })?;
+        for frame in 0..frames {
+            for channel in channels {
+                self.scratch.push(sanitize_sample(channel[frame]));
+            }
+        }
+        self.analyzer
+            .add_frames_f64(&self.scratch)
+            .map_err(|error| format!("analyze streaming loudness: {error}"))?;
+        self.frames = self
+            .frames
+            .checked_add(frames as u64)
+            .ok_or_else(|| "streaming loudness frame count overflows".to_string())?;
+        Ok(())
+    }
+
+    pub fn finish(
+        self,
+        target_lufs: f64,
+        peak_limit_dbtp: f64,
+    ) -> Result<StreamingLoudnessGain, String> {
+        validate_normalization_targets(target_lufs, peak_limit_dbtp)?;
+        if self.frames == 0 {
+            return Err("cannot measure empty streaming audio".into());
+        }
+        let input_lufs = integrated_loudness(&self.analyzer)?;
+        let input_peak = true_peak_dbtp(&self.analyzer, self.channels)?;
+        let loudness_gain = target_lufs - input_lufs;
+        let peak_gain = peak_limit_dbtp - input_peak;
+        let gain_db = loudness_gain.min(peak_gain);
+        let linear = 10f64.powf(gain_db / 20.0);
+        Ok(StreamingLoudnessGain {
+            report: LoudnessReport {
+                input_lufs,
+                output_lufs: input_lufs + gain_db,
+                true_peak_dbtp: input_peak + gain_db,
+                gain_db,
+            },
+            linear,
+        })
+    }
+}
+
+/// Conservative denoize-owned and analyzer state for a bounded loudness pass.
+pub fn estimate_streaming_loudness_bytes(
+    channels: usize,
+    sample_rate: u32,
+    block_frames: usize,
+) -> Result<u64, ConfigError> {
+    if channels == 0 {
+        return Err(ConfigError::invalid("channels", "a positive channel count"));
+    }
+    let scratch_samples = checked_resource_multiply(
+        "streaming loudness scratch",
+        channels as u64,
+        block_frames as u64,
+    )?;
+    let scratch_bytes = checked_resource_multiply(
+        "streaming loudness scratch",
+        scratch_samples,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    // ebur128 retains a 400 ms channel ring, K-weighting/true-peak state, and
+    // two fixed 1,000-bin histograms. One second per channel is conservative.
+    let analyzer_samples = checked_resource_multiply(
+        "streaming loudness analyzer",
+        channels as u64,
+        sample_rate as u64,
+    )?;
+    let analyzer_bytes = checked_resource_multiply(
+        "streaming loudness analyzer",
+        analyzer_samples,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    checked_resource_add(
+        "streaming loudness analyzer",
+        checked_resource_add("streaming loudness analyzer", scratch_bytes, analyzer_bytes)?,
+        2 * 1_000 * std::mem::size_of::<u64>() as u64,
+    )
 }
 
 /// Loudness values calculated according to EBU R128 / ITU-R BS.1770.
@@ -49,12 +219,7 @@ pub fn normalize(
     target_lufs: f64,
     peak_limit_dbtp: f64,
 ) -> Result<LoudnessReport, String> {
-    if !target_lufs.is_finite() || !(-70.0..=0.0).contains(&target_lufs) {
-        return Err("loudness target must be between -70 and 0 LUFS".into());
-    }
-    if !peak_limit_dbtp.is_finite() || !(-20.0..=0.0).contains(&peak_limit_dbtp) {
-        return Err("true-peak limit must be between -20 and 0 dBTP".into());
-    }
+    validate_normalization_targets(target_lufs, peak_limit_dbtp)?;
     let (input_lufs, input_peak) = measure(audio)?;
     let loudness_gain = target_lufs - input_lufs;
     let peak_gain = peak_limit_dbtp - input_peak;
@@ -72,6 +237,16 @@ pub fn normalize(
         true_peak_dbtp,
         gain_db,
     })
+}
+
+fn validate_normalization_targets(target_lufs: f64, peak_limit_dbtp: f64) -> Result<(), String> {
+    if !target_lufs.is_finite() || !(-70.0..=0.0).contains(&target_lufs) {
+        return Err("loudness target must be between -70 and 0 LUFS".into());
+    }
+    if !peak_limit_dbtp.is_finite() || !(-20.0..=0.0).contains(&peak_limit_dbtp) {
+        return Err("true-peak limit must be between -20 and 0 dBTP".into());
+    }
+    Ok(())
 }
 
 pub fn measure(audio: &Audio) -> Result<(f64, f64), String> {
@@ -163,11 +338,21 @@ fn create_analyzer(audio: &Audio, mode: Mode) -> Result<EbuR128, String> {
 /// analyzer's conservative defaults.
 fn ebur_channel_map(audio: &Audio) -> Option<Vec<EbuChannel>> {
     let channels = audio.channels();
-    let positions = audio
-        .effective_channel_mask()
+    ebur_channel_map_for(channels, audio.effective_channel_mask())
+}
+
+fn ebur_channel_map_for(
+    channels: usize,
+    channel_mask: Option<ChannelMask>,
+) -> Option<Vec<EbuChannel>> {
+    let positions = channel_mask
         .filter(|mask| mask.bits() != 0 && mask.channels() == channels)
         .map(|mask| mask.positions())
-        .or_else(|| audio.channel_layout().mask().map(|mask| mask.positions()))?;
+        .or_else(|| {
+            ChannelLayout::from_channel_count(channels)
+                .mask()
+                .map(|mask| mask.positions())
+        })?;
     if positions.len() != channels {
         return None;
     }
@@ -440,5 +625,49 @@ mod tests {
         normalize(&mut audio, -20.0, -1.0).unwrap();
         assert!(audio.channels[0].iter().all(|sample| sample.is_finite()));
         assert!(audio.channels[0].iter().all(|sample| sample.abs() <= 1.0));
+    }
+
+    #[test]
+    fn bounded_streaming_analyzer_matches_constant_gain_contract() {
+        let audio = reference_stereo_sine();
+        let (input_lufs, input_peak) = measure(&audio).unwrap();
+        let mut analyzer = StreamingLoudnessAnalyzer::new(
+            audio.channels(),
+            audio.sample_rate,
+            audio.effective_channel_mask(),
+        )
+        .unwrap();
+        for start in (0..audio.frames()).step_by(997) {
+            let end = (start + 997).min(audio.frames());
+            let block: Vec<Vec<f64>> = audio
+                .channels
+                .iter()
+                .map(|channel| channel[start..end].to_vec())
+                .collect();
+            analyzer.add_block(&block).unwrap();
+        }
+        let gain = analyzer.finish(-18.0, -1.0).unwrap();
+        let report = gain.report();
+        assert!((report.input_lufs - input_lufs).abs() < 0.05);
+        let expected_gain = (-18.0 - report.input_lufs).min(-1.0 - input_peak);
+        assert!((report.gain_db - expected_gain).abs() < 0.05);
+        assert!((report.output_lufs - (report.input_lufs + report.gain_db)).abs() < 1e-12);
+        assert!(report.true_peak_dbtp <= -1.0 + 1e-9);
+    }
+
+    #[test]
+    fn bounded_streaming_gain_preserves_block_geometry() {
+        let mut block = vec![vec![0.5, -0.5], vec![0.25, -0.25]];
+        let gain = StreamingLoudnessGain {
+            report: LoudnessReport {
+                input_lufs: -10.0,
+                output_lufs: -16.0,
+                true_peak_dbtp: -7.0,
+                gain_db: -6.0,
+            },
+            linear: 0.5,
+        };
+        gain.apply(&mut block);
+        assert_eq!(block, vec![vec![0.25, -0.25], vec![0.125, -0.125]]);
     }
 }

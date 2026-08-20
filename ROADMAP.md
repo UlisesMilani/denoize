@@ -83,9 +83,10 @@ set, and VAD regions use the same session instead of reopening a graph per
 region. Fixed-shape adapters retain one optimized graph; dynamic BSRNN,
 SGMSE+, and generic waveform adapters retain the most recently required tensor
 shape. DeepFilterNet's non-`Send` runtime is cached once per worker thread. The
-stateful `StreamingBackendSession` provides the corresponding continuous API
-for Classical, RNNoise, and GTCRN and is used by both WAV `--stream` and live
-capture/playback.
+stateful `StreamingBackendSession` provides the continuous file-streaming API
+for Classical, RNNoise, DeepFilterNet, MossFormer2, and GTCRN. The low-latency
+live capture/playback path deliberately accepts only Classical, RNNoise, and
+GTCRN.
 
 The generated rank-2 and rank-3 ONNX fixtures exercise real tract inference,
 sample-rate conversion, multichannel independence, exact duration restoration,
@@ -247,7 +248,7 @@ unreviewable release.
 | 12 | Native gapless/granule/edit-aware checkpoints, encoded output, and bounded non-seekable streams | Released in v0.60.0 |
 | 13 | Parser and resource-amplification fuzzing, deterministic fault injection, and crash/power-loss simulation | Released in v0.61.0 |
 | 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Released in v0.62.0 |
-| 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Planned |
+| 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Implemented |
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Planned |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
@@ -330,6 +331,16 @@ use structured codes with localized Japanese/English summaries and preserved
 technical details. Keyboard/ARIA navigation, visible focus, reduced motion,
 and forced-colors checks are joined by a real-WebView interaction test in the
 desktop release gate.
+
+Stage 15 closes the bounded file-streaming feature gap without converting the
+pipeline back into a whole-file allocation. A fixed-history VAD aligns original
+and processed presentation samples across backend latency. Loudness uses a
+fixed-memory EBU R128 analysis pass over an anonymous bounded PCM spool and a
+constant-gain encoding pass; restart checkpoints reuse their existing PCM
+spool. Metadata is applied before verification for regular-file and stdout
+destinations. DeepFilterNet processes reusable 48 kHz hops, while MossFormer2
+retains only its official four-second window and three-second stride; both
+reuse a prepared model and preserve the exact input presentation length.
 
 Stage 19 exposes only local, authenticated control surfaces and reuses the
 bounded JSON contracts, resource admission, signed receipts, and regular-file

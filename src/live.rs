@@ -97,7 +97,14 @@ impl LiveConfig {
 /// the current live capture worker.
 #[allow(unreachable_patterns)]
 pub fn backend_is_live_capable(backend: Backend) -> bool {
-    StreamingBackendSession::supports(backend)
+    match backend {
+        Backend::Classical => true,
+        #[cfg(feature = "rnnoise")]
+        Backend::Rnnoise => true,
+        #[cfg(feature = "gtcrn")]
+        Backend::Gtcrn => true,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -853,7 +860,7 @@ where
         .try_reserve_exact(buffer_plan.input_capacity)
         .map_err(|_| ConfigError::allocation_failed("live input buffer").to_string())?;
     let (tx, rx) = mpsc::sync_channel::<CapturedChunk>(CAPTURE_QUEUE_CHUNKS);
-    let live_processor = LiveProcessor::new_with_accelerator(&config, in_channels, accelerator)?;
+    let (worker_ready_tx, worker_ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let input_level = Arc::new(AtomicU32::new(0));
     let output_level = Arc::new(AtomicU32::new(0));
     let dropped_chunks = Arc::new(AtomicU64::new(0));
@@ -864,8 +871,22 @@ where
     let worker_output_level = Arc::clone(&output_level);
     let worker_processed = Arc::clone(&processed_chunks);
     let worker_failure = Arc::clone(&worker_error);
+    let worker_config = config.clone();
     let worker = std::thread::spawn(move || {
-        let mut live_processor = live_processor;
+        // Some compiled stream backends intentionally own thread-affine model
+        // state. Construct the live processor on its permanent worker thread,
+        // then acknowledge readiness before either device stream is opened.
+        let mut live_processor =
+            match LiveProcessor::new_with_accelerator(&worker_config, in_channels, accelerator) {
+                Ok(processor) => processor,
+                Err(error) => {
+                    let _ = worker_ready_tx.send(Err(error));
+                    return;
+                }
+            };
+        if worker_ready_tx.send(Ok(())).is_err() {
+            return;
+        }
         while worker_running.load(Ordering::Relaxed) {
             let captured = match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(captured) => captured,
@@ -939,6 +960,17 @@ where
             worker_processed.fetch_add(1, Ordering::Relaxed);
         }
     });
+    match worker_ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = worker.join();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = worker.join();
+            return Err("live worker exited before processor initialization completed".into());
+        }
+    }
 
     let input_stream = build_input(
         &input,
@@ -1639,6 +1671,15 @@ mod tests {
             config.validate_config(),
             Err(ConfigError::InvalidValue { field: "vad", .. })
         ));
+    }
+
+    #[cfg(any(feature = "deepfilter", feature = "mossformer2"))]
+    #[test]
+    fn bounded_file_stream_backends_do_not_claim_low_latency_live_support() {
+        #[cfg(feature = "deepfilter")]
+        assert!(!backend_is_live_capable(Backend::DeepFilter));
+        #[cfg(feature = "mossformer2")]
+        assert!(!backend_is_live_capable(Backend::Mossformer2));
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub struct StreamingBackendSession {
     channel_mode: ChannelMode,
     denoiser: DenoiserConfig,
     processor: StreamingBackend,
+    vad: Option<crate::vad::StreamingVad>,
     linked_original: VecDeque<(f64, f64)>,
     finished: bool,
 }
@@ -31,6 +32,10 @@ enum StreamingBackend {
     Classical(StreamingDenoiser),
     #[cfg(feature = "rnnoise")]
     Rnnoise(Box<super::rnnoise::StreamingProcessor>),
+    #[cfg(feature = "deepfilter")]
+    DeepFilter(Box<super::deepfilter::StreamingProcessor>),
+    #[cfg(feature = "mossformer2")]
+    Mossformer2(Box<super::mossformer2::StreamingProcessor>),
     #[cfg(feature = "gtcrn")]
     Gtcrn(Box<super::gtcrn::StreamingProcessor>),
 }
@@ -43,6 +48,10 @@ impl StreamingBackendSession {
             Backend::Classical => true,
             #[cfg(feature = "rnnoise")]
             Backend::Rnnoise => true,
+            #[cfg(feature = "deepfilter")]
+            Backend::DeepFilter => true,
+            #[cfg(feature = "mossformer2")]
+            Backend::Mossformer2 => true,
             #[cfg(feature = "gtcrn")]
             Backend::Gtcrn => true,
             _ => false,
@@ -113,11 +122,24 @@ impl StreamingBackendSession {
                 channels
             };
         let _ = (sample_rate, processor_channels);
+        let vad = denoiser
+            .vad
+            .then(|| {
+                crate::vad::StreamingVad::new(
+                    sample_rate,
+                    channels,
+                    denoiser.vad_silence_gain,
+                    denoiser.vad_speech_mix,
+                )
+            })
+            .transpose()?;
+        let mut processor_denoiser = denoiser.clone();
+        processor_denoiser.vad = false;
         let processor = Self::build_processor(
             backend,
             sample_rate,
             processor_channels,
-            &denoiser,
+            &processor_denoiser,
             &backend_options,
             accelerator,
         )?;
@@ -133,6 +155,7 @@ impl StreamingBackendSession {
             },
             denoiser,
             processor,
+            vad,
             linked_original: VecDeque::new(),
             finished: false,
         })
@@ -186,6 +209,42 @@ impl StreamingBackendSession {
                         resource: "RNNoise stream state",
                     })
             }
+            #[cfg(feature = "deepfilter")]
+            Backend::DeepFilter => {
+                let resamplers = resampler_pair_bytes(
+                    processor_channels,
+                    sample_rate,
+                    48_000,
+                    "DeepFilterNet stream resamplers",
+                )?;
+                resamplers
+                    .checked_add(super::deepfilter::streaming_state_bytes(
+                        processor_channels,
+                        sample_rate,
+                        channels,
+                    )?)
+                    .ok_or(ConfigError::ResourceOverflow {
+                        resource: "DeepFilterNet stream state",
+                    })
+            }
+            #[cfg(feature = "mossformer2")]
+            Backend::Mossformer2 => {
+                let resamplers = resampler_pair_bytes(
+                    processor_channels,
+                    sample_rate,
+                    48_000,
+                    "MossFormer2 stream resamplers",
+                )?;
+                resamplers
+                    .checked_add(super::mossformer2::streaming_state_bytes(
+                        processor_channels,
+                        sample_rate,
+                        channels,
+                    )?)
+                    .ok_or(ConfigError::ResourceOverflow {
+                        resource: "MossFormer2 stream state",
+                    })
+            }
             #[cfg(feature = "gtcrn")]
             Backend::Gtcrn => {
                 let resamplers = resampler_pair_bytes(
@@ -208,6 +267,24 @@ impl StreamingBackendSession {
         }
     }
 
+    /// Conservative VAD alignment state beyond the backend and ordinary
+    /// caller-owned stream blocks.
+    pub fn estimate_vad_additional_bytes(
+        sample_rate: u32,
+        channels: usize,
+        block_frames: usize,
+        frame_size: usize,
+        profile_ms: f64,
+    ) -> Result<u64, ConfigError> {
+        crate::vad::estimate_streaming_bytes(
+            sample_rate,
+            channels,
+            block_frames,
+            frame_size,
+            profile_ms,
+        )
+    }
+
     /// Process a block. The returned block can be empty while bounded model or
     /// sample-rate-converter latency is retained.
     pub fn process_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
@@ -226,10 +303,23 @@ impl StreamingBackendSession {
             StreamingBackend::Classical(processor) => processor.finish(),
             #[cfg(feature = "rnnoise")]
             StreamingBackend::Rnnoise(processor) => processor.finish(),
+            #[cfg(feature = "deepfilter")]
+            StreamingBackend::DeepFilter(processor) => processor.finish(),
+            #[cfg(feature = "mossformer2")]
+            StreamingBackend::Mossformer2(processor) => processor.finish(),
             #[cfg(feature = "gtcrn")]
             StreamingBackend::Gtcrn(processor) => processor.finish(),
         }?;
         let output = self.restore_channel_mode(processed)?;
+        let output = if let Some(vad) = &mut self.vad {
+            vad.finish_input()?;
+            vad.push_processed(&output)?;
+            let output = vad.drain_ready()?;
+            vad.finish_output()?;
+            output
+        } else {
+            output
+        };
         if self.channel_mode == ChannelMode::StereoLinked && !self.linked_original.is_empty() {
             return Err("linked streaming backend did not flush every input frame".into());
         }
@@ -247,10 +337,17 @@ impl StreamingBackendSession {
             }
             #[cfg(feature = "rnnoise")]
             StreamingBackend::Rnnoise(processor) => processor.reset(),
+            #[cfg(feature = "deepfilter")]
+            StreamingBackend::DeepFilter(processor) => processor.reset()?,
+            #[cfg(feature = "mossformer2")]
+            StreamingBackend::Mossformer2(processor) => processor.reset(),
             #[cfg(feature = "gtcrn")]
             StreamingBackend::Gtcrn(processor) => processor.reset(),
         }
         self.linked_original.clear();
+        if let Some(vad) = &mut self.vad {
+            vad.reset();
+        }
         self.finished = false;
         Ok(())
     }
@@ -273,6 +370,24 @@ impl StreamingBackendSession {
             Backend::Rnnoise => Ok(StreamingBackend::Rnnoise(Box::new(
                 super::rnnoise::StreamingProcessor::new(sample_rate, channels)?,
             ))),
+            #[cfg(feature = "deepfilter")]
+            Backend::DeepFilter => Ok(StreamingBackend::DeepFilter(Box::new(
+                super::deepfilter::StreamingProcessor::new(sample_rate, channels)?,
+            ))),
+            #[cfg(feature = "mossformer2")]
+            Backend::Mossformer2 => {
+                let model = backend_options.onnx.as_ref().ok_or_else(|| {
+                    "MossFormer2 streaming requires the configured ONNX model".to_string()
+                })?;
+                Ok(StreamingBackend::Mossformer2(Box::new(
+                    super::mossformer2::StreamingProcessor::new_with_accelerator(
+                        model,
+                        sample_rate,
+                        channels,
+                        accelerator.effective(),
+                    )?,
+                )))
+            }
             #[cfg(feature = "gtcrn")]
             Backend::Gtcrn => {
                 let model = backend_options
@@ -320,6 +435,9 @@ impl StreamingBackendSession {
     }
 
     fn process_bounded_block(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        if let Some(vad) = &mut self.vad {
+            vad.push_input(channels)?;
+        }
         let backend_input = match self.channel_mode {
             ChannelMode::Independent => Cow::Borrowed(channels),
             ChannelMode::StereoLinked => {
@@ -347,10 +465,20 @@ impl StreamingBackendSession {
             StreamingBackend::Classical(processor) => processor.process_block(&backend_input),
             #[cfg(feature = "rnnoise")]
             StreamingBackend::Rnnoise(processor) => processor.process_block(&backend_input),
+            #[cfg(feature = "deepfilter")]
+            StreamingBackend::DeepFilter(processor) => processor.process_block(&backend_input),
+            #[cfg(feature = "mossformer2")]
+            StreamingBackend::Mossformer2(processor) => processor.process_block(&backend_input),
             #[cfg(feature = "gtcrn")]
             StreamingBackend::Gtcrn(processor) => processor.process_block(&backend_input),
         }?;
-        self.restore_channel_mode(processed)
+        let processed = self.restore_channel_mode(processed)?;
+        if let Some(vad) = &mut self.vad {
+            vad.push_processed(&processed)?;
+            vad.drain_ready()
+        } else {
+            Ok(processed)
+        }
     }
 
     fn restore_channel_mode(
@@ -401,7 +529,12 @@ impl StreamingBackendSession {
     }
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+#[cfg(any(
+    feature = "rnnoise",
+    feature = "deepfilter",
+    feature = "mossformer2",
+    feature = "gtcrn"
+))]
 fn resampler_pair_bytes(
     channels: usize,
     source_rate: u32,
@@ -508,6 +641,49 @@ mod tests {
         }
         assert_eq!(output.len(), input.len());
         assert!(output.iter().all(|channel| channel.len() == 2048));
+    }
+
+    #[test]
+    fn classical_streaming_vad_preserves_delayed_presentation_length() {
+        let mut config = DenoiserConfig::default(48_000);
+        config.profile_ms = -1.0;
+        config.vad = true;
+        let mut session = StreamingBackendSession::new(
+            Backend::Classical,
+            48_000,
+            1,
+            config,
+            BackendOptions::default(),
+        )
+        .unwrap();
+        let input = vec![vec![0.001; 4_321]];
+        let mut output = Vec::new();
+        for block in input[0].chunks(113) {
+            output.extend(session.process_block(&[block.to_vec()]).unwrap().remove(0));
+        }
+        output.extend(session.finish().unwrap().remove(0));
+        assert_eq!(output.len(), input[0].len());
+        assert!(output.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn streaming_vad_resource_estimate_is_finite_and_profile_aware() {
+        let without_profile =
+            StreamingBackendSession::estimate_vad_additional_bytes(48_000, 2, 8_192, 2_048, -1.0)
+                .unwrap();
+        let with_profile = StreamingBackendSession::estimate_vad_additional_bytes(
+            48_000, 2, 8_192, 2_048, 1_000.0,
+        )
+        .unwrap();
+        assert!(without_profile > 0);
+        assert!(with_profile > without_profile);
+    }
+
+    #[cfg(feature = "deepfilter")]
+    #[test]
+    fn deepfilter_build_keeps_public_streaming_sessions_sendable() {
+        fn assert_send<T: Send>() {}
+        assert_send::<StreamingBackendSession>();
     }
 
     #[test]

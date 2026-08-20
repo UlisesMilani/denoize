@@ -18,7 +18,8 @@ use denoize::{
     ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
     PlannedResources, ReceiptItem, ReceiptSecretKey, ReceiptTrustPolicy, ReceiptVerificationReport,
     ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile,
-    SignedExecutionReceipt, StreamEncodeLimits, StreamEncodeSpec, StreamingBackendSession,
+    SignedExecutionReceipt, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
+    StreamingBackendSession,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -4476,12 +4477,6 @@ fn validate_request(request: &ProcessRequest) -> Result<(), String> {
                 denoize::config::MAX_STREAM_BLOCK_FRAMES
             ));
         }
-        if request.options.vad {
-            return Err("長時間ストリームではVADを無効にしてください".into());
-        }
-        if request.options.loudness_lufs.is_some() {
-            return Err("長時間ストリームではラウドネス正規化を無効にしてください".into());
-        }
         format.validate_encoder(parse_aac_encoder(&request.options.aac_encoder)?)?;
         if let Some(backend) = configured_backend(&request.options.backend)? {
             if !StreamingBackendSession::supports(backend) {
@@ -4684,12 +4679,6 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
             denoize::config::MAX_STREAM_BLOCK_FRAMES
         ));
     }
-    if request.options.vad {
-        return Err("長時間ストリームではVADを無効にしてください".into());
-    }
-    if request.options.loudness_lufs.is_some() {
-        return Err("長時間ストリームではラウドネス正規化を無効にしてください".into());
-    }
     preflight_explicit_backend_resources_read_only(&request.options)?;
     let input = Path::new(&request.input);
     let output = Path::new(&request.output);
@@ -4749,6 +4738,28 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
         backend_options.channel_mode,
     )
     .map_err(|error| error.to_string())?;
+    let vad_state = if config.vad {
+        StreamingBackendSession::estimate_vad_additional_bytes(
+            spec.sample_rate,
+            spec.channels as usize,
+            request.stream_frames,
+            config.frame_size,
+            config.profile_ms,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let loudness_state = if request.options.loudness_lufs.is_some() {
+        denoize::loudness::estimate_streaming_loudness_bytes(
+            spec.channels as usize,
+            spec.sample_rate,
+            request.stream_frames,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
     let encoder_state = denoize::estimate_stream_encode_additional_bytes(
         output_format,
         encode_spec,
@@ -4757,6 +4768,8 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
     )?;
     let initial_working_set = base_working_set
         .checked_add(backend_state)
+        .and_then(|bytes| bytes.checked_add(vad_state))
+        .and_then(|bytes| bytes.checked_add(loudness_state))
         .and_then(|bytes| bytes.checked_add(initial_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_state))
         .and_then(|bytes| {
@@ -4796,6 +4809,8 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
     }
     let working_set = base_working_set
         .checked_add(backend_state)
+        .and_then(|bytes| bytes.checked_add(vad_state))
+        .and_then(|bytes| bytes.checked_add(loudness_state))
         .and_then(|bytes| bytes.checked_add(info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_state))
         .and_then(|bytes| {
@@ -4826,8 +4841,8 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
         denoiser: config.clone(),
         backend_options: backend_options.clone(),
         accelerator,
-        loudness_lufs: None,
-        true_peak_dbtp: -1.0,
+        loudness_lufs: request.options.loudness_lufs,
+        true_peak_dbtp: request.options.true_peak_dbtp,
     };
     resolved.validate_config()?;
     let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
@@ -4858,6 +4873,7 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
         encode_limits,
         configured_temporary,
         request.resume,
+        request.options.loudness_lufs.is_some(),
         metadata_bytes,
     )?;
     let mut worker_request = ResourceRequest::worker(
@@ -5306,6 +5322,7 @@ fn desktop_stream_temporary_bytes(
     encode_limits: StreamEncodeLimits,
     configured_limit: Option<u64>,
     checkpointed: bool,
+    two_pass_loudness: bool,
     metadata_allowance_bytes: u64,
 ) -> Result<DesktopStreamTemporaryReservation, String> {
     const MAX_WAV_FILE_BYTES: u64 = u32::MAX as u64 + 8;
@@ -5338,10 +5355,21 @@ fn desktop_stream_temporary_bytes(
             });
         }
         if !checkpointed {
-            let total_bytes = MAX_WAV_FILE_BYTES
+            let mut total_bytes = MAX_WAV_FILE_BYTES
                 .checked_add(encoder_auxiliary_bytes)
                 .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
                 .ok_or_else(|| "ストリーム一時領域の予約量が大きすぎます".to_string())?;
+            if two_pass_loudness {
+                let data_limit = MAX_WAV_FILE_BYTES.saturating_sub(68);
+                let output_sample_bytes = u64::from(info.output_spec.bits_per_sample / 8);
+                let max_samples = data_limit / output_sample_bytes;
+                let spool_bytes = max_samples
+                    .checked_mul(std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| "ストリームラウドネスPCMの一時領域が大きすぎます".to_string())?;
+                total_bytes = total_bytes
+                    .checked_add(spool_bytes)
+                    .ok_or_else(|| "ストリームラウドネスの一時領域が大きすぎます".to_string())?;
+            }
             return Ok(DesktopStreamTemporaryReservation {
                 total_bytes,
                 encoder_auxiliary_bytes,
@@ -5374,13 +5402,24 @@ fn desktop_stream_temporary_bytes(
         .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
         .ok_or_else(|| "ストリーム出力サイズが大きすぎます".to_string())?;
     if !checkpointed {
-        if configured_limit.is_some_and(|limit| base_bytes > limit) {
+        let total_bytes = if two_pass_loudness {
+            let spool_bytes = frames
+                .checked_mul(u64::from(info.output_spec.channels))
+                .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+                .ok_or_else(|| "ストリームラウドネスPCMの一時領域が大きすぎます".to_string())?;
+            base_bytes
+                .checked_add(spool_bytes)
+                .ok_or_else(|| "ストリームラウドネスの一時領域が大きすぎます".to_string())?
+        } else {
+            base_bytes
+        };
+        if configured_limit.is_some_and(|limit| total_bytes > limit) {
             return Err(format!(
-                "一時出力、エンコーダー補助データ、メタデータに{base_bytes} bytes必要ですが、一時領域上限を超えます"
+                "一時出力、エンコーダー補助データ、メタデータ、multi-pass PCMに{total_bytes} bytes必要ですが、一時領域上限を超えます"
             ));
         }
         return Ok(DesktopStreamTemporaryReservation {
-            total_bytes: base_bytes,
+            total_bytes,
             encoder_auxiliary_bytes,
             checkpoint_limit: None,
         });
@@ -5405,6 +5444,50 @@ fn desktop_stream_temporary_bytes(
         encoder_auxiliary_bytes,
         checkpoint_limit: Some(checkpoint_limit),
     })
+}
+
+fn desktop_stream_pcm_spool_limit(
+    info: AudioStreamInfo,
+    total_temporary_bytes: u64,
+    encoder_auxiliary_bytes: u64,
+    metadata_bytes: u64,
+) -> Result<u64, String> {
+    if let Some(frames) = info.total_frames {
+        return frames
+            .checked_mul(u64::from(info.output_spec.channels))
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+            .ok_or_else(|| "ストリームラウドネスPCMサイズが大きすぎます".to_string());
+    }
+    let unavailable = encoder_auxiliary_bytes
+        .checked_add(metadata_bytes)
+        .ok_or_else(|| "ストリームラウドネス一時領域が大きすぎます".to_string())?;
+    let shared = total_temporary_bytes
+        .checked_sub(unavailable)
+        .ok_or_else(|| "ストリームラウドネスPCM用の一時領域がありません".to_string())?;
+    // Encoded WAV is at most half the interleaved-f64 PCM size. Keep at least
+    // the other half for the staged output when the decoder cannot declare a
+    // presentation length during preflight.
+    Ok(shared / 2)
+}
+
+fn analyze_desktop_stream_pcm_spool(
+    spool: &mut StreamPcmSpool,
+    channels: usize,
+    sample_rate: u32,
+    channel_mask: Option<denoize::ChannelMask>,
+    block_frames: usize,
+    target_lufs: f64,
+    true_peak_dbtp: f64,
+) -> Result<denoize::loudness::StreamingLoudnessGain, String> {
+    spool.prepare_read()?;
+    let mut analyzer =
+        denoize::loudness::StreamingLoudnessAnalyzer::new(channels, sample_rate, channel_mask)?;
+    while let Some(block) = spool.next_block(block_frames)? {
+        analyzer.add_block(&block)?;
+    }
+    let gain = analyzer.finish(target_lufs, true_peak_dbtp)?;
+    spool.prepare_read()?;
+    Ok(gain)
 }
 
 fn replay_desktop_stream_checkpoint(
@@ -5444,6 +5527,41 @@ fn replay_desktop_stream_checkpoint(
     Ok(input_frames)
 }
 
+fn process_desktop_stream_blocks(
+    reader: &mut AudioStreamReader,
+    processor: &mut StreamingBackendSession,
+    block_frames: usize,
+    control: &JobControl,
+    mut write_block: impl FnMut(&[Vec<f64>]) -> Result<(), String>,
+) -> Result<u64, String> {
+    let mut input_frames = 0_u64;
+    let mut output_frames = 0_u64;
+    while let Some(block) = reader.next_block(block_frames)? {
+        check_cancelled(control)?;
+        let decoded_frames = block.first().map(Vec::len).unwrap_or(0) as u64;
+        let enhanced = processor.process_block(&block)?;
+        let enhanced_frames = enhanced.first().map(Vec::len).unwrap_or(0) as u64;
+        write_block(&enhanced)?;
+        input_frames = input_frames
+            .checked_add(decoded_frames)
+            .ok_or_else(|| "ストリーム入力フレーム数が大きすぎます".to_string())?;
+        output_frames = output_frames
+            .checked_add(enhanced_frames)
+            .ok_or_else(|| "ストリーム出力フレーム数が大きすぎます".to_string())?;
+    }
+    let tail = processor.finish()?;
+    output_frames = output_frames
+        .checked_add(tail.first().map(Vec::len).unwrap_or(0) as u64)
+        .ok_or_else(|| "ストリーム出力フレーム数が大きすぎます".to_string())?;
+    write_block(&tail)?;
+    if output_frames != input_frames {
+        return Err(format!(
+            "ストリームバックエンドが{input_frames}入力framesから{output_frames}出力framesを生成しました"
+        ));
+    }
+    Ok(input_frames)
+}
+
 fn process_stream_file(
     request: &ProcessRequest,
     mut receipt: Option<DesktopReceiptContext>,
@@ -5472,9 +5590,6 @@ fn process_stream_file(
     };
     let encode_limits = StreamEncodeLimits::new(auxiliary_limit);
     let config = processing_config(&request.options, spec.sample_rate)?;
-    if config.vad {
-        return Err("長時間ストリームではVADを無効にしてください".into());
-    }
     let backend =
         configured_backend(&request.options.backend)?.unwrap_or_else(service::select_live_backend);
     if !StreamingBackendSession::supports(backend) {
@@ -5504,6 +5619,28 @@ fn process_stream_file(
         backend_options.channel_mode,
     )
     .map_err(|error| error.to_string())?;
+    let vad_state = if config.vad {
+        StreamingBackendSession::estimate_vad_additional_bytes(
+            spec.sample_rate,
+            spec.channels as usize,
+            request.stream_frames,
+            config.frame_size,
+            config.profile_ms,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let loudness_state = if request.options.loudness_lufs.is_some() {
+        denoize::loudness::estimate_streaming_loudness_bytes(
+            spec.channels as usize,
+            spec.sample_rate,
+            request.stream_frames,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
     let encoder_state = denoize::estimate_stream_encode_additional_bytes(
         output_format,
         encode_spec,
@@ -5517,6 +5654,8 @@ fn process_stream_file(
     };
     let initial_working_set = base_working_set
         .checked_add(backend_state)
+        .and_then(|bytes| bytes.checked_add(vad_state))
+        .and_then(|bytes| bytes.checked_add(loudness_state))
         .and_then(|bytes| bytes.checked_add(initial_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
@@ -5550,6 +5689,8 @@ fn process_stream_file(
     }
     let working_set = base_working_set
         .checked_add(backend_state)
+        .and_then(|bytes| bytes.checked_add(vad_state))
+        .and_then(|bytes| bytes.checked_add(loudness_state))
         .and_then(|bytes| bytes.checked_add(info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
@@ -5574,8 +5715,8 @@ fn process_stream_file(
         denoiser: config.clone(),
         backend_options: backend_options.clone(),
         accelerator,
-        loudness_lufs: None,
-        true_peak_dbtp: -1.0,
+        loudness_lufs: request.options.loudness_lufs,
+        true_peak_dbtp: request.options.true_peak_dbtp,
     };
     resolved.validate_config()?;
     let metadata_policy = if request.options.preserve_metadata {
@@ -5627,6 +5768,7 @@ fn process_stream_file(
         encode_limits,
         configured_temporary,
         request.resume,
+        request.options.loudness_lufs.is_some(),
         metadata_bytes,
     )?;
     let temporary_bytes = temporary_reservation.total_bytes;
@@ -5854,9 +5996,26 @@ fn process_stream_file(
                 "ストリームバックエンドが{input_frames}入力framesから{output_frames}出力framesを生成しました"
             ));
         }
+        drop(reader);
+        drop(processor);
         check_cancelled(control)?;
         progress(3, "エンコード出力を準備しています");
         checkpoint.prepare_spool_read()?;
+        let loudness_gain = if let Some(target_lufs) = request.options.loudness_lufs {
+            let mut analyzer = denoize::loudness::StreamingLoudnessAnalyzer::new(
+                spec.channels as usize,
+                spec.sample_rate,
+                channel_mask,
+            )?;
+            while let Some(block) = checkpoint.next_spool_block(request.stream_frames)? {
+                check_cancelled(control)?;
+                analyzer.add_block(&block)?;
+            }
+            checkpoint.prepare_spool_read()?;
+            Some(analyzer.finish(target_lufs, request.options.true_peak_dbtp)?)
+        } else {
+            None
+        };
         let mut final_encode_spec = encode_spec;
         final_encode_spec.total_frames = Some(output_frames);
         let mut transaction = AtomicOutput::new(output)?;
@@ -5869,8 +6028,11 @@ fn process_stream_file(
                 encode_options,
                 encode_limits,
             )?;
-            while let Some(block) = checkpoint.next_spool_block(request.stream_frames)? {
+            while let Some(mut block) = checkpoint.next_spool_block(request.stream_frames)? {
                 check_cancelled(control)?;
+                if let Some(gain) = loudness_gain {
+                    gain.apply(&mut block);
+                }
                 writer.write_block(&block)?;
             }
             writer.finalize()?;
@@ -5984,6 +6146,146 @@ fn process_stream_file(
         denoize::fault_injection::hit("stream-checkpoint.before-cleanup")?;
         if let Err(error) = checkpoint.cleanup() {
             eprintln!("denoize desktop: checkpoint cleanup failed after commit: {error}");
+        }
+    } else if let Some(target_lufs) = request.options.loudness_lufs {
+        let spool_limit = desktop_stream_pcm_spool_limit(
+            info,
+            temporary_bytes,
+            temporary_reservation.encoder_auxiliary_bytes,
+            metadata_bytes,
+        )?;
+        let mut spool = StreamPcmSpool::new(spec.channels as usize, spool_limit)?;
+        let input_frames = process_desktop_stream_blocks(
+            &mut reader,
+            &mut processor,
+            request.stream_frames,
+            control,
+            |block| spool.write_block(block),
+        )?;
+        if spool.frames() != input_frames {
+            return Err("ストリームラウドネスPCMのフレーム数が一致しません".into());
+        }
+        verify_desktop_stream_bound_sources(
+            &reader,
+            input,
+            execution_identity
+                .as_ref()
+                .map(|(fingerprint, _, _)| *fingerprint),
+            execution_identity
+                .as_ref()
+                .and_then(|(_, _, model)| model.as_ref()),
+            stream_evidence.as_ref(),
+        )?;
+        drop(reader);
+        drop(processor);
+        check_cancelled(control)?;
+        progress(2, "ラウドネスを測定しています");
+        let loudness_gain = analyze_desktop_stream_pcm_spool(
+            &mut spool,
+            spec.channels as usize,
+            spec.sample_rate,
+            channel_mask,
+            request.stream_frames,
+            target_lufs,
+            request.options.true_peak_dbtp,
+        )?;
+        let mut final_encode_spec = encode_spec;
+        final_encode_spec.total_frames = Some(input_frames);
+        progress(3, "エンコード出力を準備しています");
+        let mut transaction = AtomicOutput::new(output)?;
+        let _recovery_stage = control.track_stage(&transaction)?;
+        {
+            let mut writer = AudioStreamWriter::new_with_limits(
+                transaction.file_mut(),
+                output_format,
+                final_encode_spec,
+                encode_options,
+                encode_limits,
+            )?;
+            while let Some(mut block) = spool.next_block(request.stream_frames)? {
+                check_cancelled(control)?;
+                loudness_gain.apply(&mut block);
+                writer.write_block(&block)?;
+            }
+            writer.finalize()?;
+        }
+        if output_format == OutputFormat::Wav {
+            denoize::audio::write_wav_channel_mask_to_file(
+                transaction.file_mut(),
+                spec.channels as usize,
+                channel_mask,
+            )?;
+        }
+        if let Some(metadata) = metadata {
+            denoize::metadata::write_extended_to_file_with_limits(
+                metadata,
+                transaction.file_mut(),
+                metadata_limits,
+            )?;
+        }
+        let staged_bytes = transaction
+            .file_mut()
+            .metadata()
+            .map_err(|error| format!("一時出力のサイズを確認できません: {error}"))?
+            .len();
+        let combined = staged_bytes
+            .checked_add(spool.len())
+            .and_then(|bytes| bytes.checked_add(temporary_reservation.encoder_auxiliary_bytes))
+            .ok_or_else(|| "ストリームラウドネスの一時領域が大きすぎます".to_string())?;
+        if combined > temporary_bytes {
+            return Err(format!(
+                "ラウドネスPCM、一時出力、エンコーダー補助データが予約量を超えました: {combined} > {temporary_bytes} bytes"
+            ));
+        }
+        denoize::verify_stream_output_file(
+            transaction.file_mut(),
+            output,
+            output_format,
+            final_encode_spec,
+            input_frames,
+            encode_options,
+            decode_limits,
+            verification_block_frames,
+        )?;
+        match (receipt.as_mut(), stream_evidence.as_ref()) {
+            (Some(receipt), Some(evidence)) => {
+                let output_fingerprint =
+                    batch_resume::fingerprint_open_file_at(transaction.file_mut(), output)?;
+                let publication = receipt.publication;
+                let reason = receipt.reason;
+                write_desktop_stream_receipt(
+                    receipt,
+                    input,
+                    output,
+                    evidence,
+                    input_frames,
+                    output_fingerprint,
+                    publication,
+                    "process",
+                    reason,
+                    None,
+                )?;
+            }
+            (None, None) => {}
+            _ => return Err("ストリーム実行証明の状態が事前検査後に変化しました".into()),
+        }
+        progress(4, "出力を確定しています");
+        if let Some(receipt_context) = receipt.take() {
+            let receipt_path = receipt_context.path;
+            control.commit_fence(|| {
+                transaction.commit(commit_mode)?;
+                receipt_context
+                    .stage
+                    .commit(CommitMode::NoClobber)
+                    .map_err(|error| {
+                        format!(
+                            "ストリーム音声は確定しましたが、実行証明 {} を公開できませんでした: {error}",
+                            receipt_path.display()
+                        )
+                    })
+            })?;
+        } else {
+            control.commit(transaction, commit_mode)?;
         }
     } else {
         let mut transaction = AtomicOutput::new(output)?;
@@ -6920,6 +7222,32 @@ mod tests {
         wav.extend(48_000_u32.to_le_bytes());
         wav.extend(192_000_u32.to_le_bytes());
         wav.extend(4_u16.to_le_bytes());
+        wav.extend(16_u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend((samples.len() as u32).to_le_bytes());
+        wav.extend(samples);
+        std::fs::write(path, wav).unwrap();
+    }
+
+    fn write_loudness_test_wav(path: &Path) {
+        let sample_rate = 16_000_u32;
+        let frames = sample_rate as usize * 2;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let phase = frame as f64 * std::f64::consts::TAU * 440.0 / sample_rate as f64;
+            let sample = (phase.sin() * 0.25 * i16::MAX as f64).round() as i16;
+            samples.extend(sample.to_le_bytes());
+        }
+        let mut wav = Vec::with_capacity(44 + samples.len());
+        wav.extend(b"RIFF");
+        wav.extend((36_u32 + samples.len() as u32).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16_u32.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(1_u16.to_le_bytes());
+        wav.extend(sample_rate.to_le_bytes());
+        wav.extend((sample_rate * 2).to_le_bytes());
+        wav.extend(2_u16.to_le_bytes());
         wav.extend(16_u16.to_le_bytes());
         wav.extend(b"data");
         wav.extend((samples.len() as u32).to_le_bytes());
@@ -7915,14 +8243,82 @@ deterministic = false
 
         request.stream_frames = DEFAULT_STREAM_BLOCK_FRAMES;
         request.options.vad = true;
-        assert!(validate_request(&request).unwrap_err().contains("VAD"));
+        validate_request(&request).unwrap();
 
-        request.options.vad = false;
+        request.options.loudness_lufs = Some(-24.0);
+        request.options.true_peak_dbtp = -1.0;
+        validate_request(&request).unwrap();
+
         request.stream = false;
         request.resume = true;
         assert!(validate_request(&request)
             .unwrap_err()
             .contains("長時間ストリーム"));
+    }
+
+    #[test]
+    fn desktop_stream_vad_preserves_presentation_length() {
+        let directory = TestDirectory::create("stream-vad");
+        let input = directory.join("input.wav");
+        let output = directory.join("output.wav");
+        write_test_wav(&input);
+        let original = read_audio(&input).unwrap();
+        let mut options = classical_options(false);
+        options.vad = true;
+        let mut request = process_request(&input, &output, options);
+        request.stream = true;
+        request.stream_frames = 113;
+
+        validate_request(&request).unwrap();
+        process_file(&request, None, &JobControl::default(), |_, _| {}).unwrap();
+
+        let enhanced = read_audio(&output).unwrap();
+        assert_eq!(enhanced.sample_rate, original.sample_rate);
+        assert_eq!(enhanced.channels(), original.channels());
+        assert_eq!(enhanced.frames(), original.frames());
+        directory.assert_no_staged_outputs();
+    }
+
+    #[test]
+    fn desktop_stream_loudness_normalizes_non_resume_and_resume_outputs() {
+        let directory = TestDirectory::create("stream-loudness");
+        let input = directory.join("input.wav");
+        write_loudness_test_wav(&input);
+        let original = read_audio(&input).unwrap();
+
+        for (name, resume) in [("plain.wav", false), ("resume.wav", true)] {
+            let output = directory.join(name);
+            let mut options = classical_options(false);
+            options.loudness_lufs = Some(-24.0);
+            options.true_peak_dbtp = -1.0;
+            let mut request = process_request(&input, &output, options);
+            request.stream = true;
+            request.resume = resume;
+            request.stream_frames = 257;
+
+            validate_request(&request).unwrap();
+            process_file(&request, None, &JobControl::default(), |_, _| {}).unwrap();
+
+            let enhanced = read_audio(&output).unwrap();
+            assert_eq!(enhanced.sample_rate, original.sample_rate);
+            assert_eq!(enhanced.channels(), original.channels());
+            assert_eq!(enhanced.frames(), original.frames());
+            let (measured_lufs, measured_peak) = denoize::loudness::measure(&enhanced).unwrap();
+            assert!(
+                (measured_lufs - -24.0).abs() < 0.2,
+                "{name}: {measured_lufs}"
+            );
+            assert!(measured_peak <= -0.8, "{name}: {measured_peak}");
+
+            if resume {
+                let (state, spool, lock) =
+                    batch_resume::stream_checkpoint_sidecar_paths(&output).unwrap();
+                assert!(!state.exists());
+                assert!(!spool.exists());
+                assert!(lock.is_file());
+            }
+        }
+        directory.assert_no_staged_outputs();
     }
 
     #[test]

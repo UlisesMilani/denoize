@@ -1073,6 +1073,132 @@ pub struct SpooledAudioStreamWriter<W: Write> {
     pcm_bytes: u64,
 }
 
+/// Finite anonymous interleaved-f64 spool for multi-pass stream processing.
+///
+/// This is used when a first pass must finish before encoding can begin, such
+/// as integrated-loudness normalization. It never names or publishes a file;
+/// dropping it removes the operating-system-managed anonymous storage.
+pub struct StreamPcmSpool {
+    pcm: File,
+    channels: usize,
+    frames: u64,
+    bytes: u64,
+    max_bytes: u64,
+    read_frames: u64,
+    reading: bool,
+}
+
+impl StreamPcmSpool {
+    pub fn new(channels: usize, max_bytes: u64) -> Result<Self, String> {
+        if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {
+            return Err(format!(
+                "PCM stream spool channels must be between 1 and {}",
+                crate::config::MAX_STREAM_CHANNELS
+            ));
+        }
+        let pcm = tempfile::tempfile()
+            .map_err(|error| format!("create anonymous PCM stream spool: {error}"))?;
+        Ok(Self {
+            pcm,
+            channels,
+            frames: 0,
+            bytes: 0,
+            max_bytes,
+            read_frames: 0,
+            reading: false,
+        })
+    }
+
+    pub fn write_block(&mut self, channels: &[Vec<f64>]) -> Result<(), String> {
+        if self.reading {
+            return Err("PCM stream spool cannot append after replay has begun".into());
+        }
+        if channels.len() != self.channels {
+            return Err(format!(
+                "PCM stream spool expected {} channels, received {}",
+                self.channels,
+                channels.len()
+            ));
+        }
+        let frames = channels.first().map_or(0, Vec::len);
+        if channels.iter().any(|channel| channel.len() != frames) {
+            return Err("PCM stream spool blocks must have equal channel lengths".into());
+        }
+        let block_bytes = (frames as u64)
+            .checked_mul(self.channels as u64)
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+            .ok_or_else(|| "PCM stream spool block size overflows".to_string())?;
+        let next_bytes = self
+            .bytes
+            .checked_add(block_bytes)
+            .ok_or_else(|| "PCM stream spool size overflows".to_string())?;
+        if next_bytes > self.max_bytes {
+            return Err(format!(
+                "PCM stream spool requires {next_bytes} bytes, exceeding its {}-byte limit",
+                self.max_bytes
+            ));
+        }
+        for frame in 0..frames {
+            for channel in channels {
+                self.pcm
+                    .write_all(&crate::sanitize_sample(channel[frame]).to_le_bytes())
+                    .map_err(|error| format!("write anonymous PCM stream spool: {error}"))?;
+            }
+        }
+        self.frames = self
+            .frames
+            .checked_add(frames as u64)
+            .ok_or_else(|| "PCM stream spool frame count overflows".to_string())?;
+        self.bytes = next_bytes;
+        Ok(())
+    }
+
+    pub fn prepare_read(&mut self) -> Result<(), String> {
+        self.pcm
+            .flush()
+            .and_then(|_| self.pcm.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|error| format!("rewind anonymous PCM stream spool: {error}"))?;
+        self.read_frames = 0;
+        self.reading = true;
+        Ok(())
+    }
+
+    pub fn next_block(&mut self, max_frames: usize) -> Result<Option<Vec<Vec<f64>>>, String> {
+        if max_frames == 0 || max_frames > crate::config::MAX_STREAM_BLOCK_FRAMES {
+            return Err(format!(
+                "PCM stream spool replay size must be between 1 and {} frames",
+                crate::config::MAX_STREAM_BLOCK_FRAMES
+            ));
+        }
+        if !self.reading {
+            return Err("PCM stream spool must be prepared before replay".into());
+        }
+        let remaining = self.frames.saturating_sub(self.read_frames);
+        if remaining == 0 {
+            return Ok(None);
+        }
+        let frames = remaining.min(max_frames as u64) as usize;
+        let block = read_interleaved_pcm_block(&mut self.pcm, self.channels, frames)?;
+        self.read_frames += frames as u64;
+        Ok(Some(block))
+    }
+
+    #[must_use]
+    pub const fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> u64 {
+        self.bytes
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.frames == 0
+    }
+}
+
 impl<W: Write> SpooledAudioStreamWriter<W> {
     /// Construct a non-seekable writer with finite default spool/codec limits.
     pub fn new(
@@ -1199,8 +1325,34 @@ impl<W: Write> SpooledAudioStreamWriter<W> {
     /// returned only after the sink accepted and flushed every byte, allowing a
     /// caller to sign a stdout receipt without authenticating a partial copy.
     pub fn finalize_with_fingerprint(
-        mut self,
+        self,
     ) -> Result<(W, crate::batch_resume::FileFingerprint), String> {
+        self.finalize_with_metadata_and_loudness(
+            None,
+            crate::metadata::MetadataLimits::default(),
+            None,
+        )
+        .map(|(sink, fingerprint, _)| (sink, fingerprint))
+    }
+
+    /// Complete optional two-pass normalization and metadata preservation,
+    /// verify the encoded spool, and only then copy it to the sink.
+    ///
+    /// `loudness` is `(target_lufs, true_peak_dbtp)`. The returned report is
+    /// present exactly when normalization was requested.
+    pub fn finalize_with_metadata_and_loudness(
+        mut self,
+        metadata: Option<crate::metadata::Metadata>,
+        metadata_limits: crate::metadata::MetadataLimits,
+        loudness: Option<(f64, f64)>,
+    ) -> Result<
+        (
+            W,
+            crate::batch_resume::FileFingerprint,
+            Option<crate::loudness::LoudnessReport>,
+        ),
+        String,
+    > {
         if self
             .spec
             .total_frames
@@ -1227,6 +1379,30 @@ impl<W: Write> SpooledAudioStreamWriter<W> {
             .flush()
             .and_then(|_| self.pcm.seek(SeekFrom::Start(0)).map(|_| ()))
             .map_err(|error| format!("rewind anonymous PCM output spool: {error}"))?;
+        let loudness_gain = if let Some((target_lufs, peak_limit_dbtp)) = loudness {
+            let mut analyzer = crate::loudness::StreamingLoudnessAnalyzer::new(
+                usize::from(self.spec.channels),
+                self.spec.sample_rate,
+                self.spec.channel_mask,
+            )?;
+            let mut remaining = self.frames_written;
+            while remaining != 0 {
+                let frames = remaining.min(self.replay_frames as u64) as usize;
+                let block = read_interleaved_pcm_block(
+                    &mut self.pcm,
+                    usize::from(self.spec.channels),
+                    frames,
+                )?;
+                analyzer.add_block(&block)?;
+                remaining -= frames as u64;
+            }
+            self.pcm
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| format!("rewind analyzed PCM output spool: {error}"))?;
+            Some(analyzer.finish(target_lufs, peak_limit_dbtp)?)
+        } else {
+            None
+        };
         let mut encoded = tempfile::tempfile()
             .map_err(|error| format!("create anonymous encoded output spool: {error}"))?;
         {
@@ -1240,11 +1416,14 @@ impl<W: Write> SpooledAudioStreamWriter<W> {
             let mut remaining = self.frames_written;
             while remaining != 0 {
                 let frames = remaining.min(self.replay_frames as u64) as usize;
-                let block = read_interleaved_pcm_block(
+                let mut block = read_interleaved_pcm_block(
                     &mut self.pcm,
                     usize::from(self.spec.channels),
                     frames,
                 )?;
+                if let Some(gain) = loudness_gain {
+                    gain.apply(&mut block);
+                }
                 writer.write_block(&block)?;
                 remaining -= frames as u64;
             }
@@ -1255,6 +1434,13 @@ impl<W: Write> SpooledAudioStreamWriter<W> {
                 &mut encoded,
                 usize::from(self.spec.channels),
                 self.spec.channel_mask,
+            )?;
+        }
+        if let Some(metadata) = metadata {
+            crate::metadata::write_extended_to_file_with_limits(
+                metadata,
+                &mut encoded,
+                metadata_limits,
             )?;
         }
         let encoded_bytes = encoded
@@ -1295,7 +1481,11 @@ impl<W: Write> SpooledAudioStreamWriter<W> {
         self.sink
             .flush()
             .map_err(|error| format!("flush non-seekable audio output: {error}"))?;
-        Ok((self.sink, fingerprint))
+        Ok((
+            self.sink,
+            fingerprint,
+            loudness_gain.map(crate::loudness::StreamingLoudnessGain::report),
+        ))
     }
 }
 
@@ -1416,6 +1606,31 @@ mod tests {
                 "{format:?} output exceeded its {output_bound}-byte bound"
             );
         }
+    }
+
+    #[test]
+    fn finite_pcm_spool_replays_exact_blocks_and_enforces_limit() {
+        let bytes = 3_u64 * 2 * std::mem::size_of::<f64>() as u64;
+        let mut spool = StreamPcmSpool::new(2, bytes).unwrap();
+        spool
+            .write_block(&[vec![0.1, 0.2], vec![-0.1, -0.2]])
+            .unwrap();
+        spool.write_block(&[vec![0.3], vec![-0.3]]).unwrap();
+        assert_eq!(spool.frames(), 3);
+        assert_eq!(spool.len(), bytes);
+        assert!(spool.write_block(&[vec![0.4], vec![-0.4]]).is_err());
+        assert!(spool.next_block(2).is_err());
+        spool.prepare_read().unwrap();
+        assert!(spool.write_block(&[vec![0.4], vec![-0.4]]).is_err());
+        assert_eq!(
+            spool.next_block(2).unwrap().unwrap(),
+            vec![vec![0.1, 0.2], vec![-0.1, -0.2]]
+        );
+        assert_eq!(
+            spool.next_block(2).unwrap().unwrap(),
+            vec![vec![0.3], vec![-0.3]]
+        );
+        assert!(spool.next_block(2).unwrap().is_none());
     }
 
     #[test]

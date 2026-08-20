@@ -555,26 +555,31 @@ resampler, and encoder state in memory instead of loading the whole file:
 `--stream` accepts content-detected WAV, FLAC, Ogg Vorbis, granule-aware Ogg
 Opus, gapless MP3, frame-aware ADTS AAC, and edit-aware M4A AAC/ALAC input. It
 writes WAV, FLAC, Ogg Opus, MP3, M4A AAC, or ADTS AAC with the compiled
-Classical, RNNoise, and GTCRN backends, including independent, linked-stereo,
-and mid/side channel modes. GTCRN uses an explicit `--onnx-model` or the
-installed managed `gtcrn` model. A regular-file destination is staged, decoded
+Classical, RNNoise, DeepFilterNet, MossFormer2, and GTCRN backends, including
+independent, linked-stereo, and mid/side channel modes. MossFormer2 and GTCRN
+use an explicit `--onnx-model` or their installed managed model; DeepFilterNet
+uses its embedded graph. A regular-file destination is staged, decoded
 end-to-end to verify its codec, geometry, and presentation duration, then
 published atomically. Supported metadata is retained unless `--no-metadata` is
-selected. VAD, two-pass loudness normalization, and additional AI backends
-remain for Stage 15. The default block size is 8192 frames; use
-`--stream-frames N` (1–1,048,576) to trade latency and working memory for
-throughput. Noise profiling retains only a bounded leading segment before
-output begins. Stream resource arithmetic is checked from the input header,
-and the processor is constructed before an output or temporary file is staged.
+selected. Bounded VAD preserves the presentation timeline across backend
+latency. `--loudness` performs a fixed-memory analysis pass over an anonymous
+PCM spool, then applies one constant gain during the verified encoding pass.
+The default block size is 8192 frames; use `--stream-frames N` (1–1,048,576) to
+trade latency and working memory for throughput. Noise profiling retains only
+a bounded leading segment before output begins. Stream resource arithmetic is
+checked from the input header, and the processor is constructed before an
+output or temporary file is staged.
 
 `-` selects stdin or stdout for `--stream`. Stdin is copied into an anonymous
 regular-file spool before parsing, preserving one authoritative seekable input
 without retaining all encoded bytes in RAM. Stdout accumulates bounded PCM and
-encoded anonymous spools, verifies the completed encoded stream, then copies it
-to the sink. Stdin and stdout share the `--max-temp-space` allowance (1 GiB by
-default); stdout drops metadata, and a sink error can leave partial external
-bytes because a pipe has no atomic rename. `--resume` intentionally rejects
-stdin/stdout because their anonymous spools cannot survive process restart.
+encoded anonymous spools, applies metadata and optional two-pass loudness,
+verifies the completed encoded stream, then copies it to the sink. Stdin and
+stdout share the `--max-temp-space` allowance (1 GiB by default); supported
+input metadata is preserved unless `--no-metadata` is selected. A sink error
+can leave partial external bytes because a pipe has no atomic rename. `--resume`
+intentionally rejects stdin/stdout because their anonymous spools cannot
+survive process restart.
 
 Library callers use `AudioStreamReader::from_reader_with_limits` for a plain
 `Read` source and `SpooledAudioStreamWriter::new_with_limits` for a plain
