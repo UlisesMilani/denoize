@@ -1,6 +1,6 @@
 use denoize::audio::{
     estimate_audio_working_set_bytes, estimate_stream_memory_bytes_checked, read_audio,
-    read_audio_from_session_with_limits, write_audio,
+    read_audio_from_session_with_limits,
 };
 use denoize::batch_resume::{
     self, BatchSession, Digest, MetadataPolicy, ResumeDecision, ResumeExpectation,
@@ -22,8 +22,8 @@ use denoize::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -31,7 +31,244 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod diagnostics;
+mod job_worker;
+mod preview;
+mod recovery;
+
+pub use job_worker::{job_worker_request_from_args, run_job_worker};
+pub use preview::{preview_worker_request_from_args, run_preview_worker};
+
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
+static ACCESSIBILITY_E2E_ACTIVE: AtomicBool = AtomicBool::new(false);
+const ACCESSIBILITY_E2E_ARGUMENT: &str = "--denoize-desktop-a11y-e2e";
+const MAX_DESKTOP_ERROR_DETAIL_BYTES: usize = 4 * 1024;
+const MAX_DESKTOP_ERROR_PARAMETERS: usize = 16;
+const MAX_DESKTOP_ERROR_PARAMETER_KEY_BYTES: usize = 64;
+const MAX_DESKTOP_ERROR_PARAMETER_VALUE_BYTES: usize = 256;
+const MAX_ACCESSIBILITY_E2E_FAILURE_BYTES: usize = 2 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesktopError {
+    code: String,
+    parameters: BTreeMap<String, String>,
+    technical_detail: String,
+}
+
+type DesktopResult<T> = Result<T, DesktopError>;
+
+impl DesktopError {
+    fn new(code: impl Into<String>, technical_detail: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            parameters: BTreeMap::new(),
+            technical_detail: bounded_desktop_error_detail(technical_detail.into()),
+        }
+    }
+
+    fn classify(technical_detail: String) -> Self {
+        let technical_detail = bounded_desktop_error_detail(technical_detail);
+        let lower = technical_detail.to_ascii_lowercase();
+        let code = if lower == "cancelled" || lower.contains("キャンセル") {
+            "job.cancelled"
+        } else if (lower.contains("job") || lower.contains("ジョブ"))
+            && (lower.contains("not found") || lower.contains("見つかりません"))
+        {
+            "job.not-found"
+        } else if lower.contains("別の処理")
+            || lower.contains("already running")
+            || lower.contains("実行中です")
+        {
+            "job.busy"
+        } else if lower.contains("gpu") || lower.contains("accelerator") {
+            "resource.accelerator"
+        } else if lower.contains("memory")
+            || lower.contains("メモリ")
+            || lower.contains("working set")
+        {
+            "resource.memory"
+        } else if lower.contains("temporary") || lower.contains("一時領域") {
+            "resource.temporary"
+        } else if lower.contains("worker") || lower.contains("隔離") {
+            "worker.failed"
+        } else if lower.contains("receipt") || lower.contains("実行証明") {
+            "receipt.failed"
+        } else if lower.contains("model") || lower.contains("モデル") {
+            "model.failed"
+        } else if lower.contains("復旧") || lower.contains("recovery") {
+            "recovery.failed"
+        } else if lower.contains("regular file") || lower.contains("regular-file") {
+            "input.not-regular"
+        } else if lower.contains("no such file")
+            || lower.contains("not found")
+            || lower.contains("見つかりません")
+            || lower.contains("存在しません")
+        {
+            "input.not-found"
+        } else if lower.contains("invalid")
+            || lower.contains("unsupported")
+            || lower.contains("不正")
+            || lower.contains("指定してください")
+            || lower.contains("対応していません")
+        {
+            "validation.invalid"
+        } else if lower.contains("read")
+            || lower.contains("write")
+            || lower.contains("open")
+            || lower.contains("保存")
+            || lower.contains("読み")
+            || lower.contains("書き")
+        {
+            "io.failed"
+        } else {
+            "operation.failed"
+        };
+        Self::new(code, technical_detail)
+    }
+
+    fn is_valid(&self) -> bool {
+        matches!(
+            self.code.as_str(),
+            "job.cancelled"
+                | "job.busy"
+                | "job.not-found"
+                | "input.not-regular"
+                | "input.not-found"
+                | "resource.memory"
+                | "resource.temporary"
+                | "resource.accelerator"
+                | "worker.failed"
+                | "receipt.failed"
+                | "model.failed"
+                | "recovery.failed"
+                | "validation.invalid"
+                | "io.failed"
+                | "operation.failed"
+        ) && !self.technical_detail.is_empty()
+            && self.technical_detail.len() <= MAX_DESKTOP_ERROR_DETAIL_BYTES
+            && self.parameters.len() <= MAX_DESKTOP_ERROR_PARAMETERS
+            && self.parameters.iter().all(|(key, value)| {
+                !key.is_empty()
+                    && key.len() <= MAX_DESKTOP_ERROR_PARAMETER_KEY_BYTES
+                    && key.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+                    && value.len() <= MAX_DESKTOP_ERROR_PARAMETER_VALUE_BYTES
+            })
+    }
+}
+
+fn bounded_desktop_error_detail(mut detail: String) -> String {
+    if detail.len() <= MAX_DESKTOP_ERROR_DETAIL_BYTES {
+        return detail;
+    }
+    let mut end = MAX_DESKTOP_ERROR_DETAIL_BYTES.saturating_sub('…'.len_utf8());
+    while !detail.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    detail.truncate(end);
+    detail.push('…');
+    detail
+}
+
+impl From<String> for DesktopError {
+    fn from(value: String) -> Self {
+        Self::classify(value)
+    }
+}
+
+impl From<&str> for DesktopError {
+    fn from(value: &str) -> Self {
+        Self::classify(value.into())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccessibilityE2eReport {
+    schema: String,
+    schema_version: u32,
+    assertions: Vec<String>,
+    failures: Vec<String>,
+}
+
+fn validate_accessibility_e2e_report(report: &AccessibilityE2eReport) -> Result<(), String> {
+    if report.schema != "denoize-desktop-a11y-e2e-v1" || report.schema_version != 1 {
+        return Err("invalid desktop accessibility E2E report schema".into());
+    }
+    if report.assertions.is_empty() || report.assertions.len() > 64 || report.failures.len() > 32 {
+        return Err("desktop accessibility E2E report has invalid bounds".into());
+    }
+    let mut unique = HashSet::new();
+    for assertion in &report.assertions {
+        if assertion.is_empty()
+            || assertion.len() > 128
+            || !assertion
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || !unique.insert(assertion)
+        {
+            return Err("desktop accessibility E2E assertion is invalid".into());
+        }
+    }
+    if report
+        .failures
+        .iter()
+        .any(|failure| failure.is_empty() || failure.len() > MAX_ACCESSIBILITY_E2E_FAILURE_BYTES)
+    {
+        return Err("desktop accessibility E2E failure is invalid".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn accessibility_e2e_active() -> bool {
+    ACCESSIBILITY_E2E_ACTIVE.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn finish_accessibility_e2e(app: AppHandle, report: AccessibilityE2eReport) -> DesktopResult<()> {
+    if !ACCESSIBILITY_E2E_ACTIVE.load(Ordering::SeqCst) {
+        return Err(DesktopError::new(
+            "validation.invalid",
+            "desktop accessibility E2E mode is not active",
+        ));
+    }
+    validate_accessibility_e2e_report(&report)?;
+    let status = if report.failures.is_empty() {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    let payload = serde_json::to_string(&report)
+        .map_err(|error| format!("serialize desktop accessibility E2E report: {error}"))?;
+    println!("DENOIZE_DESKTOP_A11Y_E2E:{status}:{payload}");
+    let _ = std::io::stdout().flush();
+    ACCESSIBILITY_E2E_ACTIVE.store(false, Ordering::SeqCst);
+    let exit_code = if report.failures.is_empty() { 0 } else { 1 };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        app.exit(exit_code);
+    });
+    Ok(())
+}
+
+pub fn accessibility_e2e_requested_from_args() -> Result<bool, String> {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new(ACCESSIBILITY_E2E_ARGUMENT)) {
+        return Ok(false);
+    }
+    if arguments.next().is_some() {
+        return Err("desktop accessibility E2E mode accepts no additional arguments".into());
+    }
+    Ok(true)
+}
+
+pub fn run_accessibility_e2e() {
+    ACCESSIBILITY_E2E_ACTIVE.store(true, Ordering::SeqCst);
+    run();
+}
 
 #[cfg(test)]
 thread_local! {
@@ -74,28 +311,337 @@ const fn default_max_gpu_jobs() -> usize {
 struct AppState {
     jobs: Arc<Mutex<HashMap<u64, Arc<JobControl>>>>,
     live: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    diagnostics: Arc<diagnostics::DiagnosticLog>,
+}
+
+struct IsolatedChild {
+    child: std::process::Child,
+    #[cfg(windows)]
+    _job: std::os::windows::io::OwnedHandle,
+}
+
+impl IsolatedChild {
+    #[cfg(not(windows))]
+    fn new(child: std::process::Child, _memory_limit: Option<u64>) -> Result<Self, String> {
+        Ok(Self { child })
+    }
+
+    #[cfg(windows)]
+    fn new(mut child: std::process::Child, memory_limit: Option<u64>) -> Result<Self, String> {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        };
+
+        let process_memory_limit = match memory_limit.map(usize::try_from).transpose() {
+            Ok(limit) => limit,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("隔離workerのmemory上限がこのplatformの範囲を超えます".into());
+            }
+        };
+        let raw_job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if raw_job.is_null() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "隔離worker Job Objectを作成できません: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let job = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw_job) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(memory_limit) = process_memory_limit {
+            limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+            limits.ProcessMemoryLimit = memory_limit;
+        }
+        let configured = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0
+            || unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("隔離workerをJob Objectへ登録できません: {error}"));
+        }
+        Ok(Self { child, _job: job })
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+}
+
+impl Drop for IsolatedChild {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+struct SharedCancellation {
+    marker: PathBuf,
+    fence: File,
 }
 
 #[derive(Default)]
 struct JobControl {
     cancelled: AtomicBool,
     commit_gate: Mutex<()>,
+    child: Mutex<Option<IsolatedChild>>,
+    shared_cancellation: Mutex<Option<SharedCancellation>>,
+    recovery: Mutex<Option<Arc<recovery::RecoveryTracker>>>,
 }
 
 impl JobControl {
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        if self.cancelled.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Ok(boundary) = self.shared_cancellation.lock() else {
+            return true;
+        };
+        let Some(boundary) = boundary.as_ref() else {
+            return false;
+        };
+        cancellation_marker_exists(&boundary.marker)
     }
 
     fn cancel(&self) -> Result<(), String> {
+        let boundary = self
+            .shared_cancellation
+            .lock()
+            .map_err(|_| "隔離workerの取消境界を取得できません")?;
+        if let Some(boundary) = boundary.as_ref() {
+            fs2::FileExt::lock_exclusive(&boundary.fence)
+                .map_err(|error| format!("隔離workerの公開境界をlockできません: {error}"))?;
+            self.cancelled.store(true, Ordering::SeqCst);
+            let result = write_private_cancel_marker(&boundary.marker);
+            let unlock = fs2::FileExt::unlock(&boundary.fence)
+                .map_err(|error| format!("隔離workerの公開境界をunlockできません: {error}"));
+            result?;
+            unlock?;
+            return Ok(());
+        }
+        drop(boundary);
         // Signal first so no waiter can enter a later commit fence while this
         // call waits for the publication that already owns the gate.
         self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(mut child) = self.child.lock() {
+            if let Some(child) = child.as_mut() {
+                let _ = child.kill();
+            }
+        }
         let _commit_guard = self
             .commit_gate
             .lock()
             .map_err(|_| "出力確定状態を取得できません")?;
         Ok(())
+    }
+
+    fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn install_shared_cancellation(&self, marker: PathBuf, fence: File) -> Result<(), String> {
+        let mut boundary = self
+            .shared_cancellation
+            .lock()
+            .map_err(|_| "隔離workerの取消境界を更新できません")?;
+        if boundary.is_some() {
+            return Err("隔離workerの取消境界は既に登録されています".into());
+        }
+        *boundary = Some(SharedCancellation { marker, fence });
+        Ok(())
+    }
+
+    fn install_child(&self, child: IsolatedChild) -> Result<(), String> {
+        let mut slot = self
+            .child
+            .lock()
+            .map_err(|_| "隔離ワーカー状態を更新できません")?;
+        if slot.is_some() {
+            return Err("隔離ワーカーは既に実行中です".into());
+        }
+        *slot = Some(child);
+        if self.is_cancelled() {
+            if let Some(child) = slot.as_mut() {
+                let _ = child.kill();
+            }
+        }
+        Ok(())
+    }
+
+    fn install_recovery(&self, tracker: Arc<recovery::RecoveryTracker>) -> Result<(), String> {
+        let mut slot = self
+            .recovery
+            .lock()
+            .map_err(|_| "復旧状態を更新できません")?;
+        if slot.is_some() {
+            return Err("復旧状態は既に登録されています".into());
+        }
+        *slot = Some(tracker);
+        Ok(())
+    }
+
+    fn recovery_attachment(&self) -> Result<recovery::RecoveryAttachment, String> {
+        let tracker = self
+            .recovery
+            .lock()
+            .map_err(|_| "復旧状態を取得できません")?
+            .clone()
+            .ok_or_else(|| "復旧状態が登録されていません".to_string())?;
+        tracker.attachment()
+    }
+
+    fn cleanup_isolated_recovery(&self) -> Result<usize, String> {
+        let tracker = self
+            .recovery
+            .lock()
+            .map_err(|_| "復旧状態を取得できません")?
+            .clone()
+            .ok_or_else(|| "復旧状態が登録されていません".to_string())?;
+        tracker.cleanup_isolated_stages()
+    }
+
+    fn track_stage(&self, output: &AtomicOutput) -> Result<recovery::RecoveryStageGuard, String> {
+        let tracker = self
+            .recovery
+            .lock()
+            .map_err(|_| "復旧状態を取得できません")?
+            .clone();
+        match tracker {
+            Some(tracker) => tracker.track(output),
+            None => Ok(recovery::RecoveryStageGuard::untracked()),
+        }
+    }
+
+    fn finish_recovery(&self, status: &'static str) {
+        let tracker = self
+            .recovery
+            .lock()
+            .ok()
+            .and_then(|tracker| tracker.clone());
+        if let Some(tracker) = tracker {
+            if let Err(error) = tracker.finish(status) {
+                eprintln!("denoize desktop: recovery record cleanup failed: {error}");
+            }
+        }
+    }
+
+    fn wait_for_child(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let started = Instant::now();
+        loop {
+            let status = {
+                let mut slot = self
+                    .child
+                    .lock()
+                    .map_err(|_| "隔離ワーカー状態を取得できません")?;
+                let child = slot
+                    .as_mut()
+                    .ok_or_else(|| "隔離ワーカーが登録されていません".to_string())?;
+                child
+                    .try_wait()
+                    .map_err(|error| format!("隔離ワーカー状態を確認できません: {error}"))?
+            };
+            if let Some(status) = status {
+                let mut slot = self
+                    .child
+                    .lock()
+                    .map_err(|_| "隔離ワーカー状態を更新できません")?;
+                let mut child = slot
+                    .take()
+                    .ok_or_else(|| "隔離ワーカーが途中で失われました".to_string())?;
+                let _ = child.wait();
+                return Ok(status);
+            }
+            if started.elapsed() >= timeout {
+                let mut slot = self
+                    .child
+                    .lock()
+                    .map_err(|_| "隔離ワーカー状態を更新できません")?;
+                let mut child = slot
+                    .take()
+                    .ok_or_else(|| "隔離ワーカーが途中で失われました".to_string())?;
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("隔離プレビューワーカーが制限時間を超えました".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn wait_for_job_child(
+        &self,
+        cancellation_grace: std::time::Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let mut cancellation_started = None;
+        loop {
+            let status = {
+                let mut slot = self
+                    .child
+                    .lock()
+                    .map_err(|_| "隔離worker状態を取得できません")?;
+                let child = slot
+                    .as_mut()
+                    .ok_or_else(|| "隔離workerが登録されていません".to_string())?;
+                child
+                    .try_wait()
+                    .map_err(|error| format!("隔離worker状態を確認できません: {error}"))?
+            };
+            if let Some(status) = status {
+                let mut slot = self
+                    .child
+                    .lock()
+                    .map_err(|_| "隔離worker状態を更新できません")?;
+                let mut child = slot
+                    .take()
+                    .ok_or_else(|| "隔離workerが途中で失われました".to_string())?;
+                let _ = child.wait();
+                return Ok(status);
+            }
+            if self.is_cancelled() {
+                let started = cancellation_started.get_or_insert_with(Instant::now);
+                if started.elapsed() >= cancellation_grace {
+                    let mut slot = self
+                        .child
+                        .lock()
+                        .map_err(|_| "隔離worker状態を更新できません")?;
+                    let mut child = slot
+                        .take()
+                        .ok_or_else(|| "隔離workerが途中で失われました".to_string())?;
+                    let _ = child.kill();
+                    return child
+                        .wait()
+                        .map_err(|error| format!("隔離workerの終了を待機できません: {error}"));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 
     fn commit(&self, transaction: AtomicOutput, mode: CommitMode) -> Result<(), String> {
@@ -107,14 +653,63 @@ impl JobControl {
             .commit_gate
             .lock()
             .map_err(|_| "出力確定状態を取得できません")?;
+        let boundary = self
+            .shared_cancellation
+            .lock()
+            .map_err(|_| "隔離workerの取消境界を取得できません")?;
+        if let Some(boundary) = boundary.as_ref() {
+            fs2::FileExt::lock_exclusive(&boundary.fence)
+                .map_err(|error| format!("隔離workerの公開境界をlockできません: {error}"))?;
+            let cancelled = self.cancelled.load(Ordering::SeqCst)
+                || cancellation_marker_exists(&boundary.marker);
+            let result = if cancelled {
+                Err("cancelled".into())
+            } else {
+                publish()
+            };
+            let unlock = fs2::FileExt::unlock(&boundary.fence)
+                .map_err(|error| format!("隔離workerの公開境界をunlockできません: {error}"));
+            return match (result, unlock) {
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+                (Ok(value), Ok(())) => Ok(value),
+            };
+        }
+        drop(boundary);
         check_cancelled(self)?;
         publish()
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+fn cancellation_marker_exists(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata.file_type().is_file(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn write_private_cancel_marker(path: &Path) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => file
+            .sync_all()
+            .map_err(|error| format!("隔離workerの取消markerを同期できません: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("隔離workerの取消markerを作成できません: {error}")),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProcessOptions {
+pub(crate) struct ProcessOptions {
     backend: String,
     preset: Option<String>,
     mode: Option<String>,
@@ -332,11 +927,15 @@ impl GuiConfigPatch {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProcessRequest {
     input: String,
     output: String,
+    #[serde(default)]
+    expected_input_fingerprint: Option<batch_resume::FileFingerprint>,
+    #[serde(default)]
+    expected_recipe: Option<Digest>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
@@ -363,7 +962,7 @@ struct RecommendationRequest {
     deterministic: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchRequest {
     inputs: Vec<String>,
@@ -447,42 +1046,43 @@ struct LiveEvent {
     processed_chunks: u64,
     dropped_chunks: u64,
     accelerator: Option<AcceleratorResult>,
+    error: Option<DesktopError>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AcceleratorResult {
-    requested: &'static str,
-    effective: &'static str,
-    fallback: Option<&'static str>,
+    requested: String,
+    effective: String,
+    fallback: Option<String>,
 }
 
 fn accelerator_result(selection: denoize::AcceleratorSelection) -> AcceleratorResult {
     AcceleratorResult {
-        requested: selection.requested().name(),
-        effective: selection.effective().name(),
-        fallback: selection.fallback().map(|fallback| fallback.name()),
+        requested: selection.requested().name().into(),
+        effective: selection.effective().name().into(),
+        fallback: selection.fallback().map(|fallback| fallback.name().into()),
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JobProgress {
     job_id: u64,
-    kind: &'static str,
-    status: &'static str,
+    kind: String,
+    status: String,
     message: String,
     current: usize,
     total: usize,
     fraction: f64,
     elapsed_seconds: f64,
     output: Option<String>,
-    error: Option<String>,
+    error: Option<DesktopError>,
     eta_seconds: Option<f64>,
     item: Option<String>,
-    item_status: Option<&'static str>,
+    item_status: Option<String>,
     item_id: Option<String>,
-    resume_reason: Option<&'static str>,
+    resume_reason: Option<String>,
     accelerator: Option<AcceleratorResult>,
 }
 
@@ -498,6 +1098,7 @@ struct DesktopReceiptContext {
     stage: AtomicOutput,
     publication: &'static str,
     reason: &'static str,
+    _recovery_stage: Option<recovery::RecoveryStageGuard>,
 }
 
 struct DesktopBatchReceiptContext {
@@ -505,6 +1106,7 @@ struct DesktopBatchReceiptContext {
     key: ReceiptSecretKey,
     stage: AtomicOutput,
     plan: ExecutionPlan,
+    _recovery_stage: Option<recovery::RecoveryStageGuard>,
 }
 
 struct UnplannedDesktopBatchReceipt {
@@ -512,6 +1114,7 @@ struct UnplannedDesktopBatchReceipt {
     key_path: PathBuf,
     key: ReceiptSecretKey,
     stage: AtomicOutput,
+    _recovery_stage: Option<recovery::RecoveryStageGuard>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -551,6 +1154,7 @@ struct ModelProgress {
     downloaded: u64,
     total: Option<u64>,
     fraction: Option<f64>,
+    error: Option<DesktopError>,
 }
 
 #[derive(Default, Deserialize)]
@@ -954,12 +1558,12 @@ struct OfflineBundleImportRow {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct PreviewData {
-    source: String,
-    playable_path: String,
-    duration_seconds: f64,
-    rms_db: f64,
-    waveform: Vec<f64>,
+struct PreviewProgress {
+    job_id: u64,
+    status: &'static str,
+    message: String,
+    result: Option<preview::PreviewResult>,
+    error: Option<DesktopError>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1036,46 +1640,50 @@ fn desktop_recommendation_options(
 #[tauri::command]
 async fn recommend_settings(
     request: RecommendationRequest,
-) -> Result<denoize::RecommendationReport, String> {
+) -> DesktopResult<denoize::RecommendationReport> {
     let options = desktop_recommendation_options(&request)?;
     if request.input.trim().is_empty() {
         return Err("推奨を分析する入力ファイルを選択してください".into());
     }
     let input = request.input;
-    tauri::async_runtime::spawn_blocking(move || {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
         denoize::recommend_file_with_options(input, options)
     })
     .await
-    .map_err(|error| format!("推奨分析タスクに失敗しました: {error}"))?
+    .map_err(|error| format!("推奨分析タスクに失敗しました: {error}"))??)
 }
 
 #[tauri::command]
-async fn plan_process(request: ProcessRequest) -> Result<ExecutionPlan, String> {
-    tauri::async_runtime::spawn_blocking(move || build_process_execution_plan(&request))
-        .await
-        .map_err(|error| format!("実行計画タスクに失敗しました: {error}"))?
+async fn plan_process(request: ProcessRequest) -> DesktopResult<ExecutionPlan> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || build_process_execution_plan(&request))
+            .await
+            .map_err(|error| format!("実行計画タスクに失敗しました: {error}"))??,
+    )
 }
 
 #[tauri::command]
-async fn plan_batch(request: BatchRequest) -> Result<ExecutionPlan, String> {
-    tauri::async_runtime::spawn_blocking(move || build_batch_execution_plan(&request))
-        .await
-        .map_err(|error| format!("バッチ実行計画タスクに失敗しました: {error}"))?
+async fn plan_batch(request: BatchRequest) -> DesktopResult<ExecutionPlan> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || build_batch_execution_plan(&request))
+            .await
+            .map_err(|error| format!("バッチ実行計画タスクに失敗しました: {error}"))??,
+    )
 }
 
 #[tauri::command]
-fn save_execution_plan(path: String, plan: ExecutionPlan) -> Result<(), String> {
-    denoize::write_execution_plan(path, &plan)
+fn save_execution_plan(path: String, plan: ExecutionPlan) -> DesktopResult<()> {
+    denoize::write_execution_plan(path, &plan).map_err(DesktopError::from)
 }
 
 #[tauri::command]
-fn generate_receipt_key(secret: String, public: String) -> Result<String, String> {
-    denoize::write_new_receipt_keypair(secret, public)
+fn generate_receipt_key(secret: String, public: String) -> DesktopResult<String> {
+    denoize::write_new_receipt_keypair(secret, public).map_err(DesktopError::from)
 }
 
 #[tauri::command]
-fn export_receipt_public_key(secret: String, public: String) -> Result<String, String> {
-    denoize::export_receipt_public_key(secret, public)
+fn export_receipt_public_key(secret: String, public: String) -> DesktopResult<String> {
+    denoize::export_receipt_public_key(secret, public).map_err(DesktopError::from)
 }
 
 #[tauri::command]
@@ -1083,20 +1691,20 @@ fn create_receipt_policy(
     path: String,
     public_keys: Vec<String>,
     revoked_key_ids: Vec<String>,
-) -> Result<(), String> {
+) -> DesktopResult<()> {
     let keys = public_keys
         .iter()
         .map(denoize::ReceiptPublicKey::from_file)
         .collect::<Result<Vec<_>, _>>()?;
     let policy = ReceiptTrustPolicy::new(keys, revoked_key_ids)?;
-    denoize::write_receipt_trust_policy(path, &policy)
+    denoize::write_receipt_trust_policy(path, &policy).map_err(DesktopError::from)
 }
 
 #[tauri::command]
 async fn verify_execution_receipt(
     request: ReceiptVerificationRequest,
-) -> Result<ReceiptVerificationReport, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+) -> DesktopResult<ReceiptVerificationReport> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
         let receipt = SignedExecutionReceipt::from_file(&request.receipt)?;
         let output_root = request.output_root.as_deref().map(Path::new);
         match (request.key.as_deref(), request.policy.as_deref()) {
@@ -1134,7 +1742,7 @@ async fn verify_execution_receipt(
         }
     })
     .await
-    .map_err(|error| format!("実行証明の検証タスクに失敗しました: {error}"))?
+    .map_err(|error| format!("実行証明の検証タスクに失敗しました: {error}"))??)
 }
 
 #[tauri::command]
@@ -1142,68 +1750,92 @@ fn start_process(
     app: AppHandle,
     state: State<'_, AppState>,
     request: ProcessRequest,
+) -> DesktopResult<u64> {
+    start_process_inner(app, &state, request).map_err(DesktopError::from)
+}
+
+fn start_process_inner(
+    app: AppHandle,
+    state: &AppState,
+    request: ProcessRequest,
 ) -> Result<u64, String> {
     validate_request(&request)?;
-    let receipt = prepare_process_receipt(&request)?;
-    let (job_id, control) = register_job(&state)?;
+    let (job_id, control) = register_job(state)?;
+    let tracker = match recovery::RecoveryTracker::create(
+        &app,
+        job_id,
+        recovery::RecoveryOperation::File(request.clone()),
+    ) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            unregister_job(state, job_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = control.install_recovery(tracker) {
+        unregister_job(state, job_id);
+        return Err(error);
+    }
+    state
+        .diagnostics
+        .record(diagnostics::DiagnosticCode::FileJobStarted);
+    let diagnostic_log = Arc::clone(&state.diagnostics);
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
-        emit_progress(
+        let result = job_worker::run_isolated(
             &app,
             job_id,
-            "file",
-            "running",
-            "音声を読み込んでいます",
-            0,
-            4,
-            started,
-            None,
-            None,
+            recovery::RecoveryOperation::File(request),
+            &control,
         );
-        let result = process_file(&request, receipt, &control, |stage, message| {
-            emit_progress(
-                &app, job_id, "file", "running", message, stage, 4, started, None, None,
-            );
+        let terminal = match result {
+            Ok(progress) => match progress.status.as_str() {
+                "completed" => "completed",
+                "cancelled" => "cancelled",
+                _ => "failed",
+            },
+            Err(error) if error == "cancelled" || control.is_cancelled() => {
+                emit_progress(
+                    &app,
+                    job_id,
+                    "file",
+                    "cancelled",
+                    "処理をキャンセルしました",
+                    0,
+                    4,
+                    started,
+                    None,
+                    None,
+                );
+                "cancelled"
+            }
+            Err(error) => {
+                emit_progress(
+                    &app,
+                    job_id,
+                    "file",
+                    "failed",
+                    "処理に失敗しました",
+                    0,
+                    4,
+                    started,
+                    None,
+                    Some(error),
+                );
+                "failed"
+            }
+        };
+        diagnostic_log.record(match terminal {
+            "completed" => diagnostics::DiagnosticCode::FileJobCompleted,
+            "cancelled" => diagnostics::DiagnosticCode::FileJobCancelled,
+            _ => diagnostics::DiagnosticCode::FileJobFailed,
         });
-        match result {
-            Ok(result) => emit_progress_with_accelerator(
-                &app,
-                job_id,
-                "file",
-                "completed",
-                "処理が完了しました",
-                4,
-                4,
-                started,
-                Some(result.output),
-                None,
-                Some(result.accelerator),
-            ),
-            Err(error) if error == "cancelled" => emit_progress(
-                &app,
-                job_id,
-                "file",
-                "cancelled",
-                "処理をキャンセルしました",
-                0,
-                4,
-                started,
-                None,
-                None,
-            ),
-            Err(error) => emit_progress(
-                &app,
-                job_id,
-                "file",
-                "failed",
-                "処理に失敗しました",
-                0,
-                4,
-                started,
-                None,
-                Some(error),
-            ),
+        match control.cleanup_isolated_recovery() {
+            Ok(_) => control.finish_recovery(terminal),
+            Err(error) => {
+                eprintln!("denoize desktop: isolated file stage cleanup failed: {error}")
+            }
         }
         if let Ok(mut jobs) = jobs.lock() {
             jobs.remove(&job_id);
@@ -1217,129 +1849,93 @@ fn start_batch(
     app: AppHandle,
     state: State<'_, AppState>,
     request: BatchRequest,
+) -> DesktopResult<u64> {
+    start_batch_inner(app, &state, request).map_err(DesktopError::from)
+}
+
+fn start_batch_inner(
+    app: AppHandle,
+    state: &AppState,
+    request: BatchRequest,
 ) -> Result<u64, String> {
-    let RegisteredBatch {
+    let (job_id, control) = register_batch_job(state, &request)?;
+    let tracker = match recovery::RecoveryTracker::create(
+        &app,
         job_id,
-        control,
-        pool,
-        session,
-        items,
-        mut receipt,
-    } = prepare_registered_batch(&state, &request)?;
+        recovery::RecoveryOperation::Batch(request.clone()),
+    ) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            unregister_job(state, job_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = control.install_recovery(tracker) {
+        unregister_job(state, job_id);
+        return Err(error);
+    }
+    state
+        .diagnostics
+        .record(diagnostics::DiagnosticCode::BatchJobStarted);
+    let diagnostic_log = Arc::clone(&state.diagnostics);
     let jobs = Arc::clone(&state.jobs);
     std::thread::spawn(move || {
         let started = Instant::now();
-        let total = items.len();
-        let finished = AtomicUsize::new(0);
-        let run_item = |batch_item: &PlannedBatchItem| -> BatchItemOutcome {
-            let commit_mode = match batch_item_commit_mode(
-                batch_item.decision,
-                batch_item.existing_output,
-                control.is_cancelled(),
-            ) {
-                Ok(commit_mode) => commit_mode,
-                Err(outcome) => return outcome,
-            };
-            let prepared = &batch_item.prepared;
-            let worker_permit = match prepared
-                .governor
-                .acquire_with_cancel(prepared.resource_request, || control.is_cancelled())
-            {
-                Ok(permit) => permit,
-                Err(_) if control.is_cancelled() => return BatchItemOutcome::Cancelled,
-                Err(error) => return BatchItemOutcome::Failed(error),
-            };
-            let result = stage_batch_output(
-                &prepared.item.input,
-                &prepared.item.output,
-                prepared.item.output_format,
-                prepared.encode,
-                prepared.metadata_policy,
-                &prepared.processing,
-                &prepared.backend_session,
-                prepared.decode_limits,
-                prepared.metadata_limits,
-                prepared.resource_request.temporary_bytes(),
-                &control,
-            )
-            .and_then(|transaction| {
-                verify_prepared_batch_recipe(prepared)?;
-                control.commit_fence(|| {
-                    session.publish(&prepared.expectation, transaction, commit_mode)
-                })
-            });
-            drop(worker_permit);
-            match result {
-                Ok(fingerprint) => BatchItemOutcome::Completed(fingerprint),
-                Err(error) if error == "cancelled" => BatchItemOutcome::Cancelled,
-                Err(error) => BatchItemOutcome::Failed(error),
-            }
-        };
-        let process_item = |batch_item: &PlannedBatchItem| {
-            let outcome = run_item(batch_item);
-            let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
-            emit_batch_item(
-                &app,
-                job_id,
-                outcome.status(),
-                &batch_item.prepared.item,
-                Some(batch_item.decision.reason()),
-                current,
-                total,
-                started,
-                outcome.error(),
-                batch_item.prepared.processing.accelerator,
-            );
-            outcome
-        };
-        let outcomes = if let Some(pool) = pool {
-            pool.install(|| items.par_iter().map(process_item).collect::<Vec<_>>())
-        } else {
-            items.iter().map(process_item).collect::<Vec<_>>()
-        };
-        let counts = count_batch_outcomes(&outcomes);
-        debug_assert_eq!(counts.total(), total);
-        debug_assert_eq!(finished.load(Ordering::SeqCst), total);
-        let receipt_result = if counts.failed == 0 && counts.cancelled == 0 {
-            match receipt.take() {
-                Some(receipt) => {
-                    publish_desktop_batch_receipt(receipt, &items, &outcomes, &request, &control)
-                }
-                None => Ok(()),
-            }
-        } else {
-            Ok(())
-        };
-        let mut terminal = batch_terminal_outcome(counts);
-        if let Err(receipt_error) = receipt_result {
-            if receipt_error == "cancelled" {
-                terminal.status = "cancelled";
-                terminal.message = format!(
-                    "{} · 実行証明はキャンセルにより公開されませんでした",
-                    terminal.message
-                );
-                terminal.error = None;
-            } else {
-                terminal.status = "failed";
-                terminal.message = format!(
-                    "{} · 出力は確定しましたが実行証明を公開できませんでした",
-                    terminal.message
-                );
-                terminal.error = Some(receipt_error);
-            }
-        }
-        emit_progress(
+        let output = request.output_dir.clone();
+        let result = job_worker::run_isolated(
             &app,
             job_id,
-            "batch",
-            terminal.status,
-            &terminal.message,
-            total,
-            total,
-            started,
-            Some(request.output_dir),
-            terminal.error,
+            recovery::RecoveryOperation::Batch(request),
+            &control,
         );
+        let terminal = match result {
+            Ok(progress) => match progress.status.as_str() {
+                "completed" => "completed",
+                "cancelled" => "cancelled",
+                _ => "failed",
+            },
+            Err(error) if error == "cancelled" || control.is_cancelled() => {
+                emit_progress(
+                    &app,
+                    job_id,
+                    "batch",
+                    "cancelled",
+                    "バッチをキャンセルしました",
+                    0,
+                    1,
+                    started,
+                    Some(output),
+                    None,
+                );
+                "cancelled"
+            }
+            Err(error) => {
+                emit_progress(
+                    &app,
+                    job_id,
+                    "batch",
+                    "failed",
+                    "バッチ処理に失敗しました",
+                    0,
+                    1,
+                    started,
+                    Some(output),
+                    Some(error),
+                );
+                "failed"
+            }
+        };
+        diagnostic_log.record(match terminal {
+            "completed" => diagnostics::DiagnosticCode::BatchJobCompleted,
+            "cancelled" => diagnostics::DiagnosticCode::BatchJobCancelled,
+            _ => diagnostics::DiagnosticCode::BatchJobFailed,
+        });
+        match control.cleanup_isolated_recovery() {
+            Ok(_) => control.finish_recovery(terminal),
+            Err(error) => {
+                eprintln!("denoize desktop: isolated batch stage cleanup failed: {error}")
+            }
+        }
         if let Ok(mut jobs) = jobs.lock() {
             jobs.remove(&job_id);
         }
@@ -1347,69 +1943,71 @@ fn start_batch(
     Ok(job_id)
 }
 
-struct RegisteredBatch {
-    job_id: u64,
-    control: Arc<JobControl>,
+fn register_batch_job(
+    state: &AppState,
+    request: &BatchRequest,
+) -> Result<(u64, Arc<JobControl>), String> {
+    validate_batch_request(request)?;
+    register_job(state)
+}
+
+struct PreparedBatchExecution {
     pool: Option<rayon::ThreadPool>,
     session: BatchSession,
     items: Vec<PlannedBatchItem>,
     receipt: Option<DesktopBatchReceiptContext>,
 }
 
-fn prepare_registered_batch(
-    state: &AppState,
+fn prepare_batch_execution(
     request: &BatchRequest,
-) -> Result<RegisteredBatch, String> {
-    validate_batch_request(request)?;
-    let unplanned_receipt = prepare_batch_receipt(request)?;
-    let (job_id, control) = register_job(state)?;
-    let prepared = (|| {
-        let prepared = prepare_batch_request(request)?;
-        if let Some(receipt) = &unplanned_receipt {
-            let batch_items = prepared
-                .iter()
-                .map(|prepared| prepared.item.clone())
-                .collect::<Vec<_>>();
-            validate_batch_receipt_output_paths(&batch_items, receipt)?;
-        }
-        let pool = if request.options.deterministic {
-            None
-        } else {
-            Some(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(request.jobs)
-                    .build()
-                    .map_err(|error| format!("並列処理を準備できませんでした: {error}"))?,
-            )
-        };
-        let session = BatchSession::acquire(Path::new(&request.output_dir), request.resume)?;
-        let items = plan_batch_items(&session, prepared, request.options.force)?;
-        let receipt = unplanned_receipt
-            .map(|receipt| {
-                Ok::<DesktopBatchReceiptContext, String>(DesktopBatchReceiptContext {
-                    path: receipt.path,
-                    key: receipt.key,
-                    stage: receipt.stage,
-                    plan: build_desktop_batch_plan(request, &items)?,
-                })
-            })
-            .transpose()?;
-        session.activate()?;
-        Ok(RegisteredBatch {
-            job_id,
-            control: Arc::clone(&control),
-            pool,
-            session,
-            items,
-            receipt,
-        })
-    })();
-    if prepared.is_err() {
-        if let Ok(mut jobs) = state.jobs.lock() {
-            jobs.remove(&job_id);
-        }
+    control: &Arc<JobControl>,
+) -> Result<PreparedBatchExecution, String> {
+    let mut unplanned_receipt = prepare_batch_receipt(request)?;
+    let receipt_stage = unplanned_receipt
+        .as_ref()
+        .map(|receipt| control.track_stage(&receipt.stage))
+        .transpose()?;
+    if let Some(guard) = receipt_stage {
+        unplanned_receipt.as_mut().unwrap()._recovery_stage = Some(guard);
     }
-    prepared
+    let prepared = prepare_batch_request(request)?;
+    if let Some(receipt) = &unplanned_receipt {
+        let batch_items = prepared
+            .iter()
+            .map(|prepared| prepared.item.clone())
+            .collect::<Vec<_>>();
+        validate_batch_receipt_output_paths(&batch_items, receipt)?;
+    }
+    let pool = if request.options.deterministic {
+        None
+    } else {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(request.jobs)
+                .build()
+                .map_err(|error| format!("並列処理を準備できませんでした: {error}"))?,
+        )
+    };
+    let session = BatchSession::acquire(Path::new(&request.output_dir), request.resume)?;
+    let items = plan_batch_items(&session, prepared, request.options.force)?;
+    let receipt = unplanned_receipt
+        .map(|receipt| {
+            Ok::<DesktopBatchReceiptContext, String>(DesktopBatchReceiptContext {
+                path: receipt.path,
+                key: receipt.key,
+                stage: receipt.stage,
+                plan: build_desktop_batch_plan(request, &items)?,
+                _recovery_stage: receipt._recovery_stage,
+            })
+        })
+        .transpose()?;
+    session.activate()?;
+    Ok(PreparedBatchExecution {
+        pool,
+        session,
+        items,
+        receipt,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1516,6 +2114,134 @@ fn batch_terminal_outcome(counts: BatchOutcomeCounts) -> BatchTerminalOutcome {
             )),
         }
     }
+}
+
+fn execute_prepared_batch(
+    request: &BatchRequest,
+    job_id: u64,
+    control: &Arc<JobControl>,
+    prepared: PreparedBatchExecution,
+    emit: &(dyn Fn(JobProgress) + Sync),
+) -> BatchTerminalOutcome {
+    let PreparedBatchExecution {
+        pool,
+        session,
+        items,
+        mut receipt,
+    } = prepared;
+    let started = Instant::now();
+    let total = items.len();
+    let finished = AtomicUsize::new(0);
+    let run_item = |batch_item: &PlannedBatchItem| -> BatchItemOutcome {
+        let commit_mode = match batch_item_commit_mode(
+            batch_item.decision,
+            batch_item.existing_output,
+            control.is_cancelled(),
+        ) {
+            Ok(commit_mode) => commit_mode,
+            Err(outcome) => return outcome,
+        };
+        let prepared = &batch_item.prepared;
+        let worker_permit = match prepared
+            .governor
+            .acquire_with_cancel(prepared.resource_request, || control.is_cancelled())
+        {
+            Ok(permit) => permit,
+            Err(_) if control.is_cancelled() => return BatchItemOutcome::Cancelled,
+            Err(error) => return BatchItemOutcome::Failed(error),
+        };
+        let result = stage_batch_output(
+            &prepared.item.input,
+            &prepared.item.output,
+            prepared.item.output_format,
+            prepared.encode,
+            prepared.metadata_policy,
+            &prepared.processing,
+            &prepared.backend_session,
+            prepared.decode_limits,
+            prepared.metadata_limits,
+            prepared.resource_request.temporary_bytes(),
+            control,
+        )
+        .and_then(|transaction| {
+            let _recovery_stage = control.track_stage(&transaction)?;
+            verify_prepared_batch_recipe(prepared)?;
+            control
+                .commit_fence(|| session.publish(&prepared.expectation, transaction, commit_mode))
+        });
+        drop(worker_permit);
+        match result {
+            Ok(fingerprint) => BatchItemOutcome::Completed(fingerprint),
+            Err(error) if error == "cancelled" => BatchItemOutcome::Cancelled,
+            Err(error) => BatchItemOutcome::Failed(error),
+        }
+    };
+    let process_item = |batch_item: &PlannedBatchItem| {
+        let outcome = run_item(batch_item);
+        let current = finished.fetch_add(1, Ordering::SeqCst) + 1;
+        emit(batch_item_progress(
+            job_id,
+            outcome.status(),
+            &batch_item.prepared.item,
+            Some(batch_item.decision.reason()),
+            current,
+            total,
+            started,
+            outcome.error(),
+            batch_item.prepared.processing.accelerator,
+        ));
+        outcome
+    };
+    let outcomes = if let Some(pool) = pool {
+        pool.install(|| items.par_iter().map(process_item).collect::<Vec<_>>())
+    } else {
+        items.iter().map(process_item).collect::<Vec<_>>()
+    };
+    let counts = count_batch_outcomes(&outcomes);
+    debug_assert_eq!(counts.total(), total);
+    debug_assert_eq!(finished.load(Ordering::SeqCst), total);
+    let receipt_result = if counts.failed == 0 && counts.cancelled == 0 {
+        match receipt.take() {
+            Some(receipt) => {
+                publish_desktop_batch_receipt(receipt, &items, &outcomes, request, control)
+            }
+            None => Ok(()),
+        }
+    } else {
+        Ok(())
+    };
+    let mut terminal = batch_terminal_outcome(counts);
+    if let Err(receipt_error) = receipt_result {
+        if receipt_error == "cancelled" {
+            terminal.status = "cancelled";
+            terminal.message = format!(
+                "{} · 実行証明はキャンセルにより公開されませんでした",
+                terminal.message
+            );
+            terminal.error = None;
+        } else {
+            terminal.status = "failed";
+            terminal.message = format!(
+                "{} · 出力は確定しましたが実行証明を公開できませんでした",
+                terminal.message
+            );
+            terminal.error = Some(receipt_error);
+        }
+    }
+    drop(receipt);
+    emit(job_progress(
+        job_id,
+        "batch",
+        terminal.status,
+        &terminal.message,
+        total,
+        total,
+        started,
+        Some(request.output_dir.clone()),
+        terminal.error.clone(),
+        None,
+    ));
+    terminal
 }
 
 fn plan_batch_items(
@@ -1827,18 +2553,18 @@ fn validate_batch_reserved_path(
 }
 
 #[tauri::command]
-fn cancel_job(state: State<'_, AppState>, job_id: u64) -> Result<(), String> {
+fn cancel_job(state: State<'_, AppState>, job_id: u64) -> DesktopResult<()> {
     let jobs = state
         .jobs
         .lock()
         .map_err(|_| "ジョブ状態を取得できません")?;
     let control = jobs.get(&job_id).ok_or("実行中のジョブが見つかりません")?;
-    control.cancel()
+    control.cancel().map_err(DesktopError::from)
 }
 
 #[tauri::command]
 #[cfg(feature = "live")]
-async fn live_devices() -> Result<LiveDevices, String> {
+async fn live_devices() -> DesktopResult<LiveDevices> {
     tauri::async_runtime::spawn_blocking(|| {
         let (inputs, outputs) = denoize::live::device_names()?;
         Ok(LiveDevices { inputs, outputs })
@@ -1849,7 +2575,7 @@ async fn live_devices() -> Result<LiveDevices, String> {
 
 #[tauri::command]
 #[cfg(not(feature = "live"))]
-async fn live_devices() -> Result<LiveDevices, String> {
+async fn live_devices() -> DesktopResult<LiveDevices> {
     Err("このビルドではライブ処理を利用できません".into())
 }
 
@@ -1859,7 +2585,7 @@ fn start_live(
     app: AppHandle,
     state: State<'_, AppState>,
     request: LiveRequest,
-) -> Result<(), String> {
+) -> DesktopResult<()> {
     let backend = validate_live_request(&request)?;
     let backend_options = parsed_backend_options_for(backend, &request.options)?;
     let denoiser = processing_config(&request.options, 48_000)?;
@@ -1896,13 +2622,17 @@ fn start_live(
                         processed_chunks: status.processed_chunks,
                         dropped_chunks: status.dropped_chunks,
                         accelerator: Some(accelerator_result(status.accelerator)),
+                        error: None,
                     },
                 );
             },
         );
-        let (status, message) = match result {
-            Ok(()) => ("stopped", "ライブ処理を停止しました".into()),
-            Err(error) => ("failed", error),
+        let (status, message, error) = match result {
+            Ok(()) => ("stopped", "ライブ処理を停止しました".into(), None),
+            Err(error) => {
+                let structured = DesktopError::from(error.clone());
+                ("failed", error, Some(structured))
+            }
         };
         let _ = app.emit(
             "live-status",
@@ -1918,6 +2648,7 @@ fn start_live(
                 processed_chunks: 0,
                 dropped_chunks: 0,
                 accelerator: Some(accelerator_result(accelerator)),
+                error,
             },
         );
         if let Ok(mut live) = live_state.lock() {
@@ -1933,13 +2664,13 @@ fn start_live(
     _app: AppHandle,
     _state: State<'_, AppState>,
     _request: LiveRequest,
-) -> Result<(), String> {
+) -> DesktopResult<()> {
     Err("このビルドではライブ処理を利用できません".into())
 }
 
 #[tauri::command]
 #[cfg(feature = "live")]
-fn stop_live(state: State<'_, AppState>) -> Result<(), String> {
+fn stop_live(state: State<'_, AppState>) -> DesktopResult<()> {
     let live = state
         .live
         .lock()
@@ -1951,7 +2682,7 @@ fn stop_live(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 #[cfg(not(feature = "live"))]
-fn stop_live(_state: State<'_, AppState>) -> Result<(), String> {
+fn stop_live(_state: State<'_, AppState>) -> DesktopResult<()> {
     Err("このビルドではライブ処理を利用できません".into())
 }
 
@@ -1960,7 +2691,7 @@ async fn compare_audio(
     clean: String,
     noisy: String,
     enhanced: String,
-) -> Result<ComparisonOutput, String> {
+) -> DesktopResult<ComparisonOutput> {
     tauri::async_runtime::spawn_blocking(move || {
         let report = ComparisonReport::compare(
             &read_audio(clean)?,
@@ -1982,7 +2713,7 @@ async fn compare_audio(
 }
 
 #[tauri::command]
-fn list_models() -> Result<ModelLibraryRow, String> {
+fn list_models() -> DesktopResult<ModelLibraryRow> {
     let catalog = denoize::models::active_catalog()?;
     let health = denoize::models::doctor_model_cache_for_catalog(&catalog)?;
     let models = catalog
@@ -2175,37 +2906,37 @@ fn offline_bundle_row(info: denoize::models::OfflineBundleInfo) -> OfflineBundle
 }
 
 #[tauri::command]
-fn model_catalog_status() -> Result<ModelCatalogRow, String> {
-    current_model_catalog_row()
+fn model_catalog_status() -> DesktopResult<ModelCatalogRow> {
+    current_model_catalog_row().map_err(DesktopError::from)
 }
 
 #[tauri::command]
 async fn update_model_catalog(
     options: Option<ModelActionOptions>,
-) -> Result<ModelCatalogRow, String> {
+) -> DesktopResult<ModelCatalogRow> {
     let options = catalog_action_options(options)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
         denoize::models::update_catalog(&options)?;
         current_model_catalog_row()
     })
     .await
-    .map_err(|error| format!("モデルカタログ更新タスクに失敗しました: {error}"))?
+    .map_err(|error| format!("モデルカタログ更新タスクに失敗しました: {error}"))??)
 }
 
 #[tauri::command]
-async fn inspect_model_bundle(path: String) -> Result<OfflineBundleRow, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn inspect_model_bundle(path: String) -> DesktopResult<OfflineBundleRow> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
         denoize::models::inspect_offline_bundle(path).map(offline_bundle_row)
     })
     .await
-    .map_err(|error| format!("オフラインモデルバンドル検証タスクに失敗しました: {error}"))?
+    .map_err(|error| format!("オフラインモデルバンドル検証タスクに失敗しました: {error}"))??)
 }
 
 #[tauri::command]
 async fn import_model_bundle(
     path: String,
     expected_bundle_sha256: String,
-) -> Result<OfflineBundleImportRow, String> {
+) -> DesktopResult<OfflineBundleImportRow> {
     tauri::async_runtime::spawn_blocking(move || {
         let report =
             denoize::models::import_offline_bundle_if_sha256(path, &expected_bundle_sha256)?;
@@ -2228,32 +2959,32 @@ async fn import_model_bundle(
 }
 
 #[tauri::command]
-async fn recover_model_trust_root() -> Result<ModelCatalogRow, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn recover_model_trust_root() -> DesktopResult<ModelCatalogRow> {
+    Ok(tauri::async_runtime::spawn_blocking(|| {
         denoize::models::recover_embedded_trust_root()?;
         current_model_catalog_row()
     })
     .await
-    .map_err(|error| format!("モデル信頼ルート復旧タスクに失敗しました: {error}"))?
+    .map_err(|error| format!("モデル信頼ルート復旧タスクに失敗しました: {error}"))??)
 }
 
 #[tauri::command]
-async fn reset_model_trust_time_floor() -> Result<ModelCatalogRow, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn reset_model_trust_time_floor() -> DesktopResult<ModelCatalogRow> {
+    Ok(tauri::async_runtime::spawn_blocking(|| {
         denoize::models::reset_trust_time_floor()?;
         current_model_catalog_row()
     })
     .await
-    .map_err(|error| format!("モデル信頼時刻リセットタスクに失敗しました: {error}"))?
+    .map_err(|error| format!("モデル信頼時刻リセットタスクに失敗しました: {error}"))??)
 }
 
 #[tauri::command]
-async fn model_cache_doctor() -> Result<ModelCacheReportRow, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+async fn model_cache_doctor() -> DesktopResult<ModelCacheReportRow> {
+    Ok(tauri::async_runtime::spawn_blocking(|| {
         denoize::models::doctor_model_cache().map(model_cache_report_row)
     })
     .await
-    .map_err(|error| format!("モデルキャッシュ診断タスクに失敗しました: {error}"))?
+    .map_err(|error| format!("モデルキャッシュ診断タスクに失敗しました: {error}"))??)
 }
 
 fn write_automation_json(path: &Path, json: &str) -> Result<(), String> {
@@ -2271,14 +3002,16 @@ fn write_automation_snapshot(path: &Path) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn save_automation_snapshot(path: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || write_automation_snapshot(Path::new(&path)))
-        .await
-        .map_err(|error| format!("自動化JSONの書出タスクに失敗しました: {error}"))?
+async fn save_automation_snapshot(path: String) -> DesktopResult<()> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || write_automation_snapshot(Path::new(&path)))
+            .await
+            .map_err(|error| format!("自動化JSONの書出タスクに失敗しました: {error}"))??,
+    )
 }
 
 #[tauri::command]
-async fn prune_model_cache(dry_run: bool) -> Result<ModelPruneReportRow, String> {
+async fn prune_model_cache(dry_run: bool) -> DesktopResult<ModelPruneReportRow> {
     tauri::async_runtime::spawn_blocking(move || {
         let report = denoize::models::prune_model_cache(dry_run)?;
         Ok(ModelPruneReportRow {
@@ -2311,7 +3044,7 @@ fn model_action(
     name: String,
     action: String,
     options: Option<ModelActionOptions>,
-) -> Result<u64, String> {
+) -> DesktopResult<u64> {
     let catalog = denoize::models::active_catalog()?;
     let model = catalog
         .find(&name)
@@ -2321,7 +3054,7 @@ fn model_action(
         action.as_str(),
         "install" | "update" | "verify" | "repair" | "remove"
     ) {
-        return Err(format!("不明な操作: {action}"));
+        return Err(format!("不明な操作: {action}").into());
     }
     let (download_options, source_path) =
         if matches!(action.as_str(), "install" | "update" | "repair") {
@@ -2444,73 +3177,114 @@ fn emit_model_progress(
             fraction: total
                 .filter(|total| *total > 0)
                 .map(|total| downloaded as f64 / total as f64),
+            error: (status == "failed").then(|| DesktopError::from(message)),
+        },
+    );
+}
+
+fn emit_preview_progress(
+    app: &AppHandle,
+    job_id: u64,
+    status: &'static str,
+    message: impl Into<String>,
+    result: Option<preview::PreviewResult>,
+    error: Option<String>,
+) {
+    let _ = app.emit(
+        "preview-progress",
+        PreviewProgress {
+            job_id,
+            status,
+            message: message.into(),
+            result,
+            error: error.map(DesktopError::from),
         },
     );
 }
 
 #[tauri::command]
-async fn prepare_preview(path: String, points: Option<usize>) -> Result<PreviewData, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let source = Path::new(&path);
-        if !source.is_file() {
-            return Err("プレビューする音声ファイルが存在しません".into());
-        }
-        let audio = read_audio(source)?;
-        let frames = audio.frames();
-        let point_count = points.unwrap_or(180).clamp(32, 512);
-        let mut waveform = vec![0.0f64; point_count];
-        let mut sum_squares = 0.0;
-        let mut sample_count = 0usize;
-        for channel in &audio.channels {
-            for (index, sample) in channel.iter().enumerate() {
-                let bucket = index.saturating_mul(point_count) / frames.max(1);
-                if let Some(peak) = waveform.get_mut(bucket.min(point_count - 1)) {
-                    *peak = peak.max(sample.abs());
-                }
-                sum_squares += sample * sample;
-                sample_count += 1;
+fn start_preview(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: preview::PreviewRequest,
+) -> DesktopResult<u64> {
+    preview::validate_preview_request(&request)?;
+    let (job_id, control) = register_job(&state)?;
+    state
+        .diagnostics
+        .record(diagnostics::DiagnosticCode::PreviewStarted);
+    let diagnostic_log = Arc::clone(&state.diagnostics);
+    let jobs = Arc::clone(&state.jobs);
+    std::thread::spawn(move || {
+        emit_preview_progress(
+            &app,
+            job_id,
+            "running",
+            "隔離ワーカーでプレビューを作成しています",
+            None,
+            None,
+        );
+        let code = match preview::render_isolated(request, job_id, &control) {
+            Ok(result) => {
+                emit_preview_progress(
+                    &app,
+                    job_id,
+                    "completed",
+                    "プレビューを作成しました",
+                    Some(result),
+                    None,
+                );
+                diagnostics::DiagnosticCode::PreviewCompleted
             }
+            Err(error) if error == "cancelled" => {
+                emit_preview_progress(
+                    &app,
+                    job_id,
+                    "cancelled",
+                    "プレビューをキャンセルしました",
+                    None,
+                    None,
+                );
+                diagnostics::DiagnosticCode::PreviewCancelled
+            }
+            Err(error) => {
+                emit_preview_progress(
+                    &app,
+                    job_id,
+                    "failed",
+                    "プレビューを作成できませんでした",
+                    None,
+                    Some(error),
+                );
+                diagnostics::DiagnosticCode::PreviewFailed
+            }
+        };
+        diagnostic_log.record(code);
+        if let Ok(mut jobs) = jobs.lock() {
+            jobs.remove(&job_id);
         }
-        let peak = waveform.iter().copied().fold(0.0f64, f64::max).max(1e-9);
-        for value in &mut waveform {
-            *value /= peak;
-        }
-        let rms = (sum_squares / sample_count.max(1) as f64).sqrt();
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        source
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .hash(&mut hasher);
-        let preview_dir = std::env::temp_dir().join("denoize-previews");
-        std::fs::create_dir_all(&preview_dir)
-            .map_err(|error| format!("プレビューフォルダを作成できません: {error}"))?;
-        let playable = preview_dir.join(format!("{:016x}.wav", hasher.finish()));
-        if !playable.is_file() {
-            write_audio(&playable, &audio, EncodeOptions::default())?;
-        }
-        Ok(PreviewData {
-            source: path,
-            playable_path: playable.to_string_lossy().into_owned(),
-            duration_seconds: frames as f64 / audio.sample_rate.max(1) as f64,
-            rms_db: 20.0 * rms.max(1e-10).log10(),
-            waveform,
-        })
-    })
-    .await
-    .map_err(|error| format!("プレビュー処理に失敗しました: {error}"))?
+    });
+    Ok(job_id)
 }
 
 #[tauri::command]
-fn load_gui_config(path: String, current: GuiConfig) -> Result<GuiConfig, String> {
+async fn release_preview_artifacts(preview_id: String) -> DesktopResult<()> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || preview::release_preview(&preview_id))
+            .await
+            .map_err(|error| format!("プレビュー消去タスクに失敗しました: {error}"))??,
+    )
+}
+
+#[tauri::command]
+fn load_gui_config(path: String, current: GuiConfig) -> DesktopResult<GuiConfig> {
     let source =
         std::fs::read_to_string(&path).map_err(|error| format!("{path} を読めません: {error}"))?;
-    parse_gui_config(&source, current)
+    Ok(parse_gui_config(&source, current)?)
 }
 
 #[tauri::command]
-fn save_gui_config(path: String, config: GuiConfig) -> Result<(), String> {
+fn save_gui_config(path: String, config: GuiConfig) -> DesktopResult<()> {
     let mut config = config.normalized()?;
     // `-1` is the CLI-compatible legacy sentinel for explicitly disabling
     // loudness/true-peak processing. Keeping it in exported TOML distinguishes
@@ -2520,7 +3294,8 @@ fn save_gui_config(path: String, config: GuiConfig) -> Result<(), String> {
     }
     let source = toml::to_string_pretty(&config)
         .map_err(|error| format!("設定をTOMLへ変換できません: {error}"))?;
-    std::fs::write(&path, source).map_err(|error| format!("{path} を保存できません: {error}"))
+    Ok(std::fs::write(&path, source)
+        .map_err(|error| format!("{path} を保存できません: {error}"))?)
 }
 
 fn parse_gui_config(source: &str, current: GuiConfig) -> Result<GuiConfig, String> {
@@ -2550,8 +3325,88 @@ fn classify_dropped_paths(paths: Vec<String>) -> DropSelection {
 }
 
 #[tauri::command]
-fn save_text_file(path: String, contents: String) -> Result<(), String> {
-    std::fs::write(&path, contents).map_err(|error| format!("{path} を保存できません: {error}"))
+fn save_text_file(path: String, contents: String) -> DesktopResult<()> {
+    Ok(std::fs::write(&path, contents)
+        .map_err(|error| format!("{path} を保存できません: {error}"))?)
+}
+
+#[tauri::command]
+fn list_recoveries(app: AppHandle) -> DesktopResult<Vec<recovery::RecoverySummary>> {
+    recovery::RecoveryStore::for_app(&app)?
+        .list()
+        .map_err(DesktopError::from)
+}
+
+#[tauri::command]
+fn discard_recovery(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    recovery_id: String,
+) -> DesktopResult<usize> {
+    let removed = recovery::RecoveryStore::for_app(&app)?.discard(&recovery_id)?;
+    state
+        .diagnostics
+        .record(diagnostics::DiagnosticCode::RecoveryDiscarded);
+    Ok(removed)
+}
+
+#[tauri::command]
+fn retry_recovery(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    recovery_id: String,
+) -> DesktopResult<u64> {
+    let store = recovery::RecoveryStore::for_app(&app)?;
+    let operation = store.operation_for_retry(&recovery_id)?;
+    store.cleanup_stages(&recovery_id)?;
+    let result = match operation {
+        recovery::RecoveryOperation::File(request) => start_process_inner(app, &state, request),
+        recovery::RecoveryOperation::Batch(request) => start_batch_inner(app, &state, request),
+    };
+    if result.is_ok() {
+        state
+            .diagnostics
+            .record(diagnostics::DiagnosticCode::RecoveryRetried);
+        if let Err(error) = store.remove_record(&recovery_id) {
+            eprintln!("denoize desktop: superseded recovery record cleanup failed: {error}");
+        }
+    }
+    result.map_err(DesktopError::from)
+}
+
+#[tauri::command]
+fn export_redacted_diagnostics(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> DesktopResult<()> {
+    let recoveries = recovery::RecoveryStore::for_app(&app)?.list()?;
+    let recovery_counts = diagnostics::DiagnosticRecoveryCounts {
+        pending: recoveries.iter().filter(|summary| !summary.corrupt).count(),
+        corrupt: recoveries.iter().filter(|summary| summary.corrupt).count(),
+        staged_artifacts: recoveries
+            .iter()
+            .map(|summary| summary.staged_artifacts)
+            .sum(),
+    };
+    let active_jobs = state
+        .jobs
+        .lock()
+        .map_err(|_| "診断用のジョブ状態を取得できません")?
+        .len();
+    let live_session_active = state
+        .live
+        .lock()
+        .map_err(|_| "診断用のlive状態を取得できません")?
+        .is_some();
+    diagnostics::DiagnosticReport::build(
+        active_jobs,
+        live_session_active,
+        recovery_counts,
+        state.diagnostics.snapshot(),
+    )
+    .write_new(Path::new(&path))
+    .map_err(DesktopError::from)
 }
 
 fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
@@ -2575,6 +3430,13 @@ fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
     Ok((job_id, control))
 }
 
+fn unregister_job(state: &AppState, job_id: u64) {
+    if let Ok(mut jobs) = state.jobs.lock() {
+        jobs.remove(&job_id);
+    }
+}
+
+#[cfg(any(feature = "live", test))]
 fn register_live_session(state: &AppState, running: Arc<AtomicBool>) -> Result<(), String> {
     // Use the same jobs-then-live lock order as `register_job`. Holding both
     // guards across validation and insertion makes the desktop's one-active-
@@ -3542,6 +4404,7 @@ fn prepare_process_receipt(
         stage,
         publication,
         reason,
+        _recovery_stage: None,
     }))
 }
 
@@ -3587,6 +4450,7 @@ fn prepare_batch_receipt(
         key_path,
         key,
         stage,
+        _recovery_stage: None,
     }))
 }
 
@@ -3601,6 +4465,9 @@ fn validate_batch_receipt_output_paths(
 fn validate_request(request: &ProcessRequest) -> Result<(), String> {
     validate_process_options(&request.options)?;
     validate_receipt_pair(request.receipt.as_deref(), request.receipt_key.as_deref())?;
+    if request.expected_input_fingerprint.is_some() != request.expected_recipe.is_some() {
+        return Err("採用したプレビューの入力fingerprintとrecipeは両方指定してください".into());
+    }
     let format = OutputFormat::from_path(Path::new(&request.output))?;
     if request.stream {
         if !(1..=denoize::config::MAX_STREAM_BLOCK_FRAMES).contains(&request.stream_frames) {
@@ -3639,6 +4506,30 @@ fn validate_request(request: &ProcessRequest) -> Result<(), String> {
     } else {
         ensure_output_available(Path::new(&request.output), request.options.force)
     }
+}
+
+fn validate_expected_preview_binding(
+    request: &ProcessRequest,
+    input_fingerprint: batch_resume::FileFingerprint,
+    recipe: Digest,
+) -> Result<(), String> {
+    let (expected_input, expected_recipe) =
+        match (request.expected_input_fingerprint, request.expected_recipe) {
+            (None, None) => return Ok(()),
+            (Some(input), Some(recipe)) => (input, recipe),
+            _ => {
+                return Err(
+                    "採用したプレビューの入力fingerprintとrecipeは両方指定してください".into(),
+                );
+            }
+        };
+    if input_fingerprint != expected_input {
+        return Err("採用したプレビューと最終処理の入力fingerprintが一致しません".into());
+    }
+    if recipe != expected_recipe {
+        return Err("採用したプレビューと最終処理のrecipeが一致しません".into());
+    }
+    Ok(())
 }
 
 fn build_process_execution_plan(request: &ProcessRequest) -> Result<ExecutionPlan, String> {
@@ -3739,6 +4630,7 @@ fn build_process_execution_plan(request: &ProcessRequest) -> Result<ExecutionPla
             .as_ref()
             .map(|model| (&model.fingerprint, model.sample_rate)),
     )?;
+    validate_expected_preview_binding(request, input_fingerprint, recipe)?;
     let output_locator = denoize::portable_file_locator(output)?;
     let item_id = denoize::execution_item_id(input_fingerprint, &output_locator, recipe)?;
     let frames = u64::try_from(audio.frames())
@@ -4018,6 +4910,7 @@ fn build_stream_process_execution_plan(request: &ProcessRequest) -> Result<Execu
             .as_ref()
             .map(|model| (&model.fingerprint, model.sample_rate)),
     )?;
+    validate_expected_preview_binding(request, input_fingerprint, base_recipe)?;
     let recipe = batch_resume::stream_recipe_digest(base_recipe, request.stream_frames, info)?;
     let mut reader = AudioStreamReader::from_session(input_session, decode_limits)?;
     let mut frames = 0_u64;
@@ -4307,26 +5200,44 @@ fn build_desktop_stream_plan_from_evidence(
     )
 }
 
-fn verify_desktop_stream_receipt_sources(
+fn verify_desktop_stream_bound_sources(
     reader: &AudioStreamReader,
     input: &Path,
+    bound_input: Option<batch_resume::FileFingerprint>,
+    bound_model: Option<&batch_resume::ConsumedModel>,
     evidence: Option<&DesktopStreamExecutionEvidence>,
 ) -> Result<(), String> {
-    let Some(evidence) = evidence else {
-        return Ok(());
+    let expected_input = match (bound_input, evidence) {
+        (Some(bound), Some(evidence)) if bound != evidence.input_fingerprint => {
+            return Err("ストリーム入力の拘束情報が一致しません".into());
+        }
+        (Some(bound), _) => Some(bound),
+        (None, Some(evidence)) => Some(evidence.input_fingerprint),
+        (None, None) => None,
     };
-    if reader.fingerprint_input()? != evidence.input_fingerprint
-        || batch_resume::fingerprint_file(input)? != evidence.input_fingerprint
-    {
-        return Err(format!(
-            "署名対象のストリーム入力が処理中に変更されました: {}",
-            input.display()
-        ));
+    if let Some(expected_input) = expected_input {
+        if reader.fingerprint_input()? != expected_input
+            || batch_resume::fingerprint_file(input)? != expected_input
+        {
+            return Err(format!(
+                "プレビューまたは実行証明に拘束されたストリーム入力が処理中に変更されました: {}",
+                input.display()
+            ));
+        }
     }
-    if let Some(model) = &evidence.model {
+    if let (Some(bound), Some(evidence_model)) = (
+        bound_model,
+        evidence.and_then(|evidence| evidence.model.as_ref()),
+    ) {
+        if bound != evidence_model {
+            return Err("ストリームモデルの拘束情報が一致しません".into());
+        }
+    }
+    let expected_model = bound_model.or_else(|| evidence.and_then(|item| item.model.as_ref()));
+    if let Some(model) = expected_model {
         if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
             return Err(format!(
-                "署名対象のストリームモデルが処理中に変更されました: {}",
+                "プレビューまたは実行証明に拘束されたストリームモデルが処理中に変更されました: {}",
                 model.path.display()
             ));
         }
@@ -4672,30 +5583,33 @@ fn process_stream_file(
     } else {
         MetadataPolicy::Drop
     };
-    let execution_identity = if request.resume || receipt.is_some() {
-        let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
-        let model = match batch_resume::consumed_model_config(&resolved)? {
-            Some(config) if request.resume => {
-                Some(batch_resume::fingerprint_resumable_model(config)?)
-            }
-            Some(config) => Some(batch_resume::fingerprint_consumed_model(config)?),
-            None => None,
+    let execution_identity =
+        if request.resume || receipt.is_some() || request.expected_input_fingerprint.is_some() {
+            let input_fingerprint = batch_resume::fingerprint_input_session(&mut input_session)?;
+            let model = match batch_resume::consumed_model_config(&resolved)? {
+                Some(config) if request.resume => {
+                    Some(batch_resume::fingerprint_resumable_model(config)?)
+                }
+                Some(config) => Some(batch_resume::fingerprint_consumed_model(config)?),
+                None => None,
+            };
+            let base_recipe = batch_resume::recipe_digest(
+                &resolved,
+                spec.channels as usize,
+                output_format,
+                encode_options,
+                metadata_policy,
+                model
+                    .as_ref()
+                    .map(|model| (&model.fingerprint, model.sample_rate)),
+            )?;
+            validate_expected_preview_binding(request, input_fingerprint, base_recipe)?;
+            let recipe =
+                batch_resume::stream_recipe_digest(base_recipe, request.stream_frames, info)?;
+            Some((input_fingerprint, recipe, model))
+        } else {
+            None
         };
-        let base_recipe = batch_resume::recipe_digest(
-            &resolved,
-            spec.channels as usize,
-            output_format,
-            encode_options,
-            metadata_policy,
-            model
-                .as_ref()
-                .map(|model| (&model.fingerprint, model.sample_rate)),
-        )?;
-        let recipe = batch_resume::stream_recipe_digest(base_recipe, request.stream_frames, info)?;
-        Some((input_fingerprint, recipe, model))
-    } else {
-        None
-    };
     let metadata = if request.options.preserve_metadata {
         input_session.read_metadata_with_limits(metadata_limits)?
     } else {
@@ -4779,9 +5693,9 @@ fn process_stream_file(
     } else {
         None
     };
-    if let Some(model) = stream_evidence
+    if let Some(model) = execution_identity
         .as_ref()
-        .and_then(|evidence| evidence.model.as_ref())
+        .and_then(|(_, _, model)| model.as_ref())
     {
         if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
             return Err(format!(
@@ -4839,7 +5753,17 @@ fn process_stream_file(
                 if completed.input_frames() != completed.output_frames() {
                     return Err("完了済みストリームcheckpointの入出力長が一致しません".into());
                 }
-                verify_desktop_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+                verify_desktop_stream_bound_sources(
+                    &reader,
+                    input,
+                    execution_identity
+                        .as_ref()
+                        .map(|(fingerprint, _, _)| *fingerprint),
+                    execution_identity
+                        .as_ref()
+                        .and_then(|(_, _, model)| model.as_ref()),
+                    stream_evidence.as_ref(),
+                )?;
                 if let (Some(receipt_context), Some(evidence)) =
                     (receipt.as_mut(), stream_evidence.as_ref())
                 {
@@ -4915,10 +5839,15 @@ fn process_stream_file(
             }
         }
         checkpoint.append_block(&processor.finish()?)?;
-        if reader.fingerprint_input()? != input_fingerprint {
-            return Err("処理中にストリーム入力が変更されました".into());
-        }
-        verify_desktop_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+        verify_desktop_stream_bound_sources(
+            &reader,
+            input,
+            Some(input_fingerprint),
+            execution_identity
+                .as_ref()
+                .and_then(|(_, _, model)| model.as_ref()),
+            stream_evidence.as_ref(),
+        )?;
         let output_frames = checkpoint.output_frames();
         if output_frames != input_frames {
             return Err(format!(
@@ -4931,6 +5860,7 @@ fn process_stream_file(
         let mut final_encode_spec = encode_spec;
         final_encode_spec.total_frames = Some(output_frames);
         let mut transaction = AtomicOutput::new(output)?;
+        let _recovery_stage = control.track_stage(&transaction)?;
         {
             let mut writer = AudioStreamWriter::new_with_limits(
                 transaction.file_mut(),
@@ -5057,6 +5987,7 @@ fn process_stream_file(
         }
     } else {
         let mut transaction = AtomicOutput::new(output)?;
+        let _recovery_stage = control.track_stage(&transaction)?;
         let mut input_frames = 0_u64;
         let mut output_frames = 0_u64;
         {
@@ -5129,7 +6060,17 @@ fn process_stream_file(
             decode_limits,
             verification_block_frames,
         )?;
-        verify_desktop_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+        verify_desktop_stream_bound_sources(
+            &reader,
+            input,
+            execution_identity
+                .as_ref()
+                .map(|(fingerprint, _, _)| *fingerprint),
+            execution_identity
+                .as_ref()
+                .and_then(|(_, _, model)| model.as_ref()),
+            stream_evidence.as_ref(),
+        )?;
         drop(reader);
         drop(processor);
         match (receipt.as_mut(), stream_evidence.as_ref()) {
@@ -5204,11 +6145,19 @@ fn process_file(
     } else {
         None
     };
-    let receipt_input_fingerprint = if receipt.is_some() {
-        Some(batch_resume::fingerprint_input_session(&mut input_session)?)
-    } else {
-        None
-    };
+    let bound_input_fingerprint =
+        if receipt.is_some() || request.expected_input_fingerprint.is_some() {
+            Some(batch_resume::fingerprint_input_session(&mut input_session)?)
+        } else {
+            None
+        };
+    if let (Some(expected), Some(actual)) =
+        (request.expected_input_fingerprint, bound_input_fingerprint)
+    {
+        if expected != actual {
+            return Err("採用したプレビューと最終処理の入力fingerprintが一致しません".into());
+        }
+    }
     let mut audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)?;
     let decoded_working_set = estimate_audio_working_set_bytes(&audio);
     let metadata_limits =
@@ -5228,13 +6177,35 @@ fn process_file(
     progress(1, "ノイズ除去を実行しています");
     check_cancelled(control)?;
     let processing = resolved_processing_options(&request.options, &audio)?;
-    let receipt_model = if receipt.is_some() {
+    let bound_model = if receipt.is_some() || request.expected_recipe.is_some() {
         batch_resume::consumed_model_config(&processing)?
             .map(batch_resume::fingerprint_consumed_model)
             .transpose()?
     } else {
         None
     };
+    let metadata_policy = if request.options.preserve_metadata {
+        MetadataPolicy::Preserve
+    } else {
+        MetadataPolicy::Drop
+    };
+    let bound_recipe = if receipt.is_some() || request.expected_recipe.is_some() {
+        Some(batch_resume::recipe_digest(
+            &processing,
+            audio.channels(),
+            format,
+            encode,
+            metadata_policy,
+            bound_model
+                .as_ref()
+                .map(|model| (&model.fingerprint, model.sample_rate)),
+        )?)
+    } else {
+        None
+    };
+    if let (Some(input_fingerprint), Some(recipe)) = (bound_input_fingerprint, bound_recipe) {
+        validate_expected_preview_binding(request, input_fingerprint, recipe)?;
+    }
     let governor = desktop_resource_governor(&request.options, 1)?;
     let worker_request = desktop_worker_request(
         input_bytes,
@@ -5264,7 +6235,7 @@ fn process_file(
         processing.backend_options.clone(),
         processing.accelerator,
     )?;
-    if let Some(model) = &receipt_model {
+    if let Some(model) = &bound_model {
         if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
             return Err(format!(
                 "署名対象のモデルが準備中に変更されました: {}",
@@ -5285,6 +6256,7 @@ fn process_file(
             .map_err(|error| format!("出力フォルダを作成できません: {error}"))?;
     }
     let mut transaction = AtomicOutput::new(output)?;
+    let _recovery_stage = control.track_stage(&transaction)?;
     write_audio_to_file(transaction.file_mut(), format, &audio, encode)?;
     if let Some(metadata) = metadata {
         denoize::metadata::write_extended_to_file_with_limits(
@@ -5304,48 +6276,36 @@ fn process_file(
             worker_request.temporary_bytes()
         ));
     }
-    if let Some(receipt_context) = receipt.as_mut() {
-        let input_fingerprint =
-            receipt_input_fingerprint.ok_or("実行証明の入力fingerprintが取得されていません")?;
-        let receipt_probe = receipt_probe
-            .as_ref()
-            .ok_or("実行証明の入力codecが確認されていません")?;
+    if let Some(input_fingerprint) = bound_input_fingerprint {
         if batch_resume::fingerprint_input_session(&mut input_session)? != input_fingerprint
             || batch_resume::fingerprint_file(input)? != input_fingerprint
         {
             return Err(format!(
-                "署名対象の入力が処理中に変更されました: {}",
+                "プレビューまたは実行証明に拘束された入力が処理中に変更されました: {}",
                 input.display()
             ));
         }
-        if let Some(model) = &receipt_model {
-            if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
-                return Err(format!(
-                    "署名対象のモデルが処理中に変更されました: {}",
-                    model.path.display()
-                ));
-            }
+    }
+    if let Some(model) = &bound_model {
+        if batch_resume::fingerprint_file(&model.path)? != model.fingerprint {
+            return Err(format!(
+                "プレビューまたは実行証明に拘束されたモデルが処理中に変更されました: {}",
+                model.path.display()
+            ));
         }
-        let metadata_policy = if request.options.preserve_metadata {
-            MetadataPolicy::Preserve
-        } else {
-            MetadataPolicy::Drop
-        };
-        let recipe = batch_resume::recipe_digest(
-            &processing,
-            audio.channels(),
-            format,
-            encode,
-            metadata_policy,
-            receipt_model
-                .as_ref()
-                .map(|model| (&model.fingerprint, model.sample_rate)),
-        )?;
+    }
+    if let Some(receipt_context) = receipt.as_mut() {
+        let input_fingerprint =
+            bound_input_fingerprint.ok_or("実行証明の入力fingerprintが取得されていません")?;
+        let receipt_probe = receipt_probe
+            .as_ref()
+            .ok_or("実行証明の入力codecが確認されていません")?;
+        let recipe = bound_recipe.ok_or("実行証明のrecipeが取得されていません")?;
         let output_locator = denoize::portable_file_locator(output)?;
         let item_id = denoize::execution_item_id(input_fingerprint, &output_locator, recipe)?;
         let frames = u64::try_from(audio.frames())
             .map_err(|_| "実行証明のフレーム数が大きすぎます".to_string())?;
-        let planned_model = receipt_model
+        let planned_model = bound_model
             .as_ref()
             .map(|model| {
                 Ok::<PlannedArtifact, String>(PlannedArtifact {
@@ -5561,32 +6521,58 @@ fn emit_progress_with_accelerator(
 ) {
     let _ = app.emit(
         "job-progress",
-        JobProgress {
+        job_progress(
             job_id,
             kind,
             status,
-            message: message.into(),
+            message,
             current,
             total,
-            fraction: current as f64 / total.max(1) as f64,
-            elapsed_seconds: started.elapsed().as_secs_f64(),
+            started,
             output,
             error,
-            eta_seconds: None,
-            item: None,
-            item_status: None,
-            item_id: None,
-            resume_reason: None,
-            accelerator: accelerator.map(accelerator_result),
-        },
+            accelerator,
+        ),
     );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_batch_item(
-    app: &AppHandle,
+fn job_progress(
     job_id: u64,
-    item_status: &'static str,
+    kind: &str,
+    status: &str,
+    message: &str,
+    current: usize,
+    total: usize,
+    started: Instant,
+    output: Option<String>,
+    error: Option<String>,
+    accelerator: Option<denoize::AcceleratorSelection>,
+) -> JobProgress {
+    JobProgress {
+        job_id,
+        kind: kind.into(),
+        status: status.into(),
+        message: message.into(),
+        current,
+        total,
+        fraction: current as f64 / total.max(1) as f64,
+        elapsed_seconds: started.elapsed().as_secs_f64(),
+        output,
+        error: error.map(DesktopError::from),
+        eta_seconds: None,
+        item: None,
+        item_status: None,
+        item_id: None,
+        resume_reason: None,
+        accelerator: accelerator.map(accelerator_result),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_item_progress(
+    job_id: u64,
+    item_status: &str,
     item: &BatchItem,
     resume_reason: Option<batch_resume::ResumeReason>,
     current: usize,
@@ -5594,7 +6580,7 @@ fn emit_batch_item(
     started: Instant,
     error: Option<String>,
     accelerator: denoize::AcceleratorSelection,
-) {
+) -> JobProgress {
     let elapsed = started.elapsed().as_secs_f64();
     let eta =
         (current > 0).then(|| elapsed / current as f64 * total.saturating_sub(current) as f64);
@@ -5603,27 +6589,26 @@ fn emit_batch_item(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("audio");
-    let _ = app.emit(
-        "job-progress",
-        JobProgress {
-            job_id,
-            kind: "batch",
-            status: "running",
-            message: format!("{name}: {item_status}"),
-            current,
-            total,
-            fraction: current as f64 / total.max(1) as f64,
-            elapsed_seconds: elapsed,
-            output: Some(item.output.to_string_lossy().into_owned()),
-            error,
-            eta_seconds: eta,
-            item: Some(item.input.to_string_lossy().into_owned()),
-            item_status: Some(item_status),
-            item_id: Some(item.item_id.as_hex()),
-            resume_reason: resume_reason.map(batch_resume::ResumeReason::as_str),
-            accelerator: Some(accelerator_result(accelerator)),
-        },
-    );
+    JobProgress {
+        job_id,
+        kind: "batch".into(),
+        status: "running".into(),
+        message: format!("{name}: {item_status}"),
+        current,
+        total,
+        fraction: current as f64 / total.max(1) as f64,
+        elapsed_seconds: elapsed,
+        output: Some(item.output.to_string_lossy().into_owned()),
+        error: error.map(DesktopError::from),
+        eta_seconds: eta,
+        item: Some(item.input.to_string_lossy().into_owned()),
+        item_status: Some(item_status.into()),
+        item_id: Some(item.item_id.as_hex()),
+        resume_reason: resume_reason
+            .map(batch_resume::ResumeReason::as_str)
+            .map(Into::into),
+        accelerator: Some(accelerator_result(accelerator)),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5634,6 +6619,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            accessibility_e2e_active,
+            finish_accessibility_e2e,
             app_info,
             recommend_settings,
             plan_process,
@@ -5645,6 +6632,10 @@ pub fn run() {
             verify_execution_receipt,
             start_process,
             start_batch,
+            list_recoveries,
+            retry_recovery,
+            discard_recovery,
+            export_redacted_diagnostics,
             cancel_job,
             live_devices,
             start_live,
@@ -5661,17 +6652,32 @@ pub fn run() {
             save_automation_snapshot,
             prune_model_cache,
             model_action,
-            prepare_preview,
+            start_preview,
+            release_preview_artifacts,
             load_gui_config,
             save_gui_config,
             classify_dropped_paths,
             save_text_file
         ])
         .setup(|app| {
-            let preview_dir = std::env::temp_dir().join("denoize-previews");
-            let _ = std::fs::remove_dir_all(&preview_dir);
+            app.state::<AppState>()
+                .diagnostics
+                .record(diagnostics::DiagnosticCode::ApplicationStarted);
+            if let Err(error) = preview::cleanup_preview_root() {
+                eprintln!("denoize desktop: stale preview cleanup failed: {error}");
+            }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_title(&format!("denoize {}", env!("CARGO_PKG_VERSION")));
+            }
+            if ACCESSIBILITY_E2E_ACTIVE.load(Ordering::SeqCst) {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(45));
+                    if ACCESSIBILITY_E2E_ACTIVE.swap(false, Ordering::SeqCst) {
+                        eprintln!("DENOIZE_DESKTOP_A11Y_E2E:FAIL:timeout");
+                        handle.exit(124);
+                    }
+                });
             }
             Ok(())
         })
@@ -5708,6 +6714,47 @@ mod tests {
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
         "ca612de7a807fbd3375ce5f9945d9a438805a10e8eea15d10b6c5922ac104d8b";
+
+    #[test]
+    fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {
+        let error = DesktopError::from("GPU memory budget exceeded".to_string());
+        assert_eq!(error.code, "resource.accelerator");
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["code"], "resource.accelerator");
+        assert_eq!(value["parameters"], serde_json::json!({}));
+        assert_eq!(value["technicalDetail"], "GPU memory budget exceeded");
+        assert!(value.get("technical_detail").is_none());
+
+        let bounded = DesktopError::from("界".repeat(2_000));
+        assert!(bounded.technical_detail.len() <= MAX_DESKTOP_ERROR_DETAIL_BYTES);
+        assert!(bounded.technical_detail.ends_with('…'));
+        assert!(bounded.is_valid());
+
+        let mut invalid = bounded.clone();
+        invalid.code = "unknown.failure".into();
+        assert!(!invalid.is_valid());
+        invalid.code = "operation.failed".into();
+        invalid.parameters.insert("bad key".into(), "value".into());
+        assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn accessibility_e2e_reports_are_bounded_and_unique() {
+        let mut report = AccessibilityE2eReport {
+            schema: "denoize-desktop-a11y-e2e-v1".into(),
+            schema_version: 1,
+            assertions: vec!["runtime.started".into(), "runtime.keyboard".into()],
+            failures: Vec::new(),
+        };
+        validate_accessibility_e2e_report(&report).unwrap();
+        report.assertions.push("runtime.keyboard".into());
+        assert!(validate_accessibility_e2e_report(&report).is_err());
+        report.assertions.pop();
+        report
+            .failures
+            .push("x".repeat(MAX_ACCESSIBILITY_E2E_FAILURE_BYTES + 1));
+        assert!(validate_accessibility_e2e_report(&report).is_err());
+    }
 
     #[test]
     fn recommendation_request_maps_to_bounded_library_options() {
@@ -5815,7 +6862,10 @@ mod tests {
             missing.to_string_lossy().into_owned(),
         ))
         .unwrap_err();
-        assert!(inspect_error.contains("file not found"), "{inspect_error}");
+        assert!(
+            inspect_error.technical_detail.contains("file not found"),
+            "{inspect_error:?}"
+        );
 
         let import_error = tauri::async_runtime::block_on(import_model_bundle(
             missing.to_string_lossy().into_owned(),
@@ -5823,8 +6873,10 @@ mod tests {
         ))
         .unwrap_err();
         assert!(
-            import_error.contains("expected offline bundle SHA-256"),
-            "{import_error}"
+            import_error
+                .technical_detail
+                .contains("expected offline bundle SHA-256"),
+            "{import_error:?}"
         );
     }
 
@@ -5887,6 +6939,8 @@ mod tests {
         ProcessRequest {
             input: input.to_string_lossy().into_owned(),
             output: output.to_string_lossy().into_owned(),
+            expected_input_fingerprint: None,
+            expected_recipe: None,
             stream: false,
             resume: false,
             stream_frames: DEFAULT_STREAM_BLOCK_FRAMES,
@@ -6140,6 +7194,62 @@ deterministic = false
     }
 
     #[test]
+    fn adopted_preview_binds_the_final_input_and_recipe() {
+        let directory = TestDirectory::create("adopted-preview-binding");
+        let input = directory.join("input.wav");
+        let output = directory.join("output.wav");
+        write_test_wav(&input);
+        let mut request = process_request(&input, &output, classical_options(false));
+        let plan = build_process_execution_plan(&request).unwrap();
+        let item = plan.items.first().unwrap();
+        request.expected_input_fingerprint = Some(item.input.fingerprint);
+        request.expected_recipe = Some(item.recipe);
+
+        validate_request(&request).unwrap();
+        process_file(&request, None, &JobControl::default(), |_, _| {}).unwrap();
+
+        assert!(output.is_file());
+        directory.assert_no_staged_outputs();
+
+        let mismatched_output = directory.join("mismatched.wav");
+        let mut mismatched = process_request(&input, &mismatched_output, classical_options(false));
+        mismatched.expected_input_fingerprint = Some(item.input.fingerprint);
+        mismatched.expected_recipe = Some("00".repeat(32).parse().unwrap());
+        let error = process_file(&mismatched, None, &JobControl::default(), |_, _| {}).unwrap_err();
+        assert!(error.contains("recipe"), "{error}");
+        assert!(!mismatched_output.exists());
+        directory.assert_no_staged_outputs();
+
+        mismatched.expected_recipe = None;
+        assert!(validate_request(&mismatched)
+            .unwrap_err()
+            .contains("両方指定"));
+    }
+
+    #[test]
+    fn adopted_preview_recipe_also_binds_a_streaming_final_job() {
+        let directory = TestDirectory::create("adopted-preview-stream-binding");
+        let input = directory.join("input.wav");
+        let output = directory.join("output.wav");
+        write_test_wav(&input);
+        let mut request = process_request(&input, &output, classical_options(false));
+        let preview_plan = build_process_execution_plan(&request).unwrap();
+        let preview_item = preview_plan.items.first().unwrap();
+        request.expected_input_fingerprint = Some(preview_item.input.fingerprint);
+        request.expected_recipe = Some(preview_item.recipe);
+        request.stream = true;
+        request.stream_frames = 113;
+
+        validate_request(&request).unwrap();
+        let stream_plan = build_process_execution_plan(&request).unwrap();
+        assert_eq!(stream_plan.kind, ExecutionKind::Stream);
+        process_file(&request, None, &JobControl::default(), |_, _| {}).unwrap();
+
+        assert!(output.is_file());
+        directory.assert_no_staged_outputs();
+    }
+
+    #[test]
     fn desktop_stream_plan_and_receipt_authenticate_the_same_encoded_output() {
         let directory = TestDirectory::create("execution-stream-plan-receipt");
         let input = directory.join("input.wav");
@@ -6386,6 +7496,7 @@ deterministic = false
             key: unplanned.key,
             stage: unplanned.stage,
             plan,
+            _recovery_stage: unplanned._recovery_stage,
         };
         session.activate().unwrap();
         let outcomes = planned
@@ -6436,6 +7547,7 @@ deterministic = false
             key: unplanned.key,
             stage: unplanned.stage,
             plan: build_desktop_batch_plan(&request, &planned).unwrap(),
+            _recovery_stage: unplanned._recovery_stage,
         };
         session.activate().unwrap();
         let outcomes = planned
@@ -6821,7 +7933,7 @@ deterministic = false
         let output = directory.join("output.flac");
         write_test_wav(&wav);
         let original = read_audio(&wav).unwrap();
-        write_audio(&input, &original, EncodeOptions::default()).unwrap();
+        denoize::audio::write_audio(&input, &original, EncodeOptions::default()).unwrap();
 
         let mut request = process_request(&input, &output, classical_options(false));
         request.stream = true;
@@ -6874,7 +7986,7 @@ deterministic = false
         let mut request = batch_request();
         request.output_dir = directory.path.to_string_lossy().into_owned();
 
-        let error = prepare_registered_batch(&state, &request)
+        let error = register_batch_job(&state, &request)
             .err()
             .expect("an active job must reject the batch");
 
@@ -7137,6 +8249,45 @@ deterministic = false
 
         assert!(published.load(Ordering::SeqCst));
         assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn shared_worker_cancel_fence_prevents_later_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("cancel");
+        let fence_path = directory.path().join("commit.lock");
+        std::fs::write(&fence_path, b"").unwrap();
+        let parent_fence = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fence_path)
+            .unwrap();
+        let worker_fence = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fence_path)
+            .unwrap();
+        let parent = JobControl::default();
+        let worker = JobControl::default();
+        parent
+            .install_shared_cancellation(marker.clone(), parent_fence)
+            .unwrap();
+        worker
+            .install_shared_cancellation(marker.clone(), worker_fence)
+            .unwrap();
+
+        parent.cancel().unwrap();
+        let published = AtomicBool::new(false);
+        let error = worker
+            .commit_fence(|| {
+                published.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert_eq!(error, "cancelled");
+        assert!(!published.load(Ordering::SeqCst));
+        assert!(marker.is_file());
     }
 
     #[test]

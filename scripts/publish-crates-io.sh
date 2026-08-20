@@ -150,6 +150,7 @@ if [[ "$is_dry_run" == true ]]; then
   for required in \
     "denoize-${package_version}/src/automation.rs" \
     "denoize-${package_version}/src/recommendation.rs" \
+    "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
@@ -159,6 +160,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-execution-receipt-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-hardware-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-presentation-region-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-public-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-secret-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-trust-policy-v1.schema.json" \

@@ -1053,6 +1053,8 @@ name = "denoize-desktop"
 version = "0.61.0"
 dependencies = [
  "denoize",
+ "fs2",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
@@ -1062,6 +1064,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-process",
  "tauri-plugin-updater",
+ "tempfile",
  "toml 0.8.2",
  "windows-sys 0.61.2",
 ]
