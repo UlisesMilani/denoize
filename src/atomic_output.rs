@@ -1009,6 +1009,16 @@ impl AtomicOutput {
         })
     }
 
+    /// Return the private staged-file path held by this transaction.
+    ///
+    /// The path is valid only while this value is alive and has not been
+    /// committed. It is exposed so a supervising application can durably
+    /// record the exact artifact that must be considered after an abrupt
+    /// process exit; callers must never publish or reopen it as user output.
+    pub fn staged_path(&self) -> &Path {
+        self.temporary.path()
+    }
+
     /// Create a staged output whose newly published destination remains
     /// owner-only.
     ///
@@ -1032,8 +1042,11 @@ impl AtomicOutput {
         self.temporary.as_file_mut()
     }
 
-    /// Return the destination path fixed when this transaction was created.
-    pub(crate) fn destination_path(&self) -> &Path {
+    /// Return the resolved destination fixed when this transaction was created.
+    ///
+    /// This is the exact sibling destination against which
+    /// [`staged_path`](Self::staged_path) was created and security-checked.
+    pub fn destination_path(&self) -> &Path {
         &self.destination
     }
 
@@ -1301,7 +1314,7 @@ impl AtomicOutput {
 
     #[cfg(test)]
     pub(crate) fn temporary_path(&self) -> &Path {
-        self.temporary.path()
+        self.staged_path()
     }
 }
 

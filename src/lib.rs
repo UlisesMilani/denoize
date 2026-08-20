@@ -64,6 +64,7 @@ pub mod perceptual;
 pub mod postfilter;
 pub mod quality;
 pub mod recommendation;
+pub mod region;
 pub mod resample;
 pub mod resource;
 pub mod service;
@@ -137,6 +138,9 @@ pub use recommendation::{
     RecommendationGoal, RecommendationInput, RecommendationMaterial, RecommendationOptions,
     RecommendationReason, RecommendationReport, RECOMMENDATION_SCHEMA,
     RECOMMENDATION_SCHEMA_VERSION,
+};
+pub use region::{
+    PresentationRegion, PRESENTATION_REGION_SCHEMA, PRESENTATION_REGION_SCHEMA_VERSION,
 };
 pub use resource::{
     estimate_backend_session_request, estimate_gpu_session_bytes, estimate_gpu_worker_bytes,

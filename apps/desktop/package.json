@@ -6,6 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check:a11y": "node scripts/check-a11y.mjs",
+    "test:a11y:webview": "bash scripts/test-webview-a11y.sh",
+    "check:i18n": "node scripts/check-i18n.mjs",
+    "check:ui": "npm run check:i18n && npm run check:a11y",
     "preview": "vite preview",
     "tauri": "tauri"
   },

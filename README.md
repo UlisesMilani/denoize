@@ -633,8 +633,9 @@ on Unix, `--max-process-memory` becomes an `RLIMIT_AS` address-space ceiling,
 and on Windows it becomes a Job Object process-memory ceiling. The parent
 survives a decoder/model abort and publishes no staged output from a failed
 child. Without a process-memory value, isolation still contains child failure
-but does not invent a memory ceiling. The desktop resource controls use the
-same cooperative governor; they do not create a subprocess.
+but does not invent a memory ceiling. Desktop file and batch jobs always use
+the equivalent supervised child boundary; desktop live audio remains in
+the application process under the cooperative governor.
 
 FLAC and Ogg structure is also checked with finite block,
 packet, page, stream, item, and aggregate metadata limits before a decoder can
@@ -671,8 +672,15 @@ ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
 when selected; managed GTCRN weights are resolved automatically after install.
 The resource panel applies aggregate RAM and staged-output admission, a
 conservative GPU-memory reservation, and a GPU-worker concurrency limit to
-single-file, batch, and live jobs. Desktop jobs remain in-process; use the CLI
-with `--isolate` when an OS-enforced child boundary is required.
+single-file, batch, and live jobs. Final file, batch, and short preview work run
+in supervised child processes so a decoder or model abort cannot directly take
+down the UI. Unix workers disable core dumps and die with their parent; Windows
+workers start behind a gate, enter a kill-on-close Job Object before processing,
+and apply the configured process-memory ceiling. Without an explicit ceiling,
+isolation still contains a worker crash but does not claim allocator-exact RSS.
+Final workers exchange bounded nonce-authenticated progress records. A shared
+commit/cancel fence prevents a cancelled or rejected worker from publishing a
+later output.
 The model manager shows signed-catalog identity and installed provenance and
 can update the catalog or atomically export the stable automation JSON. Its
 offline, alternate-source, proxy/direct,
@@ -683,8 +691,17 @@ CLI-compatible imports and exports.
 Desktop batches accept files or folders, preserve relative paths, run with a
 configurable worker count, continue after individual failures, and can resume
 from the same `.denoize-state` journal used by the CLI in the output directory.
-Single-file processing also provides local waveform previews, RMS-matched
-before/after switching, click-to-seek, and configurable section looping.
+Single-file processing also provides a bounded non-destructive audition flow.
+It renders at most 30 seconds and up to three candidate recipes, exposes
+loudness-matched original, processed, and removed-signal audio, supports
+keyboard seeking and looping, and includes a blind A/B choice. A selected
+recipe is persisted locally, but applying it to a final job still requires the
+same source fingerprint, effective backend, output format, and recipe. Restored
+choices must be rendered again before use. The public
+[`denoize-presentation-region-v1`](schemas/denoize-presentation-region-v1.schema.json)
+locator stores exact presentation ticks rather than encoded packet time. A
+cancelled or failed preview publishes no final output or restart state and its
+private temporary directory is removed.
 Desktop settings are restored automatically, can be stored as named presets,
 and can be imported or exported as CLI-compatible TOML. Recent input files are
 kept locally for quick reuse. The single-file and batch views also expose a
@@ -705,10 +722,37 @@ capture or playback starts. GTCRN requires its managed model to be installed
 recurrent state per processed channel. Headphones help prevent acoustic
 feedback.
 
+File and batch jobs keep owner-private recovery records while their exact
+denoize staging files are live. After a crash, the desktop can retry the saved
+request or discard the record and only those verified private stage files;
+existing outputs and batch restart journals are never deleted by recovery.
+Startup cleanup preserves previews owned by another running desktop instance.
+The diagnostics export is bounded, owner-private, and no-clobber. It contains
+only schema-defined capability, limit, recovery-count, and event-code fields;
+paths, URLs, credentials, device names, free-form errors, and audio are not
+recorded.
+
+The desktop interface can switch between Japanese and English without a
+restart and stores only that locale preference. Static interface text and
+application-owned status messages are checked against the translation catalog
+during the frontend build. Rust command failures cross the IPC boundary as a
+stable code, bounded parameters, and a preserved technical detail; the WebView
+localizes the code instead of treating backend prose as UI copy. Navigation,
+preview candidates, seek controls, progress, and level meters expose keyboard
+and ARIA semantics; visible focus, reduced-motion, and forced-colors modes are
+also supported. CI starts the application in a real Linux WebKit WebView and
+exercises control names, tab/panel state, keyboard navigation, the skip link,
+locale changes, live-region semantics, and structured-error IPC.
+
 ```sh
 cd apps/desktop
 npm ci
 npm run tauri -- dev
+
+# Static UI contracts plus the real-WebKit accessibility run
+npm run check:ui
+npm run build
+npm run test:a11y:webview
 
 # Build a platform-native installer/package
 npm run tauri -- build
@@ -721,7 +765,7 @@ Linux development requires the WebKitGTK 4.1 and GTK 3 development packages.
 For Ubuntu 24.04 or later:
 
 ```sh
-sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf xvfb
 ```
 
 ## Prebuilt binaries

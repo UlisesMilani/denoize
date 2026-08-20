@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes fourteen versioned JSON contracts for local automation. Their
+denoize publishes fifteen versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -20,6 +20,9 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-hardware-v1.schema.json`](../schemas/denoize-hardware-v1.schema.json)
   describes a network-free snapshot of CPU features, compiled accelerator
   runtimes, runtime availability, and backend accelerator support.
+- [`denoize-presentation-region-v1.schema.json`](../schemas/denoize-presentation-region-v1.schema.json)
+  describes one exact, source-bound interval on the decoded presentation
+  timeline.
 - [`denoize-receipt-public-key-v1.schema.json`](../schemas/denoize-receipt-public-key-v1.schema.json)
   describes a distributable receipt-verification key.
 - [`denoize-receipt-secret-key-v1.schema.json`](../schemas/denoize-receipt-secret-key-v1.schema.json)
@@ -43,8 +46,9 @@ documented enum/string values are stable. A future release may add fields, so
 consumers must ignore unknown fields unless the contract explicitly says they
 are rejected. Removing a field, changing its type, or changing a documented
 value requires a new schema identifier and version. Execution plans, receipts,
-keys, policies, and verification reports deliberately reject unknown fields:
-their exact typed representation participates in signing and trust decisions.
+keys, policies, verification reports, and presentation regions deliberately
+reject unknown fields: their exact typed representation participates in
+signing, trust, or source-binding decisions.
 
 ## Model and provenance snapshot
 
@@ -132,6 +136,44 @@ the concrete `cpu`, `metal`, or `cuda` runtime. `fallback` is `null` unless an
 `auto` request deliberately selected CPU because deterministic mode was active,
 the backend is CPU-only, or no GPU runtime passed its local availability probe.
 The effective runtime participates in finite-file recipe identity.
+
+## Source-bound presentation regions
+
+`denoize-presentation-region-v1` represents one half-open interval on decoded
+presentation PCM. `timescale` is the exact decoded sample rate, so `start_tick`
+and `duration_ticks` map one-to-one to presentation frames after codec delay,
+granule, or edit-list handling. All integer fields remain within JavaScript's
+exact `2^53 - 1` range.
+
+The locator embeds the source file's byte length and SHA-256 fingerprint. A
+consumer must validate that fingerprint, timescale, positive duration, checked
+endpoint, and input bounds before returning samples. Replacement bytes, a
+different presentation rate, an interval beyond the input, unknown fields, and
+future schema versions fail without modifying the source or an existing output.
+The locator contains neither an input path nor audio. Stage 14 desktop previews
+use this contract for a single bounded interval; the public `PresentationRegion`
+library type is intentionally reusable by the later portable timeline work.
+
+## Desktop structured failures
+
+Tauri command failures and asynchronous file, batch, preview, model, and live
+events use one internal camel-case envelope:
+
+```json
+{
+  "code": "input.not-found",
+  "parameters": {},
+  "technicalDetail": "入力ファイルが存在しません"
+}
+```
+
+`code` is the application-owned localization key, `parameters` contains only
+schema-defined substitutions, and `technicalDetail` preserves the bounded
+backend explanation for troubleshooting. The Japanese and English WebView
+catalogs cover the same exact code set and fall back to `operation.failed` for
+an unknown future code. Backend prose is never used as the localization key.
+This envelope is an internal desktop IPC contract, not an additional CLI JSON
+automation schema.
 
 ## Read-only plans and signed execution receipts
 

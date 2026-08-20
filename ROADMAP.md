@@ -317,13 +317,31 @@ switch between loudness-matched original and processed audio, run a blind A/B
 comparison, and persist the chosen recipe. Preview work uses the same backend,
 resource admission, and source fingerprint as the final job. Its bounded region
 locator is versioned so Stage 23 can reuse it without changing presentation
-time; cancelling a preview leaves no output or durable state.
+time; cancelling a preview leaves no output or durable state. Preview,
+final-file, and batch decoding/inference run in supervised child processes.
+Final workers publish bounded authenticated progress, and a shared
+commit/cancel fence prevents output publication after cancellation or protocol
+failure. File and batch jobs keep owner-private recovery records for their exact
+live stages.
+Recovery can retry a request or remove only verified denoize-owned stages; it
+does not delete an existing output or restart journal. Diagnostics contain only
+bounded schema-defined event codes and capability/count fields. Rust failures
+use structured codes with localized Japanese/English summaries and preserved
+technical details. Keyboard/ARIA navigation, visible focus, reduced motion,
+and forced-colors checks are joined by a real-WebView interaction test in the
+desktop release gate.
 
 Stage 19 exposes only local, authenticated control surfaces and reuses the
 bounded JSON contracts, resource admission, signed receipts, and regular-file
 publication rules rather than creating a second execution model. Capability
 grants are explicit and revocable; discovery, transport, request size, timeout,
-and concurrency limits are part of the public contract.
+and concurrency limits are part of the public contract. Its durable queue
+supports explicit priority plus pause and resume at a verified checkpoint
+boundary; work without a resumable boundary remains cancel-and-retry rather
+than pretending to pause safely. Before admission, clients can inspect a
+bounded dry-run report of requested RAM, temporary space, destination changes,
+and overwrite policy. Bounded job history links that report to the resulting
+execution plan and signed receipt without retaining input paths indefinitely.
 
 Stage 20 brings the existing causal/live backends into DAW hosts without
 allocating, blocking, performing filesystem or network I/O, or changing model
@@ -366,3 +384,7 @@ relocation and missing-source recovery require an exact fingerprint match. CLI,
 desktop, plans, receipts, and batch/watch automation share the same
 deterministic assembly semantics, and unsupported overlapping or future edit
 records fail closed without changing source, project, or existing output.
+An offline export/import bundle carries the project manifest, settings,
+presets, trusted model-package references, and verification evidence; source
+audio and model payloads are included only by an explicit bounded option and
+retain their existing signature, license, and fingerprint checks.
