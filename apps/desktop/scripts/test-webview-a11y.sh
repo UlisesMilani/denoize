@@ -76,7 +76,7 @@ if [[ "$task_status" -ne 0 ]]; then
   echo "real-WebView accessibility test exited with status $task_status" >&2
   exit "$task_status"
 fi
-if ! rg -q '^DENOIZE_DESKTOP_A11Y_E2E:PASS:' "$task_log"; then
+if ! grep -q '^DENOIZE_DESKTOP_A11Y_E2E:PASS:' "$task_log"; then
   echo "real-WebView accessibility test did not emit its authenticated PASS report" >&2
   exit 1
 fi
