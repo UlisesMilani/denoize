@@ -24,6 +24,7 @@ const FRAMES: usize = 496;
 const BINS: usize = FFT_SIZE / 2 + 1;
 const MEL_BINS: usize = 60;
 const FEATURES: usize = MEL_BINS * 3;
+const STREAM_SCRATCH_ALLOWANCE_BYTES: u64 = 16 * 1024 * 1024;
 
 pub fn process(
     channels: &[Vec<f64>],
@@ -72,6 +73,358 @@ impl Mossformer2Model {
             .map(|channel| process_channel(channel, input_sample_rate, self.model.as_ref()))
             .collect()
     }
+}
+
+/// Continuous bounded-window MossFormer2 processing.
+///
+/// The official four-second window is retained until complete. Each following
+/// inference advances by the three-second stride and emits only the samples
+/// outside the model's discarded half-second edges. At end of stream one
+/// partial window is zero-padded exactly like the offline adapter.
+pub(crate) struct StreamingProcessor {
+    channels: usize,
+    to_model_rate: crate::resample::StreamingResampler,
+    from_model_rate: crate::resample::StreamingResampler,
+    model: SharedRunnable,
+    pending_model_rate: Vec<Vec<f64>>,
+    windows_processed: usize,
+    model_source_frames: usize,
+    model_output_frames: usize,
+    input_frames: usize,
+    output_frames: usize,
+    finished: bool,
+}
+
+impl StreamingProcessor {
+    pub(crate) fn new_with_accelerator(
+        config: &OnnxModelConfig,
+        sample_rate: u32,
+        channels: usize,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
+        if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {
+            return Err(format!(
+                "MossFormer2 streaming channels must be between 1 and {}",
+                crate::config::MAX_STREAM_CHANNELS
+            ));
+        }
+        let model = Mossformer2Model::load(config, runtime)?.model;
+        let to_model_rate =
+            crate::resample::StreamingResampler::new(channels, sample_rate, MODEL_RATE)?;
+        let from_model_rate =
+            crate::resample::StreamingResampler::new(channels, MODEL_RATE, sample_rate)?;
+        let mut pending_model_rate = Vec::new();
+        pending_model_rate
+            .try_reserve_exact(channels)
+            .map_err(|_| "unable to reserve MossFormer2 pending channels".to_string())?;
+        for _ in 0..channels {
+            let mut pending = Vec::new();
+            pending
+                .try_reserve_exact(WINDOW_SAMPLES)
+                .map_err(|_| "unable to reserve MossFormer2 pending samples".to_string())?;
+            pending_model_rate.push(pending);
+        }
+        Ok(Self {
+            channels,
+            to_model_rate,
+            from_model_rate,
+            model,
+            pending_model_rate,
+            windows_processed: 0,
+            model_source_frames: 0,
+            model_output_frames: 0,
+            input_frames: 0,
+            output_frames: 0,
+            finished: false,
+        })
+    }
+
+    pub(crate) fn process_block(&mut self, input: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        if self.finished {
+            return Err(
+                "MossFormer2 stream is finished; reset it before processing more input".into(),
+            );
+        }
+        let frames = validate_stream_block(input, self.channels)?;
+        let input_frames = self
+            .input_frames
+            .checked_add(frames)
+            .ok_or_else(|| "MossFormer2 streaming input length overflow".to_string())?;
+        let at_model_rate = self.to_model_rate.process(input)?;
+        let enhanced_model_rate = self.process_model_rate(&at_model_rate)?;
+        let output = self.from_model_rate.process(&enhanced_model_rate)?;
+        let produced = validate_stream_block(&output, self.channels)?;
+        let output_frames = self
+            .output_frames
+            .checked_add(produced)
+            .ok_or_else(|| "MossFormer2 streaming output length overflow".to_string())?;
+        if output_frames > input_frames {
+            return Err("MossFormer2 stream produced samples ahead of its input clock".into());
+        }
+        self.input_frames = input_frames;
+        self.output_frames = output_frames;
+        Ok(output)
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<Vec<Vec<f64>>, String> {
+        let remaining = self
+            .input_frames
+            .checked_sub(self.output_frames)
+            .ok_or_else(|| "MossFormer2 stream exceeded its input clock".to_string())?;
+        let mut output = empty_stream_output(self.channels, remaining)?;
+        if self.finished {
+            return Ok(output);
+        }
+
+        let model_input_tail = self.to_model_rate.finish()?;
+        let enhanced = self.process_model_rate(&model_input_tail)?;
+        let converted = self.from_model_rate.process(&enhanced)?;
+        append_stream_output(&mut output, &converted, remaining)?;
+
+        let enhanced = self.finish_model_rate()?;
+        let converted = self.from_model_rate.process(&enhanced)?;
+        append_stream_output(&mut output, &converted, remaining)?;
+
+        let converted = self.from_model_rate.finish()?;
+        append_stream_output(&mut output, &converted, remaining)?;
+        if output.first().map_or(0, Vec::len) < remaining {
+            for channel in &mut output {
+                channel.resize(remaining, 0.0);
+            }
+        }
+        self.output_frames = self.input_frames;
+        self.finished = true;
+        Ok(output)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.to_model_rate.reset();
+        self.from_model_rate.reset();
+        for pending in &mut self.pending_model_rate {
+            pending.clear();
+        }
+        self.windows_processed = 0;
+        self.model_source_frames = 0;
+        self.model_output_frames = 0;
+        self.input_frames = 0;
+        self.output_frames = 0;
+        self.finished = false;
+    }
+
+    fn process_model_rate(&mut self, input: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        let frames = validate_stream_block(input, self.channels)?;
+        self.model_source_frames = self
+            .model_source_frames
+            .checked_add(frames)
+            .ok_or_else(|| "MossFormer2 model input length overflow".to_string())?;
+        let mut output = empty_stream_output(self.channels, frames)?;
+        let mut position = 0usize;
+        while position < frames {
+            let pending = self.pending_model_rate.first().map_or(0, Vec::len);
+            let copied = (WINDOW_SAMPLES - pending).min(frames - position);
+            for (destination, source) in self.pending_model_rate.iter_mut().zip(input) {
+                destination.extend(
+                    source[position..position + copied]
+                        .iter()
+                        .copied()
+                        .map(crate::sanitize_sample),
+                );
+            }
+            position += copied;
+            if pending + copied == WINDOW_SAMPLES {
+                self.run_window(&mut output)?;
+            }
+        }
+        Ok(output)
+    }
+
+    fn finish_model_rate(&mut self) -> Result<Vec<Vec<f64>>, String> {
+        let remaining = self
+            .model_source_frames
+            .checked_sub(self.model_output_frames)
+            .ok_or_else(|| "MossFormer2 model output exceeded its input clock".to_string())?;
+        let mut output = empty_stream_output(self.channels, remaining)?;
+        if self.model_source_frames == 0 {
+            return Ok(output);
+        }
+        let last_complete_end = if self.windows_processed == 0 {
+            0
+        } else {
+            WINDOW_SAMPLES
+                .checked_add(
+                    (self.windows_processed - 1)
+                        .checked_mul(STRIDE_SAMPLES)
+                        .ok_or_else(|| "MossFormer2 window position overflow".to_string())?,
+                )
+                .ok_or_else(|| "MossFormer2 window position overflow".to_string())?
+        };
+        if self.model_source_frames > last_complete_end {
+            for pending in &mut self.pending_model_rate {
+                pending.resize(WINDOW_SAMPLES, 0.0);
+            }
+            self.run_window(&mut output)?;
+        }
+        let produced = output.first().map_or(0, Vec::len);
+        if produced < remaining {
+            for channel in &mut output {
+                channel.resize(remaining, 0.0);
+            }
+            self.model_output_frames = self.model_source_frames;
+        }
+        for pending in &mut self.pending_model_rate {
+            pending.clear();
+        }
+        if self.model_output_frames != self.model_source_frames {
+            return Err("MossFormer2 stream did not flush to its model clock".into());
+        }
+        Ok(output)
+    }
+
+    fn run_window(&mut self, output: &mut [Vec<f64>]) -> Result<(), String> {
+        if self
+            .pending_model_rate
+            .iter()
+            .any(|channel| channel.len() != WINDOW_SAMPLES)
+        {
+            return Err("MossFormer2 streaming window has an invalid length".into());
+        }
+        let source_start = if self.windows_processed == 0 {
+            0
+        } else {
+            GIVE_UP_SAMPLES
+        };
+        let source_end = WINDOW_SAMPLES - GIVE_UP_SAMPLES;
+        let available = source_end - source_start;
+        let remaining = self
+            .model_source_frames
+            .checked_sub(self.model_output_frames)
+            .ok_or_else(|| "MossFormer2 model output exceeded its input clock".to_string())?;
+        let take = available.min(remaining);
+        for (channel, destination) in output.iter_mut().enumerate() {
+            let segment: Vec<f32> = self.pending_model_rate[channel]
+                .iter()
+                .map(|sample| (*sample * 32_768.0) as f32)
+                .collect();
+            let enhanced = enhance_segment(&segment, self.model.as_ref())?;
+            destination.extend(
+                enhanced[source_start..source_start + take]
+                    .iter()
+                    .map(|sample| crate::sanitize_sample(*sample as f64 / 32_768.0)),
+            );
+        }
+        self.model_output_frames = self
+            .model_output_frames
+            .checked_add(take)
+            .ok_or_else(|| "MossFormer2 model output length overflow".to_string())?;
+        self.windows_processed = self
+            .windows_processed
+            .checked_add(1)
+            .ok_or_else(|| "MossFormer2 window count overflow".to_string())?;
+        for pending in &mut self.pending_model_rate {
+            pending.copy_within(STRIDE_SAMPLES..WINDOW_SAMPLES, 0);
+            pending.truncate(WINDOW_SAMPLES - STRIDE_SAMPLES);
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn streaming_state_bytes(
+    processor_channels: usize,
+    input_sample_rate: u32,
+    input_channels: usize,
+) -> Result<u64, crate::config::ConfigError> {
+    use crate::config::{checked_resource_add, checked_resource_multiply, ConfigError};
+
+    if processor_channels == 0
+        || processor_channels > crate::config::MAX_STREAM_CHANNELS
+        || input_channels == 0
+        || input_channels > crate::config::MAX_STREAM_CHANNELS
+    {
+        return Err(ConfigError::invalid("channels", "an integer in 1..=64"));
+    }
+    let pending_samples = checked_resource_multiply(
+        "MossFormer2 stream window",
+        processor_channels as u64,
+        WINDOW_SAMPLES as u64,
+    )?;
+    let pending_bytes = checked_resource_multiply(
+        "MossFormer2 stream window",
+        pending_samples,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    let model_state = checked_resource_add(
+        "MossFormer2 stream state",
+        pending_bytes,
+        STREAM_SCRATCH_ALLOWANCE_BYTES,
+    )?;
+    // The first result is emitted after one four-second model window. Reserve
+    // the wrapper's possible stereo-link and VAD alignment queues as three
+    // simultaneous input-rate f64 copies, even when those modes are disabled.
+    let alignment_frames = checked_resource_multiply(
+        "MossFormer2 stream alignment",
+        u64::from(input_sample_rate),
+        4,
+    )?;
+    let alignment_samples = checked_resource_multiply(
+        "MossFormer2 stream alignment",
+        alignment_frames,
+        input_channels as u64,
+    )?;
+    let alignment_bytes = checked_resource_multiply(
+        "MossFormer2 stream alignment",
+        alignment_samples,
+        3 * std::mem::size_of::<f64>() as u64,
+    )?;
+    checked_resource_add("MossFormer2 stream state", model_state, alignment_bytes)
+}
+
+fn validate_stream_block(input: &[Vec<f64>], channels: usize) -> Result<usize, String> {
+    if input.len() != channels {
+        return Err(format!(
+            "MossFormer2 stream expected {channels} channels, received {}",
+            input.len()
+        ));
+    }
+    let frames = input.first().map_or(0, Vec::len);
+    if input.iter().any(|channel| channel.len() != frames) {
+        return Err("MossFormer2 stream channels must contain the same number of frames".into());
+    }
+    Ok(frames)
+}
+
+fn empty_stream_output(channels: usize, capacity: usize) -> Result<Vec<Vec<f64>>, String> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(channels)
+        .map_err(|_| "unable to reserve MossFormer2 output channels".to_string())?;
+    for _ in 0..channels {
+        let mut channel = Vec::new();
+        channel
+            .try_reserve_exact(capacity)
+            .map_err(|_| "unable to reserve MossFormer2 output samples".to_string())?;
+        output.push(channel);
+    }
+    Ok(output)
+}
+
+fn append_stream_output(
+    destination: &mut [Vec<f64>],
+    source: &[Vec<f64>],
+    limit: usize,
+) -> Result<(), String> {
+    if destination.len() != source.len() {
+        return Err("MossFormer2 stream output channel count changed".into());
+    }
+    let frames = source.first().map_or(0, Vec::len);
+    if source.iter().any(|channel| channel.len() != frames) {
+        return Err("MossFormer2 stream output channels became unaligned".into());
+    }
+    let retained = limit.saturating_sub(destination.first().map_or(0, Vec::len));
+    let take = retained.min(frames);
+    for (output, input) in destination.iter_mut().zip(source) {
+        output.extend(input.iter().take(take).copied().map(crate::sanitize_sample));
+    }
+    Ok(())
 }
 
 fn process_channel(
@@ -331,6 +684,12 @@ fn model_error(stage: &str, error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
+    use tract_onnx::pb::{
+        attribute_proto, tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto,
+        ModelProto, NodeProto, OperatorSetIdProto, TensorProto, TensorShapeProto, TypeProto,
+        ValueInfoProto,
+    };
 
     #[test]
     fn official_window_has_496_frames() {
@@ -365,5 +724,121 @@ mod tests {
             .map(|(left, right)| (left - right).abs())
             .fold(0.0f32, f32::max);
         assert!(maximum < 2e-4, "maximum reconstruction error: {maximum}");
+    }
+
+    #[test]
+    fn bounded_streaming_matches_offline_window_stitching_and_reset() {
+        let mut bytes = Vec::new();
+        constant_unity_mask_model().encode(&mut bytes).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "denoize-mossformer-stream-{}-{}.onnx",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let config = OnnxModelConfig {
+            path: path.clone(),
+            sample_rate: MODEL_RATE,
+        };
+        let input: Vec<f64> = (0..WINDOW_SAMPLES + 777)
+            .map(|index| {
+                let time = index as f64 / MODEL_RATE as f64;
+                0.12 * (std::f64::consts::TAU * 230.0 * time).sin()
+            })
+            .collect();
+        let offline = process(&[input.clone()], MODEL_RATE, &config).unwrap();
+
+        let run = |stream: &mut StreamingProcessor| {
+            let mut output = Vec::new();
+            for block in input.chunks(7_919) {
+                output.extend_from_slice(&stream.process_block(&[block.to_vec()]).unwrap()[0]);
+            }
+            output.extend_from_slice(&stream.finish().unwrap()[0]);
+            output
+        };
+        let mut stream = StreamingProcessor::new_with_accelerator(
+            &config,
+            MODEL_RATE,
+            1,
+            AcceleratorRuntime::Cpu,
+        )
+        .unwrap();
+        let first = run(&mut stream);
+        assert_eq!(first.len(), input.len());
+        assert_eq!(first, offline[0]);
+
+        stream.reset();
+        assert_eq!(run(&mut stream), first);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streaming_state_estimate_covers_window_scratch_and_alignment() {
+        let mono = streaming_state_bytes(1, 48_000, 1).unwrap();
+        let stereo = streaming_state_bytes(2, 48_000, 2).unwrap();
+        assert!(mono > STREAM_SCRATCH_ALLOWANCE_BYTES);
+        assert!(stereo > mono);
+        assert!(streaming_state_bytes(0, 48_000, 1).is_err());
+    }
+
+    fn constant_unity_mask_model() -> ModelProto {
+        let value_info = |name: &str, shape: Vec<i64>| ValueInfoProto {
+            name: name.into(),
+            r#type: Some(TypeProto {
+                denotation: String::new(),
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: tensor_proto::DataType::Float as i32,
+                    shape: Some(TensorShapeProto {
+                        dim: shape.into_iter().map(dimension_value).collect(),
+                    }),
+                })),
+            }),
+            doc_string: String::new(),
+        };
+        ModelProto {
+            ir_version: 8,
+            opset_import: vec![OperatorSetIdProto {
+                domain: String::new(),
+                version: 13,
+            }],
+            producer_name: "denoize-test".into(),
+            graph: Some(GraphProto {
+                name: "mossformer-unity-mask".into(),
+                node: vec![NodeProto {
+                    output: vec!["mask".into()],
+                    name: "constant-mask".into(),
+                    op_type: "Constant".into(),
+                    attribute: vec![AttributeProto {
+                        name: "value".into(),
+                        r#type: attribute_proto::AttributeType::Tensor as i32,
+                        t: Some(TensorProto {
+                            dims: vec![1, FRAMES as i64, BINS as i64],
+                            data_type: tensor_proto::DataType::Float as i32,
+                            float_data: vec![1.0; FRAMES * BINS],
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                input: vec![value_info(
+                    "features",
+                    vec![1, FRAMES as i64, FEATURES as i64],
+                )],
+                output: vec![value_info("mask", vec![1, FRAMES as i64, BINS as i64])],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn dimension_value(value: i64) -> tensor_shape_proto::Dimension {
+        tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimValue(value)),
+            denotation: String::new(),
+        }
     }
 }

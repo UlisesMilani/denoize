@@ -33,6 +33,7 @@ pub use stream::{
     estimate_stream_encode_output_bytes, estimate_stream_encode_temporary_bytes,
     estimate_stream_output_verification_bytes, verify_stream_output_file, AudioStreamWriter,
     SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamOutputVerification,
+    StreamPcmSpool,
 };
 
 /// Default AAC bitrate (bps, not kbps).

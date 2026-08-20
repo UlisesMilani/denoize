@@ -29,7 +29,8 @@ use denoize::{
     PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
     RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
     ResourceRequest, SgmseProfile, SignedExecutionReceipt, SpooledAudioStreamWriter,
-    StreamEncodeLimits, StreamEncodeSpec, StreamSpoolLimits, StreamingBackendSession, WindowType,
+    StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool, StreamSpoolLimits,
+    StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -437,11 +438,11 @@ OPTIONS:
 BACKENDS (build with --features full for all):
     classical   Enhanced STFT/IMCRA/OMLSA pipeline (default)
     rnnoise     RNNoise via nnnoiseless (requires --features rnnoise)
-    deepfilter  DeepFilterNet v3 (requires --features deepfilter)
+    deepfilter  DeepFilterNet v3 for files and --stream (requires --features deepfilter)
     onnx        External waveform ONNX model (requires --features onnx)
     mpsenet     MP-SENet magnitude/phase model (requires --features mpsenet)
     bsrnn       ESPnet BSRNN spectral model (requires --features bsrnn)
-    mossformer2 ClearerVoice MossFormer2 model (requires --features mossformer2)
+    mossformer2 ClearerVoice MossFormer2 for files and --stream (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
     gtcrn       Official causal GTCRN for files, --stream, and live processing
 
@@ -2715,13 +2716,6 @@ fn build_stream_execution_plan(
             service::backend_name(backend)
         ));
     }
-    let preflight_cfg = build_config(options, VALIDATION_SAMPLE_RATE);
-    if preflight_cfg.vad {
-        return Err("--stream does not support VAD; omit --mode speech or --vad".into());
-    }
-    if options.loudness_lufs.is_some() || options.true_peak_dbtp.is_some() {
-        return Err("--stream does not support loudness normalization".into());
-    }
     let backend_options =
         service::resolve_backend_options_read_only(backend, build_backend_options(options))?;
     let accelerator = denoize::select_accelerator(
@@ -2790,6 +2784,28 @@ fn build_stream_execution_plan(
         backend_options.channel_mode,
     )
     .map_err(|error| error.to_string())?;
+    let vad_stream_state = if cfg.vad {
+        StreamingBackendSession::estimate_vad_additional_bytes(
+            spec.sample_rate,
+            spec.channels as usize,
+            block_frames,
+            cfg.frame_size,
+            cfg.profile_ms,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let loudness_stream_state = if options.loudness_lufs.is_some() {
+        denoize::loudness::estimate_streaming_loudness_bytes(
+            spec.channels as usize,
+            spec.sample_rate,
+            block_frames,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
     let encoder_stream_state = denoize::estimate_stream_encode_additional_bytes(
         output_format,
         encode_spec,
@@ -2798,6 +2814,8 @@ fn build_stream_execution_plan(
     )?;
     let stream_working_set = base_stream_working_set
         .checked_add(backend_stream_state)
+        .and_then(|bytes| bytes.checked_add(vad_stream_state))
+        .and_then(|bytes| bytes.checked_add(loudness_stream_state))
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| {
@@ -2848,7 +2866,7 @@ fn build_stream_execution_plan(
         effective_memory_mb,
         "stream plan working set",
     )?;
-    let metadata_policy = if options.no_metadata || standard_output {
+    let metadata_policy = if options.no_metadata {
         MetadataPolicy::Drop
     } else {
         MetadataPolicy::Preserve
@@ -2878,8 +2896,13 @@ fn build_stream_execution_plan(
             encode_spec,
             encode_options,
             encode_limits,
-        )?
-        .unwrap_or(remaining_stdio_spool_bytes);
+        )?;
+        let total = match total {
+            Some(bytes) => bytes
+                .checked_add(metadata_bytes)
+                .ok_or_else(|| "non-seekable output metadata size overflows".to_string())?,
+            None => remaining_stdio_spool_bytes,
+        };
         if total > remaining_stdio_spool_bytes {
             return Err(format!(
                 "non-seekable output requires {total} bytes, but stdin and output share only {remaining_stdio_spool_bytes} remaining spool bytes"
@@ -2899,6 +2922,7 @@ fn build_stream_execution_plan(
             encode_limits,
             effective_temporary_limit,
             options.resume,
+            options.loudness_lufs.is_some(),
             metadata_bytes,
         )?
     };
@@ -2930,8 +2954,8 @@ fn build_stream_execution_plan(
         denoiser: cfg.clone(),
         backend_options: backend_options.clone(),
         accelerator,
-        loudness_lufs: None,
-        true_peak_dbtp: -1.0,
+        loudness_lufs: options.loudness_lufs,
+        true_peak_dbtp: options.true_peak_dbtp.unwrap_or(-1.0),
     };
     resolved.validate_config()?;
     let model = match batch_resume::consumed_model_config(&resolved)? {
@@ -4570,6 +4594,7 @@ fn stream_temporary_reservation_bytes(
     encode_limits: StreamEncodeLimits,
     configured_limit: Option<u64>,
     checkpointed: bool,
+    two_pass_loudness: bool,
     metadata_allowance_bytes: u64,
 ) -> Result<StreamTemporaryReservation, String> {
     const MAX_WAV_FILE_BYTES: u64 = u32::MAX as u64 + 8;
@@ -4608,10 +4633,21 @@ fn stream_temporary_reservation_bytes(
             });
         }
         if !checkpointed {
-            let total_bytes = MAX_WAV_FILE_BYTES
+            let mut total_bytes = MAX_WAV_FILE_BYTES
                 .checked_add(encoder_auxiliary_bytes)
                 .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
                 .ok_or_else(|| "stream temporary reservation overflows".to_string())?;
+            if two_pass_loudness {
+                let data_limit = MAX_WAV_FILE_BYTES.saturating_sub(68);
+                let output_sample_bytes = u64::from(info.output_spec.bits_per_sample / 8);
+                let max_samples = data_limit / output_sample_bytes;
+                let spool_bytes = max_samples
+                    .checked_mul(std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| "stream loudness spool reservation overflows".to_string())?;
+                total_bytes = total_bytes
+                    .checked_add(spool_bytes)
+                    .ok_or_else(|| "stream loudness temporary reservation overflows".to_string())?;
+            }
             return Ok(StreamTemporaryReservation {
                 total_bytes,
                 encoder_auxiliary_bytes,
@@ -4645,14 +4681,25 @@ fn stream_temporary_reservation_bytes(
         .and_then(|bytes| bytes.checked_add(metadata_allowance_bytes))
         .ok_or_else(|| "stream output file size overflows".to_string())?;
     if !checkpointed {
-        if configured_limit.is_some_and(|limit| base_bytes > limit) {
+        let total_bytes = if two_pass_loudness {
+            let spool_bytes = frames
+                .checked_mul(u64::from(info.output_spec.channels))
+                .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+                .ok_or_else(|| "stream loudness spool reservation overflows".to_string())?;
+            base_bytes
+                .checked_add(spool_bytes)
+                .ok_or_else(|| "stream loudness temporary reservation overflows".to_string())?
+        } else {
+            base_bytes
+        };
+        if configured_limit.is_some_and(|limit| total_bytes > limit) {
             return Err(format!(
-                "staged stream output, encoder auxiliary data, and metadata require {base_bytes} bytes, exceeding --max-temp-space ({} bytes)",
+                "staged stream output, encoder auxiliary data, metadata, and multi-pass PCM require {total_bytes} bytes, exceeding --max-temp-space ({} bytes)",
                 configured_limit.unwrap_or(0)
             ));
         }
         return Ok(StreamTemporaryReservation {
-            total_bytes: base_bytes,
+            total_bytes,
             encoder_auxiliary_bytes,
             checkpoint_limit: None,
         });
@@ -4764,6 +4811,51 @@ fn process_stream_blocks(
     Ok(input_frames)
 }
 
+fn stream_pcm_spool_limit(
+    info: denoize::AudioStreamInfo,
+    total_temporary_bytes: u64,
+    encoder_auxiliary_bytes: u64,
+    metadata_bytes: u64,
+) -> Result<u64, String> {
+    if let Some(frames) = info.total_frames {
+        return frames
+            .checked_mul(u64::from(info.output_spec.channels))
+            .and_then(|samples| samples.checked_mul(std::mem::size_of::<f64>() as u64))
+            .ok_or_else(|| "stream loudness PCM spool size overflows".to_string());
+    }
+    let unavailable = encoder_auxiliary_bytes
+        .checked_add(metadata_bytes)
+        .ok_or_else(|| "stream loudness temporary allowance overflows".to_string())?;
+    let shared = total_temporary_bytes
+        .checked_sub(unavailable)
+        .ok_or_else(|| "stream loudness has no temporary space for PCM".to_string())?;
+    // Reserve at least half for the encoded stage. WAV is at most half the
+    // interleaved-f64 PCM size; compressed formats normally need less.
+    Ok(shared / 2)
+}
+
+fn analyze_stream_pcm_spool(
+    spool: &mut StreamPcmSpool,
+    spec: hound::WavSpec,
+    channel_mask: Option<denoize::ChannelMask>,
+    block_frames: usize,
+    target_lufs: f64,
+    true_peak_dbtp: f64,
+) -> Result<denoize::loudness::StreamingLoudnessGain, String> {
+    spool.prepare_read()?;
+    let mut analyzer = denoize::loudness::StreamingLoudnessAnalyzer::new(
+        spec.channels as usize,
+        spec.sample_rate,
+        channel_mask,
+    )?;
+    while let Some(block) = spool.next_block(block_frames)? {
+        analyzer.add_block(&block)?;
+    }
+    let gain = analyzer.finish(target_lufs, true_peak_dbtp)?;
+    spool.prepare_read()?;
+    Ok(gain)
+}
+
 fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
     validate_effective_options(&ov, VALIDATION_SAMPLE_RATE)?;
     let standard_input = input == "-";
@@ -4829,13 +4921,6 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             service::backend_name(backend)
         ));
     }
-    let preflight_cfg = build_config(&ov, VALIDATION_SAMPLE_RATE);
-    if preflight_cfg.vad {
-        return Err("--stream does not support VAD; omit --mode speech or --vad".into());
-    }
-    if ov.loudness_lufs.is_some() || ov.true_peak_dbtp.is_some() {
-        return Err("--stream does not support loudness normalization".into());
-    }
     let backend_options = service::resolve_backend_options(backend, build_backend_options(&ov))?;
     let accelerator = denoize::select_accelerator(
         backend,
@@ -4898,6 +4983,28 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         backend_options.channel_mode,
     )
     .map_err(|error| error.to_string())?;
+    let vad_stream_state = if cfg.vad {
+        StreamingBackendSession::estimate_vad_additional_bytes(
+            spec.sample_rate,
+            spec.channels as usize,
+            block_frames,
+            cfg.frame_size,
+            cfg.profile_ms,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
+    let loudness_stream_state = if ov.loudness_lufs.is_some() {
+        denoize::loudness::estimate_streaming_loudness_bytes(
+            spec.channels as usize,
+            spec.sample_rate,
+            block_frames,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        0
+    };
     let encoder_stream_state = denoize::estimate_stream_encode_additional_bytes(
         output_format,
         encode_spec,
@@ -4911,6 +5018,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     };
     let initial_stream_working_set = base_stream_working_set
         .checked_add(backend_stream_state)
+        .and_then(|bytes| bytes.checked_add(vad_stream_state))
+        .and_then(|bytes| bytes.checked_add(loudness_stream_state))
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
@@ -4945,6 +5054,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let stream_info = final_stream_info;
     let stream_working_set = base_stream_working_set
         .checked_add(backend_stream_state)
+        .and_then(|bytes| bytes.checked_add(vad_stream_state))
+        .and_then(|bytes| bytes.checked_add(loudness_stream_state))
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
@@ -4982,7 +5093,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         return Ok(());
     }
 
-    let stream_metadata_policy = if ov.no_metadata || standard_output {
+    let stream_metadata_policy = if ov.no_metadata {
         MetadataPolicy::Drop
     } else {
         MetadataPolicy::Preserve
@@ -4994,8 +5105,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             denoiser: cfg.clone(),
             backend_options: backend_options.clone(),
             accelerator,
-            loudness_lufs: None,
-            true_peak_dbtp: -1.0,
+            loudness_lufs: ov.loudness_lufs,
+            true_peak_dbtp: ov.true_peak_dbtp.unwrap_or(-1.0),
         };
         resolved.validate_config()?;
         let model = match batch_resume::consumed_model_config(&resolved)? {
@@ -5019,8 +5130,6 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         None
     };
 
-    // Metadata parity for non-seekable output belongs to Stage 15. Filesystem
-    // output, including spooled stdin, retains the existing preservation path.
     let metadata = if stream_metadata_policy == MetadataPolicy::Preserve {
         input_session.read_metadata_with_limits(metadata_limits)?
     } else {
@@ -5046,8 +5155,13 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             encode_spec,
             encode_options,
             encode_limits,
-        )?
-        .unwrap_or(remaining_stdio_spool_bytes);
+        )?;
+        let total_bytes = match total_bytes {
+            Some(bytes) => bytes
+                .checked_add(metadata_bytes)
+                .ok_or_else(|| "non-seekable output metadata size overflows".to_string())?,
+            None => remaining_stdio_spool_bytes,
+        };
         if total_bytes > remaining_stdio_spool_bytes {
             return Err(format!(
                 "non-seekable output requires {total_bytes} bytes, but stdin and output share only {} remaining spool bytes",
@@ -5068,6 +5182,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             encode_limits,
             effective_temporary_limit,
             ov.resume,
+            ov.loudness_lufs.is_some(),
             metadata_bytes,
         )?
     };
@@ -5148,6 +5263,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     } else {
         CommitMode::NoClobber
     };
+    let mut streaming_loudness = None;
     let frames = if ov.resume {
         let (input_fingerprint, recipe, model) = execution_identity
             .clone()
@@ -5261,6 +5377,20 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                 drop(processor);
 
                 checkpoint.prepare_spool_read()?;
+                let loudness_gain = if let Some(target_lufs) = ov.loudness_lufs {
+                    let mut analyzer = denoize::loudness::StreamingLoudnessAnalyzer::new(
+                        spec.channels as usize,
+                        spec.sample_rate,
+                        channel_mask,
+                    )?;
+                    while let Some(block) = checkpoint.next_spool_block(block_frames)? {
+                        analyzer.add_block(&block)?;
+                    }
+                    checkpoint.prepare_spool_read()?;
+                    Some(analyzer.finish(target_lufs, ov.true_peak_dbtp.unwrap_or(-1.0))?)
+                } else {
+                    None
+                };
                 let mut final_encode_spec = encode_spec;
                 final_encode_spec.total_frames = Some(output_frames);
                 let mut transaction = AtomicOutput::new(output_path)?;
@@ -5272,7 +5402,10 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                         encode_options,
                         encode_limits,
                     )?;
-                    while let Some(block) = checkpoint.next_spool_block(block_frames)? {
+                    while let Some(mut block) = checkpoint.next_spool_block(block_frames)? {
+                        if let Some(gain) = loudness_gain {
+                            gain.apply(&mut block);
+                        }
                         writer.write_block(&block)?;
                     }
                     writer.finalize()?;
@@ -5291,6 +5424,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                         metadata_limits,
                     )?;
                 }
+                streaming_loudness = loudness_gain.map(|gain| gain.report());
                 let staged_bytes = transaction
                     .file_mut()
                     .metadata()
@@ -5403,7 +5537,14 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         drop(processor);
         // `process_stream_blocks` validates the backend presentation length
         // before finalize publishes the first caller-visible byte.
-        let (_stdout, output_fingerprint) = writer.finalize_with_fingerprint()?;
+        let (_stdout, output_fingerprint, loudness_report) = writer
+            .finalize_with_metadata_and_loudness(
+                metadata,
+                metadata_limits,
+                ov.loudness_lufs
+                    .map(|target| (target, ov.true_peak_dbtp.unwrap_or(-1.0))),
+            )?;
+        streaming_loudness = loudness_report;
         if let (Some(receipt), Some(evidence)) = (&stream_receipt, &stream_evidence) {
             let (publication, reason) = receipt_publication
                 .ok_or("stdout stream receipt publication is missing after preflight")?;
@@ -5426,6 +5567,112 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             })?;
             commit_stream_receipt_after_output(receipt, staged, "stdout")?;
         }
+        frames
+    } else if let Some(target_lufs) = ov.loudness_lufs {
+        let spool_limit = stream_pcm_spool_limit(
+            stream_info,
+            temporary_bytes,
+            temporary_reservation.encoder_auxiliary_bytes,
+            metadata_bytes,
+        )?;
+        let mut spool = StreamPcmSpool::new(spec.channels as usize, spool_limit)?;
+        let frames = process_stream_blocks(&mut reader, &mut processor, block_frames, |block| {
+            spool.write_block(block)
+        })?;
+        verify_stream_receipt_sources(&reader, input, stream_evidence.as_ref())?;
+        drop(reader);
+        drop(processor);
+        let loudness_gain = analyze_stream_pcm_spool(
+            &mut spool,
+            spec,
+            channel_mask,
+            block_frames,
+            target_lufs,
+            ov.true_peak_dbtp.unwrap_or(-1.0),
+        )?;
+        let mut final_encode_spec = encode_spec;
+        final_encode_spec.total_frames = Some(frames as u64);
+        let mut transaction = AtomicOutput::new(output_path)?;
+        {
+            let mut writer = AudioStreamWriter::new_with_limits(
+                transaction.file_mut(),
+                output_format,
+                final_encode_spec,
+                encode_options,
+                encode_limits,
+            )?;
+            while let Some(mut block) = spool.next_block(block_frames)? {
+                loudness_gain.apply(&mut block);
+                writer.write_block(&block)?;
+            }
+            writer.finalize()?;
+        }
+        if output_format == OutputFormat::Wav {
+            write_wav_channel_mask_to_file(
+                transaction.file_mut(),
+                spec.channels as usize,
+                channel_mask,
+            )?;
+        }
+        if let Some(metadata) = metadata {
+            denoize::metadata::write_extended_to_file_with_limits(
+                metadata,
+                transaction.file_mut(),
+                metadata_limits,
+            )?;
+        }
+        let staged_bytes = transaction
+            .file_mut()
+            .metadata()
+            .map_err(|error| format!("inspect staged stream output: {error}"))?
+            .len();
+        let combined_bytes = staged_bytes
+            .checked_add(spool.len())
+            .and_then(|bytes| bytes.checked_add(temporary_reservation.encoder_auxiliary_bytes))
+            .ok_or_else(|| "stream loudness temporary byte count overflows".to_string())?;
+        if combined_bytes > temporary_bytes {
+            return Err(format!(
+                "loudness PCM spool, staged output, and encoder auxiliary data require {combined_bytes} bytes, exceeding their {temporary_bytes}-byte temporary reservation"
+            ));
+        }
+        inject_stream_output_corruption(transaction.file_mut())?;
+        verify_stream_output_file(
+            transaction.file_mut(),
+            output_path,
+            output_format,
+            final_encode_spec,
+            frames as u64,
+            encode_options,
+            decode_limits,
+            verification_block_frames,
+        )?;
+        let staged_receipt = match (&stream_receipt, &stream_evidence) {
+            (Some(receipt), Some(evidence)) => {
+                let (publication, reason) = receipt_publication
+                    .ok_or("stream receipt publication is missing after preflight")?;
+                let output_fingerprint =
+                    batch_resume::fingerprint_open_file_at(transaction.file_mut(), output_path)?;
+                Some(stage_stream_signed_receipt(
+                    input,
+                    output,
+                    receipt,
+                    evidence,
+                    frames as u64,
+                    output_fingerprint,
+                    publication,
+                    "process",
+                    reason,
+                    None,
+                )?)
+            }
+            (None, None) => None,
+            _ => return Err("stream receipt state changed after preflight".into()),
+        };
+        transaction.commit(commit_mode)?;
+        if let (Some(receipt), Some(staged)) = (&stream_receipt, staged_receipt) {
+            commit_stream_receipt_after_output(receipt, staged, output)?;
+        }
+        streaming_loudness = Some(loudness_gain.report());
         frames
     } else {
         let mut transaction = AtomicOutput::new(output_path)?;
@@ -5513,6 +5760,12 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         }
         frames
     };
+    if let Some(report) = streaming_loudness {
+        eprintln!(
+            "denoize: loudness {:.2} -> {:.2} LUFS, true peak {:.2} dBTP, gain {:+.2} dB",
+            report.input_lufs, report.output_lufs, report.true_peak_dbtp, report.gain_db
+        );
+    }
     if ov.json {
         println!(
             "{}",
@@ -7546,6 +7799,72 @@ mod streaming_tests {
         assert_eq!(result.channels(), 1);
         assert_eq!(result.frames(), 20_000);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stream_vad_preserves_duration_and_attenuates_quiet_regions() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let plain = root.path().join("plain.wav");
+        let gated = root.path().join("gated.wav");
+        let audio = denoize::Audio {
+            sample_rate: 16_000,
+            channels: vec![vec![0.001; 16_000]],
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+            channel_mask: None,
+        };
+        denoize::write_audio(&input, &audio, EncodeOptions::default()).unwrap();
+        for (output, vad) in [(&plain, false), (&gated, true)] {
+            run_streaming_wav(
+                input.to_str().unwrap(),
+                output.to_str().unwrap(),
+                Overrides {
+                    stream: true,
+                    vad: Some(vad),
+                    no_profile: true,
+                    stream_frames: Some(113),
+                    ..Overrides::default()
+                },
+            )
+            .unwrap();
+        }
+        let gated = read_audio(&gated).unwrap();
+        assert_eq!(gated.frames(), audio.frames());
+        let energy = |audio: &denoize::Audio| {
+            audio.channels[0]
+                .iter()
+                .map(|sample| sample * sample)
+                .sum::<f64>()
+        };
+        assert!(energy(&gated) < energy(&audio) * 0.01);
+    }
+
+    #[test]
+    fn stream_loudness_runs_bounded_two_pass_normalization() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.wav");
+        let output = root.path().join("output.wav");
+        write_stream_output_fixture(&input, 96_000);
+        run_streaming_wav(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            Overrides {
+                stream: true,
+                no_profile: true,
+                loudness_lufs: Some(-24.0),
+                true_peak_dbtp: Some(-1.0),
+                stream_frames: Some(317),
+                max_temporary_mb: Some(64),
+                ..Overrides::default()
+            },
+        )
+        .unwrap();
+        let output = read_audio(&output).unwrap();
+        assert_eq!(output.frames(), 96_000);
+        let (lufs, peak) = denoize::loudness::measure(&output).unwrap();
+        assert!((lufs + 24.0).abs() < 0.15, "measured {lufs} LUFS");
+        assert!(peak <= -1.0 + 0.1, "measured {peak} dBTP");
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub use encode::{
     estimate_stream_encode_output_bytes, estimate_stream_encode_temporary_bytes,
     estimate_stream_output_verification_bytes, verify_stream_output_file, AacEncoder,
     AudioStreamWriter, DownmixMode, EncodeOptions, OutputFormat, SpooledAudioStreamWriter,
-    StreamEncodeLimits, StreamEncodeSpec, StreamOutputVerification,
+    StreamEncodeLimits, StreamEncodeSpec, StreamOutputVerification, StreamPcmSpool,
 };
 pub use execution::{
     execution_item_id, export_receipt_public_key, generate_receipt_keypair, portable_file_locator,
