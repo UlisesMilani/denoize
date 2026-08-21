@@ -46,6 +46,11 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
 
+      - name: Install live audio development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libasound2-dev
+
       - name: Audit Rust dependency locks
         run: |
           cargo audit --file Cargo.lock
@@ -146,6 +151,13 @@ jobs:
         run: |
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
+
+      - name: Install live audio development dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libasound2-dev
 
       - name: Enable legacy CMake policy compatibility (Unix)
         if: runner.os != 'Windows'

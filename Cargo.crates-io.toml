@@ -87,6 +87,7 @@ lofty = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+cpal = { version = "0.15.3", optional = true }
 ctrlc = "3.4.5"
 tempfile = "3.27.0"
 sha2 = "0.10.9"
@@ -140,7 +141,8 @@ sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
 accelerators = ["onnx", "dep:tract-metal", "dep:metal", "dep:tract-cuda", "dep:cudarc"]
 visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
-full = ["rnnoise", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol"]
+live = ["dep:cpal"]
+full = ["rnnoise", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol", "live"]
 
 [dev-dependencies]
 prost = "0.14"

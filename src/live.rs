@@ -3,17 +3,20 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, FromSample, Sample, SampleFormat, Stream, StreamConfig};
+use rubato::{
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+};
 
 use crate::audio::Audio;
 #[cfg(test)]
 use crate::config::MAX_STREAM_BLOCK_FRAMES;
 use crate::config::{
     checked_profile_target_samples, checked_resource_add, checked_resource_multiply, ConfigError,
-    MAX_STREAM_CHANNELS, MAX_STREAM_STATE_BYTES,
+    MAX_SAMPLE_RATE, MAX_STREAM_CHANNELS, MAX_STREAM_STATE_BYTES,
 };
 use crate::denoiser::DenoiserConfig;
 use crate::{
@@ -23,6 +26,18 @@ use crate::{
 
 const MIN_CHUNK_MS: u32 = 10;
 const MAX_CHUNK_MS: u32 = 2_000;
+const MIN_TARGET_LATENCY_MS: u32 = 20;
+const MAX_TARGET_LATENCY_MS: u32 = 5_000;
+const MAX_DRIFT_PPM: u32 = 10_000;
+const MAX_RECONNECT_TIMEOUT_MS: u32 = 300_000;
+const DEFAULT_MAX_DRIFT_PPM: u32 = 2_500;
+const DEFAULT_RECONNECT_TIMEOUT_MS: u32 = 30_000;
+const RECONNECT_INITIAL_BACKOFF_MS: u64 = 100;
+const RECONNECT_MAX_BACKOFF_MS: u64 = 2_000;
+const LIVE_STATUS_INTERVAL: Duration = Duration::from_millis(100);
+const PRIME_TIMEOUT: Duration = Duration::from_secs(10);
+const ASYNC_SINC_LEN: usize = 128;
+const ASYNC_SINC_OVERSAMPLING: usize = 128;
 const CAPTURE_QUEUE_CHUNKS: usize = 4;
 // The callback can simultaneously retain its full pending chunk and the next
 // freshly allocated chunk while the bounded channel retains four more and the
@@ -59,6 +74,96 @@ pub struct LiveConfig {
     pub backend: Backend,
     pub backend_options: BackendOptions,
     pub denoiser: DenoiserConfig,
+}
+
+/// Runtime policy for independent capture/playback clocks and device recovery.
+///
+/// A zero target latency selects a chunk-aware default of two capture chunks,
+/// with a 40 ms minimum. A zero reconnect timeout disables automatic hotplug
+/// recovery. Clock conversion remains active when drift correction is disabled
+/// with `max_drift_ppm == 0`, so devices may still use different nominal rates.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveResilienceConfig {
+    pub target_latency_ms: u32,
+    pub max_drift_ppm: u32,
+    pub reconnect_timeout_ms: u32,
+}
+
+impl Default for LiveResilienceConfig {
+    fn default() -> Self {
+        Self {
+            target_latency_ms: 0,
+            max_drift_ppm: DEFAULT_MAX_DRIFT_PPM,
+            reconnect_timeout_ms: DEFAULT_RECONNECT_TIMEOUT_MS,
+        }
+    }
+}
+
+impl LiveResilienceConfig {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            target_latency_ms: 0,
+            max_drift_ppm: DEFAULT_MAX_DRIFT_PPM,
+            reconnect_timeout_ms: DEFAULT_RECONNECT_TIMEOUT_MS,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_target_latency_ms(mut self, target_latency_ms: u32) -> Self {
+        self.target_latency_ms = target_latency_ms;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_drift_ppm(mut self, max_drift_ppm: u32) -> Self {
+        self.max_drift_ppm = max_drift_ppm;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_reconnect_timeout_ms(mut self, reconnect_timeout_ms: u32) -> Self {
+        self.reconnect_timeout_ms = reconnect_timeout_ms;
+        self
+    }
+
+    fn validate(self) -> Result<(), ConfigError> {
+        if self.target_latency_ms != 0
+            && !(MIN_TARGET_LATENCY_MS..=MAX_TARGET_LATENCY_MS).contains(&self.target_latency_ms)
+        {
+            return Err(ConfigError::invalid(
+                "target_latency_ms",
+                "zero for automatic or an integer in 20..=5000 ms",
+            ));
+        }
+        if self.max_drift_ppm > MAX_DRIFT_PPM {
+            return Err(ConfigError::invalid(
+                "max_drift_ppm",
+                "an integer in 0..=10000 ppm",
+            ));
+        }
+        if self.reconnect_timeout_ms > MAX_RECONNECT_TIMEOUT_MS {
+            return Err(ConfigError::invalid(
+                "reconnect_timeout_ms",
+                "an integer in 0..=300000 ms",
+            ));
+        }
+        Ok(())
+    }
+
+    fn resolved_target_latency_ms(self, chunk_ms: u32) -> Result<u32, ConfigError> {
+        self.validate()?;
+        if self.target_latency_ms != 0 {
+            return Ok(self.target_latency_ms);
+        }
+        chunk_ms
+            .checked_mul(2)
+            .map(|latency| latency.max(40).min(MAX_TARGET_LATENCY_MS))
+            .ok_or(ConfigError::ResourceOverflow {
+                resource: "live target latency",
+            })
+    }
 }
 
 impl LiveConfig {
@@ -112,6 +217,10 @@ struct LiveBufferPlan {
     chunk_frames: usize,
     input_capacity: usize,
     queue_capacity: usize,
+    target_queue_frames: usize,
+    maximum_resampled_frames: usize,
+    resampler_delay_frames: usize,
+    backend_delay_frames: usize,
     required_bytes: u64,
 }
 
@@ -250,7 +359,6 @@ fn checked_ceil_scale(
     checked_ceil_div(resource, product, denominator)
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
 fn checked_ceil_div(
     resource: &'static str,
     numerator: u64,
@@ -270,13 +378,16 @@ fn greatest_common_divisor(mut lhs: u64, mut rhs: u64) -> u64 {
     lhs
 }
 
-fn plan_live_buffers(
+fn plan_live_buffers_with_resilience(
     config: &LiveConfig,
-    sample_rate: u32,
+    resilience: LiveResilienceConfig,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
     input_channels: usize,
     output_channels: usize,
 ) -> Result<LiveBufferPlan, ConfigError> {
     config.validate_config()?;
+    resilience.validate()?;
     if output_channels == 0 || output_channels > MAX_STREAM_CHANNELS {
         return Err(ConfigError::invalid(
             "output_channels",
@@ -284,35 +395,77 @@ fn plan_live_buffers(
         ));
     }
     let mut denoiser = config.denoiser.clone();
-    denoiser.sample_rate = sample_rate;
+    denoiser.sample_rate = output_sample_rate;
     denoiser.validate_config()?;
+    if input_sample_rate == 0 || input_sample_rate > MAX_SAMPLE_RATE {
+        return Err(ConfigError::invalid(
+            "input_sample_rate",
+            "an integer in 1..=768000 Hz",
+        ));
+    }
     let backend_additional_bytes = StreamingBackendSession::estimate_additional_bytes(
         config.backend,
-        sample_rate,
+        output_sample_rate,
         input_channels,
         config.backend_options.channel_mode,
     )?;
     let processor = ResourcePlan::for_stream(
         input_channels,
         denoiser.frame_size,
-        sample_rate,
+        output_sample_rate,
         denoiser.profile_ms,
     )?;
 
     let chunk_numerator = checked_resource_multiply(
         "live chunk frames",
-        sample_rate as u64,
+        input_sample_rate as u64,
         config.chunk_ms as u64,
     )?;
     let chunk_frames_u64 = (chunk_numerator / 1_000).max(1);
-    let ready_burst_frames = maximum_ready_burst_frames(config, sample_rate, chunk_frames_u64)?;
+    let nominal_output = checked_resource_multiply(
+        "live asynchronous resampler",
+        chunk_frames_u64,
+        output_sample_rate as u64,
+    )?;
+    let drifted_output =
+        checked_resource_multiply("live asynchronous resampler", nominal_output, 1_000_000)?;
+    let drift_denominator = 1_000_000u64
+        .checked_sub(resilience.max_drift_ppm as u64)
+        .ok_or(ConfigError::ResourceOverflow {
+            resource: "live asynchronous resampler",
+        })?;
+    let resample_denominator = checked_resource_multiply(
+        "live asynchronous resampler",
+        input_sample_rate as u64,
+        drift_denominator,
+    )?;
+    let maximum_resampled_frames = checked_resource_add(
+        "live asynchronous resampler",
+        checked_ceil_div(
+            "live asynchronous resampler",
+            drifted_output,
+            resample_denominator,
+        )?,
+        10,
+    )?;
+    let ready_burst_frames =
+        maximum_ready_burst_frames(config, output_sample_rate, maximum_resampled_frames)?;
     let input_samples =
         checked_resource_multiply("live input buffer", chunk_frames_u64, input_channels as u64)?;
-    let steady_queue_frames = checked_resource_multiply(
+    let target_latency_ms = resilience.resolved_target_latency_ms(config.chunk_ms)?;
+    let target_numerator = checked_resource_multiply(
+        "live target latency",
+        output_sample_rate as u64,
+        target_latency_ms as u64,
+    )?;
+    let target_queue_frames = checked_ceil_div("live target latency", target_numerator, 1_000)?;
+    let scheduling_queue_frames = checked_resource_multiply(
         "live playback queue",
-        chunk_frames_u64,
+        maximum_resampled_frames,
         PLAYBACK_QUEUE_CHUNKS,
     )?;
+    let target_headroom = checked_resource_multiply("live playback queue", target_queue_frames, 2)?;
+    let steady_queue_frames = scheduling_queue_frames.max(target_headroom);
     // Keep the historical eight-chunk scheduling cushion plus one complete
     // stateful release. The latter can be much larger than an input chunk.
     let queue_frames = checked_resource_add(
@@ -333,9 +486,19 @@ fn plan_live_buffers(
         captured_chunk_bytes,
         CAPTURE_PIPELINE_CHUNKS,
     )?;
-    let worker_chunk_bytes = checked_resource_multiply(
+    let input_planar_bytes = checked_resource_multiply(
         "live working set",
         input_samples,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    let processed_samples = checked_resource_multiply(
+        "live working set",
+        maximum_resampled_frames,
+        input_channels as u64,
+    )?;
+    let worker_chunk_bytes = checked_resource_multiply(
+        "live working set",
+        processed_samples,
         std::mem::size_of::<f64>() as u64,
     )?;
     let worker_audio_copies = if denoiser.vad {
@@ -361,16 +524,19 @@ fn plan_live_buffers(
         ready_samples,
         std::mem::size_of::<f64>() as u64,
     )?;
-    let worker_bytes = checked_resource_add("live working set", regular_worker_bytes, ready_bytes)?;
+    let backend_worker_bytes =
+        checked_resource_add("live working set", regular_worker_bytes, ready_bytes)?;
+    let worker_bytes =
+        checked_resource_add("live working set", input_planar_bytes, backend_worker_bytes)?;
     let linked_alignment_bytes = if !denoiser.vad
         && input_channels == 2
         && config.backend_options.channel_mode == ChannelMode::StereoLinked
     {
-        let retained_frames = ready_burst_frames.checked_sub(chunk_frames_u64).ok_or(
-            ConfigError::ResourceOverflow {
+        let retained_frames = ready_burst_frames
+            .checked_sub(maximum_resampled_frames)
+            .ok_or(ConfigError::ResourceOverflow {
                 resource: "live linked alignment",
-            },
-        )?;
+            })?;
         let retained_samples = checked_resource_multiply(
             "live linked alignment",
             retained_frames,
@@ -389,8 +555,15 @@ fn plan_live_buffers(
         queue_samples,
         std::mem::size_of::<f32>() as u64,
     )?;
-    let worker_and_alignment =
-        checked_resource_add("live working set", worker_bytes, linked_alignment_bytes)?;
+    let async_resampler_bytes =
+        async_resampler_plan_bytes(chunk_frames_u64, maximum_resampled_frames, input_channels)?;
+    let worker_and_resampler =
+        checked_resource_add("live working set", worker_bytes, async_resampler_bytes)?;
+    let worker_and_alignment = checked_resource_add(
+        "live working set",
+        worker_and_resampler,
+        linked_alignment_bytes,
+    )?;
     let input_bytes =
         checked_resource_add("live working set", captured_bytes, worker_and_alignment)?;
     let buffer_bytes = checked_resource_add("live working set", input_bytes, playback_bytes)?;
@@ -412,6 +585,22 @@ fn plan_live_buffers(
         });
     }
 
+    let resampler_delay_numerator = checked_resource_multiply(
+        "live resampler latency",
+        (ASYNC_SINC_LEN / 2) as u64,
+        output_sample_rate as u64,
+    )?;
+    let resampler_delay_frames = checked_ceil_div(
+        "live resampler latency",
+        resampler_delay_numerator,
+        input_sample_rate as u64,
+    )?;
+    let backend_delay_frames = ready_burst_frames
+        .checked_sub(maximum_resampled_frames)
+        .ok_or(ConfigError::ResourceOverflow {
+            resource: "live backend latency",
+        })?;
+
     Ok(LiveBufferPlan {
         chunk_frames: usize::try_from(chunk_frames_u64).map_err(|_| {
             ConfigError::ResourceOverflow {
@@ -428,13 +617,100 @@ fn plan_live_buffers(
                 resource: "live playback queue",
             }
         })?,
+        target_queue_frames: usize::try_from(target_queue_frames).map_err(|_| {
+            ConfigError::ResourceOverflow {
+                resource: "live target latency",
+            }
+        })?,
+        maximum_resampled_frames: usize::try_from(maximum_resampled_frames).map_err(|_| {
+            ConfigError::ResourceOverflow {
+                resource: "live asynchronous resampler",
+            }
+        })?,
+        resampler_delay_frames: usize::try_from(resampler_delay_frames).map_err(|_| {
+            ConfigError::ResourceOverflow {
+                resource: "live resampler latency",
+            }
+        })?,
+        backend_delay_frames: usize::try_from(backend_delay_frames).map_err(|_| {
+            ConfigError::ResourceOverflow {
+                resource: "live backend latency",
+            }
+        })?,
         required_bytes,
     })
 }
 
+#[cfg(test)]
+fn plan_live_buffers(
+    config: &LiveConfig,
+    sample_rate: u32,
+    input_channels: usize,
+    output_channels: usize,
+) -> Result<LiveBufferPlan, ConfigError> {
+    plan_live_buffers_with_resilience(
+        config,
+        LiveResilienceConfig::default(),
+        sample_rate,
+        sample_rate,
+        input_channels,
+        output_channels,
+    )
+}
+
+fn async_resampler_plan_bytes(
+    input_frames: u64,
+    output_frames: u64,
+    channels: usize,
+) -> Result<u64, ConfigError> {
+    let channels = u64::try_from(channels).map_err(|_| ConfigError::ResourceOverflow {
+        resource: "live asynchronous resampler",
+    })?;
+    let internal_frames = checked_resource_add(
+        "live asynchronous resampler",
+        input_frames,
+        (ASYNC_SINC_LEN * 2) as u64,
+    )?;
+    let channel_frames = checked_resource_add(
+        "live asynchronous resampler",
+        checked_resource_multiply("live asynchronous resampler", internal_frames, channels)?,
+        checked_resource_multiply("live asynchronous resampler", output_frames, channels)?,
+    )?;
+    let channel_bytes = checked_resource_multiply(
+        "live asynchronous resampler",
+        channel_frames,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    let filter_values = checked_resource_multiply(
+        "live asynchronous resampler",
+        ASYNC_SINC_LEN as u64,
+        ASYNC_SINC_OVERSAMPLING as u64,
+    )?;
+    let filter_bytes = checked_resource_multiply(
+        "live asynchronous resampler",
+        filter_values,
+        std::mem::size_of::<f64>() as u64,
+    )?;
+    checked_resource_add("live asynchronous resampler", channel_bytes, filter_bytes)
+}
+
+/// Connection phase reported by [`LiveStatus`].
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveConnectionState {
+    Connecting,
+    Priming,
+    Running,
+    Recovering,
+}
+
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct LiveStatus {
+    /// Processing clock. This remains the output-device rate for compatibility.
     pub sample_rate: u32,
+    pub input_sample_rate: u32,
+    pub output_sample_rate: u32,
     pub input_channels: usize,
     pub output_channels: usize,
     pub chunk_frames: usize,
@@ -442,13 +718,322 @@ pub struct LiveStatus {
     pub output_level: f32,
     pub processed_chunks: u64,
     pub dropped_chunks: u64,
+    pub underrun_frames: u64,
+    pub overflow_frames: u64,
+    pub queued_frames: usize,
+    pub target_queue_frames: usize,
+    pub queue_latency_ms: f64,
+    pub processing_latency_ms: f64,
+    pub input_device_latency_ms: f64,
+    pub output_device_latency_ms: f64,
+    /// Estimated capture-to-playback latency, including algorithmic delay.
+    pub estimated_total_latency_ms: f64,
+    /// Current output/input ratio correction. Positive values grow the queue.
+    pub drift_correction_ppm: f64,
+    pub reconnect_attempts: u64,
+    pub device_generation: u64,
+    pub connection_state: LiveConnectionState,
     /// Concrete runtime used by the live processor.
     pub accelerator: AcceleratorSelection,
+}
+
+impl LiveStatus {
+    fn connection(
+        state: LiveConnectionState,
+        accelerator: AcceleratorSelection,
+        reconnect_attempts: u64,
+        device_generation: u64,
+    ) -> Self {
+        Self {
+            sample_rate: 0,
+            input_sample_rate: 0,
+            output_sample_rate: 0,
+            input_channels: 0,
+            output_channels: 0,
+            chunk_frames: 0,
+            input_level: 0.0,
+            output_level: 0.0,
+            processed_chunks: 0,
+            dropped_chunks: 0,
+            underrun_frames: 0,
+            overflow_frames: 0,
+            queued_frames: 0,
+            target_queue_frames: 0,
+            queue_latency_ms: 0.0,
+            processing_latency_ms: 0.0,
+            input_device_latency_ms: 0.0,
+            output_device_latency_ms: 0.0,
+            estimated_total_latency_ms: 0.0,
+            drift_correction_ppm: 0.0,
+            reconnect_attempts,
+            device_generation,
+            connection_state: state,
+            accelerator,
+        }
+    }
+}
+
+struct ClockDriftController {
+    target_frames: f64,
+    max_correction_ppm: f64,
+    integral_error_seconds: f64,
+    correction_ppm: f64,
+}
+
+impl ClockDriftController {
+    fn new(target_frames: usize, max_correction_ppm: u32) -> Self {
+        Self {
+            target_frames: target_frames.max(1) as f64,
+            max_correction_ppm: max_correction_ppm as f64,
+            integral_error_seconds: 0.0,
+            correction_ppm: 0.0,
+        }
+    }
+
+    fn update(&mut self, queued_frames: usize, elapsed_seconds: f64) -> f64 {
+        if self.max_correction_ppm == 0.0 {
+            self.correction_ppm = 0.0;
+            return 0.0;
+        }
+        let normalized_error =
+            ((self.target_frames - queued_frames as f64) / self.target_frames).clamp(-2.0, 2.0);
+        self.integral_error_seconds = (self.integral_error_seconds
+            + normalized_error * elapsed_seconds.max(0.0))
+        .clamp(-5.0, 5.0);
+        let requested = 5_000.0 * normalized_error + 500.0 * self.integral_error_seconds;
+        self.correction_ppm = requested.clamp(-self.max_correction_ppm, self.max_correction_ppm);
+        self.correction_ppm
+    }
+
+    fn reset(&mut self) {
+        self.integral_error_seconds = 0.0;
+        self.correction_ppm = 0.0;
+    }
+}
+
+struct AdaptiveClockResampler {
+    converter: SincFixedIn<f64>,
+    output: Vec<Vec<f64>>,
+    maximum_output_frames: usize,
+}
+
+impl AdaptiveClockResampler {
+    fn new(
+        input_sample_rate: u32,
+        output_sample_rate: u32,
+        input_frames: usize,
+        channels: usize,
+        maximum_output_frames: usize,
+        max_drift_ppm: u32,
+    ) -> Result<Self, String> {
+        let nominal_ratio = output_sample_rate as f64 / input_sample_rate as f64;
+        let maximum_relative_ratio = 1.0 / (1.0 - max_drift_ppm as f64 / 1_000_000.0);
+        let converter = SincFixedIn::<f64>::new(
+            nominal_ratio,
+            maximum_relative_ratio,
+            SincInterpolationParameters {
+                sinc_len: ASYNC_SINC_LEN,
+                f_cutoff: 0.95,
+                oversampling_factor: ASYNC_SINC_OVERSAMPLING,
+                interpolation: SincInterpolationType::Cubic,
+                window: WindowFunction::BlackmanHarris2,
+            },
+            input_frames,
+            channels,
+        )
+        .map_err(|error| format!("initialize live asynchronous resampler: {error}"))?;
+        if converter.output_frames_max() > maximum_output_frames {
+            return Err(format!(
+                "live asynchronous resampler requires {} output frames, planned maximum is {maximum_output_frames}",
+                converter.output_frames_max()
+            ));
+        }
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(channels)
+            .map_err(|_| ConfigError::allocation_failed("live resampler output").to_string())?;
+        for _ in 0..channels {
+            let mut channel = Vec::new();
+            channel
+                .try_reserve_exact(maximum_output_frames)
+                .map_err(|_| ConfigError::allocation_failed("live resampler output").to_string())?;
+            channel.resize(maximum_output_frames, 0.0);
+            output.push(channel);
+        }
+        Ok(Self {
+            converter,
+            output,
+            maximum_output_frames,
+        })
+    }
+
+    fn process(
+        &mut self,
+        input: &[Vec<f64>],
+        correction_ppm: f64,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        let relative_ratio = 1.0 + correction_ppm / 1_000_000.0;
+        self.converter
+            .set_resample_ratio_relative(relative_ratio, true)
+            .map_err(|error| format!("adjust live asynchronous resampler: {error}"))?;
+        let (_, output_frames) = self
+            .converter
+            .process_into_buffer(input, &mut self.output, None)
+            .map_err(|error| format!("resample live capture: {error}"))?;
+        if output_frames > self.maximum_output_frames {
+            return Err("live asynchronous resampler exceeded its planned output".into());
+        }
+        let mut converted = Vec::new();
+        converted
+            .try_reserve_exact(self.output.len())
+            .map_err(|_| ConfigError::allocation_failed("live resampled channels").to_string())?;
+        for source in &self.output {
+            let mut channel = Vec::new();
+            channel.try_reserve_exact(output_frames).map_err(|_| {
+                ConfigError::allocation_failed("live resampled samples").to_string()
+            })?;
+            channel.extend_from_slice(&source[..output_frames]);
+            converted.push(channel);
+        }
+        Ok(converted)
+    }
+
+    fn reset(&mut self) {
+        self.converter.reset();
+    }
 }
 
 struct CapturedChunk {
     sequence: u64,
     samples: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct GenerationFailure {
+    message: String,
+    recoverable: bool,
+    reached_running: bool,
+}
+
+impl GenerationFailure {
+    fn recoverable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            recoverable: true,
+            reached_running: false,
+        }
+    }
+
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            recoverable: false,
+            reached_running: false,
+        }
+    }
+
+    fn after_start(mut self) -> Self {
+        self.reached_running = true;
+        self
+    }
+}
+
+struct RecoverySchedule {
+    timeout: Duration,
+    timeout_ms: u32,
+    started: Option<Instant>,
+    backoff: Duration,
+    reconnect_attempts: u64,
+    device_generation: u64,
+}
+
+impl RecoverySchedule {
+    fn new(timeout_ms: u32) -> Self {
+        Self {
+            timeout: Duration::from_millis(timeout_ms as u64),
+            timeout_ms,
+            started: None,
+            backoff: Duration::from_millis(RECONNECT_INITIAL_BACKOFF_MS),
+            reconnect_attempts: 0,
+            device_generation: 1,
+        }
+    }
+
+    fn schedule(&mut self, failure: &GenerationFailure, now: Instant) -> Result<Duration, String> {
+        if !failure.recoverable || self.timeout.is_zero() {
+            return Err(failure.message.clone());
+        }
+        if failure.reached_running || self.started.is_none() {
+            self.started = Some(now);
+            self.backoff = Duration::from_millis(RECONNECT_INITIAL_BACKOFF_MS);
+        }
+        let elapsed = now.saturating_duration_since(self.started.expect("recovery start exists"));
+        if elapsed >= self.timeout {
+            return Err(format!(
+                "live device recovery timed out after {} ms: {}",
+                self.timeout_ms, failure.message
+            ));
+        }
+        self.reconnect_attempts = self
+            .reconnect_attempts
+            .checked_add(1)
+            .ok_or_else(|| "live reconnect attempt counter exhausted".to_string())?;
+        self.device_generation = self
+            .device_generation
+            .checked_add(1)
+            .ok_or_else(|| "live device generation counter exhausted".to_string())?;
+        let remaining = self.timeout.saturating_sub(elapsed);
+        let delay = self.backoff.min(remaining);
+        self.backoff = self
+            .backoff
+            .saturating_mul(2)
+            .min(Duration::from_millis(RECONNECT_MAX_BACKOFF_MS));
+        Ok(delay)
+    }
+}
+
+fn record_generation_failure(
+    slot: &Mutex<Option<GenerationFailure>>,
+    failure: GenerationFailure,
+    generation_running: &AtomicBool,
+) {
+    if let Ok(mut current) = slot.lock() {
+        if current.is_none() {
+            *current = Some(failure);
+        }
+    }
+    generation_running.store(false, Ordering::Release);
+}
+
+#[derive(Clone)]
+struct LiveMetrics {
+    input_level: Arc<AtomicU32>,
+    output_level: Arc<AtomicU32>,
+    dropped_chunks: Arc<AtomicU64>,
+    processed_chunks: Arc<AtomicU64>,
+    underrun_frames: Arc<AtomicU64>,
+    overflow_frames: Arc<AtomicU64>,
+    input_device_latency_us: Arc<AtomicU64>,
+    output_device_latency_us: Arc<AtomicU64>,
+    processing_latency_us: Arc<AtomicU64>,
+    drift_correction_bits: Arc<AtomicU64>,
+}
+
+impl LiveMetrics {
+    fn new() -> Self {
+        Self {
+            input_level: Arc::new(AtomicU32::new(0)),
+            output_level: Arc::new(AtomicU32::new(0)),
+            dropped_chunks: Arc::new(AtomicU64::new(0)),
+            processed_chunks: Arc::new(AtomicU64::new(0)),
+            underrun_frames: Arc::new(AtomicU64::new(0)),
+            overflow_frames: Arc::new(AtomicU64::new(0)),
+            input_device_latency_us: Arc::new(AtomicU64::new(0)),
+            output_device_latency_us: Arc::new(AtomicU64::new(0)),
+            processing_latency_us: Arc::new(AtomicU64::new(0)),
+            drift_correction_bits: Arc::new(AtomicU64::new(0.0f64.to_bits())),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -674,6 +1259,33 @@ pub fn run_with_governor(
     run_prepared_with_status_impl(config, running, |_| {}, Some(governor))
 }
 
+/// Run a live session with status diagnostics until Ctrl-C.
+pub fn run_with_governor_and_status<F>(
+    config: LiveConfig,
+    governor: &crate::ResourceGovernor,
+    report: F,
+) -> Result<(), String>
+where
+    F: FnMut(LiveStatus),
+{
+    let prepared = PreparedLiveConfig::new(config)?;
+    run_prepared_with_governor_and_status(prepared, governor, report)
+}
+
+/// Run an already-prepared resilient live session until Ctrl-C.
+pub fn run_prepared_with_governor_and_status<F>(
+    prepared: PreparedLiveConfig,
+    governor: &crate::ResourceGovernor,
+    report: F,
+) -> Result<(), String>
+where
+    F: FnMut(LiveStatus),
+{
+    let running = Arc::new(AtomicBool::new(true));
+    let _signal_session = register_ctrl_c_session(Arc::clone(&running))?;
+    run_prepared_with_status_impl(prepared, running, report, Some(governor))
+}
+
 /// Run a live session controlled by the caller and periodically report levels.
 pub fn run_with_status<F>(
     config: LiveConfig,
@@ -695,6 +1307,7 @@ where
 pub struct PreparedLiveConfig {
     config: LiveConfig,
     accelerator: AcceleratorSelection,
+    resilience: LiveResilienceConfig,
 }
 
 impl PreparedLiveConfig {
@@ -713,13 +1326,29 @@ impl PreparedLiveConfig {
         Ok(Self {
             config,
             accelerator,
+            resilience: LiveResilienceConfig::default(),
         })
+    }
+
+    /// Override clock/reconnect policy after model and backend preparation.
+    pub fn with_resilience(mut self, resilience: LiveResilienceConfig) -> Result<Self, String> {
+        resilience.validate().map_err(|error| error.to_string())?;
+        resilience
+            .resolved_target_latency_ms(self.config.chunk_ms)
+            .map_err(|error| error.to_string())?;
+        self.resilience = resilience;
+        Ok(self)
     }
 
     /// Return the concrete runtime captured during preparation.
     #[must_use]
     pub const fn accelerator(&self) -> AcceleratorSelection {
         self.accelerator
+    }
+
+    #[must_use]
+    pub const fn resilience(&self) -> LiveResilienceConfig {
+        self.resilience
     }
 }
 
@@ -803,74 +1432,152 @@ fn run_prepared_with_status_impl<F>(
 where
     F: FnMut(LiveStatus),
 {
-    let PreparedLiveConfig {
-        mut config,
+    let accelerator = prepared.accelerator;
+    let mut recovery = RecoverySchedule::new(prepared.resilience.reconnect_timeout_ms);
+    let mut last_status = None::<LiveStatus>;
+
+    report(LiveStatus::connection(
+        LiveConnectionState::Connecting,
         accelerator,
-    } = prepared;
+        recovery.reconnect_attempts,
+        recovery.device_generation,
+    ));
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = run_device_generation(
+            &prepared,
+            Arc::clone(&running),
+            governor,
+            recovery.reconnect_attempts,
+            recovery.device_generation,
+            |status| {
+                last_status = Some(status);
+                report(status);
+            },
+        );
+        match result {
+            Ok(()) => return Ok(()),
+            Err(_failure) if !running.load(Ordering::Acquire) => return Ok(()),
+            Err(failure) => {
+                let delay = recovery.schedule(&failure, Instant::now())?;
+                let mut status = last_status.unwrap_or_else(|| {
+                    LiveStatus::connection(
+                        LiveConnectionState::Recovering,
+                        accelerator,
+                        recovery.reconnect_attempts,
+                        recovery.device_generation,
+                    )
+                });
+                status.connection_state = LiveConnectionState::Recovering;
+                status.reconnect_attempts = recovery.reconnect_attempts;
+                status.device_generation = recovery.device_generation;
+                report(status);
+                eprintln!(
+                    "denoize: live device interrupted; reconnect attempt {}: {}",
+                    recovery.reconnect_attempts, failure.message
+                );
+                interruptible_sleep(delay, &running);
+            }
+        }
+    }
+}
+
+fn run_device_generation<F>(
+    prepared: &PreparedLiveConfig,
+    session_running: Arc<AtomicBool>,
+    governor: Option<&crate::ResourceGovernor>,
+    reconnect_attempts: u64,
+    device_generation: u64,
+    mut report: F,
+) -> Result<(), GenerationFailure>
+where
+    F: FnMut(LiveStatus),
+{
+    let mut config = prepared.config.clone();
+    let accelerator = prepared.accelerator;
+    let resilience = prepared.resilience;
     let host = cpal::default_host();
-    let input = select_device(&host, true, config.input_device.as_deref())?;
-    let output = select_device(&host, false, config.output_device.as_deref())?;
+    let input = select_device(&host, true, config.input_device.as_deref())
+        .map_err(GenerationFailure::recoverable)?;
+    let output = select_device(&host, false, config.output_device.as_deref())
+        .map_err(GenerationFailure::recoverable)?;
     let input_supported = input
         .default_input_config()
-        .map_err(|e| format!("input config: {e}"))?;
+        .map_err(|error| GenerationFailure::recoverable(format!("input config: {error}")))?;
     let output_supported = output
         .default_output_config()
-        .map_err(|e| format!("output config: {e}"))?;
+        .map_err(|error| GenerationFailure::recoverable(format!("output config: {error}")))?;
     let input_cfg: StreamConfig = input_supported.clone().into();
     let output_cfg: StreamConfig = output_supported.clone().into();
-    if input_cfg.sample_rate != output_cfg.sample_rate {
-        return Err(format!(
-            "input/output sample rates differ ({} vs {} Hz); select devices with a common default rate",
-            input_cfg.sample_rate.0, output_cfg.sample_rate.0
-        ));
-    }
-
-    let rate = input_cfg.sample_rate.0;
+    let input_rate = input_cfg.sample_rate.0;
+    let output_rate = output_cfg.sample_rate.0;
     let in_channels = input_cfg.channels as usize;
     let out_channels = output_cfg.channels as usize;
-    let buffer_plan = plan_live_buffers(&config, rate, in_channels, out_channels)
-        .map_err(|error| error.to_string())?;
+    let buffer_plan = plan_live_buffers_with_resilience(
+        &config,
+        resilience,
+        input_rate,
+        output_rate,
+        in_channels,
+        out_channels,
+    )
+    .map_err(|error| GenerationFailure::fatal(error.to_string()))?;
     let mut worker_request = crate::ResourceRequest::worker(buffer_plan.required_bytes, 0);
     if accelerator.effective() != crate::AcceleratorRuntime::Cpu {
         worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
             buffer_plan
                 .required_bytes
                 .checked_mul(2)
-                .ok_or_else(|| "live GPU reservation overflow".to_string())?,
+                .ok_or_else(|| GenerationFailure::fatal("live GPU reservation overflow"))?,
         );
     }
-    let request = worker_request.checked_add(crate::estimate_backend_session_request(
-        config.backend,
-        &config.backend_options,
-        accelerator,
-    )?)?;
+    let request = worker_request
+        .checked_add(
+            crate::estimate_backend_session_request(
+                config.backend,
+                &config.backend_options,
+                accelerator,
+            )
+            .map_err(GenerationFailure::fatal)?,
+        )
+        .map_err(GenerationFailure::fatal)?;
     let _resource_permit = governor
-        .map(|governor| governor.acquire(request))
-        .transpose()?;
-    config.denoiser.sample_rate = rate;
+        .map(|governor| {
+            governor.acquire_with_cancel(request, || !session_running.load(Ordering::Acquire))
+        })
+        .transpose()
+        .map_err(GenerationFailure::fatal)?;
+    config.denoiser.sample_rate = output_rate;
     let chunk_frames = buffer_plan.chunk_frames;
     let queue_capacity = buffer_plan.queue_capacity;
     let mut playback_queue = VecDeque::<f32>::new();
     playback_queue
         .try_reserve_exact(queue_capacity)
-        .map_err(|_| ConfigError::allocation_failed("live playback queue").to_string())?;
+        .map_err(|_| {
+            GenerationFailure::fatal(
+                ConfigError::allocation_failed("live playback queue").to_string(),
+            )
+        })?;
     let playback = Arc::new(Mutex::new(playback_queue));
     let mut pending_input = Vec::<f32>::new();
     pending_input
         .try_reserve_exact(buffer_plan.input_capacity)
-        .map_err(|_| ConfigError::allocation_failed("live input buffer").to_string())?;
+        .map_err(|_| {
+            GenerationFailure::fatal(
+                ConfigError::allocation_failed("live input buffer").to_string(),
+            )
+        })?;
     let (tx, rx) = mpsc::sync_channel::<CapturedChunk>(CAPTURE_QUEUE_CHUNKS);
     let (worker_ready_tx, worker_ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-    let input_level = Arc::new(AtomicU32::new(0));
-    let output_level = Arc::new(AtomicU32::new(0));
-    let dropped_chunks = Arc::new(AtomicU64::new(0));
-    let processed_chunks = Arc::new(AtomicU64::new(0));
-    let worker_error = Arc::new(Mutex::new(None::<String>));
-    let worker_running = Arc::clone(&running);
+    let metrics = LiveMetrics::new();
+    let generation_failure = Arc::new(Mutex::new(None::<GenerationFailure>));
+    let generation_running = Arc::new(AtomicBool::new(true));
+    let worker_running = Arc::clone(&generation_running);
     let worker_playback = Arc::clone(&playback);
-    let worker_output_level = Arc::clone(&output_level);
-    let worker_processed = Arc::clone(&processed_chunks);
-    let worker_failure = Arc::clone(&worker_error);
+    let worker_metrics = metrics.clone();
+    let worker_failure = Arc::clone(&generation_failure);
     let worker_config = config.clone();
     let worker = std::thread::spawn(move || {
         // Some compiled stream backends intentionally own thread-affine model
@@ -884,22 +1591,44 @@ where
                     return;
                 }
             };
+        let mut clock_resampler = match AdaptiveClockResampler::new(
+            input_rate,
+            output_rate,
+            chunk_frames,
+            in_channels,
+            buffer_plan.maximum_resampled_frames,
+            resilience.max_drift_ppm,
+        ) {
+            Ok(resampler) => resampler,
+            Err(error) => {
+                let _ = worker_ready_tx.send(Err(error));
+                return;
+            }
+        };
+        let mut drift_controller =
+            ClockDriftController::new(buffer_plan.target_queue_frames, resilience.max_drift_ppm);
+        let mut next_resampler_sequence = 0u64;
+        let chunk_seconds = chunk_frames as f64 / input_rate as f64;
+        let mut processing_average_us = 0.0f64;
         if worker_ready_tx.send(Ok(())).is_err() {
             return;
         }
-        while worker_running.load(Ordering::Relaxed) {
+        while worker_running.load(Ordering::Acquire) {
             let captured = match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(captured) => captured,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(_) => break,
             };
+            let processing_started = Instant::now();
             let mut channels = Vec::new();
             if channels.try_reserve_exact(in_channels).is_err() {
-                if let Ok(mut error) = worker_failure.lock() {
-                    *error =
-                        Some(ConfigError::allocation_failed("live worker channels").to_string());
-                }
-                worker_running.store(false, Ordering::Relaxed);
+                record_generation_failure(
+                    &worker_failure,
+                    GenerationFailure::fatal(
+                        ConfigError::allocation_failed("live worker channels").to_string(),
+                    ),
+                    &worker_running,
+                );
                 break;
             }
             let mut allocation_failed = false;
@@ -912,11 +1641,13 @@ where
                 channels.push(channel);
             }
             if allocation_failed {
-                if let Ok(mut error) = worker_failure.lock() {
-                    *error =
-                        Some(ConfigError::allocation_failed("live worker samples").to_string());
-                }
-                worker_running.store(false, Ordering::Relaxed);
+                record_generation_failure(
+                    &worker_failure,
+                    GenerationFailure::fatal(
+                        ConfigError::allocation_failed("live worker samples").to_string(),
+                    ),
+                    &worker_running,
+                );
                 break;
             }
             for frame in captured.samples.chunks_exact(in_channels) {
@@ -924,13 +1655,61 @@ where
                     channel.push(*sample as f64);
                 }
             }
+            let following_sequence = match captured.sequence.checked_add(1) {
+                Some(following) => following,
+                None => {
+                    record_generation_failure(
+                        &worker_failure,
+                        GenerationFailure::fatal("live capture sequence exhausted"),
+                        &worker_running,
+                    );
+                    break;
+                }
+            };
+            let reset_for_gap = captured.sequence != next_resampler_sequence;
+            next_resampler_sequence = following_sequence;
+            if reset_for_gap {
+                clock_resampler.reset();
+                drift_controller.reset();
+            }
+            let queued_frames = match worker_playback.lock() {
+                Ok(queue) => queue.len() / out_channels,
+                Err(_) => {
+                    record_generation_failure(
+                        &worker_failure,
+                        GenerationFailure::fatal("live playback queue lock poisoned"),
+                        &worker_running,
+                    );
+                    break;
+                }
+            };
+            let correction_ppm = if reset_for_gap {
+                0.0
+            } else {
+                drift_controller.update(queued_frames, chunk_seconds)
+            };
+            worker_metrics
+                .drift_correction_bits
+                .store(correction_ppm.to_bits(), Ordering::Relaxed);
+            let channels = match clock_resampler.process(&channels, correction_ppm) {
+                Ok(channels) => channels,
+                Err(error) => {
+                    record_generation_failure(
+                        &worker_failure,
+                        GenerationFailure::fatal(error),
+                        &worker_running,
+                    );
+                    break;
+                }
+            };
             let processed = match live_processor.process_chunk(captured.sequence, channels) {
                 Ok(processed) => processed,
                 Err(error) => {
-                    if let Ok(mut failure) = worker_failure.lock() {
-                        *failure = Some(error);
-                    }
-                    worker_running.store(false, Ordering::Relaxed);
+                    record_generation_failure(
+                        &worker_failure,
+                        GenerationFailure::fatal(error),
+                        &worker_running,
+                    );
                     break;
                 }
             };
@@ -945,94 +1724,334 @@ where
                         &audio,
                         out_channels,
                         queue_capacity,
-                        &worker_output_level,
+                        &worker_metrics.output_level,
                     )
                 }
                 Err(_) => Err("live playback queue lock poisoned".into()),
             };
-            if let Err(error) = enqueue_result {
-                if let Ok(mut failure) = worker_failure.lock() {
-                    *failure = Some(error);
+            match enqueue_result {
+                Ok(overflow_frames) => {
+                    worker_metrics
+                        .overflow_frames
+                        .fetch_add(overflow_frames as u64, Ordering::Relaxed);
                 }
-                worker_running.store(false, Ordering::Relaxed);
-                break;
+                Err(error) => {
+                    record_generation_failure(
+                        &worker_failure,
+                        GenerationFailure::fatal(error),
+                        &worker_running,
+                    );
+                    break;
+                }
             }
-            worker_processed.fetch_add(1, Ordering::Relaxed);
+            worker_metrics
+                .processed_chunks
+                .fetch_add(1, Ordering::Relaxed);
+            let elapsed_us = processing_started.elapsed().as_secs_f64() * 1_000_000.0;
+            processing_average_us = if processing_average_us == 0.0 {
+                elapsed_us
+            } else {
+                0.9 * processing_average_us + 0.1 * elapsed_us
+            };
+            worker_metrics
+                .processing_latency_us
+                .store(processing_average_us.round() as u64, Ordering::Relaxed);
         }
     });
     match worker_ready_rx.recv() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let _ = worker.join();
-            return Err(error);
+            return Err(GenerationFailure::fatal(error));
         }
         Err(_) => {
             let _ = worker.join();
-            return Err("live worker exited before processor initialization completed".into());
+            return Err(GenerationFailure::fatal(
+                "live worker exited before processor initialization completed",
+            ));
         }
     }
 
-    let input_stream = build_input(
+    let input_stream = match build_input(
         &input,
         &input_cfg,
         input_supported.sample_format(),
         tx,
         chunk_frames,
         pending_input,
-        Arc::clone(&input_level),
-        Arc::clone(&dropped_chunks),
-        Arc::clone(&worker_error),
-        Arc::clone(&running),
-    )?;
-    let output_stream = build_output(
+        Arc::clone(&metrics.input_level),
+        Arc::clone(&metrics.dropped_chunks),
+        Arc::clone(&metrics.input_device_latency_us),
+        Arc::clone(&generation_failure),
+        Arc::clone(&generation_running),
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            generation_running.store(false, Ordering::Release);
+            let _ = worker.join();
+            return Err(GenerationFailure::recoverable(error));
+        }
+    };
+    let output_stream = match build_output(
         &output,
         &output_cfg,
         output_supported.sample_format(),
-        playback,
-        Arc::clone(&worker_error),
-        Arc::clone(&running),
-    )?;
-    output_stream
-        .play()
-        .map_err(|e| format!("start output: {e}"))?;
-    input_stream
-        .play()
-        .map_err(|e| format!("start input: {e}"))?;
+        Arc::clone(&playback),
+        out_channels,
+        Arc::clone(&metrics.underrun_frames),
+        Arc::clone(&metrics.output_device_latency_us),
+        Arc::clone(&generation_failure),
+        Arc::clone(&generation_running),
+    ) {
+        Ok(stream) => stream,
+        Err(error) => {
+            drop(input_stream);
+            generation_running.store(false, Ordering::Release);
+            let _ = worker.join();
+            return Err(GenerationFailure::recoverable(error));
+        }
+    };
+    if let Err(error) = input_stream.play() {
+        drop(input_stream);
+        drop(output_stream);
+        generation_running.store(false, Ordering::Release);
+        let _ = worker.join();
+        return Err(GenerationFailure::recoverable(format!(
+            "start input: {error}"
+        )));
+    }
+
+    let prime_timeout = PRIME_TIMEOUT.saturating_add(Duration::from_secs_f64(
+        (config.denoiser.profile_ms.max(0.0) / 1_000.0).min(60.0),
+    ));
+    let prime_started = Instant::now();
+    report(runtime_status(
+        LiveConnectionState::Priming,
+        input_rate,
+        output_rate,
+        in_channels,
+        out_channels,
+        &buffer_plan,
+        &playback,
+        &metrics,
+        accelerator,
+        reconnect_attempts,
+        device_generation,
+    ));
+    let mut last_report = Instant::now();
+    while session_running.load(Ordering::Acquire)
+        && generation_running.load(Ordering::Acquire)
+        && !worker.is_finished()
+    {
+        let queued_frames = playback
+            .lock()
+            .map(|queue| queue.len() / out_channels)
+            .unwrap_or(0);
+        if queued_frames >= buffer_plan.target_queue_frames {
+            break;
+        }
+        if prime_started.elapsed() >= prime_timeout {
+            record_generation_failure(
+                &generation_failure,
+                GenerationFailure::fatal(format!(
+                    "live playback queue did not reach its {} frame target",
+                    buffer_plan.target_queue_frames
+                )),
+                &generation_running,
+            );
+            break;
+        }
+        if last_report.elapsed() >= LIVE_STATUS_INTERVAL {
+            report(runtime_status(
+                LiveConnectionState::Priming,
+                input_rate,
+                output_rate,
+                in_channels,
+                out_channels,
+                &buffer_plan,
+                &playback,
+                &metrics,
+                accelerator,
+                reconnect_attempts,
+                device_generation,
+            ));
+            last_report = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !session_running.load(Ordering::Acquire) {
+        generation_running.store(false, Ordering::Release);
+        drop(input_stream);
+        drop(output_stream);
+        let _ = worker.join();
+        return Ok(());
+    }
+    if !generation_running.load(Ordering::Acquire) || worker.is_finished() {
+        drop(input_stream);
+        drop(output_stream);
+        generation_running.store(false, Ordering::Release);
+        let _ = worker.join();
+        return Err(
+            take_generation_failure(&generation_failure).unwrap_or_else(|| {
+                GenerationFailure::fatal("live worker stopped while priming playback")
+            }),
+        );
+    }
+    if let Err(error) = output_stream.play() {
+        drop(input_stream);
+        drop(output_stream);
+        generation_running.store(false, Ordering::Release);
+        let _ = worker.join();
+        return Err(GenerationFailure::recoverable(format!(
+            "start output: {error}"
+        )));
+    }
     let fallback = accelerator
         .fallback()
         .map(|reason| format!(", fallback {}", reason.name()))
         .unwrap_or_default();
     eprintln!(
-        "denoize: live at {rate} Hz, {in_channels} input channel(s), {chunk_frames} frames/chunk; accelerator {}{fallback}; press Ctrl-C to stop",
+        "denoize: live input {input_rate} Hz -> output {output_rate} Hz, {in_channels} input channel(s), {chunk_frames} frames/chunk, target {} frames; accelerator {}{fallback}; press Ctrl-C to stop",
+        buffer_plan.target_queue_frames,
         accelerator.effective().name()
     );
-    while running.load(Ordering::Relaxed) && !worker.is_finished() {
-        std::thread::sleep(Duration::from_millis(100));
-        report(LiveStatus {
-            sample_rate: rate,
-            input_channels: in_channels,
-            output_channels: out_channels,
-            chunk_frames,
-            input_level: f32::from_bits(input_level.swap(0, Ordering::Relaxed)),
-            output_level: f32::from_bits(output_level.swap(0, Ordering::Relaxed)),
-            processed_chunks: processed_chunks.load(Ordering::Relaxed),
-            dropped_chunks: dropped_chunks.load(Ordering::Relaxed),
+    report(runtime_status(
+        LiveConnectionState::Running,
+        input_rate,
+        output_rate,
+        in_channels,
+        out_channels,
+        &buffer_plan,
+        &playback,
+        &metrics,
+        accelerator,
+        reconnect_attempts,
+        device_generation,
+    ));
+    while session_running.load(Ordering::Acquire)
+        && generation_running.load(Ordering::Acquire)
+        && !worker.is_finished()
+    {
+        std::thread::sleep(LIVE_STATUS_INTERVAL);
+        report(runtime_status(
+            LiveConnectionState::Running,
+            input_rate,
+            output_rate,
+            in_channels,
+            out_channels,
+            &buffer_plan,
+            &playback,
+            &metrics,
             accelerator,
-        });
+            reconnect_attempts,
+            device_generation,
+        ));
     }
+    generation_running.store(false, Ordering::Release);
     drop(input_stream);
     drop(output_stream);
     worker
         .join()
-        .map_err(|_| "live worker panicked".to_string())?;
-    if let Some(error) = worker_error
-        .lock()
-        .map_err(|_| "live worker status lock poisoned".to_string())?
-        .take()
-    {
-        return Err(error);
+        .map_err(|_| GenerationFailure::fatal("live worker panicked"))?;
+    if !session_running.load(Ordering::Acquire) {
+        return Ok(());
     }
-    Ok(())
+    Err(take_generation_failure(&generation_failure)
+        .unwrap_or_else(|| GenerationFailure::fatal("live worker stopped unexpectedly"))
+        .after_start())
+}
+
+fn take_generation_failure(
+    failure: &Mutex<Option<GenerationFailure>>,
+) -> Option<GenerationFailure> {
+    failure.lock().ok()?.take()
+}
+
+fn interruptible_sleep(duration: Duration, running: &AtomicBool) {
+    let deadline = Instant::now().checked_add(duration);
+    while running.load(Ordering::Acquire) {
+        let Some(remaining) =
+            deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_status(
+    connection_state: LiveConnectionState,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+    input_channels: usize,
+    output_channels: usize,
+    buffer_plan: &LiveBufferPlan,
+    playback: &Mutex<VecDeque<f32>>,
+    metrics: &LiveMetrics,
+    accelerator: AcceleratorSelection,
+    reconnect_attempts: u64,
+    device_generation: u64,
+) -> LiveStatus {
+    let queued_frames = playback
+        .lock()
+        .map(|queue| queue.len() / output_channels.max(1))
+        .unwrap_or(0);
+    let queue_latency_ms = frames_to_milliseconds(queued_frames, output_sample_rate);
+    let processing_latency_ms =
+        metrics.processing_latency_us.load(Ordering::Relaxed) as f64 / 1_000.0;
+    let input_device_latency_ms =
+        metrics.input_device_latency_us.load(Ordering::Relaxed) as f64 / 1_000.0;
+    let output_device_latency_ms =
+        metrics.output_device_latency_us.load(Ordering::Relaxed) as f64 / 1_000.0;
+    let capture_latency_ms = frames_to_milliseconds(buffer_plan.chunk_frames, input_sample_rate);
+    let resampler_latency_ms =
+        frames_to_milliseconds(buffer_plan.resampler_delay_frames, output_sample_rate);
+    let backend_latency_ms =
+        frames_to_milliseconds(buffer_plan.backend_delay_frames, output_sample_rate);
+    LiveStatus {
+        sample_rate: output_sample_rate,
+        input_sample_rate,
+        output_sample_rate,
+        input_channels,
+        output_channels,
+        chunk_frames: buffer_plan.chunk_frames,
+        input_level: f32::from_bits(metrics.input_level.swap(0, Ordering::Relaxed)),
+        output_level: f32::from_bits(metrics.output_level.swap(0, Ordering::Relaxed)),
+        processed_chunks: metrics.processed_chunks.load(Ordering::Relaxed),
+        dropped_chunks: metrics.dropped_chunks.load(Ordering::Relaxed),
+        underrun_frames: metrics.underrun_frames.load(Ordering::Relaxed),
+        overflow_frames: metrics.overflow_frames.load(Ordering::Relaxed),
+        queued_frames,
+        target_queue_frames: buffer_plan.target_queue_frames,
+        queue_latency_ms,
+        processing_latency_ms,
+        input_device_latency_ms,
+        output_device_latency_ms,
+        estimated_total_latency_ms: input_device_latency_ms
+            + capture_latency_ms
+            + resampler_latency_ms
+            + backend_latency_ms
+            + processing_latency_ms
+            + queue_latency_ms
+            + output_device_latency_ms,
+        drift_correction_ppm: f64::from_bits(metrics.drift_correction_bits.load(Ordering::Relaxed)),
+        reconnect_attempts,
+        device_generation,
+        connection_state,
+        accelerator,
+    }
+}
+
+fn frames_to_milliseconds(frames: usize, sample_rate: u32) -> f64 {
+    if sample_rate == 0 {
+        0.0
+    } else {
+        frames as f64 * 1_000.0 / sample_rate as f64
+    }
 }
 
 fn select_device(
@@ -1041,22 +2060,18 @@ fn select_device(
     requested: Option<&str>,
 ) -> Result<Device, String> {
     if let Some(name) = requested {
+        let kind = if input { "input" } else { "output" };
         let devices = if input {
             host.input_devices()
         } else {
             host.output_devices()
         }
         .map_err(|e| format!("enumerate devices: {e}"))?;
-        return devices
-            .filter_map(|device| device.name().ok().map(|n| (n, device)))
-            .find(|(n, _)| n == name)
-            .map(|(_, device)| device)
-            .ok_or_else(|| {
-                format!(
-                    "{} device not found: {name}",
-                    if input { "input" } else { "output" }
-                )
-            });
+        return select_unique_named_device(
+            devices.filter_map(|device| device.name().ok().map(|name| (name, device))),
+            name,
+            kind,
+        );
     }
     if input {
         host.default_input_device()
@@ -1071,6 +2086,26 @@ fn select_device(
     })
 }
 
+fn select_unique_named_device<T>(
+    devices: impl IntoIterator<Item = (String, T)>,
+    requested: &str,
+    kind: &str,
+) -> Result<T, String> {
+    let mut selected = None;
+    for (name, device) in devices {
+        if name != requested {
+            continue;
+        }
+        if selected.is_some() {
+            return Err(format!(
+                "{kind} device name is ambiguous: {requested} (multiple exact matches)"
+            ));
+        }
+        selected = Some(device);
+    }
+    selected.ok_or_else(|| format!("{kind} device not found: {requested}"))
+}
+
 fn build_input(
     device: &Device,
     cfg: &StreamConfig,
@@ -1080,8 +2115,9 @@ fn build_input(
     pending: Vec<f32>,
     input_level: Arc<AtomicU32>,
     dropped_chunks: Arc<AtomicU64>,
-    session_error: Arc<Mutex<Option<String>>>,
-    running: Arc<AtomicBool>,
+    device_latency_us: Arc<AtomicU64>,
+    generation_failure: Arc<Mutex<Option<GenerationFailure>>>,
+    generation_running: Arc<AtomicBool>,
 ) -> Result<Stream, String> {
     let channels = cfg.channels as usize;
     let capacity = chunk_frames.checked_mul(channels).ok_or_else(|| {
@@ -1094,24 +2130,29 @@ fn build_input(
         ($ty:ty, $convert:expr) => {{
             let mut pending = pending;
             let mut next_sequence = 0u64;
-            let data_session_error = Arc::clone(&session_error);
-            let stream_session_error = Arc::clone(&session_error);
-            let data_running = Arc::clone(&running);
-            let stream_running = Arc::clone(&running);
+            let data_failure = Arc::clone(&generation_failure);
+            let stream_failure = Arc::clone(&generation_failure);
+            let data_running = Arc::clone(&generation_running);
+            let stream_running = Arc::clone(&generation_running);
+            let device_latency_us = Arc::clone(&device_latency_us);
             device.build_input_stream(
                 cfg,
-                move |data: &[$ty], _| {
+                move |data: &[$ty], info| {
+                    let timestamp = info.timestamp();
+                    if let Some(latency) = timestamp.callback.duration_since(&timestamp.capture) {
+                        store_duration_us(&device_latency_us, latency);
+                    }
                     for sample in data.iter().map($convert) {
                         pending.push(sample);
                         if pending.len() == capacity {
                             let sequence = next_sequence;
                             let Some(following) = next_sequence.checked_add(1) else {
-                                if let Ok(mut failure) = data_session_error.lock() {
-                                    if failure.is_none() {
-                                        *failure = Some("live capture sequence exhausted".into());
-                                    }
-                                }
-                                data_running.store(false, Ordering::Relaxed);
+                                record_generation_failure(
+                                    &data_failure,
+                                    GenerationFailure::fatal("live capture sequence exhausted")
+                                        .after_start(),
+                                    &data_running,
+                                );
                                 pending.clear();
                                 return;
                             };
@@ -1140,12 +2181,11 @@ fn build_input(
                 },
                 move |error| {
                     let message = format!("input stream error: {error}");
-                    if let Ok(mut failure) = stream_session_error.lock() {
-                        if failure.is_none() {
-                            *failure = Some(message.clone());
-                        }
-                    }
-                    stream_running.store(false, Ordering::Relaxed);
+                    record_generation_failure(
+                        &stream_failure,
+                        GenerationFailure::recoverable(message.clone()),
+                        &stream_running,
+                    );
                     eprintln!("denoize: {message}");
                 },
                 None,
@@ -1153,12 +2193,41 @@ fn build_input(
         }};
     }
     let result = match format {
+        SampleFormat::I8 => stream!(i8, |x: &i8| input_sample_to_f32(*x)),
         SampleFormat::F32 => stream!(f32, |x: &f32| *x),
-        SampleFormat::I16 => stream!(i16, |x: &i16| *x as f32 / 32768.0),
-        SampleFormat::U16 => stream!(u16, |x: &u16| *x as f32 / 32767.5 - 1.0),
+        SampleFormat::I16 => stream!(i16, |x: &i16| input_sample_to_f32(*x)),
+        SampleFormat::I32 => stream!(i32, |x: &i32| input_sample_to_f32(*x)),
+        SampleFormat::I64 => stream!(i64, |x: &i64| input_sample_to_f32(*x)),
+        SampleFormat::U8 => stream!(u8, |x: &u8| input_sample_to_f32(*x)),
+        SampleFormat::U16 => stream!(u16, |x: &u16| input_sample_to_f32(*x)),
+        SampleFormat::U32 => stream!(u32, |x: &u32| input_sample_to_f32(*x)),
+        SampleFormat::U64 => stream!(u64, |x: &u64| input_sample_to_f32(*x)),
+        SampleFormat::F64 => stream!(f64, |x: &f64| *x as f32),
         other => return Err(format!("unsupported live input sample format: {other:?}")),
     };
     result.map_err(|e| format!("build input stream: {e}"))
+}
+
+fn input_sample_to_f32<T>(sample: T) -> f32
+where
+    T: Sample,
+    f32: FromSample<T>,
+{
+    sample.to_sample::<f32>()
+}
+
+fn output_sample_from_f32<T>(sample: f32) -> T
+where
+    T: Sample + FromSample<f32>,
+{
+    T::from_sample(crate::audio::sanitize_sample(sample as f64) as f32)
+}
+
+fn store_duration_us(target: &AtomicU64, duration: Duration) {
+    target.store(
+        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 }
 
 fn store_peak(target: &AtomicU32, value: f32) {
@@ -1182,7 +2251,7 @@ fn enqueue_playback_block(
     output_channels: usize,
     queue_capacity: usize,
     output_level: &AtomicU32,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let frames = audio.first().map(Vec::len).unwrap_or(0);
     if audio.is_empty() || audio.iter().any(|channel| channel.len() != frames) {
         return Err("live processor returned invalid playback channels".into());
@@ -1194,10 +2263,25 @@ fn enqueue_playback_block(
         .len()
         .checked_add(samples)
         .ok_or_else(|| "live playback queue length overflow".to_string())?;
-    if required > queue_capacity {
+    if samples > queue_capacity || queue.len() % output_channels != 0 {
         return Err(format!(
-            "live playback queue invariant exceeded: {required} samples ready, capacity {queue_capacity}"
+            "live playback queue invariant exceeded: block {samples}, queued {}, capacity {queue_capacity}",
+            queue.len()
         ));
+    }
+    let overflow_samples = required.saturating_sub(queue_capacity);
+    let overflow_frames = overflow_samples.div_ceil(output_channels);
+    let discard_samples = overflow_frames
+        .checked_mul(output_channels)
+        .ok_or_else(|| "live playback overflow length overflow".to_string())?;
+    if discard_samples > queue.len() {
+        return Err(format!(
+            "live playback queue cannot discard {discard_samples} stale samples from {} queued samples",
+            queue.len()
+        ));
+    }
+    for _ in 0..discard_samples {
+        queue.pop_front();
     }
     for frame in 0..frames {
         for out_ch in 0..output_channels {
@@ -1207,7 +2291,7 @@ fn enqueue_playback_block(
             queue.push_back(sample);
         }
     }
-    Ok(())
+    Ok(overflow_frames)
 }
 
 fn build_output(
@@ -1215,31 +2299,70 @@ fn build_output(
     cfg: &StreamConfig,
     format: SampleFormat,
     queue: Arc<Mutex<VecDeque<f32>>>,
-    session_error: Arc<Mutex<Option<String>>>,
-    running: Arc<AtomicBool>,
+    output_channels: usize,
+    underrun_frames: Arc<AtomicU64>,
+    device_latency_us: Arc<AtomicU64>,
+    generation_failure: Arc<Mutex<Option<GenerationFailure>>>,
+    generation_running: Arc<AtomicBool>,
 ) -> Result<Stream, String> {
     macro_rules! stream {
         ($ty:ty, $convert:expr) => {{
             let queue = Arc::clone(&queue);
-            let session_error = Arc::clone(&session_error);
-            let running = Arc::clone(&running);
+            let data_failure = Arc::clone(&generation_failure);
+            let stream_failure = Arc::clone(&generation_failure);
+            let data_running = Arc::clone(&generation_running);
+            let stream_running = Arc::clone(&generation_running);
+            let underrun_frames = Arc::clone(&underrun_frames);
+            let device_latency_us = Arc::clone(&device_latency_us);
             device.build_output_stream(
                 cfg,
-                move |data: &mut [$ty], _| {
-                    if let Ok(mut queue) = queue.lock() {
-                        for sample in data {
-                            *sample = $convert(queue.pop_front().unwrap_or(0.0));
+                move |data: &mut [$ty], info| {
+                    let timestamp = info.timestamp();
+                    if let Some(latency) = timestamp.playback.duration_since(&timestamp.callback) {
+                        store_duration_us(&device_latency_us, latency);
+                    }
+                    match queue.try_lock() {
+                        Ok(mut queue) => {
+                            let missing_samples = data.len().saturating_sub(queue.len());
+                            if missing_samples != 0 {
+                                underrun_frames.fetch_add(
+                                    missing_samples.div_ceil(output_channels) as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            for sample in data {
+                                *sample = $convert(queue.pop_front().unwrap_or(0.0));
+                            }
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            underrun_frames.fetch_add(
+                                data.len().div_ceil(output_channels) as u64,
+                                Ordering::Relaxed,
+                            );
+                            for sample in data {
+                                *sample = $convert(0.0);
+                            }
+                        }
+                        Err(std::sync::TryLockError::Poisoned(_)) => {
+                            for sample in data {
+                                *sample = $convert(0.0);
+                            }
+                            record_generation_failure(
+                                &data_failure,
+                                GenerationFailure::fatal("live playback queue lock poisoned")
+                                    .after_start(),
+                                &data_running,
+                            );
                         }
                     }
                 },
                 move |error| {
                     let message = format!("output stream error: {error}");
-                    if let Ok(mut failure) = session_error.lock() {
-                        if failure.is_none() {
-                            *failure = Some(message.clone());
-                        }
-                    }
-                    running.store(false, Ordering::Relaxed);
+                    record_generation_failure(
+                        &stream_failure,
+                        GenerationFailure::recoverable(message.clone()),
+                        &stream_running,
+                    );
                     eprintln!("denoize: {message}");
                 },
                 None,
@@ -1247,13 +2370,16 @@ fn build_output(
         }};
     }
     let result = match format {
-        SampleFormat::F32 => stream!(f32, |x: f32| x),
-        SampleFormat::I16 => stream!(i16, |x: f32| {
-            (crate::audio::sanitize_sample(x as f64) * 32767.0) as i16
-        }),
-        SampleFormat::U16 => stream!(u16, |x: f32| {
-            ((crate::audio::sanitize_sample(x as f64) + 1.0) * 32767.5) as u16
-        }),
+        SampleFormat::I8 => stream!(i8, |x: f32| output_sample_from_f32::<i8>(x)),
+        SampleFormat::F32 => stream!(f32, |x: f32| output_sample_from_f32::<f32>(x)),
+        SampleFormat::I16 => stream!(i16, |x: f32| output_sample_from_f32::<i16>(x)),
+        SampleFormat::I32 => stream!(i32, |x: f32| output_sample_from_f32::<i32>(x)),
+        SampleFormat::I64 => stream!(i64, |x: f32| output_sample_from_f32::<i64>(x)),
+        SampleFormat::U8 => stream!(u8, |x: f32| output_sample_from_f32::<u8>(x)),
+        SampleFormat::U16 => stream!(u16, |x: f32| output_sample_from_f32::<u16>(x)),
+        SampleFormat::U32 => stream!(u32, |x: f32| output_sample_from_f32::<u32>(x)),
+        SampleFormat::U64 => stream!(u64, |x: f32| output_sample_from_f32::<u64>(x)),
+        SampleFormat::F64 => stream!(f64, |x: f32| output_sample_from_f32::<f64>(x)),
         other => return Err(format!("unsupported live output sample format: {other:?}")),
     };
     result.map_err(|e| format!("build output stream: {e}"))
@@ -1501,6 +2627,343 @@ mod tests {
     }
 
     #[test]
+    fn every_cpal_sample_format_has_centered_live_conversion() {
+        assert_eq!(input_sample_to_f32(0_i8), 0.0);
+        assert_eq!(input_sample_to_f32(0_i16), 0.0);
+        assert_eq!(input_sample_to_f32(0_i32), 0.0);
+        assert_eq!(input_sample_to_f32(0_i64), 0.0);
+        assert_eq!(input_sample_to_f32(128_u8), 0.0);
+        assert_eq!(input_sample_to_f32(32_768_u16), 0.0);
+        assert_eq!(input_sample_to_f32(2_147_483_648_u32), 0.0);
+        assert_eq!(input_sample_to_f32(9_223_372_036_854_775_808_u64), 0.0);
+        assert_eq!(input_sample_to_f32(0.25_f32), 0.25);
+        assert_eq!(input_sample_to_f32(0.25_f64), 0.25);
+
+        assert_eq!(output_sample_from_f32::<i8>(0.0), 0);
+        assert_eq!(output_sample_from_f32::<i16>(0.0), 0);
+        assert_eq!(output_sample_from_f32::<i32>(0.0), 0);
+        assert_eq!(output_sample_from_f32::<i64>(0.0), 0);
+        assert_eq!(output_sample_from_f32::<u8>(0.0), 128);
+        assert_eq!(output_sample_from_f32::<u16>(0.0), 32_768);
+        assert_eq!(output_sample_from_f32::<u32>(0.0), 2_147_483_648);
+        assert_eq!(
+            output_sample_from_f32::<u64>(0.0),
+            9_223_372_036_854_775_808
+        );
+        assert_eq!(output_sample_from_f32::<f32>(f32::NAN), 0.0);
+        assert_eq!(output_sample_from_f32::<f64>(0.25), 0.25);
+    }
+
+    #[test]
+    fn named_device_selection_rejects_missing_and_ambiguous_matches() {
+        assert_eq!(
+            select_unique_named_device(
+                [("first".to_string(), 1_u8), ("second".to_string(), 2)],
+                "second",
+                "input",
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            select_unique_named_device([("first".to_string(), 1_u8)], "missing", "input")
+                .unwrap_err(),
+            "input device not found: missing"
+        );
+        assert_eq!(
+            select_unique_named_device(
+                [("same".to_string(), 1_u8), ("same".to_string(), 2)],
+                "same",
+                "output",
+            )
+            .unwrap_err(),
+            "output device name is ambiguous: same (multiple exact matches)"
+        );
+    }
+
+    #[test]
+    fn resilience_policy_has_bounded_explicit_and_chunk_aware_defaults() {
+        let automatic = LiveResilienceConfig::default();
+        assert_eq!(automatic.resolved_target_latency_ms(10), Ok(40));
+        assert_eq!(automatic.resolved_target_latency_ms(100), Ok(200));
+        assert!(automatic.validate().is_ok());
+
+        let explicit = LiveResilienceConfig::new()
+            .with_target_latency_ms(MIN_TARGET_LATENCY_MS)
+            .with_max_drift_ppm(MAX_DRIFT_PPM)
+            .with_reconnect_timeout_ms(MAX_RECONNECT_TIMEOUT_MS);
+        assert_eq!(
+            explicit.resolved_target_latency_ms(MAX_CHUNK_MS),
+            Ok(MIN_TARGET_LATENCY_MS)
+        );
+        for invalid in [
+            LiveResilienceConfig::new().with_target_latency_ms(MIN_TARGET_LATENCY_MS - 1),
+            LiveResilienceConfig::new().with_target_latency_ms(MAX_TARGET_LATENCY_MS + 1),
+            LiveResilienceConfig::new().with_max_drift_ppm(MAX_DRIFT_PPM + 1),
+            LiveResilienceConfig::new().with_reconnect_timeout_ms(MAX_RECONNECT_TIMEOUT_MS + 1),
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn asynchronous_plan_accepts_independent_device_rates() {
+        let config = config();
+        let plan = plan_live_buffers_with_resilience(
+            &config,
+            LiveResilienceConfig::default(),
+            44_100,
+            48_000,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(plan.chunk_frames, 4_410);
+        assert_eq!(plan.input_capacity, 8_820);
+        assert_eq!(plan.target_queue_frames, 9_600);
+        assert!(plan.maximum_resampled_frames >= 4_810);
+        assert!(plan.resampler_delay_frames > 0);
+        assert!(plan.required_bytes > 0);
+
+        assert!(matches!(
+            plan_live_buffers_with_resilience(
+                &config,
+                LiveResilienceConfig::default(),
+                0,
+                48_000,
+                1,
+                1,
+            ),
+            Err(ConfigError::InvalidValue {
+                field: "input_sample_rate",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn asynchronous_resampler_tracks_ratio_and_keeps_channels_aligned() {
+        let config = config();
+        let plan = plan_live_buffers_with_resilience(
+            &config,
+            LiveResilienceConfig::default(),
+            44_100,
+            48_000,
+            2,
+            2,
+        )
+        .unwrap();
+        let input = vec![
+            (0..plan.chunk_frames)
+                .map(|frame| (frame as f64 * 0.017).sin())
+                .collect::<Vec<_>>(),
+            (0..plan.chunk_frames)
+                .map(|frame| -(frame as f64 * 0.017).sin())
+                .collect::<Vec<_>>(),
+        ];
+        let mut faster = AdaptiveClockResampler::new(
+            44_100,
+            48_000,
+            plan.chunk_frames,
+            2,
+            plan.maximum_resampled_frames,
+            DEFAULT_MAX_DRIFT_PPM,
+        )
+        .unwrap();
+        let mut slower = AdaptiveClockResampler::new(
+            44_100,
+            48_000,
+            plan.chunk_frames,
+            2,
+            plan.maximum_resampled_frames,
+            DEFAULT_MAX_DRIFT_PPM,
+        )
+        .unwrap();
+        let grown = faster
+            .process(&input, DEFAULT_MAX_DRIFT_PPM as f64)
+            .unwrap();
+        let shrunk = slower
+            .process(&input, -(DEFAULT_MAX_DRIFT_PPM as f64))
+            .unwrap();
+        assert!(grown[0].len() >= shrunk[0].len());
+        assert!(grown[0].len() <= plan.maximum_resampled_frames);
+        assert_eq!(grown[0].len(), grown[1].len());
+        for (left, right) in grown[0].iter().zip(&grown[1]) {
+            assert!((left + right).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn asynchronous_resampler_plan_covers_supported_rate_directions() {
+        let config = config();
+        for (input_rate, output_rate) in [
+            (8_000, 192_000),
+            (192_000, 8_000),
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (96_000, 192_000),
+        ] {
+            for max_drift_ppm in [0, MAX_DRIFT_PPM] {
+                let resilience = LiveResilienceConfig::new().with_max_drift_ppm(max_drift_ppm);
+                let plan = plan_live_buffers_with_resilience(
+                    &config,
+                    resilience,
+                    input_rate,
+                    output_rate,
+                    2,
+                    2,
+                )
+                .unwrap();
+                let converter = AdaptiveClockResampler::new(
+                    input_rate,
+                    output_rate,
+                    plan.chunk_frames,
+                    2,
+                    plan.maximum_resampled_frames,
+                    max_drift_ppm,
+                )
+                .unwrap();
+                assert!(converter.converter.output_frames_max() <= plan.maximum_resampled_frames);
+            }
+        }
+    }
+
+    #[test]
+    fn drift_controller_is_bounded_and_moves_queue_toward_target() {
+        let mut controller = ClockDriftController::new(4_800, DEFAULT_MAX_DRIFT_PPM);
+        let low = controller.update(0, 0.1);
+        assert!(low > 0.0);
+        assert!(low <= DEFAULT_MAX_DRIFT_PPM as f64);
+        controller.reset();
+        let high = controller.update(9_600, 0.1);
+        assert!(high < 0.0);
+        assert!(high >= -(DEFAULT_MAX_DRIFT_PPM as f64));
+        controller.reset();
+        assert_eq!(controller.update(4_800, 0.1), 0.0);
+
+        let mut disabled = ClockDriftController::new(4_800, 0);
+        assert_eq!(disabled.update(0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn drift_controller_converges_for_independent_clock_error() {
+        const TARGET: f64 = 4_800.0;
+        const FRAMES_PER_STEP: f64 = 480.0;
+        const PLAYBACK_CLOCK_ERROR_PPM: f64 = 1_000.0;
+
+        let mut controller = ClockDriftController::new(TARGET as usize, 2_500);
+        let mut queued = TARGET;
+        let mut correction = 0.0;
+        for _ in 0..20_000 {
+            correction = controller.update(queued.max(0.0) as usize, 0.01);
+            queued += FRAMES_PER_STEP * (1.0 + correction / 1_000_000.0)
+                - FRAMES_PER_STEP * (1.0 + PLAYBACK_CLOCK_ERROR_PPM / 1_000_000.0);
+        }
+
+        assert!((queued - TARGET).abs() < 10.0, "queue settled at {queued}");
+        assert!(
+            (correction - PLAYBACK_CLOCK_ERROR_PPM).abs() < 100.0,
+            "correction settled at {correction} ppm"
+        );
+    }
+
+    #[test]
+    fn reconnect_schedule_is_finite_exponential_and_resets_after_a_live_generation() {
+        let start = Instant::now();
+        let failure = GenerationFailure::recoverable("device missing");
+        let mut schedule = RecoverySchedule::new(1_000);
+        assert_eq!(
+            schedule.schedule(&failure, start).unwrap(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            schedule
+                .schedule(&failure, start + Duration::from_millis(50))
+                .unwrap(),
+            Duration::from_millis(200)
+        );
+        assert_eq!(schedule.reconnect_attempts, 2);
+        assert_eq!(schedule.device_generation, 3);
+
+        let interrupted = GenerationFailure::recoverable("unplugged").after_start();
+        assert_eq!(
+            schedule
+                .schedule(&interrupted, start + Duration::from_millis(500))
+                .unwrap(),
+            Duration::from_millis(100)
+        );
+        assert!(schedule
+            .schedule(&failure, start + Duration::from_millis(1_500))
+            .unwrap_err()
+            .contains("timed out"));
+
+        assert_eq!(
+            RecoverySchedule::new(0)
+                .schedule(&failure, start)
+                .unwrap_err(),
+            "device missing"
+        );
+        assert_eq!(
+            RecoverySchedule::new(1_000)
+                .schedule(&GenerationFailure::fatal("processor failed"), start)
+                .unwrap_err(),
+            "processor failed"
+        );
+    }
+
+    #[test]
+    fn latency_status_combines_device_queue_processing_and_algorithmic_delay() {
+        let config = config();
+        let plan = plan_live_buffers(&config, 48_000, 1, 2).unwrap();
+        let playback = Mutex::new(VecDeque::from(vec![0.0; plan.target_queue_frames * 2]));
+        let metrics = LiveMetrics::new();
+        metrics
+            .input_level
+            .store(0.5f32.to_bits(), Ordering::Relaxed);
+        metrics
+            .output_level
+            .store(0.25f32.to_bits(), Ordering::Relaxed);
+        metrics
+            .input_device_latency_us
+            .store(2_000, Ordering::Relaxed);
+        metrics
+            .output_device_latency_us
+            .store(3_000, Ordering::Relaxed);
+        metrics
+            .processing_latency_us
+            .store(1_000, Ordering::Relaxed);
+        metrics
+            .drift_correction_bits
+            .store(125.0f64.to_bits(), Ordering::Relaxed);
+        let accelerator = select_accelerator(
+            config.backend,
+            config.backend_options.accelerator,
+            config.backend_options.deterministic,
+        )
+        .unwrap();
+        let status = runtime_status(
+            LiveConnectionState::Running,
+            48_000,
+            48_000,
+            1,
+            2,
+            &plan,
+            &playback,
+            &metrics,
+            accelerator,
+            2,
+            3,
+        );
+        assert_eq!(status.queued_frames, plan.target_queue_frames);
+        assert_eq!(status.drift_correction_ppm, 125.0);
+        assert_eq!(status.reconnect_attempts, 2);
+        assert_eq!(status.device_generation, 3);
+        assert_eq!(status.connection_state, LiveConnectionState::Running);
+        assert!(status.estimated_total_latency_ms > status.queue_latency_ms + 5.0);
+        assert_eq!(status.input_level, 0.5);
+        assert_eq!(status.output_level, 0.25);
+    }
+
+    #[test]
     fn classical_ready_burst_plan_covers_frame_quantization_and_profiles() {
         let mut config = config();
         config.chunk_ms = MIN_CHUNK_MS;
@@ -1510,7 +2973,8 @@ mod tests {
         let plan = plan_live_buffers(&config, 8_000, 1, 1).unwrap();
         assert_eq!(plan.chunk_frames, 80);
         assert_eq!(maximum_ready_burst_frames(&config, 8_000, 80), Ok(4_176));
-        assert_eq!(plan.queue_capacity, 4_816);
+        assert!(plan.maximum_resampled_frames >= plan.chunk_frames);
+        assert!(plan.queue_capacity >= 4_816);
 
         let mut processor = LiveProcessor::new(&config, 1).unwrap();
         let mut largest = Vec::new();
@@ -1547,33 +3011,42 @@ mod tests {
         )
         .unwrap();
 
-        let mut full_planned_queue = VecDeque::from(vec![0.0; old_capacity]);
-        enqueue_playback_block(
-            &mut full_planned_queue,
-            &[vec![0.0; 4_176]],
-            1,
-            plan.queue_capacity,
-            &level,
-        )
-        .unwrap();
+        let mut full_planned_queue = VecDeque::from(vec![0.0; plan.queue_capacity]);
         assert_eq!(full_planned_queue.len(), plan.queue_capacity);
-        assert!(enqueue_playback_block(
+        let discarded = enqueue_playback_block(
             &mut full_planned_queue,
             &[vec![0.0]],
             1,
             plan.queue_capacity,
             &level,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(discarded, 1);
         assert_eq!(full_planned_queue.len(), plan.queue_capacity);
 
         config.denoiser.profile_ms = 100.0;
         assert_eq!(maximum_ready_burst_frames(&config, 8_000, 80), Ok(4_976));
-        assert_eq!(
+        assert!(
             plan_live_buffers(&config, 8_000, 1, 1)
                 .unwrap()
-                .queue_capacity,
-            5_616
+                .queue_capacity
+                >= 5_616
+        );
+    }
+
+    #[test]
+    fn playback_overflow_discards_only_oldest_complete_frames() {
+        let level = AtomicU32::new(0.0f32.to_bits());
+        let mut queue = VecDeque::from(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+        let audio = vec![vec![10.0, 20.0, 30.0], vec![11.0, 21.0, 31.0]];
+
+        let overflow = enqueue_playback_block(&mut queue, &audio, 2, 8, &level).unwrap();
+
+        assert_eq!(overflow, 2);
+        assert_eq!(queue.len(), 8);
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec![4.0, 5.0, 10.0, 11.0, 20.0, 21.0, 30.0, 31.0]
         );
     }
 
@@ -1587,7 +3060,7 @@ mod tests {
         config.denoiser.profile_ms = -1.0;
         let plan = plan_live_buffers(&config, 8_000, 1, 1).unwrap();
         assert_eq!(maximum_ready_burst_frames(&config, 8_000, 80), Ok(2_253));
-        assert_eq!(plan.queue_capacity, 2_893);
+        assert!(plan.queue_capacity >= 2_893);
 
         let mut processor = LiveProcessor::new(&config, 1).unwrap();
         let mut largest = Vec::new();
@@ -1688,7 +3161,9 @@ mod tests {
         let normal = plan_live_buffers(&config, 48_000, 2, 2).unwrap();
         assert_eq!(normal.chunk_frames, 4_800);
         assert_eq!(normal.input_capacity, 9_600);
-        assert_eq!(normal.queue_capacity, 90_496);
+        assert!(normal.queue_capacity >= 90_496);
+        assert!(normal.target_queue_frames > 0);
+        assert!(normal.resampler_delay_frames > 0);
         assert!(normal.required_bytes > 0);
         assert!(plan_live_buffers(&config, crate::config::MAX_SAMPLE_RATE, 1, 1).is_ok());
         config.chunk_ms = MAX_CHUNK_MS;
@@ -1783,14 +3258,19 @@ mod tests {
         vad.denoiser.profile_ms = -1.0;
         let mut without_vad = vad.clone();
         without_vad.denoiser.vad = false;
-        assert!(plan_live_buffers(&without_vad, 96_000, 22, 1).is_ok());
-        assert!(matches!(
-            plan_live_buffers(&vad, 96_000, 22, 1),
-            Err(ConfigError::ResourceLimitExceeded {
-                resource: "live working set",
-                ..
+        let boundary = (1..=crate::config::MAX_STREAM_CHANNELS)
+            .find(|channels| {
+                plan_live_buffers(&without_vad, 96_000, *channels, 1).is_ok()
+                    && matches!(
+                        plan_live_buffers(&vad, 96_000, *channels, 1),
+                        Err(ConfigError::ResourceLimitExceeded {
+                            resource: "live working set",
+                            ..
+                        })
+                    )
             })
-        ));
+            .expect("VAD copies must cross the aggregate cap before the base worker");
+        assert!(boundary > 1);
     }
 
     #[test]

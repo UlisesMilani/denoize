@@ -249,7 +249,7 @@ unreviewable release.
 | 13 | Parser and resource-amplification fuzzing, deterministic fault injection, and crash/power-loss simulation | Released in v0.61.0 |
 | 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Released in v0.62.0 |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Released in v0.63.0 |
-| 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Planned |
+| 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Implemented, pending release |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Planned |
@@ -341,6 +341,30 @@ spool. Metadata is applied before verification for regular-file and stdout
 destinations. DeepFilterNet processes reusable 48 kHz hops, while MossFormer2
 retains only its official four-second window and three-second stride; both
 reuse a prepared model and preserve the exact input presentation length.
+
+Stage 16 separates the capture and playback clocks. A bounded asynchronous
+sinc converter accepts different nominal device rates, while a bounded PI
+controller makes small ratio adjustments to hold a configured playback queue.
+The target queue, correction ceiling, and recovery window are explicit CLI,
+configuration-file, library, and desktop settings. DSP remains on the worker
+thread; capture uses a non-waiting bounded handoff, while playback consumes a
+bounded queue without waiting for the worker to release it. Overload discards
+stale complete chunks or the oldest complete playback frames, emits silence on
+playback contention, and cold-resets causal state at a sequence gap. Stage 20 remains
+responsible for the stronger allocation-free/lock-free plug-in callback
+contract.
+
+Device/configuration and stream callback failures enter a finite exponential
+backoff loop. Named devices are reacquired by an unambiguous exact name, while
+duplicate names fail closed and default-device sessions follow the new system
+default. Each successful generation rebuilds device-bound state, primes the
+playback queue before starting output, and
+retains the validated processing configuration and runtime selection. CLI
+NDJSON and the desktop report connection phase, device generation, independent
+sample rates, queue depth, underrun/overflow/drop counts, bounded drift
+correction, and a capture-to-playback latency estimate. The estimate includes
+measured callback timing, chunking, converter/backend delay, processing time,
+and queue time; it is not a hardware loopback guarantee.
 
 Stage 19 exposes only local, authenticated control surfaces and reuses the
 bounded JSON contracts, resource admission, signed receipts, and regular-file

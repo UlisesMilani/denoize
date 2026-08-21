@@ -169,9 +169,13 @@ type RecoverySummary = {
 type DropSelection = { audioFiles: string[]; directories: string[]; ignored: string[] };
 type LiveDevices = { inputs: string[]; outputs: string[] };
 type LiveEvent = {
-  status: "running" | "stopped" | "failed"; message: string; sampleRate: number;
+  status: "running" | "stopped" | "failed"; connectionState: "connecting" | "priming" | "running" | "recovering" | "stopped" | "failed" | "unknown"; message: string; sampleRate: number;
+  inputSampleRate: number; outputSampleRate: number;
   inputChannels: number; outputChannels: number; chunkFrames: number;
   inputLevel: number; outputLevel: number; processedChunks: number; droppedChunks: number;
+  underrunFrames: number; overflowFrames: number; queuedFrames: number; targetQueueFrames: number;
+  queueLatencyMs: number; processingLatencyMs: number; inputDeviceLatencyMs: number; outputDeviceLatencyMs: number;
+  estimatedTotalLatencyMs: number; driftCorrectionPpm: number; reconnectAttempts: number; deviceGeneration: number;
   accelerator?: AcceleratorSelection | null;
   error?: StructuredDesktopError | null;
 };
@@ -350,12 +354,16 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <p class="section-copy">マイク入力を低遅延でノイズ除去し、選択した再生デバイスへ出力します。ヘッドホンの使用を推奨します。</p>
             <div class="form-grid two"><label>入力デバイス<select id="live-input"><option value="">既定の入力</option></select></label><label>出力デバイス<select id="live-output"><option value="">既定の出力</option></select></label></div>
             <div class="form-grid two"><label>バックエンド<select id="live-backend"><option value="auto">自動（低遅延優先）</option></select></label><label>チャンク長 ms<input id="live-chunk" type="number" value="20" min="10" max="2000"></label></div>
+            <div class="form-grid two"><label>目標レイテンシ ms<input id="live-latency" type="number" value="0" min="0" max="5000"><small>0 はチャンク長に応じた自動設定</small></label><label>最大ドリフト補正 ppm<input id="live-drift" type="number" value="2500" min="0" max="10000"></label></div>
+            <div class="form-grid two"><label>再接続タイムアウト ms<input id="live-reconnect" type="number" value="30000" min="0" max="300000"><small>0 は自動再接続を無効化</small></label></div>
             <p id="live-device-message" class="field-hint">デバイスを確認しています。</p>
           </article>
           <article class="card action-card live-monitor">
             <div class="ready-icon">◉</div><h3 id="live-status" role="status" aria-live="polite">停止中</h3><p id="live-meta">開始すると入出力レベルを表示します</p>
             <div class="meter-row"><span>INPUT</span><div class="level-meter" role="meter" aria-label="入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="live-input-level"></i></div></div>
             <div class="meter-row"><span>OUTPUT</span><div class="level-meter" role="meter" aria-label="出力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="live-output-level"></i></div></div>
+            <div class="metric-pair"><div><span>推定総レイテンシ</span><b id="live-latency-value">—</b></div><div><span>クロック補正</span><b id="live-drift-value">—</b></div></div>
+            <p id="live-queue">キュー —</p>
             <p id="live-counters">処理 0 · ドロップ 0</p>
             <button class="primary wide" id="start-live">ライブ処理を開始 <span>→</span></button>
             <button class="danger wide hidden" id="stop-live">停止</button>
@@ -457,7 +465,7 @@ const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
 const PREVIEW_CHOICE_KEY = "denoize.desktop.preview-choice.v1";
-const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk"];
+const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk", "live-latency", "live-drift", "live-reconnect"];
 type SavedValues = Record<string, string | number | boolean>;
 type PersistedPreviewChoice = {
   schema: "denoize-desktop-preview-choice-v1"; schemaVersion: 1;
@@ -2171,6 +2179,9 @@ $("#start-live").addEventListener("click", async () => {
       inputDevice: $<HTMLSelectElement>("#live-input").value || null,
       outputDevice: $<HTMLSelectElement>("#live-output").value || null,
       chunkMs: Number($<HTMLInputElement>("#live-chunk").value), backend,
+      targetLatencyMs: Number($<HTMLInputElement>("#live-latency").value),
+      maxDriftPpm: Number($<HTMLInputElement>("#live-drift").value),
+      reconnectTimeoutMs: Number($<HTMLInputElement>("#live-reconnect").value),
       options: options(backend),
     } });
     $("#start-live").classList.add("hidden"); $("#stop-live").classList.remove("hidden");
@@ -2189,8 +2200,11 @@ listen<LiveEvent>("live-status", ({ payload }) => {
   $("#live-input-level").parentElement!.setAttribute("aria-valuenow", String(Math.round(Math.min(100, payload.inputLevel * 100))));
   $("#live-output-level").parentElement!.setAttribute("aria-valuenow", String(Math.round(Math.min(100, payload.outputLevel * 100))));
   const accelerator = payload.accelerator ? ` · ${payload.accelerator.effective.toUpperCase()}${payload.accelerator.fallback ? ` (${payload.accelerator.fallback})` : ""}` : "";
-  $("#live-meta").textContent = payload.sampleRate ? tr(`${payload.sampleRate.toLocaleString(locale())} Hz · 入力 ${payload.inputChannels}ch / 出力 ${payload.outputChannels}ch · ${payload.chunkFrames} frames${accelerator}`, `${payload.sampleRate.toLocaleString(locale())} Hz · input ${payload.inputChannels}ch / output ${payload.outputChannels}ch · ${payload.chunkFrames} frames${accelerator}`) : tr("開始すると入出力レベルを表示します", "Input and output levels appear after starting");
-  $("#live-counters").textContent = tr(`処理 ${payload.processedChunks} · ドロップ ${payload.droppedChunks}`, `Processed ${payload.processedChunks} · Dropped ${payload.droppedChunks}`);
+  $("#live-meta").textContent = payload.sampleRate ? tr(`${payload.inputSampleRate.toLocaleString(locale())} → ${payload.outputSampleRate.toLocaleString(locale())} Hz · 入力 ${payload.inputChannels}ch / 出力 ${payload.outputChannels}ch · ${payload.chunkFrames} frames${accelerator}`, `${payload.inputSampleRate.toLocaleString(locale())} → ${payload.outputSampleRate.toLocaleString(locale())} Hz · input ${payload.inputChannels}ch / output ${payload.outputChannels}ch · ${payload.chunkFrames} frames${accelerator}`) : tr("開始すると入出力レベルを表示します", "Input and output levels appear after starting");
+  $("#live-latency-value").textContent = payload.sampleRate ? `${payload.estimatedTotalLatencyMs.toFixed(1)} ms` : "—";
+  $("#live-drift-value").textContent = payload.sampleRate ? `${payload.driftCorrectionPpm >= 0 ? "+" : ""}${payload.driftCorrectionPpm.toFixed(1)} ppm` : "—";
+  $("#live-queue").textContent = payload.sampleRate ? tr(`キュー ${payload.queuedFrames}/${payload.targetQueueFrames} frames (${payload.queueLatencyMs.toFixed(1)} ms) · 処理 ${payload.processingLatencyMs.toFixed(1)} ms · device ${payload.inputDeviceLatencyMs.toFixed(1)}/${payload.outputDeviceLatencyMs.toFixed(1)} ms · 世代 ${payload.deviceGeneration}`, `Queue ${payload.queuedFrames}/${payload.targetQueueFrames} frames (${payload.queueLatencyMs.toFixed(1)} ms) · processing ${payload.processingLatencyMs.toFixed(1)} ms · device ${payload.inputDeviceLatencyMs.toFixed(1)}/${payload.outputDeviceLatencyMs.toFixed(1)} ms · generation ${payload.deviceGeneration}`) : tr("キュー —", "Queue —");
+  $("#live-counters").textContent = tr(`処理 ${payload.processedChunks} · ドロップ ${payload.droppedChunks} · underrun ${payload.underrunFrames} · overflow ${payload.overflowFrames} · 再接続 ${payload.reconnectAttempts}`, `Processed ${payload.processedChunks} · dropped ${payload.droppedChunks} · underrun ${payload.underrunFrames} · overflow ${payload.overflowFrames} · reconnects ${payload.reconnectAttempts}`);
   if (payload.status !== "running") {
     $("#start-live").classList.remove("hidden"); $("#stop-live").classList.add("hidden");
     if (payload.status === "failed") showToast(statusMessage, true);

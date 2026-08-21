@@ -7,7 +7,8 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes a complete model, catalog, trust, cache-health, provenance, and
   recipe-ABI snapshot.
 - [`denoize-cli-output-v1.schema.json`](../schemas/denoize-cli-output-v1.schema.json)
-  describes single-file results, streaming results, and batch NDJSON events.
+  describes single-file results, streaming results, batch NDJSON events, and
+  live-device status NDJSON.
 - [`denoize-execution-plan-v1.schema.json`](../schemas/denoize-execution-plan-v1.schema.json)
   describes a deterministic, read-only finite-file or batch plan.
 - [`denoize-execution-plan-v2.schema.json`](../schemas/denoize-execution-plan-v2.schema.json)
@@ -88,7 +89,7 @@ an atomic replacement.
 ## Processing results and recipe identity
 
 `--json` emits one compact result document for normal file processing and one
-NDJSON document per batch event. Every record now carries:
+NDJSON document per batch or live event. Finite processing records carry:
 
 ```json
 {
@@ -136,6 +137,23 @@ the concrete `cpu`, `metal`, or `cuda` runtime. `fallback` is `null` unless an
 `auto` request deliberately selected CPU because deterministic mode was active,
 the backend is CPU-only, or no GPU runtime passed its local availability probe.
 The effective runtime participates in finite-file recipe identity.
+
+Live processing emits one `event: "status"`, `mode: "live"` record for each
+connection-state transition and periodic running samples. These ongoing events
+do not claim a finite recipe or committed output. Their `state` is
+`connecting`, `priming`, `running`, `recovering`, or the forward-compatible
+`unknown` fallback. Each record contains independent input/output rates and
+channel counts, the current and target playback queue, component and estimated
+total latency, the bounded clock correction in ppm, underrun/overflow/drop
+counts, reconnect attempts, device generation, levels, and accelerator
+selection. Zero rates/channels identify a connection transition before device
+geometry is available.
+
+The total latency field is an engineering estimate assembled from callback
+timing, capture chunking, resampler/backend algorithmic delay, measured
+processing, and queued playback. It is not an external loopback measurement or
+an exact device/driver guarantee. Live NDJSON is diagnostic telemetry and does
+not authenticate output audio.
 
 ## Source-bound presentation regions
 

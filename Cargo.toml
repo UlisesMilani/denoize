@@ -103,7 +103,7 @@ visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
 live = ["dep:cpal"]
 fdk-aac-encoder = ["m4a-encode", "dep:fdk-aac-rust"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "m4a-encode", "visqol"]
+full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "m4a-encode", "visqol", "live"]
 
 [dev-dependencies]
 prost = "0.14"
