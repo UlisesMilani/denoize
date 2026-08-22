@@ -1021,6 +1021,9 @@ struct LiveRequest {
     input_device: Option<String>,
     output_device: Option<String>,
     chunk_ms: u32,
+    target_latency_ms: Option<u32>,
+    max_drift_ppm: Option<u32>,
+    reconnect_timeout_ms: Option<u32>,
     backend: String,
     options: ProcessOptions,
 }
@@ -1037,8 +1040,21 @@ struct LiveDevices {
 #[cfg(feature = "live")]
 struct LiveEvent {
     status: &'static str,
+    connection_state: &'static str,
     message: String,
+    #[serde(flatten)]
+    metrics: LiveEventMetrics,
+    accelerator: Option<AcceleratorResult>,
+    error: Option<DesktopError>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg(feature = "live")]
+struct LiveEventMetrics {
     sample_rate: u32,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
     input_channels: usize,
     output_channels: usize,
     chunk_frames: usize,
@@ -1046,8 +1062,61 @@ struct LiveEvent {
     output_level: f32,
     processed_chunks: u64,
     dropped_chunks: u64,
-    accelerator: Option<AcceleratorResult>,
-    error: Option<DesktopError>,
+    underrun_frames: u64,
+    overflow_frames: u64,
+    queued_frames: usize,
+    target_queue_frames: usize,
+    queue_latency_ms: f64,
+    processing_latency_ms: f64,
+    input_device_latency_ms: f64,
+    output_device_latency_ms: f64,
+    estimated_total_latency_ms: f64,
+    drift_correction_ppm: f64,
+    reconnect_attempts: u64,
+    device_generation: u64,
+}
+
+#[cfg(feature = "live")]
+impl From<denoize::live::LiveStatus> for LiveEventMetrics {
+    fn from(status: denoize::live::LiveStatus) -> Self {
+        Self {
+            sample_rate: status.sample_rate,
+            input_sample_rate: status.input_sample_rate,
+            output_sample_rate: status.output_sample_rate,
+            input_channels: status.input_channels,
+            output_channels: status.output_channels,
+            chunk_frames: status.chunk_frames,
+            input_level: status.input_level,
+            output_level: status.output_level,
+            processed_chunks: status.processed_chunks,
+            dropped_chunks: status.dropped_chunks,
+            underrun_frames: status.underrun_frames,
+            overflow_frames: status.overflow_frames,
+            queued_frames: status.queued_frames,
+            target_queue_frames: status.target_queue_frames,
+            queue_latency_ms: status.queue_latency_ms,
+            processing_latency_ms: status.processing_latency_ms,
+            input_device_latency_ms: status.input_device_latency_ms,
+            output_device_latency_ms: status.output_device_latency_ms,
+            estimated_total_latency_ms: status.estimated_total_latency_ms,
+            drift_correction_ppm: status.drift_correction_ppm,
+            reconnect_attempts: status.reconnect_attempts,
+            device_generation: status.device_generation,
+        }
+    }
+}
+
+#[cfg(feature = "live")]
+fn live_connection_event(
+    state: denoize::live::LiveConnectionState,
+) -> (&'static str, &'static str) {
+    match state {
+        denoize::live::LiveConnectionState::Connecting => ("connecting", "デバイスへ接続中"),
+        denoize::live::LiveConnectionState::Priming => ("priming", "再生キューを準備中"),
+        denoize::live::LiveConnectionState::Running => ("running", "ライブ処理中"),
+        denoize::live::LiveConnectionState::Recovering => ("recovering", "デバイス接続を復旧中"),
+        _ => ("unknown", "ライブ状態を更新中"),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2591,6 +2660,10 @@ fn start_live(
     let backend_options = parsed_backend_options_for(backend, &request.options)?;
     let denoiser = processing_config(&request.options, 48_000)?;
     let governor = desktop_resource_governor(&request.options, 1)?;
+    let resilience = denoize::live::LiveResilienceConfig::new()
+        .with_target_latency_ms(request.target_latency_ms.unwrap_or(0))
+        .with_max_drift_ppm(request.max_drift_ppm.unwrap_or(2_500))
+        .with_reconnect_timeout_ms(request.reconnect_timeout_ms.unwrap_or(30_000));
     let prepared = denoize::live::PreparedLiveConfig::new(denoize::live::LiveConfig {
         input_device: request.input_device,
         output_device: request.output_device,
@@ -2598,30 +2671,28 @@ fn start_live(
         backend,
         backend_options,
         denoiser,
-    })?;
+    })?
+    .with_resilience(resilience)?;
     let accelerator = prepared.accelerator();
     let running = Arc::new(AtomicBool::new(true));
     register_live_session(&state, Arc::clone(&running))?;
     let live_state = Arc::clone(&state.live);
     std::thread::spawn(move || {
+        let mut last_status = None;
         let result = denoize::live::run_prepared_with_status_and_governor(
             prepared,
             running,
             &governor,
             |status| {
+                last_status = Some(status);
+                let (connection_state, message) = live_connection_event(status.connection_state);
                 let _ = app.emit(
                     "live-status",
                     LiveEvent {
                         status: "running",
-                        message: "ライブ処理中".into(),
-                        sample_rate: status.sample_rate,
-                        input_channels: status.input_channels,
-                        output_channels: status.output_channels,
-                        chunk_frames: status.chunk_frames,
-                        input_level: status.input_level,
-                        output_level: status.output_level,
-                        processed_chunks: status.processed_chunks,
-                        dropped_chunks: status.dropped_chunks,
+                        connection_state,
+                        message: message.into(),
+                        metrics: status.into(),
                         accelerator: Some(accelerator_result(status.accelerator)),
                         error: None,
                     },
@@ -2639,15 +2710,9 @@ fn start_live(
             "live-status",
             LiveEvent {
                 status,
+                connection_state: status,
                 message,
-                sample_rate: 0,
-                input_channels: 0,
-                output_channels: 0,
-                chunk_frames: 0,
-                input_level: 0.0,
-                output_level: 0.0,
-                processed_chunks: 0,
-                dropped_chunks: 0,
+                metrics: last_status.map(Into::into).unwrap_or_default(),
                 accelerator: Some(accelerator_result(accelerator)),
                 error,
             },
@@ -4166,6 +4231,21 @@ fn preflight_batch_items_with_mode(
 fn validate_live_request(request: &LiveRequest) -> Result<Backend, String> {
     if !(10..=2_000).contains(&request.chunk_ms) {
         return Err("チャンク長は10〜2000msにしてください".into());
+    }
+    if request
+        .target_latency_ms
+        .is_some_and(|value| value != 0 && !(20..=5_000).contains(&value))
+    {
+        return Err("目標レイテンシは0（自動）または20〜5000msにしてください".into());
+    }
+    if request.max_drift_ppm.is_some_and(|value| value > 10_000) {
+        return Err("ドリフト補正は0〜10000ppmにしてください".into());
+    }
+    if request
+        .reconnect_timeout_ms
+        .is_some_and(|value| value > 300_000)
+    {
+        return Err("再接続時間は0〜300000msにしてください".into());
     }
     validate_process_options(&request.options)?;
     let backend = if request.backend == "auto" {
@@ -7903,6 +7983,9 @@ deterministic = false
             input_device: None,
             output_device: None,
             chunk_ms: 20,
+            target_latency_ms: Some(0),
+            max_drift_ppm: Some(2_500),
+            reconnect_timeout_ms: Some(30_000),
             backend: "auto".into(),
             options: options(),
         }
@@ -8171,7 +8254,67 @@ deterministic = false
                     .unwrap_err()
                     .contains("チャンク長"));
             }
+            for target_latency_ms in [0, 20, 5_000] {
+                let mut live = live_request();
+                live.target_latency_ms = Some(target_latency_ms);
+                validate_live_request(&live).unwrap();
+            }
+            for target_latency_ms in [1, 19, 5_001] {
+                let mut live = live_request();
+                live.target_latency_ms = Some(target_latency_ms);
+                assert!(validate_live_request(&live)
+                    .unwrap_err()
+                    .contains("レイテンシ"));
+            }
+            for max_drift_ppm in [0, 10_000] {
+                let mut live = live_request();
+                live.max_drift_ppm = Some(max_drift_ppm);
+                validate_live_request(&live).unwrap();
+            }
+            let mut live = live_request();
+            live.max_drift_ppm = Some(10_001);
+            assert!(validate_live_request(&live)
+                .unwrap_err()
+                .contains("ドリフト"));
+            for reconnect_timeout_ms in [0, 300_000] {
+                let mut live = live_request();
+                live.reconnect_timeout_ms = Some(reconnect_timeout_ms);
+                validate_live_request(&live).unwrap();
+            }
+            let mut live = live_request();
+            live.reconnect_timeout_ms = Some(300_001);
+            assert!(validate_live_request(&live).unwrap_err().contains("再接続"));
         }
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn live_event_metrics_keep_the_flat_camel_case_ipc_contract() {
+        let event = LiveEvent {
+            status: "running",
+            connection_state: "priming",
+            message: "再生キューを準備中".into(),
+            metrics: LiveEventMetrics {
+                input_sample_rate: 44_100,
+                output_sample_rate: 48_000,
+                target_queue_frames: 3_840,
+                estimated_total_latency_ms: 91.25,
+                drift_correction_ppm: 125.0,
+                device_generation: 2,
+                ..LiveEventMetrics::default()
+            },
+            accelerator: None,
+            error: None,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["connectionState"], "priming");
+        assert_eq!(value["inputSampleRate"], 44_100);
+        assert_eq!(value["outputSampleRate"], 48_000);
+        assert_eq!(value["targetQueueFrames"], 3_840);
+        assert_eq!(value["estimatedTotalLatencyMs"], 91.25);
+        assert_eq!(value["driftCorrectionPpm"], 125.0);
+        assert_eq!(value["deviceGeneration"], 2);
+        assert!(value.get("metrics").is_none());
     }
 
     #[cfg(feature = "live")]

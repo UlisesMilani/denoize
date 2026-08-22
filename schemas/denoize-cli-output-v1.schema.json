@@ -6,7 +6,8 @@
     { "$ref": "#/$defs/fileResult" },
     { "$ref": "#/$defs/streamResult" },
     { "$ref": "#/$defs/batchProgress" },
-    { "$ref": "#/$defs/batchSummary" }
+    { "$ref": "#/$defs/batchSummary" },
+    { "$ref": "#/$defs/liveStatus" }
   ],
   "$defs": {
     "recipe": {
@@ -170,6 +171,69 @@
           }
         }
       ]
+    },
+    "liveStatus": {
+      "type": "object",
+      "required": [
+        "schema",
+        "schema_version",
+        "event",
+        "mode",
+        "state",
+        "input_sample_rate",
+        "output_sample_rate",
+        "input_channels",
+        "output_channels",
+        "chunk_frames",
+        "input_level",
+        "output_level",
+        "processed_chunks",
+        "dropped_chunks",
+        "underrun_frames",
+        "overflow_frames",
+        "queued_frames",
+        "target_queue_frames",
+        "queue_latency_ms",
+        "processing_latency_ms",
+        "input_device_latency_ms",
+        "output_device_latency_ms",
+        "estimated_total_latency_ms",
+        "drift_correction_ppm",
+        "reconnect_attempts",
+        "device_generation",
+        "accelerator"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "status" },
+        "mode": { "const": "live" },
+        "state": {
+          "enum": ["connecting", "priming", "running", "recovering", "unknown"]
+        },
+        "input_sample_rate": { "type": "integer", "minimum": 0 },
+        "output_sample_rate": { "type": "integer", "minimum": 0 },
+        "input_channels": { "type": "integer", "minimum": 0 },
+        "output_channels": { "type": "integer", "minimum": 0 },
+        "chunk_frames": { "type": "integer", "minimum": 0 },
+        "input_level": { "type": "number", "minimum": 0 },
+        "output_level": { "type": "number", "minimum": 0 },
+        "processed_chunks": { "type": "integer", "minimum": 0 },
+        "dropped_chunks": { "type": "integer", "minimum": 0 },
+        "underrun_frames": { "type": "integer", "minimum": 0 },
+        "overflow_frames": { "type": "integer", "minimum": 0 },
+        "queued_frames": { "type": "integer", "minimum": 0 },
+        "target_queue_frames": { "type": "integer", "minimum": 0 },
+        "queue_latency_ms": { "type": "number", "minimum": 0 },
+        "processing_latency_ms": { "type": "number", "minimum": 0 },
+        "input_device_latency_ms": { "type": "number", "minimum": 0 },
+        "output_device_latency_ms": { "type": "number", "minimum": 0 },
+        "estimated_total_latency_ms": { "type": "number", "minimum": 0 },
+        "drift_correction_ppm": { "type": "number", "minimum": -10000, "maximum": 10000 },
+        "reconnect_attempts": { "type": "integer", "minimum": 0 },
+        "device_generation": { "type": "integer", "minimum": 0 },
+        "accelerator": { "$ref": "#/$defs/accelerator" }
+      }
     }
   }
 }

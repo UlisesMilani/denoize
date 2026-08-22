@@ -43,6 +43,10 @@ const STREAM_CHECKPOINT_FRAMES: u64 = 1_048_576;
 const MIN_STREAM_BLOCK_FRAMES: usize = 1;
 const MIN_LIVE_CHUNK_MS: u32 = 10;
 const MAX_LIVE_CHUNK_MS: u32 = 2_000;
+const MIN_LIVE_TARGET_LATENCY_MS: u32 = 20;
+const MAX_LIVE_TARGET_LATENCY_MS: u32 = 5_000;
+const MAX_LIVE_DRIFT_PPM: u32 = 10_000;
+const MAX_LIVE_RECONNECT_TIMEOUT_MS: u32 = 300_000;
 const MAX_BATCH_JOBS: usize = 32;
 const VALIDATION_SAMPLE_RATE: u32 = 48_000;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -128,6 +132,38 @@ struct AcceleratorJson {
     requested: &'static str,
     effective: &'static str,
     fallback: Option<&'static str>,
+}
+
+#[cfg(feature = "live")]
+#[derive(Serialize)]
+struct LiveStatusJson {
+    schema: &'static str,
+    schema_version: u32,
+    event: &'static str,
+    mode: &'static str,
+    state: &'static str,
+    input_sample_rate: u32,
+    output_sample_rate: u32,
+    input_channels: usize,
+    output_channels: usize,
+    chunk_frames: usize,
+    input_level: f32,
+    output_level: f32,
+    processed_chunks: u64,
+    dropped_chunks: u64,
+    underrun_frames: u64,
+    overflow_frames: u64,
+    queued_frames: usize,
+    target_queue_frames: usize,
+    queue_latency_ms: f64,
+    processing_latency_ms: f64,
+    input_device_latency_ms: f64,
+    output_device_latency_ms: f64,
+    estimated_total_latency_ms: f64,
+    drift_correction_ppm: f64,
+    reconnect_attempts: u64,
+    device_generation: u64,
+    accelerator: AcceleratorJson,
 }
 
 #[derive(Serialize)]
@@ -432,6 +468,9 @@ OPTIONS:
         --input-device <NAME> live capture device (default: system default)
         --output-device <NAME> live playback device (default: system default)
         --chunk-ms <MS>       live chunk duration in 10..2000 ms (default: 100)
+        --live-latency <MS>   playback target: 0 auto or 20..5000 ms (default: auto)
+        --max-drift-ppm <N>   clock correction in 0..10000 ppm (default: 2500)
+        --reconnect-timeout <MS> hotplug recovery window in 0..300000 ms (default: 30000)
     -h, --help               show this help
     -V, --version            show version
 
@@ -525,6 +564,9 @@ struct Overrides {
     input_device: Option<String>,
     output_device: Option<String>,
     chunk_ms: Option<u32>,
+    live_latency_ms: Option<u32>,
+    max_drift_ppm: Option<u32>,
+    reconnect_timeout_ms: Option<u32>,
     list_devices: bool,
 }
 
@@ -577,6 +619,9 @@ struct FileConfig {
     progress: Option<bool>,
     preserve_metadata: Option<bool>,
     chunk_ms: Option<u32>,
+    live_latency_ms: Option<u32>,
+    max_drift_ppm: Option<u32>,
+    reconnect_timeout_ms: Option<u32>,
 }
 
 fn load_config(path: &str) -> Result<Overrides, String> {
@@ -715,6 +760,9 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     ov.no_progress = config.progress == Some(false);
     ov.no_metadata = config.preserve_metadata == Some(false);
     ov.chunk_ms = config.chunk_ms;
+    ov.live_latency_ms = config.live_latency_ms;
+    ov.max_drift_ppm = config.max_drift_ppm;
+    ov.reconnect_timeout_ms = config.reconnect_timeout_ms;
     Ok(ov)
 }
 
@@ -903,6 +951,9 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--input-device" => ov.input_device = Some(parse_value(args, &mut i, a)?),
             "--output-device" => ov.output_device = Some(parse_value(args, &mut i, a)?),
             "--chunk-ms" => ov.chunk_ms = Some(parse_value(args, &mut i, a)?),
+            "--live-latency" => ov.live_latency_ms = Some(parse_value(args, &mut i, a)?),
+            "--max-drift-ppm" => ov.max_drift_ppm = Some(parse_value(args, &mut i, a)?),
+            "--reconnect-timeout" => ov.reconnect_timeout_ms = Some(parse_value(args, &mut i, a)?),
             "--list-devices" => ov.list_devices = true,
             "-" => {
                 if input.is_none() {
@@ -1634,6 +1685,29 @@ fn validate_effective_options(ov: &Overrides, sample_rate: u32) -> Result<(), St
         if !(MIN_LIVE_CHUNK_MS..=MAX_LIVE_CHUNK_MS).contains(&chunk_ms) {
             return Err(format!(
                 "--chunk-ms must be in {MIN_LIVE_CHUNK_MS}..={MAX_LIVE_CHUNK_MS}"
+            ));
+        }
+    }
+    if let Some(latency_ms) = ov.live_latency_ms {
+        if latency_ms != 0
+            && !(MIN_LIVE_TARGET_LATENCY_MS..=MAX_LIVE_TARGET_LATENCY_MS).contains(&latency_ms)
+        {
+            return Err(format!(
+                "--live-latency must be 0 or in {MIN_LIVE_TARGET_LATENCY_MS}..={MAX_LIVE_TARGET_LATENCY_MS}"
+            ));
+        }
+    }
+    if let Some(max_drift_ppm) = ov.max_drift_ppm {
+        if max_drift_ppm > MAX_LIVE_DRIFT_PPM {
+            return Err(format!(
+                "--max-drift-ppm must be in 0..={MAX_LIVE_DRIFT_PPM}"
+            ));
+        }
+    }
+    if let Some(timeout_ms) = ov.reconnect_timeout_ms {
+        if timeout_ms > MAX_LIVE_RECONNECT_TIMEOUT_MS {
+            return Err(format!(
+                "--reconnect-timeout must be in 0..={MAX_LIVE_RECONNECT_TIMEOUT_MS}"
             ));
         }
     }
@@ -3612,17 +3686,110 @@ fn run_live(args: &[String]) -> Result<(), String> {
     let denoiser = build_config(&ov, sample_rate);
     let backend_options = build_backend_options(&ov);
     let governor = resource_governor(&ov, 1)?;
-    denoize::live::run_with_governor(
-        denoize::live::LiveConfig {
-            input_device: ov.input_device,
-            output_device: ov.output_device,
-            chunk_ms: ov.chunk_ms.unwrap_or(100),
-            backend,
-            backend_options,
-            denoiser,
-        },
-        &governor,
-    )
+    let resilience = denoize::live::LiveResilienceConfig::new()
+        .with_target_latency_ms(ov.live_latency_ms.unwrap_or(0))
+        .with_max_drift_ppm(ov.max_drift_ppm.unwrap_or(2_500))
+        .with_reconnect_timeout_ms(ov.reconnect_timeout_ms.unwrap_or(30_000));
+    let prepared = denoize::live::PreparedLiveConfig::new(denoize::live::LiveConfig {
+        input_device: ov.input_device,
+        output_device: ov.output_device,
+        chunk_ms: ov.chunk_ms.unwrap_or(100),
+        backend,
+        backend_options,
+        denoiser,
+    })?
+    .with_resilience(resilience)?;
+    let json = ov.json;
+    let mut previous_state = None;
+    let mut last_running_report = None::<Instant>;
+    denoize::live::run_prepared_with_governor_and_status(prepared, &governor, move |status| {
+        let now = Instant::now();
+        let state_changed = previous_state != Some(status.connection_state);
+        let running_due = last_running_report
+            .is_none_or(|last| now.saturating_duration_since(last).as_secs_f64() >= 1.0);
+        if !state_changed
+            && (status.connection_state != denoize::live::LiveConnectionState::Running
+                || !running_due)
+        {
+            return;
+        }
+        previous_state = Some(status.connection_state);
+        if status.connection_state == denoize::live::LiveConnectionState::Running {
+            last_running_report = Some(now);
+        }
+        let state = live_connection_state_name(status.connection_state);
+        if json {
+            println!(
+                "{}",
+                serialize_json_line(&LiveStatusJson {
+                    schema: CLI_JSON_SCHEMA,
+                    schema_version: CLI_JSON_SCHEMA_VERSION,
+                    event: "status",
+                    mode: "live",
+                    state,
+                    input_sample_rate: status.input_sample_rate,
+                    output_sample_rate: status.output_sample_rate,
+                    input_channels: status.input_channels,
+                    output_channels: status.output_channels,
+                    chunk_frames: status.chunk_frames,
+                    input_level: status.input_level,
+                    output_level: status.output_level,
+                    processed_chunks: status.processed_chunks,
+                    dropped_chunks: status.dropped_chunks,
+                    underrun_frames: status.underrun_frames,
+                    overflow_frames: status.overflow_frames,
+                    queued_frames: status.queued_frames,
+                    target_queue_frames: status.target_queue_frames,
+                    queue_latency_ms: status.queue_latency_ms,
+                    processing_latency_ms: status.processing_latency_ms,
+                    input_device_latency_ms: status.input_device_latency_ms,
+                    output_device_latency_ms: status.output_device_latency_ms,
+                    estimated_total_latency_ms: status.estimated_total_latency_ms,
+                    drift_correction_ppm: status.drift_correction_ppm,
+                    reconnect_attempts: status.reconnect_attempts,
+                    device_generation: status.device_generation,
+                    accelerator: accelerator_json(status.accelerator),
+                })
+            );
+            // A pipe is block-buffered rather than terminal-line-buffered.
+            // Flush every sparse status record so automation observes state
+            // transitions and periodic samples when they happen.
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        } else if status.sample_rate == 0 {
+            eprintln!(
+                "live: state={state} reconnects={} generation={}",
+                status.reconnect_attempts, status.device_generation
+            );
+        } else {
+            eprintln!(
+                    "live: state={state} rate={}->{} Hz queue={}/{} frames latency={:.1} ms (device={:.1}/{:.1}, processing={:.1}) drift={:+.1} ppm underrun={} overflow={} dropped={} reconnects={}",
+                    status.input_sample_rate,
+                    status.output_sample_rate,
+                    status.queued_frames,
+                    status.target_queue_frames,
+                    status.estimated_total_latency_ms,
+                    status.input_device_latency_ms,
+                    status.output_device_latency_ms,
+                    status.processing_latency_ms,
+                    status.drift_correction_ppm,
+                    status.underrun_frames,
+                    status.overflow_frames,
+                    status.dropped_chunks,
+                    status.reconnect_attempts,
+                );
+        }
+    })
+}
+
+#[cfg(feature = "live")]
+fn live_connection_state_name(state: denoize::live::LiveConnectionState) -> &'static str {
+    match state {
+        denoize::live::LiveConnectionState::Connecting => "connecting",
+        denoize::live::LiveConnectionState::Priming => "priming",
+        denoize::live::LiveConnectionState::Running => "running",
+        denoize::live::LiveConnectionState::Recovering => "recovering",
+        _ => "unknown",
+    }
 }
 
 #[cfg(not(feature = "live"))]
@@ -6745,6 +6912,60 @@ mod json_output_tests {
         assert_eq!(value["cancelled"].as_bool(), Some(true));
         assert_eq!(value["output"].as_str(), Some(SPECIAL_OUTPUT));
     }
+
+    #[test]
+    fn cli_schema_includes_live_diagnostics_without_a_recipe() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../schemas/denoize-cli-output-v1.schema.json"))
+                .unwrap();
+        assert!(schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|variant| variant["$ref"] == "#/$defs/liveStatus"));
+        let live = &schema["$defs"]["liveStatus"];
+        assert_eq!(live["properties"]["event"]["const"], "status");
+        assert_eq!(live["properties"]["mode"]["const"], "live");
+        assert!(live["properties"].get("recipe").is_none());
+        for required in [
+            "state",
+            "estimated_total_latency_ms",
+            "drift_correction_ppm",
+            "underrun_frames",
+            "overflow_frames",
+            "reconnect_attempts",
+            "device_generation",
+        ] {
+            assert!(live["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == required));
+        }
+    }
+
+    #[cfg(feature = "live")]
+    #[test]
+    fn live_connection_states_have_stable_json_names() {
+        use denoize::live::LiveConnectionState;
+
+        assert_eq!(
+            live_connection_state_name(LiveConnectionState::Connecting),
+            "connecting"
+        );
+        assert_eq!(
+            live_connection_state_name(LiveConnectionState::Priming),
+            "priming"
+        );
+        assert_eq!(
+            live_connection_state_name(LiveConnectionState::Running),
+            "running"
+        );
+        assert_eq!(
+            live_connection_state_name(LiveConnectionState::Recovering),
+            "recovering"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8681,6 +8902,9 @@ max_gpu_memory_mb = 512
 max_gpu_jobs = 2
 isolate = true
 chunk_ms = 100
+live_latency_ms = 80
+max_drift_ppm = 1500
+reconnect_timeout_ms = 45000
 "#,
             "test.toml",
         )
@@ -8706,6 +8930,9 @@ chunk_ms = 100
         assert_eq!(options.max_gpu_jobs, Some(2));
         assert!(options.isolate);
         assert_eq!(options.chunk_ms, Some(100));
+        assert_eq!(options.live_latency_ms, Some(80));
+        assert_eq!(options.max_drift_ppm, Some(1_500));
+        assert_eq!(options.reconnect_timeout_ms, Some(45_000));
     }
 
     #[test]
@@ -8917,6 +9144,9 @@ stream_frames = 0
 max_memory_mb = 0
 jobs = 33
 chunk_ms = 2001
+live_latency_ms = 5001
+max_drift_ppm = 10001
+reconnect_timeout_ms = 300001
 "#,
             "numeric-precedence",
         );
@@ -8949,6 +9179,12 @@ chunk_ms = 2001
             "1".into(),
             "--chunk-ms".into(),
             "100".into(),
+            "--live-latency".into(),
+            "80".into(),
+            "--max-drift-ppm".into(),
+            "1500".into(),
+            "--reconnect-timeout".into(),
+            "45000".into(),
         ];
         let (_, _, options) = parse_args(&args).unwrap();
         std::fs::remove_file(path).unwrap();
@@ -8957,6 +9193,9 @@ chunk_ms = 2001
         assert_eq!(options.frame_size, Some(256));
         assert_eq!(options.stream_frames, Some(1));
         assert_eq!(options.jobs, Some(1));
+        assert_eq!(options.live_latency_ms, Some(80));
+        assert_eq!(options.max_drift_ppm, Some(1_500));
+        assert_eq!(options.reconnect_timeout_ms, Some(45_000));
     }
 
     #[test]
@@ -9143,6 +9382,21 @@ chunk_ms = 2001
             ])
             .unwrap();
         }
+
+        for value in ["0", "20", "5000"] {
+            cli_ok(&["--live-latency", value]);
+        }
+        for value in ["1", "19", "5001"] {
+            assert!(cli_error(&["--live-latency", value]).contains("--live-latency"));
+        }
+        for value in ["0", "10000"] {
+            cli_ok(&["--max-drift-ppm", value]);
+        }
+        assert!(cli_error(&["--max-drift-ppm", "10001"]).contains("--max-drift-ppm"));
+        for value in ["0", "300000"] {
+            cli_ok(&["--reconnect-timeout", value]);
+        }
+        assert!(cli_error(&["--reconnect-timeout", "300001"]).contains("--reconnect-timeout"));
     }
 
     #[test]
@@ -9162,6 +9416,10 @@ chunk_ms = 2001
             assert!(error.contains(field), "{flag} produced: {error}");
         }
         assert!(cli_error(&["--chunk-ms", &u32::MAX.to_string()]).contains("--chunk-ms"));
+        assert!(cli_error(&["--live-latency", &u32::MAX.to_string()]).contains("--live-latency"));
+        assert!(cli_error(&["--max-drift-ppm", &u32::MAX.to_string()]).contains("--max-drift-ppm"));
+        assert!(cli_error(&["--reconnect-timeout", &u32::MAX.to_string()])
+            .contains("--reconnect-timeout"));
     }
 
     #[test]
@@ -11023,10 +11281,19 @@ mod tests {
             "Cable".into(),
             "--chunk-ms".into(),
             "40".into(),
+            "--live-latency".into(),
+            "80".into(),
+            "--max-drift-ppm".into(),
+            "1500".into(),
+            "--reconnect-timeout".into(),
+            "45000".into(),
         ];
         let (_, _, options) = parse_args(&args).unwrap();
         assert_eq!(options.input_device.as_deref(), Some("Mic"));
         assert_eq!(options.output_device.as_deref(), Some("Cable"));
         assert_eq!(options.chunk_ms, Some(40));
+        assert_eq!(options.live_latency_ms, Some(80));
+        assert_eq!(options.max_drift_ppm, Some(1_500));
+        assert_eq!(options.reconnect_timeout_ms, Some(45_000));
     }
 }

@@ -88,6 +88,9 @@ OPTIONS:
         --input-device <NAME> live capture device (default: system default)
         --output-device <NAME> live playback device (default: system default)
         --chunk-ms <MS>       live chunk duration in 10..2000 ms (default: 100)
+        --live-latency <MS>   playback target: 0 auto or 20..5000 ms (default: auto)
+        --max-drift-ppm <N>   clock correction in 0..10000 ppm (default: 2500)
+        --reconnect-timeout <MS> hotplug recovery window in 0..300000 ms (default: 30000)
     -h, --help               show this help
     -V, --version            show version
 
@@ -250,12 +253,14 @@ is assembled before stdout publication and fails without partial JSON if the
 catalog or trust generation changes. URLs are credential/query/fragment
 redacted. The desktop model library exports the identical document atomically.
 
-Normal file-processing `--json` results and batch NDJSON records use
-`denoize-cli-output-v1`. Every record names the recipe domain/version/output ABI.
-A finite-file result and each batch progress event include the exact resolved
-recipe digest; streaming results and multi-recipe summaries use `null`. Consumers
-must ignore fields added within a schema version. Versioned schemas ship in each
-release and are documented in `docs/json.md`.
+Normal file-processing `--json` results, batch NDJSON records, and live status
+NDJSON records use `denoize-cli-output-v1`. Every finite processing record names
+the recipe domain/version/output ABI. A finite-file result and each batch
+progress event include the exact resolved recipe digest; streaming results and
+multi-recipe summaries use `null`. Live status records describe an ongoing
+device session rather than an output recipe. Consumers must ignore fields added
+within a schema version. Versioned schemas ship in each release and are
+documented in `docs/json.md`.
 
 `denoize hardware --json` emits the network-free `denoize-hardware-v1`
 capability snapshot. It lists CPU features, compiled Metal/CUDA runtimes, local
@@ -281,6 +286,37 @@ conservative CPU/model and GPU session reservations separate; GPU eligibility
 honors `--max-gpu-memory` and a runtime-reported device limit when available.
 The read-only probe does not create or test a CUDA kernel cache, so actual
 processing revalidates cache writability before model preparation.
+
+## Resilient realtime audio
+
+`denoize live` accepts independent default capture and playback sample rates.
+A bounded asynchronous sinc converter maps capture frames to the playback
+clock, and a bounded PI controller makes small ratio changes to keep the
+playback queue near its target. `--live-latency 0` selects two capture chunks
+with a 40 ms minimum; explicit targets are 20..5000 ms. `--max-drift-ppm`
+defaults to 2500 and accepts 0..10000. Zero disables correction while retaining
+nominal-rate conversion.
+
+Capture uses a non-waiting bounded handoff. If the worker falls behind, stale
+complete chunks are dropped; playback emits bounded silence rather than waiting
+while the worker publishes a block. A retained sequence gap cold-resets causal
+processing and clears queued playback before sound resumes.
+
+A device/configuration or stream callback failure enters a finite
+exponential-backoff reconnect loop. `--reconnect-timeout` defaults to 30000 ms,
+accepts 0..300000 ms, and zero disables recovery. Named devices are reacquired
+by an unambiguous exact name; duplicate exact names are rejected, and
+unspecified devices follow the current system default. A new generation
+cold-resets causal processing and primes playback before audio resumes.
+
+Human-readable diagnostics go to stderr about once per second. `--json` emits
+one compact status record for each connection-state transition and periodic
+running samples. Records include independent sample rates, queue depth and
+target, estimated total latency, drift correction, underrun/overflow/drop
+counts, reconnect attempts, device generation, and accelerator selection. The
+latency value combines measured callback timing, capture chunking,
+resampler/backend delay, processing, and queued playback; it is an estimate,
+not a hardware loopback guarantee.
 
 ## Hardware acceleration
 

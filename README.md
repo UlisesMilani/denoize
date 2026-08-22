@@ -43,7 +43,10 @@ every call. The CLI convenience path keeps the same `--onnx-model` contract.
 > The prebuilt GitHub binaries include every backend. Because the DeepFilterNet
 > Rust crate is not available from crates.io, the crates.io package's `full`
 > feature currently includes RNNoise, generic ONNX, MP-SENet, BSRNN,
-> MossFormer2, SGMSE+, and GTCRN, but not DeepFilterNet.
+> MossFormer2, SGMSE+, GTCRN, and live-device support, but not DeepFilterNet.
+> Building live support from source on Linux requires the ALSA development
+> package (for example, `libasound2-dev` on Debian/Ubuntu); prebuilt archives do
+> not require compiler headers.
 
 ### Hardware acceleration
 
@@ -719,13 +722,17 @@ Audio files and folders can be dropped onto the single-file or batch input
 zones; output folders have dedicated drop targets. Multiple audio files switch
 the app to batch mode automatically.
 The realtime page routes a selected capture device through a low-latency
-backend to a playback device, with input/output meters, dropped-chunk counters,
-and explicit start/stop controls. Live sessions support the live-capable
-Classical, RNNoise, and GTCRN backends; other backends are rejected before
-capture or playback starts. GTCRN requires its managed model to be installed
-(or an explicit model path) and keeps one optimized graph with independent
-recurrent state per processed channel. Headphones help prevent acoustic
-feedback.
+backend to a playback device, with independent input/output sample rates,
+adaptive clock correction, bounded playback priming, and explicit start/stop
+controls. It reports queue depth, estimated capture-to-playback latency, drift
+correction, underrun/overflow frames, dropped chunks, and reconnect attempts.
+If a device disappears, the session retries the selected name (or the current
+system default) for the configured finite recovery window. Live sessions
+support the live-capable Classical, RNNoise, and GTCRN backends; other backends
+are rejected before capture or playback starts. GTCRN requires its managed
+model to be installed (or an explicit model path) and keeps one optimized graph
+with independent recurrent state per processed channel. Headphones help
+prevent acoustic feedback.
 
 File and batch jobs keep owner-private recovery records while their exact
 denoize staging files are live. After a crash, the desktop can retry the saved
@@ -900,15 +907,38 @@ microphone through a denoising backend to an output or virtual-audio device:
 cargo build --release --features live,rnnoise,gtcrn
 denoize live --list-devices
 denoize live --backend rnnoise --input-device "Microphone" --output-device "Virtual Cable"
-denoize live --backend gtcrn --input-device "Microphone" --output-device "Virtual Cable"
+denoize live --backend gtcrn --live-latency 80 --max-drift-ppm 2500 \
+  --reconnect-timeout 30000 --input-device "Microphone" --output-device "Virtual Cable"
 ```
 
-Realtime processing runs outside the device callbacks and uses bounded queues,
-so an overloaded backend drops stale capture chunks instead of blocking the
-audio thread. `--chunk-ms` controls the latency/throughput trade-off and defaults
-to 100 ms. The low-latency Classical, RNNoise, and causal GTCRN backends are
+Realtime processing runs outside the device callbacks and uses bounded queues.
+The capture callback uses a non-waiting handoff, so an overloaded backend drops
+stale chunks; the playback callback emits bounded silence instead of waiting
+while the worker publishes a block. `--chunk-ms` controls the latency/throughput
+trade-off and defaults to 100 ms. The low-latency Classical, RNNoise, and causal GTCRN backends are
 live-capable; other backend selections are rejected before capture or playback
-starts. Input and output devices must currently share a default sample rate.
+starts. Input and output devices may use different default sample rates: a
+bounded asynchronous sinc converter maps capture frames to the playback clock,
+while a PI controller keeps the playback queue near its target without an
+abrupt timebase reset. `--live-latency 0` selects an automatic target of two
+capture chunks with a 40 ms minimum; explicit targets are 20–5,000 ms.
+`--max-drift-ppm` bounds clock correction (2,500 ppm by default, or zero to
+disable drift correction while retaining nominal-rate conversion).
+
+Device stream failures enter a finite exponential-backoff recovery loop.
+`--reconnect-timeout` defaults to 30 seconds and zero disables recovery. Named
+devices are reselected by an unambiguous exact name; duplicate exact names are
+rejected rather than silently routing to a different device. An unspecified
+device follows the current system default. Each recovered generation starts
+from a cold backend/resampler
+state and primes playback before sound resumes. Human-readable status is
+written to stderr about once per second. `--json` instead emits
+`denoize-cli-output-v1` NDJSON status records containing connection state,
+sample rates, queue/latency measurements, drift correction, underruns,
+overflows, dropped chunks, reconnects, generation, and accelerator selection.
+Latency is an engineering estimate assembled from device callback timing,
+capture chunking, algorithmic delay, processing time, and queued playback—not
+a loopback measurement or an exact hardware guarantee.
 
 Classical, RNNoise, and GTCRN sessions preserve denoiser, overlap, recurrent,
 partial-frame, and sample-rate-converter state across consecutive capture
@@ -1092,7 +1122,9 @@ before input decoding, output staging, or batch worker creation. For example,
 FFT frames must be powers of two from 256 through 65,536, streaming blocks must
 be from 1 through 1,048,576 frames, batch jobs from 1 through 32, and live
 chunks from 10 through 2,000 ms. Non-finite effective floating-point settings
-are rejected; loudness targets are limited to -70..0 LUFS and true-peak
+are rejected; live latency accepts zero for automatic or 20 through 5,000 ms,
+drift correction accepts 0 through 10,000 ppm, and reconnect timeout accepts 0
+through 300,000 ms. Loudness targets are limited to -70..0 LUFS and true-peak
 ceilings to -20..0 dBTP.
 
 ```toml
@@ -1108,6 +1140,10 @@ true_peak_dbtp = -1.0
 # deterministic = true  # serialize processing for reproducible output
 # seed = 12345          # optional SGMSE sampler seed (implies deterministic)
 # stream_frames = 8192
+# chunk_ms = 100
+# live_latency_ms = 0       # automatic; otherwise 20..5000
+# max_drift_ppm = 2500     # 0..10000
+# reconnect_timeout_ms = 30000 # 0 disables hotplug recovery
 # max_memory_mb = 1024
 # max_process_memory_mb = 2048
 # max_temporary_mb = 4096

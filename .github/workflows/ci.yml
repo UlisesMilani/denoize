@@ -53,6 +53,11 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
 
+      - name: Install live audio development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libasound2-dev
+
       - name: Verify synchronized release versions
         run: bash scripts/verify-release-version.sh
 
