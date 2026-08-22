@@ -344,6 +344,9 @@ jobs:
           receipt_verification_schema="$asset_dir/denoize-receipt-verification-v1.schema.json"
           stream_receipt_verification_schema="$asset_dir/denoize-receipt-verification-v2.schema.json"
           runtime_model_package_schema="$asset_dir/denoize-runtime-model-package-v1.schema.json"
+          watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
+          watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
+          watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
           bundle="$asset_dir/denoize-models-${GITHUB_REF_NAME}.dmb"
           bundle_checksum="$bundle.sha256"
           cp models/catalog-v1.json "$asset"
@@ -364,6 +367,9 @@ jobs:
           cp schemas/denoize-receipt-verification-v1.schema.json "$receipt_verification_schema"
           cp schemas/denoize-receipt-verification-v2.schema.json "$stream_receipt_verification_schema"
           cp schemas/denoize-runtime-model-package-v1.schema.json "$runtime_model_package_schema"
+          cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
+          cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
+          cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -383,6 +389,8 @@ jobs:
             "$receipt_trust_policy_schema" "$receipt_verification_schema" \
             "$stream_receipt_verification_schema" \
             "$runtime_model_package_schema" \
+            "$watch_cycle_schema" "$watch_quarantine_schema" \
+            "$watch_state_schema" \
             "$bundle" "$bundle_checksum" --clobber
 
   release-evidence:

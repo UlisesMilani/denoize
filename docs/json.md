@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes sixteen versioned JSON contracts for local automation. Their
+denoize publishes nineteen versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -44,6 +44,14 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-runtime-model-package-v1.schema.json`](../schemas/denoize-runtime-model-package-v1.schema.json)
   describes the signed identity, license, frontend, tensor, accelerator, and
   resource manifest embedded in a custom-model `.dmp` package.
+- [`denoize-watch-state-v1.schema.json`](../schemas/denoize-watch-state-v1.schema.json)
+  describes durable settle observations, retry scheduling, processing state,
+  and completed/quarantined watch-folder jobs.
+- [`denoize-watch-cycle-v1.schema.json`](../schemas/denoize-watch-cycle-v1.schema.json)
+  describes one bounded CLI watch scan/attempt report emitted by `--json`.
+- [`denoize-watch-quarantine-v1.schema.json`](../schemas/denoize-watch-quarantine-v1.schema.json)
+  describes the exact failed input, attempt count, bounded diagnostic, and
+  quarantine time recorded beside a verified quarantined copy.
 
 Within a schema version, required field names, field types, digest encoding, and
 documented enum/string values are stable. A future release may add fields, so
@@ -53,6 +61,36 @@ value requires a new schema identifier and version. Execution plans, receipts,
 keys, policies, verification reports, presentation regions, and runtime model
 package manifests deliberately reject unknown fields: their exact typed
 representation participates in signing, trust, or source-binding decisions.
+
+## Watch-folder state and quarantine records
+
+The CLI `denoize watch` command and desktop **Watch folders** page atomically
+replace one bounded `denoize-watch-state-v1` document after discovery and
+before/after every due attempt. Its generation is monotonic within the state
+file. Portable relative locators identify observations and jobs; absolute
+input, output, key, and control paths are deliberately not serialized. Each
+content generation is identified by the relative locator plus its exact length
+and SHA-256. The
+`processor_identity` is an opaque SHA-256 binding of the version, processing
+template, output format, signing-key identity, and explicit model artifacts;
+it prevents a changed processor from silently accepting old completion state
+without disclosing local paths.
+
+The statuses `ready`, `processing`, `retry`, `quarantinePending`, `completed`,
+`quarantined`, and `superseded` are stable v1 values. A `processing` status
+loaded after restart is converted to a due retry before any processor runs.
+Retry timestamps are Unix milliseconds. The watcher clamps a backward wall
+clock to the last persisted cycle rather than making a due job run early.
+
+A `denoize-watch-quarantine-v1` explanation is written beside the verified
+copy before the original input is removed. It contains the package version,
+job and source locator, fingerprint, attempt count, bounded final diagnostic,
+and Unix-millisecond quarantine time. It is operational evidence, not a signed
+success receipt. Successful audio instead uses the existing signed execution
+receipt contract and is re-authenticated during crash recovery. The state fixes
+the quarantine time, package version, and final processing diagnostic before
+copying, so a restart can accept the exact same explanation and finish source
+removal without rewriting evidence.
 
 ## Model and provenance snapshot
 

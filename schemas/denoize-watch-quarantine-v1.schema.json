@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-watch-quarantine-v1.schema.json",
+  "title": "denoize watch-folder quarantine explanation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "job_id",
+    "original_relative_path",
+    "input_fingerprint",
+    "attempts",
+    "error",
+    "quarantined_at_unix_millis"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-watch-quarantine-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "job_id": { "type": "string", "minLength": 66, "maxLength": 4161 },
+    "original_relative_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "input_fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 0 },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "attempts": { "type": "integer", "minimum": 1, "maximum": 100 },
+    "error": { "type": "string", "maxLength": 4097 },
+    "quarantined_at_unix_millis": { "type": "integer", "minimum": 0 }
+  }
+}

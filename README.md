@@ -800,8 +800,8 @@ trust-root document, and `denoize-models-<tag>.dmb` plus its checksum. The signe
 bundle contains the catalog models, upstream licenses, and provenance for
 closed-network installation; the standalone catalog/root assets remain
 available for independent audit and recovery tooling. Releases also publish the
-versioned automation, CLI-output, hardware, recommendation, and release-evidence
-JSON Schemas used by monitoring and verification clients.
+every versioned JSON Schema used by automation, monitoring, and verification
+clients.
 
 Every installable CLI archive, desktop package, crates.io archive, and offline
 model bundle also has a per-artifact CycloneDX SBOM. The release evidence
@@ -989,6 +989,76 @@ the backend it actually selected, not merely the word `auto`.
 Execution-only controls such as memory/temporary/GPU limits, `--isolate`,
 `--jobs`, and progress output do not change that audio recipe, although their
 validation still applies to each run.
+
+### Watch-folder automation
+
+Run a durable local inbox that waits for complete files, processes them one at
+a time, and signs every successful result:
+
+```sh
+denoize receipts keygen watch-secret.json watch-public.json
+denoize watch incoming cleaned --recursive --output-format flac \
+  --receipt-key watch-secret.json
+```
+
+Watch mode polls portably on Linux, macOS, and Windows. A candidate is opened
+only when it is a supported regular audio file and its length, modification
+stamp, filesystem identity, and SHA-256 content remain unchanged for the full
+`--settle-ms` interval (2 seconds by default). Directory symlinks, FIFOs,
+devices, and the separate output tree are never followed as inputs. Use
+`--once` for a bounded settle-and-scan invocation suitable for schedulers; the
+default command continues until Ctrl+C. `--poll-ms` controls the daemon scan
+interval, while `--max-watch-files` bounds each traversal.
+
+Each transition is atomically recorded in
+`OUTPUT/.denoize-watch-state.json` while a sibling lock enforces one writer.
+The state binds an opaque digest of the denoize version, processing template,
+output format, receipt public-key identity, and any explicitly selected model
+or model-key files. Reopening it with a different template fails without
+touching prior outputs; choose a fresh `--watch-state` path to begin a deliberate
+new generation.
+An interrupted `processing` entry becomes a due retry on restart. If output
+and receipt were both committed before the interruption, their signature,
+settled input fingerprint, locator, and output bytes are verified and the job
+is recovered without reprocessing. If both disappeared, the same job may be
+recreated; a one-sided output/receipt pair is preserved as an operator-visible
+failure rather than silently guessed or overwritten. Stable inputs already
+recorded as complete are checked with filesystem metadata rather than hashed
+on every poll.
+
+Failures use bounded exponential delay from `--retry-initial-ms` through
+`--retry-max-ms`. `--max-attempts` defaults to five. A permanent failure or an
+exhausted retry budget is copied without clobbering to
+`OUTPUT/.denoize-quarantine`, verified against the settled SHA-256, accompanied
+by a `denoize-watch-quarantine-v1` JSON explanation, and only then removed from
+the inbox. A failed copy leaves the source and a durable quarantine-pending
+entry for the next cycle. Custom `--quarantine`, `--receipt-dir`, and
+`--watch-state` paths must remain below the output root, which itself must not
+overlap the input tree.
+
+The unencrypted receipt key is mandatory and must remain outside both trees
+and unchanged for the watcher lifetime. A missing or changed key or explicit
+model artifact defers due jobs without consuming their attempt budgets or
+quarantining their inputs; restart the watcher with a fresh state path to adopt
+a deliberate processing-template change.
+
+Outputs preserve relative layout and default to WAV; `--output-format` selects
+another encoder. Existing unrelated destinations are never replaced. When a
+later content generation would collide with a prior name, its full content
+digest is inserted before the extension.
+Watch mode is intentionally sequential and uses the normal per-input resource
+governor; `--batch`, `--stream`, `--resume`, `--force`, `--report`, `--isolate`,
+and `--jobs` are rejected.
+
+The desktop **Watch folders** page uses the same state engine and isolated
+per-file worker. Select an inbox, a separate output directory, and a receipt
+secret key outside both trees; then choose the settle/retry policy and start
+watching. The page displays observed, pending, successful, retrying,
+quarantined, and superseded counts. **Stop** prevents another scan and cancels
+the currently isolated item at its safe publication boundary. Watch paths and
+the secret-key selection are session-only and are not stored in desktop
+settings. Processing and resource settings come from the main denoise page,
+while overwrite remains disabled.
 
 ### Automatic backend selection
 

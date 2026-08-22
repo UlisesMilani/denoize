@@ -14,6 +14,7 @@ USAGE:
     denoize hardware [--json|--pretty]
     denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
+    denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
@@ -118,6 +119,43 @@ CONFIGURATION:
     before audio decoding, output staging, or batch worker creation.
 ```
 
+## Watch-folder automation
+
+```text
+denoize 0.65.0 watch-folder automation
+
+USAGE:
+    denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
+
+WATCH OPTIONS:
+        --once                    settle and scan once, then exit
+        --settle-ms <MS>          unchanged-content interval in 0..2592000000 (default: 2000)
+        --poll-ms <MS>            daemon polling interval in 1..2592000000 (default: 500)
+        --retry-initial-ms <MS>   initial retry delay (default: 1000)
+        --retry-max-ms <MS>       maximum exponential delay (default: 60000)
+        --max-attempts <N>        attempts before quarantine in 1..100 (default: 5)
+        --max-watch-files <N>     bounded directory entries in 1..100000 (default: 10000)
+        --quarantine <DIR>        failed-input root (default: OUTPUT/.denoize-quarantine)
+        --receipt-dir <DIR>       per-item signed receipts (default: OUTPUT/.denoize-receipts)
+        --watch-state <PATH>      durable state (default: OUTPUT/.denoize-watch-state.json)
+
+PROCESSING OPTIONS:
+    File-processing options from `denoize --help` are accepted. `--output-format`
+    defaults to wav. `--recursive` includes subdirectories. Watch mode is
+    sequential and forbids --batch, --stream, --resume, --force, --report,
+    --isolate, --receipt, and --jobs. A receipt key is mandatory; every
+    successful output is atomically paired with a signed receipt.
+
+SETTLE AND FAILURE CONTRACT:
+    A candidate must retain the same regular-file length, modification stamp,
+    and SHA-256 content for the full settle interval. Processing failures use
+    bounded exponential retry. Exhausted or permanent failures are copied to
+    quarantine with a v1 JSON explanation before the source is removed. The
+    durable state and output roots must be outside the input tree. State is
+    bound to the processing, output, signing-key, and explicit-model template;
+    choose a new state path after an intentional template change.
+```
+
 ## Managed models
 
 ```text
@@ -211,6 +249,28 @@ trust key: verification requires an explicit public key or a rotation/revocation
 policy. Without --output-root, file locators are anchored beside the receipt.
 Stdout stream receipts use the `-` locator and require --output during verification.
 ```
+
+Watch mode uses portable bounded polling. A regular audio file becomes eligible
+only after its length, modification stamp, filesystem identity, and SHA-256
+remain unchanged for the complete settle interval. Every processing transition
+is persisted before work begins. Interrupted jobs retry on restart; an already
+committed output and receipt pair is authenticated and recovered without
+reprocessing. Retries use bounded exponential backoff. Exhausted or permanent
+failures are copied without clobbering into quarantine, verified, accompanied
+by a versioned JSON explanation, and only then removed from the inbox.
+The state binds an opaque digest of the denoize version, processing template,
+output format, receipt public-key identity, and explicit model artifacts.
+Reopening it with a different template fails without touching existing output;
+use a fresh `--watch-state` path for a deliberate new generation.
+
+`--receipt-key` is mandatory and must remain outside the disjoint input/output
+trees. A missing or changed key or explicit model artifact defers jobs without
+consuming their retry budgets or quarantining inputs; restart with a fresh
+state path to adopt an intentional processing-template change. Each success
+receives its own signed receipt below `--receipt-dir`.
+`--once` provides a bounded settle-and-scan scheduler entry point; otherwise the
+watcher runs until Ctrl+C. State, receipts, and quarantine remain below the
+output root, while directory links and special input files are ignored.
 
 `plan` performs bounded input decoding, metadata and encoder validation,
 read-only backend/model resolution and preparation, and resource admission. It

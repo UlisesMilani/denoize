@@ -68,6 +68,9 @@ expected_assets=(
   "denoize-recommendation-v1.schema.json"
   "denoize-release-evidence-v1.schema.json"
   "denoize-runtime-model-package-v1.schema.json"
+  "denoize-watch-cycle-v1.schema.json"
+  "denoize-watch-quarantine-v1.schema.json"
+  "denoize-watch-state-v1.schema.json"
   "denoize-models-${tag}.dmb"
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
@@ -161,6 +164,9 @@ gh release download "$tag" \
   --pattern 'denoize-recommendation-v1.schema.json' \
   --pattern 'denoize-release-evidence-v1.schema.json' \
   --pattern 'denoize-runtime-model-package-v1.schema.json' \
+  --pattern 'denoize-watch-cycle-v1.schema.json' \
+  --pattern 'denoize-watch-quarantine-v1.schema.json' \
+  --pattern 'denoize-watch-state-v1.schema.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -203,7 +209,10 @@ for schema in \
   denoize-receipt-verification-v2.schema.json \
   denoize-recommendation-v1.schema.json \
   denoize-release-evidence-v1.schema.json \
-  denoize-runtime-model-package-v1.schema.json; do
+  denoize-runtime-model-package-v1.schema.json \
+  denoize-watch-cycle-v1.schema.json \
+  denoize-watch-quarantine-v1.schema.json \
+  denoize-watch-state-v1.schema.json; do
   if ! cmp -s "schemas/$schema" "$tmp_dir/$schema"; then
     echo "release JSON Schema differs from tagged schemas/$schema" >&2
     exit 1

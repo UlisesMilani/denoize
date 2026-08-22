@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-watch-state-v1.schema.json",
+  "title": "denoize durable watch-folder state v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "processor_identity",
+    "generation",
+    "last_cycle_unix_millis",
+    "observations",
+    "jobs"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-watch-state-v1" },
+    "schema_version": { "const": 1 },
+    "processor_identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "generation": { "type": "integer", "minimum": 0 },
+    "last_cycle_unix_millis": { "type": "integer", "minimum": 0 },
+    "observations": {
+      "type": "object",
+      "maxProperties": 100000,
+      "additionalProperties": { "$ref": "#/$defs/observation" }
+    },
+    "jobs": {
+      "type": "object",
+      "maxProperties": 100000,
+      "additionalProperties": { "$ref": "#/$defs/job" }
+    }
+  },
+  "$defs": {
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 0 },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "modified": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["before_epoch", "seconds", "nanoseconds"],
+      "properties": {
+        "before_epoch": { "type": "boolean" },
+        "seconds": { "type": "integer" },
+        "nanoseconds": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "modified", "identity", "fingerprint", "stable_since_unix_millis"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 0 },
+        "modified": { "$ref": "#/$defs/modified" },
+        "identity": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["platform", "first", "second"],
+          "properties": {
+            "platform": { "enum": ["unix", "windows"] },
+            "first": { "type": "integer", "minimum": 0 },
+            "second": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "stable_since_unix_millis": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "relative_path",
+        "fingerprint",
+        "output_relative_path",
+        "receipt_relative_path",
+        "status",
+        "attempts",
+        "next_attempt_unix_millis",
+        "last_error",
+        "completed_at_unix_millis",
+        "quarantine_relative_path",
+        "quarantine_started_at_unix_millis",
+        "quarantine_denoize_version",
+        "quarantine_error"
+      ],
+      "properties": {
+        "id": { "type": "string", "maxLength": 4161 },
+        "relative_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "output_relative_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "receipt_relative_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "status": {
+          "enum": [
+            "ready",
+            "processing",
+            "retry",
+            "quarantinePending",
+            "completed",
+            "quarantined",
+            "superseded"
+          ]
+        },
+        "attempts": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "next_attempt_unix_millis": { "type": "integer", "minimum": 0 },
+        "last_error": { "type": ["string", "null"], "maxLength": 4097 },
+        "completed_at_unix_millis": { "type": ["integer", "null"], "minimum": 0 },
+        "quarantine_relative_path": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "quarantine_started_at_unix_millis": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "quarantine_denoize_version": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "quarantine_error": {
+          "type": ["string", "null"],
+          "maxLength": 4097
+        }
+      }
+    }
+  }
+}

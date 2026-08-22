@@ -37,6 +37,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" --help
   echo '```'
   echo
+  echo '## Watch-folder automation'
+  echo
+  echo '```text'
+  "$binary" watch --help
+  echo '```'
+  echo
   echo '## Managed models'
   echo
   echo '```text'
@@ -55,6 +61,28 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" receipts --help
   echo '```'
   cat <<'EOF'
+
+Watch mode uses portable bounded polling. A regular audio file becomes eligible
+only after its length, modification stamp, filesystem identity, and SHA-256
+remain unchanged for the complete settle interval. Every processing transition
+is persisted before work begins. Interrupted jobs retry on restart; an already
+committed output and receipt pair is authenticated and recovered without
+reprocessing. Retries use bounded exponential backoff. Exhausted or permanent
+failures are copied without clobbering into quarantine, verified, accompanied
+by a versioned JSON explanation, and only then removed from the inbox.
+The state binds an opaque digest of the denoize version, processing template,
+output format, receipt public-key identity, and explicit model artifacts.
+Reopening it with a different template fails without touching existing output;
+use a fresh `--watch-state` path for a deliberate new generation.
+
+`--receipt-key` is mandatory and must remain outside the disjoint input/output
+trees. A missing or changed key or explicit model artifact defers jobs without
+consuming their retry budgets or quarantining inputs; restart with a fresh
+state path to adopt an intentional processing-template change. Each success
+receives its own signed receipt below `--receipt-dir`.
+`--once` provides a bounded settle-and-scan scheduler entry point; otherwise the
+watcher runs until Ctrl+C. State, receipts, and quarantine remain below the
+output root, while directory links and special input files are ignored.
 
 `plan` performs bounded input decoding, metadata and encoder validation,
 read-only backend/model resolution and preparation, and resource admission. It

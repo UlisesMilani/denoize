@@ -251,7 +251,7 @@ unreviewable release.
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Released in v0.63.0 |
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Released in v0.64.0 |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Released in v0.65.0 |
-| 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
+| 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Implemented (pending release) |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Planned |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
 | 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Planned |
@@ -321,6 +321,26 @@ fingerprint; changing model, notice, signature, or contract changes that
 identity. V1 intentionally supports the reproducible mono waveform frontend
 only—spectral, recurrent multi-input, or code-bearing packages require a future
 versioned adapter rather than weakening the v1 contract.
+
+Stage 18 uses bounded portable polling rather than a platform-specific event
+queue. A candidate must remain the same regular-file identity, length,
+modification stamp, and SHA-256 content for the configured settle interval.
+Input and output trees cannot overlap, directory links are not traversed, and
+state, receipts, and quarantine evidence stay below the output root. Every
+processing transition is atomically recorded under a single-writer lock before
+work begins, so a restart retries an interrupted attempt or verifies an already
+published output/receipt pair instead of guessing which side committed.
+
+The durable v1 state binds the denoize version, effective processing template,
+output format, signing identity, and explicitly selected model artifacts.
+Retries use bounded exponential delay; unavailable keys, models, or operator
+cancellation defer work without consuming the input's attempt budget. A
+permanent or exhausted failure is copied without clobbering, fingerprinted,
+paired with bounded v1 quarantine evidence, and only then removed from the
+inbox. Successful outputs retain the existing signed execution-receipt
+contract. CLI and desktop use the same sequential state engine, per-input
+resource admission, isolated desktop worker, collision-safe relative naming,
+and stable cycle/state/quarantine JSON schemas.
 
 Every stage from Stage 12 onward also carries an upgrade-compatibility gate:
 persisted presets, journals, checkpoints, receipts, and automation schemas must
