@@ -826,7 +826,7 @@ impl WatchFolder {
             return Ok(());
         }
         let modified = modified_stamp(metadata.modified().ok());
-        let identity = file_identity(&metadata);
+        let identity = file_identity(input, &metadata)?;
         let len = metadata.len();
         let changed = self
             .state
@@ -1306,28 +1306,53 @@ fn modified_stamp(time: Option<SystemTime>) -> Option<ModifiedStamp> {
 }
 
 #[cfg(unix)]
-fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+fn file_identity(
+    _path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<Option<FileIdentity>, String> {
     use std::os::unix::fs::MetadataExt as _;
-    Some(FileIdentity {
+    Ok(Some(FileIdentity {
         platform: "unix".into(),
         first: metadata.dev(),
         second: metadata.ino(),
-    })
+    }))
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-    use std::os::windows::fs::MetadataExt as _;
-    Some(FileIdentity {
+fn file_identity(
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<Option<FileIdentity>, String> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let (file, _) = crate::input::open_regular_file(path, "watch input")?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live handle and `information` is writable storage.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return Err(format!(
+            "inspect watch input identity {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Ok(Some(FileIdentity {
         platform: "windows".into(),
-        first: u64::from(metadata.volume_serial_number().unwrap_or(0)),
-        second: metadata.file_index().unwrap_or(0),
-    })
+        first: information.dwVolumeSerialNumber as u64,
+        second: index,
+    }))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-    None
+fn file_identity(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<Option<FileIdentity>, String> {
+    Ok(None)
 }
 
 fn is_supported_audio_path(path: &Path) -> bool {
