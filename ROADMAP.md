@@ -249,7 +249,7 @@ unreviewable release.
 | 13 | Parser and resource-amplification fuzzing, deterministic fault injection, and crash/power-loss simulation | Released in v0.61.0 |
 | 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Released in v0.62.0 |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Released in v0.63.0 |
-| 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Implemented, pending release |
+| 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Released in v0.64.0 |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Planned |
