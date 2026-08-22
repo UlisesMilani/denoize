@@ -250,7 +250,7 @@ unreviewable release.
 | 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Released in v0.62.0 |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Released in v0.63.0 |
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Released in v0.64.0 |
-| 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Implemented (pending release) |
+| 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Released in v0.65.0 |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Planned |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
