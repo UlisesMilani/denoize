@@ -33,6 +33,7 @@ include = [
     "/THIRD_PARTY.md",
     "/src/**/*.rs",
     "/src/decode/testdata/*",
+    "/src/model_package/testdata/*",
     "/src/models/testdata/*",
     "/examples/**/*.rs",
     "/scripts/export-mpsenet.py",

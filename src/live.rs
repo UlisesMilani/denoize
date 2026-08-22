@@ -20,8 +20,8 @@ use crate::config::{
 };
 use crate::denoiser::DenoiserConfig;
 use crate::{
-    denoise_audio_with_backend_config, select_accelerator, AcceleratorSelection, Backend,
-    BackendOptions, ChannelMode, ResourcePlan, StreamingBackendSession,
+    denoise_audio_with_backend_config, select_accelerator_for_options, AcceleratorSelection,
+    Backend, BackendOptions, ChannelMode, ResourcePlan, StreamingBackendSession,
 };
 
 const MIN_CHUNK_MS: u32 = 10;
@@ -1078,11 +1078,7 @@ struct StatefulLiveProcessor {
 impl LiveProcessor {
     #[cfg(test)]
     fn new(config: &LiveConfig, channels: usize) -> Result<Self, String> {
-        let accelerator = select_accelerator(
-            config.backend,
-            config.backend_options.accelerator,
-            config.backend_options.deterministic,
-        )?;
+        let accelerator = select_accelerator_for_options(config.backend, &config.backend_options)?;
         Self::new_with_accelerator(config, channels, accelerator)
     }
 
@@ -1318,11 +1314,7 @@ impl PreparedLiveConfig {
             .map_err(|error| error.to_string())?;
         config.backend_options =
             crate::service::resolve_backend_options(config.backend, config.backend_options)?;
-        let accelerator = select_accelerator(
-            config.backend,
-            config.backend_options.accelerator,
-            config.backend_options.deterministic,
-        )?;
+        let accelerator = select_accelerator_for_options(config.backend, &config.backend_options)?;
         Ok(Self {
             config,
             accelerator,
@@ -1524,14 +1516,26 @@ where
         out_channels,
     )
     .map_err(|error| GenerationFailure::fatal(error.to_string()))?;
-    let mut worker_request = crate::ResourceRequest::worker(buffer_plan.required_bytes, 0);
+    let worker_memory = buffer_plan
+        .required_bytes
+        .checked_add(crate::estimate_backend_worker_memory_bytes(
+            &config.backend_options,
+        ))
+        .ok_or_else(|| GenerationFailure::fatal("live worker memory reservation overflow"))?;
+    let mut worker_request = crate::ResourceRequest::worker(worker_memory, 0);
     if accelerator.effective() != crate::AcceleratorRuntime::Cpu {
-        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
-            buffer_plan
-                .required_bytes
-                .checked_mul(2)
-                .ok_or_else(|| GenerationFailure::fatal("live GPU reservation overflow"))?,
-        );
+        let gpu_memory = buffer_plan
+            .required_bytes
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(crate::estimate_backend_worker_gpu_memory_bytes(
+                    &config.backend_options,
+                ))
+            })
+            .ok_or_else(|| GenerationFailure::fatal("live GPU reservation overflow"))?;
+        worker_request = worker_request
+            .with_gpu_jobs(1)
+            .with_gpu_memory_bytes(gpu_memory);
     }
     let request = worker_request
         .checked_add(
@@ -2934,12 +2938,8 @@ mod tests {
         metrics
             .drift_correction_bits
             .store(125.0f64.to_bits(), Ordering::Relaxed);
-        let accelerator = select_accelerator(
-            config.backend,
-            config.backend_options.accelerator,
-            config.backend_options.deterministic,
-        )
-        .unwrap();
+        let accelerator =
+            select_accelerator_for_options(config.backend, &config.backend_options).unwrap();
         let status = runtime_status(
             LiveConnectionState::Running,
             48_000,

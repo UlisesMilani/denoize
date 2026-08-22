@@ -4,8 +4,8 @@ use crate::loudness::LoudnessReport;
 #[cfg(feature = "gtcrn")]
 use crate::OnnxModelConfig;
 use crate::{
-    select_accelerator, AcceleratorSelection, Audio, Backend, BackendOptions, BackendSession,
-    ConfigError, DenoiserConfig,
+    select_accelerator_for_options, AcceleratorSelection, Audio, Backend, BackendOptions,
+    BackendSession, ConfigError, DenoiserConfig,
 };
 use std::time::Duration;
 
@@ -299,11 +299,7 @@ pub fn resolve_processing_options(
         .map_err(|error| error.to_string())?;
     let denoiser = denoiser.sanitized();
     let backend_options = resolve_backend_options(backend, options.backend_options)?;
-    let accelerator = select_accelerator(
-        backend,
-        backend_options.accelerator,
-        backend_options.deterministic,
-    )?;
+    let accelerator = select_accelerator_for_options(backend, &backend_options)?;
     Ok(ResolvedProcessingOptions {
         backend,
         denoiser,
@@ -330,11 +326,7 @@ pub fn resolve_processing_options_read_only(
         .map_err(|error| error.to_string())?;
     let denoiser = denoiser.sanitized();
     let backend_options = resolve_backend_options_read_only(backend, options.backend_options)?;
-    let accelerator = select_accelerator(
-        backend,
-        backend_options.accelerator,
-        backend_options.deterministic,
-    )?;
+    let accelerator = select_accelerator_for_options(backend, &backend_options)?;
     Ok(ResolvedProcessingOptions {
         backend,
         denoiser,

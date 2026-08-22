@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-runtime-model-package-v1.schema.json",
+  "title": "denoize signed runtime model package manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "format_version",
+    "package_id",
+    "package_revision",
+    "signing_key_id",
+    "runtime",
+    "frontend",
+    "tensor",
+    "resources",
+    "model",
+    "license"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-runtime-model-package-v1" },
+    "format_version": { "const": 1 },
+    "package_id": { "$ref": "#/$defs/identifier" },
+    "package_revision": { "$ref": "#/$defs/identifier" },
+    "signing_key_id": { "type": "string", "pattern": "^[0-9A-F]{16}$" },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "sample_rate_hz"],
+      "properties": {
+        "kind": { "const": "onnx-waveform-v1" },
+        "sample_rate_hz": { "type": "integer", "minimum": 1, "maximum": 768000 }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel_mapping", "normalization", "resampling", "duration"],
+      "properties": {
+        "channel_mapping": { "const": "independent-mono-v1" },
+        "normalization": { "const": "pcm-f32-minus-one-to-one-v1" },
+        "resampling": { "const": "bandlimited-waveform-v1" },
+        "duration": { "const": "preserve-input-frames-v1" }
+      }
+    },
+    "tensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["element_type", "layout", "fixed_input_samples", "fixed_output_samples"],
+      "properties": {
+        "element_type": { "const": "float32" },
+        "layout": { "enum": ["batch-samples", "batch-channels-samples"] },
+        "fixed_input_samples": { "$ref": "#/$defs/optionalSamples" },
+        "fixed_output_samples": { "$ref": "#/$defs/optionalSamples" }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_session_memory_bytes",
+        "max_worker_memory_bytes",
+        "max_gpu_session_memory_bytes",
+        "max_gpu_worker_memory_bytes",
+        "accelerators"
+      ],
+      "properties": {
+        "max_session_memory_bytes": {
+          "$ref": "#/$defs/memoryBytes",
+          "description": "Total conservative host-memory reservation for one prepared model session."
+        },
+        "max_worker_memory_bytes": {
+          "$ref": "#/$defs/memoryBytes",
+          "description": "Package-specific host scratch added for each active inference worker."
+        },
+        "max_gpu_session_memory_bytes": {
+          "$ref": "#/$defs/memoryBytes",
+          "description": "Total conservative device-memory reservation for one prepared GPU model session."
+        },
+        "max_gpu_worker_memory_bytes": {
+          "$ref": "#/$defs/memoryBytes",
+          "description": "Package-specific device scratch added for each active GPU inference worker."
+        },
+        "accelerators": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "contains": { "const": "cpu" },
+          "items": { "enum": ["cpu", "metal", "cuda"] }
+        }
+      }
+    },
+    "model": { "$ref": "#/$defs/file" },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx", "file"],
+      "properties": {
+        "spdx": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._+(): -]+$"
+        },
+        "file": {
+          "allOf": [
+            { "$ref": "#/$defs/file" },
+            { "properties": { "size_bytes": { "maximum": 16777216 } } }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._+-]+$"
+    },
+    "optionalSamples": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "integer", "minimum": 1, "maximum": 1099511627776 }
+      ]
+    },
+    "memoryBytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1099511627776
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "size_bytes", "sha256"],
+      "properties": {
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/\\\\\\u0000-\\u001F\\u007F-\\u009F]+$",
+          "not": { "enum": [".", ".."] }
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 68719476736
+        },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

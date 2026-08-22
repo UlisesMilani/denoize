@@ -149,6 +149,10 @@ if [[ "$is_dry_run" == true ]]; then
   fi
   for required in \
     "denoize-${package_version}/src/automation.rs" \
+    "denoize-${package_version}/src/model_package/testdata/manifest.json" \
+    "denoize-${package_version}/src/model_package/testdata/manifest.json.sig" \
+    "denoize-${package_version}/src/model_package/testdata/minisign.pub" \
+    "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
     "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/docs/json.md" \
@@ -168,6 +172,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-receipt-verification-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-recommendation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-release-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-runtime-model-package-v1.schema.json" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
     if ! tar -tf "$package_archive" | grep -Fx "$required" >/dev/null; then

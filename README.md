@@ -190,6 +190,11 @@ denoize noisy.wav clean.wav --mp3-bitrate 320
 denoize noisy.wav clean.wav -b onnx \
   --onnx-model model.onnx --onnx-rate 16000
 
+# Signed model + license + frontend/tensor/resource contracts
+denoize noisy.wav clean.wav -b onnx \
+  --model-package voice-cleaner.dmp \
+  --model-package-key vendor-model.pub
+
 # Official MP-SENet checkpoint converted with scripts/export-mpsenet.py
 denoize noisy.wav clean.wav -b mpsenet \
   --onnx-model mp-senet-vb.onnx --onnx-rate 16000

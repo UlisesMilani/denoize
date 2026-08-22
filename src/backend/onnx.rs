@@ -124,6 +124,43 @@ impl OnnxWaveformModel {
                     config.path.display()
                 )
             })?;
+        Self::from_template(config, runtime, template, None)
+    }
+
+    /// Parse a graph from an authenticated runtime package and require its
+    /// signed tensor contract to match the graph before inference.
+    pub(crate) fn load_runtime_package_with_accelerator(
+        package: &crate::RuntimeModelPackage,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
+        let config = package.model_config();
+        config
+            .validate_config()
+            .map_err(|error| error.to_string())?;
+        let mut reader = package.open_model_reader()?;
+        let template = tract_onnx::onnx()
+            .model_for_read(&mut reader)
+            .map_err(|error| {
+                format!(
+                    "failed to load ONNX model from authenticated package {}: {error:#}",
+                    package.package_path().display()
+                )
+            })?;
+        reader.finish().map_err(|error| {
+            format!(
+                "failed to authenticate ONNX model bytes from package {}: {error}",
+                package.package_path().display()
+            )
+        })?;
+        Self::from_template(config, runtime, template, Some(&package.manifest().tensor))
+    }
+
+    fn from_template(
+        config: OnnxModelConfig,
+        runtime: AcceleratorRuntime,
+        template: InferenceModel,
+        expected: Option<&crate::RuntimeModelTensorContract>,
+    ) -> Result<Self, String> {
         // Propagate declared facts through simple dynamic graphs before
         // inspecting their public output. Some operators need a concrete
         // sample length and are validated later during compilation, so an
@@ -134,6 +171,9 @@ impl OnnxWaveformModel {
         } else {
             validate_contract(&template)?
         };
+        if let Some(expected) = expected {
+            validate_package_contract(contract, expected)?;
+        }
         Ok(Self {
             config,
             contract,
@@ -322,6 +362,33 @@ fn validate_contract(model: &InferenceModel) -> Result<OnnxWaveformContract, Str
     })
 }
 
+fn validate_package_contract(
+    actual: OnnxWaveformContract,
+    expected: &crate::RuntimeModelTensorContract,
+) -> Result<(), String> {
+    let actual_layout = match actual.layout {
+        OnnxWaveformLayout::BatchSamples => "batch-samples",
+        OnnxWaveformLayout::BatchChannelsSamples => "batch-channels-samples",
+    };
+    let actual_input = actual
+        .fixed_input_samples
+        .map(|value| u64::try_from(value).unwrap_or(u64::MAX));
+    let actual_output = actual
+        .fixed_output_samples
+        .map(|value| u64::try_from(value).unwrap_or(u64::MAX));
+    if expected.element_type != "float32"
+        || expected.layout != actual_layout
+        || expected.fixed_input_samples != actual_input
+        || expected.fixed_output_samples != actual_output
+    {
+        return Err(format!(
+            "authenticated runtime model tensor contract does not match the ONNX graph: manifest layout={} input={:?} output={:?}, graph layout={actual_layout} input={actual_input:?} output={actual_output:?}",
+            expected.layout, expected.fixed_input_samples, expected.fixed_output_samples
+        ));
+    }
+    Ok(())
+}
+
 fn validate_float32_input(fact: &InferenceFact) -> Result<(), String> {
     match fact.datum_type.concretize() {
         Some(DatumType::F32) => Ok(()),
@@ -428,8 +495,8 @@ mod tests {
     use prost::Message;
     use tract_onnx::pb::{
         attribute_proto, tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto,
-        ModelProto, NodeProto, OperatorSetIdProto, TensorProto, TensorShapeProto, TypeProto,
-        ValueInfoProto,
+        ModelProto, NodeProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
+        TensorShapeProto, TypeProto, ValueInfoProto,
     };
 
     #[test]
@@ -479,6 +546,95 @@ mod tests {
         for (actual, expected) in output[0].iter().zip(&input[0]) {
             assert!((actual - expected).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn authenticated_package_tensor_contract_is_checked_before_inference() {
+        let (_directory, path) = write_model(identity_model());
+        let tensor = crate::RuntimeModelTensorContract {
+            element_type: "float32".into(),
+            layout: "batch-samples".into(),
+            fixed_input_samples: None,
+            fixed_output_samples: None,
+        };
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(path, tensor.clone());
+        let model = OnnxWaveformModel::load_runtime_package_with_accelerator(
+            &package,
+            AcceleratorRuntime::Cpu,
+        )
+        .unwrap();
+        let input = vec![vec![-0.5, 0.0, 0.25, 0.75]];
+        assert_eq!(model.process(&input, 16_000, false).unwrap(), input);
+
+        let (_directory, path) = write_model(identity_model());
+        let mut mismatched = tensor;
+        mismatched.fixed_input_samples = Some(4);
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(path, mismatched);
+        let error = OnnxWaveformModel::load_runtime_package_with_accelerator(
+            &package,
+            AcceleratorRuntime::Cpu,
+        )
+        .err()
+        .expect("mismatched signed tensor contract must fail");
+        assert!(error.contains("does not match the ONNX graph"), "{error}");
+    }
+
+    #[test]
+    fn authenticated_package_model_range_rejects_path_replacement() {
+        let (_directory, path) = write_model(identity_model());
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(
+            path.clone(),
+            crate::RuntimeModelTensorContract {
+                element_type: "float32".into(),
+                layout: "batch-samples".into(),
+                fixed_input_samples: None,
+                fixed_output_samples: None,
+            },
+        );
+        std::fs::write(path, b"replaced after package verification").unwrap();
+        let error = OnnxWaveformModel::load_runtime_package_with_accelerator(
+            &package,
+            AcceleratorRuntime::Cpu,
+        )
+        .err()
+        .expect("replaced package path must fail");
+        assert!(error.contains("changed after verification"), "{error}");
+    }
+
+    #[test]
+    fn authenticated_package_rejects_external_tensor_sidecars() {
+        let mut model = identity_model();
+        let graph = model.graph.as_mut().unwrap();
+        graph.node[0].op_type = "Add".into();
+        graph.node[0].input.push("weights".into());
+        graph.initializer.push(TensorProto {
+            dims: vec![1],
+            data_type: tensor_proto::DataType::Float as i32,
+            name: "weights".into(),
+            external_data: vec![StringStringEntryProto {
+                key: "location".into(),
+                value: "weights.bin".into(),
+            }],
+            data_location: Some(tensor_proto::DataLocation::External as i32),
+            ..Default::default()
+        });
+        let (_directory, path) = write_model(model);
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(
+            path,
+            crate::RuntimeModelTensorContract {
+                element_type: "float32".into(),
+                layout: "batch-samples".into(),
+                fixed_input_samples: None,
+                fixed_output_samples: None,
+            },
+        );
+        let error = OnnxWaveformModel::load_runtime_package_with_accelerator(
+            &package,
+            AcceleratorRuntime::Cpu,
+        )
+        .err()
+        .expect("package models must not resolve external tensor sidecars");
+        assert!(error.to_ascii_lowercase().contains("external"), "{error}");
     }
 
     #[test]
@@ -712,6 +868,60 @@ mod tests {
             tensor_proto::DataType::Float,
             tensor_proto::DataType::Float,
         )
+    }
+
+    #[test]
+    fn signed_runtime_package_fixture_loads_and_runs_end_to_end() {
+        use base64::Engine as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("manifest.json");
+        let signature_path = directory.path().join("manifest.json.sig");
+        let public_key_path = directory.path().join("minisign.pub");
+        let model_path = directory.path().join("model.onnx");
+        let license_path = directory.path().join("LICENSE.txt");
+        let package_path = directory.path().join("model.dmp");
+        std::fs::write(
+            &manifest_path,
+            include_bytes!("../model_package/testdata/manifest.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            &signature_path,
+            include_bytes!("../model_package/testdata/manifest.json.sig"),
+        )
+        .unwrap();
+        std::fs::write(
+            &public_key_path,
+            include_bytes!("../model_package/testdata/minisign.pub"),
+        )
+        .unwrap();
+        let model_bytes = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../model_package/testdata/model.onnx.base64").trim())
+            .unwrap();
+        let mut expected_model_bytes = Vec::new();
+        identity_model().encode(&mut expected_model_bytes).unwrap();
+        assert_eq!(model_bytes, expected_model_bytes);
+        std::fs::write(&model_path, model_bytes).unwrap();
+        std::fs::write(&license_path, b"fixture license").unwrap();
+        crate::build_runtime_model_package(
+            &package_path,
+            &manifest_path,
+            &signature_path,
+            &public_key_path,
+            &model_path,
+            &license_path,
+        )
+        .unwrap();
+
+        let package = crate::RuntimeModelPackage::open(&package_path, &public_key_path).unwrap();
+        let model = OnnxWaveformModel::load_runtime_package_with_accelerator(
+            &package,
+            AcceleratorRuntime::Cpu,
+        )
+        .unwrap();
+        let input = vec![vec![-0.5, 0.0, 0.25, 0.75]];
+        assert_eq!(model.process(&input, 16_000, false).unwrap(), input);
     }
 
     fn cast_output_model() -> ModelProto {

@@ -203,7 +203,9 @@ saved recipe; subsequent identical runs skip it normally.
 Resumable ONNX-backed batches require a self-contained `.onnx` file. Models
 that declare external tensor sidecars can still be used without `--resume`, but
 are rejected for resume because the v3 model digest cannot represent every
-consumed sidecar byte.
+consumed sidecar byte. A signed `.dmp` package is already one authenticated
+container identity and remains resumable without treating its framing as raw
+ONNX protobuf.
 
 Every batch completes input/codec/configuration preflight before creating the
 output directory. It then acquires `.denoize-batch.lock` before resume or output

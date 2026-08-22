@@ -1205,6 +1205,8 @@ mod tests {
             aac_encoder: "oxide".into(),
             onnx_model: None,
             onnx_sample_rate: 16_000,
+            model_package: None,
+            model_package_key: None,
             sgmse_profile: "balanced".into(),
             accelerator: "cpu".into(),
             deterministic: false,

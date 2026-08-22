@@ -5,7 +5,9 @@ use std::collections::VecDeque;
 
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::config::{ConfigError, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS};
-use crate::{select_accelerator, AcceleratorSelection, DenoiserConfig, StreamingDenoiser};
+use crate::{
+    select_accelerator_for_options, AcceleratorSelection, DenoiserConfig, StreamingDenoiser,
+};
 
 #[cfg(feature = "rnnoise")]
 const RNNOISE_STATE_ALLOWANCE_PER_CHANNEL: u64 = 2 * 1024 * 1024;
@@ -67,11 +69,7 @@ impl StreamingBackendSession {
         denoiser: DenoiserConfig,
         backend_options: BackendOptions,
     ) -> Result<Self, String> {
-        let accelerator = select_accelerator(
-            backend,
-            backend_options.accelerator,
-            backend_options.deterministic,
-        )?;
+        let accelerator = select_accelerator_for_options(backend, &backend_options)?;
         Self::new_with_accelerator(
             backend,
             sample_rate,

@@ -179,6 +179,12 @@ impl SgmseProfile {
 pub struct BackendOptions {
     /// Model configuration used by the `onnx` backend when that feature is enabled.
     pub onnx: Option<OnnxModelConfig>,
+    /// Authenticated custom-model package used by the generic `onnx` backend.
+    ///
+    /// Prefer [`BackendOptions::with_runtime_model_package`] so the compatible
+    /// path/rate identity is populated atomically. Raw ONNX configuration and
+    /// runtime packages cannot be mixed.
+    pub runtime_package: Option<crate::RuntimeModelPackage>,
     /// Stereo channel coupling strategy.
     pub channel_mode: ChannelMode,
     /// SGMSE+ diffusion budget.
@@ -202,12 +208,34 @@ pub struct BackendOptions {
 }
 
 impl BackendOptions {
+    /// Select one already verified custom-model package.
+    #[must_use]
+    pub fn with_runtime_model_package(mut self, package: crate::RuntimeModelPackage) -> Self {
+        self.onnx = Some(package.model_config());
+        self.runtime_package = Some(package);
+        self
+    }
+
     /// Validate backend options before any model path is inspected.
     ///
     /// A missing GTCRN model remains valid at this stage because application
     /// services may resolve it from the managed model library. Backends whose
     /// models must be supplied by the caller reject a missing configuration.
     pub fn validate_config(&self, backend: Backend) -> Result<(), ConfigError> {
+        if let Some(package) = &self.runtime_package {
+            if !backend_accepts_runtime_package(backend) {
+                return Err(ConfigError::invalid(
+                    "backend_options.runtime_package",
+                    "a package used only by the generic onnx backend",
+                ));
+            }
+            if self.onnx.as_ref() != Some(&package.model_config()) {
+                return Err(ConfigError::invalid(
+                    "backend_options.runtime_package",
+                    "a package selected through with_runtime_model_package without a conflicting raw ONNX model",
+                ));
+            }
+        }
         if let Some(model) = &self.onnx {
             model.validate_config()?;
             validate_named_model_rate(backend, model.sample_rate)?;
@@ -235,6 +263,15 @@ impl BackendOptions {
         self.validate_resolved_config(backend)
             .map_err(|error| error.to_string())?;
         if requires_any_model(backend) {
+            if let Some(package) = &self.runtime_package {
+                if !package.package_path().is_file() {
+                    return Err(format!(
+                        "selected runtime model package does not exist or is not a file: {}",
+                        package.package_path().display()
+                    ));
+                }
+                return Ok(());
+            }
             let model = self
                 .onnx
                 .as_ref()
@@ -247,6 +284,18 @@ impl BackendOptions {
             }
         }
         Ok(())
+    }
+}
+
+fn backend_accepts_runtime_package(backend: Backend) -> bool {
+    #[cfg(feature = "onnx")]
+    {
+        backend == Backend::Onnx
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = backend;
+        false
     }
 }
 
@@ -502,6 +551,37 @@ mod channel_tests {
                 })
             ));
         }
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn authenticated_package_is_bound_to_the_generic_onnx_backend_and_model_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("model.onnx");
+        std::fs::write(&model, b"test model bytes").unwrap();
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(
+            model,
+            crate::RuntimeModelTensorContract {
+                element_type: "float32".into(),
+                layout: "batch-samples".into(),
+                fixed_input_samples: None,
+                fixed_output_samples: None,
+            },
+        );
+        let mut options = BackendOptions::default().with_runtime_model_package(package);
+        options.validate_config(Backend::Onnx).unwrap();
+        assert!(options
+            .validate_config(Backend::Classical)
+            .unwrap_err()
+            .to_string()
+            .contains("generic onnx"));
+
+        options.onnx.as_mut().unwrap().sample_rate = 48_000;
+        assert!(options
+            .validate_config(Backend::Onnx)
+            .unwrap_err()
+            .to_string()
+            .contains("conflicting raw ONNX"));
     }
 
     #[test]
