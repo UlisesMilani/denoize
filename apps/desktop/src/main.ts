@@ -201,6 +201,7 @@ type WatchCycleReport = {
   observed: number; pending: number; attempted: number; succeeded: number;
   retrying: number; quarantined: number; superseded: number; scan_errors: number;
 };
+type IpcResult = { type: string; value?: unknown };
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
@@ -252,6 +253,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="nav-live" class="nav-item" role="tab" data-page="live" aria-controls="page-live" aria-selected="false" tabindex="-1"><span aria-hidden="true">◉</span>リアルタイム</button>
         <button id="nav-compare" class="nav-item" role="tab" data-page="compare" aria-controls="page-compare" aria-selected="false" tabindex="-1"><span aria-hidden="true">◒</span>品質比較</button>
         <button id="nav-models" class="nav-item" role="tab" data-page="models" aria-controls="page-models" aria-selected="false" tabindex="-1"><span aria-hidden="true">⬡</span>モデル</button>
+        <button id="nav-automation" class="nav-item" role="tab" data-page="automation" aria-controls="page-automation" aria-selected="false" tabindex="-1"><span aria-hidden="true">⌁</span>IPC 自動化</button>
         <button id="nav-receipts" class="nav-item" role="tab" data-page="receipts" aria-controls="page-receipts" aria-selected="false" tabindex="-1"><span aria-hidden="true">✓</span>実行証明</button>
       </nav>
       <div class="sidebar-foot"><span class="status-dot"></span><span id="engine-label">エンジンを確認中</span><small id="version"></small></div>
@@ -469,6 +471,37 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
           <p class="field-hint model-security-hint">BearerまたはBasicのどちらか一方を指定してください。ローカルファイルも署名カタログ固定のSHA-256で検証されます。ローカルモデル導入時、共有ネットワーク欄はモデル本体には使われず、カタログ更新にだけ使用できます。</p>
         </article>
         <article class="card"><div class="card-heading"><div><span class="step">AI</span><h2>モデルライブラリ</h2></div><div class="button-row"><button class="secondary" id="model-doctor">診断</button><button class="secondary" id="export-model-json">JSONを書出</button><button class="secondary" id="model-prune-preview">整理確認</button><button class="secondary" id="model-prune">整理実行</button><button class="secondary" id="recover-model-trust-root">信頼ルート復旧</button><button class="secondary" id="reset-model-trust-time">信頼時刻リセット</button><button class="secondary" id="update-model-catalog">署名カタログ更新</button><button class="secondary" id="refresh-models">再読込</button></div></div><p id="model-catalog-status" class="section-copy">署名付きモデルカタログを確認しています。</p><p id="model-health-status" class="section-copy">モデルキャッシュを診断しています。</p><p class="section-copy">外部モデルは版管理された信頼ルート、カタログ署名、期限、サイズ、SHA-256を検証し、インストール来歴とともにローカルキャッシュへ保存されます。期限切れや失効後も検証済みモデルは利用できますが、新規取得は停止します。信頼ルート復旧は破損した同世代のキャッシュだけを、このアプリに埋め込まれたルートへ戻します。信頼時刻リセットは、誤った未来時刻を修正した後にだけ使用します。</p><div id="model-list" class="model-list"><div class="empty-panel">モデル情報を読み込んでいます</div></div></article>
+      </section>
+
+      <section class="page" id="page-automation" role="tabpanel" aria-labelledby="nav-automation" aria-hidden="true">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">AUTH</span><h2>ローカル IPC 接続</h2></div><span class="hint">LOOPBACK · CAPABILITY</span></div>
+              <p class="section-copy">Bearer token は画面へ読み込まず、owner-only の grant ファイルを Rust 側で使用します。サービスの初期化と grant の発行・失効は CLI で行えます。</p>
+              <div class="file-row"><div><label>Discovery JSON</label><div id="ipc-discovery-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-ipc-discovery">選択</button></div>
+              <div class="file-row"><div><label>Capability grant JSON</label><div id="ipc-grant-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-ipc-grant">選択</button></div>
+              <input type="hidden" id="ipc-discovery-path"><input type="hidden" id="ipc-grant-path">
+              <div class="button-row"><button class="secondary" id="ipc-ping">接続確認</button><button class="secondary" id="ipc-list">実行中一覧</button><button class="secondary" id="ipc-history">履歴</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">JOB</span><h2>耐久ジョブ</h2></div><span class="hint">SERIAL · BOUNDED</span></div>
+              <div class="form-grid two"><label>種類<select id="ipc-job-kind"><option value="file">ファイル</option><option value="batch">バッチ</option><option value="stream">ストリーム</option></select></label><label>優先度<input id="ipc-priority" type="number" value="0" min="-100" max="100"></label></div>
+              <div class="file-row"><div><label>入力</label><div id="ipc-input-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-ipc-input">選択</button></div>
+              <div class="file-row"><div><label>出力</label><div id="ipc-output-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-ipc-output">選択</button></div>
+              <input type="hidden" id="ipc-input-path"><input type="hidden" id="ipc-output-path">
+              <label>処理オプション（1行に1引数）<textarea id="ipc-arguments" rows="5" spellcheck="false" placeholder="--backend&#10;classical&#10;--no-metadata"></textarea></label>
+              <div class="button-row"><button class="secondary" id="ipc-dry-run">Dry run</button><button class="primary" id="ipc-submit">キューへ追加</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">CONTROL</span><h2>ジョブ制御</h2></div></div>
+              <label>Job ID<input id="ipc-job-id" type="text" autocomplete="off" spellcheck="false" placeholder="job-..."></label>
+              <div class="button-row"><button class="secondary" id="ipc-status">状態</button><button class="secondary" id="ipc-pause">一時停止</button><button class="secondary" id="ipc-resume">再開</button><button class="danger" id="ipc-cancel">取消</button></div>
+              <p class="field-hint">ファイルジョブは cancel-and-retry です。バッチとストリームだけが検証済み checkpoint で一時停止・再開します。</p>
+            </article>
+          </div>
+          <article class="card result-card"><div class="card-heading"><div><span class="step">RESULT</span><h2>IPC 応答</h2></div></div><div id="ipc-result-empty" class="empty-panel">接続確認または dry run を実行してください</div><pre id="ipc-result" class="json-preview hidden" aria-live="polite"></pre></article>
+        </div>
       </section>
 
       <section class="page" id="page-receipts" role="tabpanel" aria-labelledby="nav-receipts" aria-hidden="true">
@@ -1143,6 +1176,88 @@ navigationTabs.forEach((button) => {
     selectNavigation(navigationTabs[next]!, false);
   });
 });
+
+function ipcConnectionPaths() {
+  const discovery = $<HTMLInputElement>("#ipc-discovery-path").value;
+  const grant = $<HTMLInputElement>("#ipc-grant-path").value;
+  if (!discovery || !grant) {
+    throw new Error(tr("Discovery と capability grant を選択してください", "Select discovery and capability grant files"));
+  }
+  return { discovery, grant };
+}
+
+async function performIpcOperation(operation: Record<string, unknown>): Promise<IpcResult> {
+  const result = await invoke<IpcResult>("ipc_request", { ...ipcConnectionPaths(), operation });
+  $("#ipc-result-empty").classList.add("hidden");
+  const preview = $("#ipc-result");
+  preview.textContent = JSON.stringify(result, null, 2);
+  preview.classList.remove("hidden");
+  if ((result.type === "submitted" || result.type === "status") && result.value && typeof result.value === "object") {
+    const jobId = (result.value as { job_id?: unknown }).job_id;
+    if (typeof jobId === "string") $<HTMLInputElement>("#ipc-job-id").value = jobId;
+  }
+  return result;
+}
+
+function ipcJobOperation(action: "dry-run" | "submit") {
+  const input = $<HTMLInputElement>("#ipc-input-path").value;
+  const output = $<HTMLInputElement>("#ipc-output-path").value;
+  if (!input || !output) throw new Error(tr("IPC ジョブの入力と出力を選択してください", "Select IPC job input and output paths"));
+  const kind = $<HTMLSelectElement>("#ipc-job-kind").value;
+  const priority = Number($<HTMLInputElement>("#ipc-priority").value);
+  if (!Number.isInteger(priority) || priority < -100 || priority > 100) {
+    throw new Error(tr("優先度は -100〜100 の整数で指定してください", "Priority must be an integer from -100 to 100"));
+  }
+  const argumentsList = $<HTMLTextAreaElement>("#ipc-arguments").value
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return { action, job: { kind, input, output, arguments: argumentsList, priority } };
+}
+
+function ipcControlOperation(action: "status" | "pause" | "resume" | "cancel") {
+  const job_id = $<HTMLInputElement>("#ipc-job-id").value.trim();
+  if (!job_id) throw new Error(tr("Job ID を入力してください", "Enter a job ID"));
+  return { action, job_id };
+}
+
+const runIpc = (operation: Record<string, unknown>) => void performIpcOperation(operation)
+  .catch((error) => showToast(errorText(error), true));
+
+$("#choose-ipc-discovery").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "IPC discovery", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#ipc-discovery-path", "#ipc-discovery-display", path);
+});
+$("#choose-ipc-grant").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "IPC capability grant", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#ipc-grant-path", "#ipc-grant-display", path);
+});
+$("#choose-ipc-input").addEventListener("click", async () => {
+  const batch = $<HTMLSelectElement>("#ipc-job-kind").value === "batch";
+  const path = await open({ multiple: false, directory: batch, filters: batch ? undefined : audioFilters });
+  if (typeof path === "string") setPath("#ipc-input-path", "#ipc-input-display", path);
+});
+$("#choose-ipc-output").addEventListener("click", async () => {
+  const kind = $<HTMLSelectElement>("#ipc-job-kind").value;
+  const path = kind === "batch"
+    ? await open({ multiple: false, directory: true })
+    : await save({ defaultPath: "denoized.wav", filters: audioFilters });
+  if (typeof path === "string") setPath("#ipc-output-path", "#ipc-output-display", path);
+});
+$("#ipc-ping").addEventListener("click", () => runIpc({ action: "ping" }));
+$("#ipc-list").addEventListener("click", () => runIpc({ action: "list", limit: 100 }));
+$("#ipc-history").addEventListener("click", () => runIpc({ action: "history", limit: 100 }));
+$("#ipc-dry-run").addEventListener("click", () => {
+  try { runIpc(ipcJobOperation("dry-run")); } catch (error) { showToast(errorText(error), true); }
+});
+$("#ipc-submit").addEventListener("click", () => {
+  try { runIpc(ipcJobOperation("submit")); } catch (error) { showToast(errorText(error), true); }
+});
+for (const action of ["status", "pause", "resume", "cancel"] as const) {
+  $(`#ipc-${action}`).addEventListener("click", () => {
+    try { runIpc(ipcControlOperation(action)); } catch (error) { showToast(errorText(error), true); }
+  });
+}
 
 function previewRequest() {
   const input = $<HTMLInputElement>("#input-path").value;

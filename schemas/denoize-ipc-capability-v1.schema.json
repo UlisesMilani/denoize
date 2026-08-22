@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-ipc-capability-v1.schema.json",
+  "title": "denoize owner-private IPC capability document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "server_id",
+    "grant_id",
+    "token",
+    "policy",
+    "issued_at_unix_millis"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-ipc-capability-v1" },
+    "schema_version": { "const": 1 },
+    "server_id": { "$ref": "#/$defs/id" },
+    "grant_id": { "$ref": "#/$defs/id" },
+    "token": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "policy": { "$ref": "#/$defs/policy" },
+    "issued_at_unix_millis": { "$ref": "#/$defs/u64" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "u64": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "capability": {
+      "enum": [
+        "plan",
+        "submit",
+        "read-own",
+        "read-all",
+        "control-own",
+        "control-all",
+        "manage-grants",
+        "shutdown"
+      ]
+    },
+    "root": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label",
+        "capabilities",
+        "input_roots",
+        "output_roots",
+        "max_priority",
+        "expires_at_unix_millis"
+      ],
+      "properties": {
+        "label": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000]+$" },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/capability" }
+        },
+        "input_roots": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/root" }
+        },
+        "output_roots": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/root" }
+        },
+        "max_priority": { "type": "integer", "minimum": -100, "maximum": 100 },
+        "expires_at_unix_millis": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64" }]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capabilities": {
+                "contains": { "enum": ["plan", "submit"] }
+              }
+            },
+            "required": ["capabilities"]
+          },
+          "then": {
+            "properties": {
+              "input_roots": { "minItems": 1 },
+              "output_roots": { "minItems": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

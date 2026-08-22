@@ -903,6 +903,83 @@ in desktop settings.
 See the [stable JSON contracts](docs/json.md) for schema, privacy, verification,
 and key-rotation details.
 
+### Local authenticated IPC and durable jobs
+
+`denoize ipc` exposes the same planner, resource admission, atomic publication,
+checkpoint, and signed-receipt engine to trusted local automation. It is not a
+network service: v1 binds only an ephemeral `127.0.0.1` TCP port, publishes that
+endpoint in an owner-private discovery file, and requires an explicit bearer
+capability on every framed JSON request. The transport is not encrypted; its
+security boundary is the local OS account and the private state/grant files.
+
+Initialize one state directory, then run the foreground server:
+
+```sh
+denoize ipc init --state-dir "$HOME/.local/state/denoize/ipc" \
+  --admin-grant "$HOME/.config/denoize/ipc-admin.json" \
+  --max-memory 1024 --max-temp-space 4096 --max-history 1024
+denoize ipc serve --state-dir "$HOME/.local/state/denoize/ipc"
+```
+
+The initial administrator capability can manage grants and the server but
+cannot submit audio. Create a least-privilege worker policy whose canonical
+input/output roots are disjoint from secrets and state:
+
+```json
+{
+  "label": "local-render-worker",
+  "capabilities": ["plan", "submit", "read-own", "control-own"],
+  "input_roots": ["/absolute/path/to/inbox"],
+  "output_roots": ["/absolute/path/to/results"],
+  "max_priority": 10,
+  "expires_at_unix_millis": null
+}
+```
+
+```sh
+denoize ipc grant create worker-policy.json worker-grant.json \
+  --discovery "$HOME/.local/state/denoize/ipc/discovery.json" \
+  --grant "$HOME/.config/denoize/ipc-admin.json"
+
+denoize ipc dry-run batch /absolute/path/to/inbox /absolute/path/to/results \
+  --discovery "$HOME/.local/state/denoize/ipc/discovery.json" \
+  --grant worker-grant.json -- --recursive --output-format flac
+denoize ipc submit batch /absolute/path/to/inbox /absolute/path/to/results \
+  --priority 5 --discovery "$HOME/.local/state/denoize/ipc/discovery.json" \
+  --grant worker-grant.json -- --recursive --output-format flac
+denoize ipc status JOB_ID --discovery DISCOVERY.json --grant worker-grant.json
+denoize ipc pause JOB_ID --discovery DISCOVERY.json --grant worker-grant.json
+denoize ipc resume JOB_ID --discovery DISCOVERY.json --grant worker-grant.json
+denoize ipc history --limit 100 --discovery DISCOVERY.json --grant worker-grant.json
+```
+
+Arguments after `--` are ordinary processing options. The server rejects flags
+that could redirect plans, receipts, resource governors, isolation, model
+files, configuration, or publication outside its policy. Dry-run is mandatory
+before admission and reports conservative RAM, temporary storage, CPU/GPU work,
+destination create/replace/skip counts, overwrite policy, pause support, and an
+exact execution-plan digest. V1 executes one job at a time; priority orders the
+durable queue and is capped by the submitting capability.
+
+Batch and durable stream jobs pause only after a verified checkpoint or atomic
+publication boundary and resume by replanning the same request. A daemon crash
+reclaims them through their lease and checkpoint. A file job has no safe
+mid-file checkpoint, so an uncertain publication is reported and never retried
+automatically. Cancellation preserves already published atomic outputs and
+never emits a false success receipt. A valid signed receipt discovered during
+recovery wins over an ambiguous process exit. Revocation blocks future requests
+but does not silently delete already admitted work; use an explicit cancel
+before revoking when queued/running jobs must stop.
+
+Request/response sizes, request/planning/job timeouts, connections, queue,
+history, concurrency, and optional memory/temp/GPU ceilings are finite and
+published in `denoize-ipc-discovery-v1`. Terminal history is bounded and keeps
+resource/destination summaries plus plan and receipt fingerprints, not input or
+output paths; receipt artifacts are pruned when their history entries age out.
+The desktop **IPC automation** page uses the same Rust client and keeps bearer
+tokens outside the WebView. All eight IPC/job schemas ship with releases and
+the crate; see the [stable JSON contracts](docs/json.md).
+
 ### Realtime audio
 
 Build with the optional system-audio integration, list devices, then route a

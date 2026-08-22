@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-ipc-capability-summary-v1.schema.json",
+  "title": "denoize redacted IPC capability summary v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "server_id",
+    "grant_id",
+    "policy",
+    "issued_at_unix_millis",
+    "revoked_at_unix_millis"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-ipc-capability-summary-v1" },
+    "schema_version": { "const": 1 },
+    "server_id": { "$ref": "denoize-ipc-capability-v1.schema.json#/$defs/id" },
+    "grant_id": { "$ref": "denoize-ipc-capability-v1.schema.json#/$defs/id" },
+    "policy": { "$ref": "denoize-ipc-capability-v1.schema.json#/$defs/policy" },
+    "issued_at_unix_millis": { "$ref": "denoize-ipc-capability-v1.schema.json#/$defs/u64" },
+    "revoked_at_unix_millis": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "denoize-ipc-capability-v1.schema.json#/$defs/u64" }
+      ]
+    }
+  }
+}

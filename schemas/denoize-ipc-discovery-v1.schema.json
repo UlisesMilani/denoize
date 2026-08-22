@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-ipc-discovery-v1.schema.json",
+  "title": "denoize local IPC discovery document v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "server_id",
+    "transport",
+    "endpoint",
+    "process_id",
+    "started_at_unix_millis",
+    "limits"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-ipc-discovery-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "server_id": { "$ref": "#/$defs/id" },
+    "transport": { "const": "loopback-tcp" },
+    "endpoint": {
+      "type": "string",
+      "minLength": 12,
+      "maxLength": 4096,
+      "pattern": "^tcp://(?:127\\.0\\.0\\.1|\\[::1\\]):[0-9]{1,5}$"
+    },
+    "process_id": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+    "started_at_unix_millis": { "$ref": "#/$defs/u64" },
+    "limits": { "$ref": "#/$defs/limits" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "optionalResourceLimit": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "integer", "minimum": 1048576, "maximum": 9007199254740991 }
+      ]
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_request_bytes",
+        "max_response_bytes",
+        "request_timeout_millis",
+        "planning_timeout_millis",
+        "job_timeout_millis",
+        "max_connections",
+        "max_queue_entries",
+        "max_history_entries",
+        "max_running_jobs",
+        "max_memory_bytes",
+        "max_temporary_bytes",
+        "max_gpu_memory_bytes"
+      ],
+      "properties": {
+        "max_request_bytes": { "type": "integer", "minimum": 4096, "maximum": 16777216 },
+        "max_response_bytes": { "type": "integer", "minimum": 4096, "maximum": 67108864 },
+        "request_timeout_millis": { "type": "integer", "minimum": 100, "maximum": 3600000 },
+        "planning_timeout_millis": { "type": "integer", "minimum": 100, "maximum": 3600000 },
+        "job_timeout_millis": { "type": "integer", "minimum": 100, "maximum": 604800000 },
+        "max_connections": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "max_queue_entries": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "max_history_entries": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "max_running_jobs": { "const": 1 },
+        "max_memory_bytes": { "$ref": "#/$defs/optionalResourceLimit" },
+        "max_temporary_bytes": { "$ref": "#/$defs/optionalResourceLimit" },
+        "max_gpu_memory_bytes": { "$ref": "#/$defs/optionalResourceLimit" }
+      }
+    }
+  }
+}

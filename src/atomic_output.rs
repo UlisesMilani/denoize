@@ -373,10 +373,10 @@ mod windows_security {
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FileDispositionInfo, FileRenameInfo, SetFileInformationByHandle, CREATE_NEW,
-        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        READ_CONTROL, WRITE_DAC,
+        CreateDirectoryW, CreateFileW, FileDispositionInfo, FileRenameInfo,
+        SetFileInformationByHandle, CREATE_NEW, DELETE, FILE_ATTRIBUTE_NORMAL,
+        FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
 
     struct LocalMemory(*mut core::ffi::c_void);
@@ -584,6 +584,39 @@ mod windows_security {
             GENERIC_READ | GENERIC_WRITE | WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
         )
+    }
+
+    pub(super) fn create_private_directory(path: &Path) -> io::Result<()> {
+        // Keep the IPC state root private even when its parent grants access to
+        // other users. The protected DACL is the directory equivalent of the
+        // private control-file descriptor above.
+        let sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)\0"
+            .encode_utf16()
+            .collect();
+        let mut descriptor = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let _descriptor_guard = LocalMemory(descriptor);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn well_known_sid(kind: i32) -> io::Result<Vec<usize>> {
@@ -839,6 +872,11 @@ mod windows_security {
 #[cfg(windows)]
 pub(crate) fn create_private_windows_control_file(path: &Path) -> io::Result<File> {
     windows_security::create_private_control(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_private_windows_directory(path: &Path) -> io::Result<()> {
+    windows_security::create_private_directory(path)
 }
 
 #[cfg(windows)]
@@ -1150,6 +1188,7 @@ impl AtomicOutput {
         }
 
         fault_injection::hit("atomic-output.before-publish")?;
+        crate::ipc::check_publication_fence()?;
         #[cfg(windows)]
         let result = self.commit_windows(mode);
         #[cfg(all(not(windows), unix))]

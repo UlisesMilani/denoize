@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-job-dry-run-v1.schema.json",
+  "title": "denoize IPC bounded job dry-run report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "plan_digest",
+    "resources",
+    "destinations",
+    "overwrite_policy",
+    "pause_supported",
+    "plan"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-job-dry-run-v1" },
+    "schema_version": { "const": 1 },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "resources": { "$ref": "#/$defs/resources" },
+    "destinations": { "$ref": "#/$defs/destinations" },
+    "overwrite_policy": { "enum": ["no-clobber", "replace", "mixed", "none"] },
+    "pause_supported": { "type": "boolean" },
+    "plan": {
+      "oneOf": [
+        { "$ref": "denoize-execution-plan-v1.schema.json" },
+        { "$ref": "denoize-execution-plan-v2.schema.json" }
+      ]
+    }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "u64": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "memory_bytes",
+        "temporary_bytes",
+        "cpu_jobs",
+        "gpu_jobs",
+        "gpu_memory_bytes"
+      ],
+      "properties": {
+        "memory_bytes": { "$ref": "#/$defs/u64" },
+        "temporary_bytes": { "$ref": "#/$defs/u64" },
+        "cpu_jobs": { "$ref": "#/$defs/u64" },
+        "gpu_jobs": { "$ref": "#/$defs/u64" },
+        "gpu_memory_bytes": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "destinations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["process", "create", "replace", "skip"],
+      "properties": {
+        "process": { "$ref": "#/$defs/u64" },
+        "create": { "$ref": "#/$defs/u64" },
+        "replace": { "$ref": "#/$defs/u64" },
+        "skip": { "$ref": "#/$defs/u64" }
+      }
+    }
+  }
+}

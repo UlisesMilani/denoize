@@ -60,6 +60,12 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```text'
   "$binary" receipts --help
   echo '```'
+  echo
+  echo '## Local authenticated IPC and durable jobs'
+  echo
+  echo '```text'
+  "$binary" ipc --help
+  echo '```'
   cat <<'EOF'
 
 Watch mode uses portable bounded polling. A regular audio file becomes eligible
@@ -119,6 +125,34 @@ rehashed. The report proves the signed recipe/input/model/output identities; it
 does not prove wall-clock time, duration, host, or user identity. Stage 11 JSON
 v1 files remain accepted; the additive bounded-stream v2 files reject unknown
 fields and unsupported future schema versions without modifying them.
+
+## Local authenticated IPC and durable jobs
+
+`denoize ipc` is a local OS-account control surface, not a remote service. V1
+binds only `127.0.0.1`, publishes an ephemeral endpoint and every finite limit
+in an owner-private discovery document, and authenticates each length-prefixed
+JSON request with an explicit bearer capability. The initial administrator
+grant manages grants and shutdown but cannot plan or submit audio. Worker grants
+name canonical input/output roots, permitted operations, a priority ceiling,
+and optional expiry. Their unencrypted tokens must remain in private files and
+must not be copied into logs, shell arguments, browser contexts, or history.
+
+Every submission first produces the same bounded read-only execution plan and
+resource admission report used by the CLI. Server-controlled plan, receipt,
+resource, isolation, model-path, configuration, and publication arguments
+cannot be overridden by a client. V1 runs one job at a time and durably orders
+the queue by bounded priority then submission sequence. Batch and durable stream
+jobs pause only at verified checkpoints/publication boundaries and are replanned
+before resume; a non-resumable file job is never retried after uncertain
+publication. Signed receipts reconcile a completed child across daemon restart.
+
+Terminal history is bounded and path-free. It keeps plan identity, conservative
+resource totals, destination actions, overwrite policy, error code, and an
+optional receipt fingerprint; receipt artifacts are pruned with expired history.
+Revoking a grant blocks new requests but does not erase admitted work, so cancel
+first when queued or running jobs must stop. The versioned discovery,
+capability, request/response, dry-run, status, and history schemas are documented
+in `docs/json.md` and shipped in both release assets and the crates.io package.
 
 ## Stable JSON automation
 

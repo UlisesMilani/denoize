@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-ipc-request-v1.schema.json",
+  "title": "denoize authenticated local IPC request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "request_id",
+    "server_id",
+    "grant_id",
+    "token",
+    "operation"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-ipc-request-v1" },
+    "schema_version": { "const": 1 },
+    "request_id": { "$ref": "#/$defs/id" },
+    "server_id": { "$ref": "#/$defs/id" },
+    "grant_id": { "$ref": "#/$defs/id" },
+    "token": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "operation": { "$ref": "#/$defs/operation" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000]+$"
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "input", "output", "arguments", "priority"],
+      "properties": {
+        "kind": { "enum": ["file", "batch", "stream"] },
+        "input": { "$ref": "#/$defs/path" },
+        "output": { "$ref": "#/$defs/path" },
+        "arguments": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[^\\u0000]+$"
+          }
+        },
+        "priority": { "type": "integer", "minimum": -100, "maximum": 100 }
+      }
+    },
+    "jobOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "job"],
+      "properties": {
+        "action": { "enum": ["dry-run", "submit"] },
+        "job": { "$ref": "#/$defs/job" }
+      }
+    },
+    "jobIdOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "job_id"],
+      "properties": {
+        "action": { "enum": ["status", "cancel", "pause", "resume"] },
+        "job_id": { "$ref": "#/$defs/id" }
+      }
+    },
+    "listOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "limit"],
+      "properties": {
+        "action": { "enum": ["list", "history", "list-grants"] },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 10000 }
+      }
+    },
+    "operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action"],
+          "properties": { "action": { "const": "ping" } }
+        },
+        { "$ref": "#/$defs/jobOperation" },
+        { "$ref": "#/$defs/jobIdOperation" },
+        { "$ref": "#/$defs/listOperation" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "policy"],
+          "properties": {
+            "action": { "const": "create-grant" },
+            "policy": { "$ref": "denoize-ipc-capability-v1.schema.json#/$defs/policy" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "grant_id"],
+          "properties": {
+            "action": { "const": "revoke-grant" },
+            "grant_id": { "$ref": "#/$defs/id" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action", "force"],
+          "properties": {
+            "action": { "const": "shutdown" },
+            "force": { "type": "boolean" }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-job-history-v1.schema.json",
+  "title": "denoize bounded path-free IPC job history v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "entries", "truncated"],
+  "properties": {
+    "schema": { "const": "denoize-job-history-v1" },
+    "schema_version": { "const": 1 },
+    "entries": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/entry" }
+    },
+    "truncated": { "type": "boolean" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "u64": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "nullableU64": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/u64" }] },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "resources": { "$ref": "denoize-job-dry-run-v1.schema.json#/$defs/resources" },
+    "destinations": { "$ref": "denoize-job-dry-run-v1.schema.json#/$defs/destinations" },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "state",
+        "kind",
+        "priority",
+        "submitted_at_unix_millis",
+        "started_at_unix_millis",
+        "finished_at_unix_millis",
+        "attempt",
+        "plan_digest",
+        "resources",
+        "destinations",
+        "overwrite_policy",
+        "receipt",
+        "error_code"
+      ],
+      "properties": {
+        "job_id": { "$ref": "#/$defs/id" },
+        "state": { "enum": ["completed", "failed", "cancelled"] },
+        "kind": { "enum": ["file", "batch", "stream"] },
+        "priority": { "type": "integer", "minimum": -100, "maximum": 100 },
+        "submitted_at_unix_millis": { "$ref": "#/$defs/u64" },
+        "started_at_unix_millis": { "$ref": "#/$defs/nullableU64" },
+        "finished_at_unix_millis": { "$ref": "#/$defs/u64" },
+        "attempt": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "plan_digest": { "$ref": "#/$defs/digest" },
+        "resources": { "$ref": "#/$defs/resources" },
+        "destinations": { "$ref": "#/$defs/destinations" },
+        "overwrite_policy": { "enum": ["no-clobber", "replace", "mixed", "none"] },
+        "receipt": {
+          "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/fingerprint" }]
+        },
+        "error_code": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000]+$" }
+          ]
+        }
+      }
+    }
+  }
+}
