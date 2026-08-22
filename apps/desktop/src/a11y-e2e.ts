@@ -65,12 +65,12 @@ export async function runAccessibilityE2e(): Promise<void> {
   check("runtime.control-names", unnamed.length === 0, `unnamed controls: ${unnamed.join(", ")}`);
 
   const tabs = [...document.querySelectorAll<HTMLButtonElement>('[role="tab"][data-page]')];
-  const tabPairsValid = tabs.length === 6 && tabs.every((tab) => {
+  const tabPairsValid = tabs.length === 7 && tabs.every((tab) => {
     const panel = document.getElementById(tab.getAttribute("aria-controls") ?? "");
     return panel?.getAttribute("role") === "tabpanel"
       && panel.getAttribute("aria-labelledby") === tab.id;
   });
-  check("runtime.tab-panel-pairs", tabPairsValid, "navigation tabs and panels do not form six valid pairs");
+  check("runtime.tab-panel-pairs", tabPairsValid, "navigation tabs and panels do not form seven valid pairs");
   check(
     "runtime.single-tab-stop",
     tabs.filter((tab) => tab.getAttribute("aria-selected") === "true" && tab.tabIndex === 0).length === 1,

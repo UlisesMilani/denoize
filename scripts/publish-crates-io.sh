@@ -173,6 +173,9 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-recommendation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-release-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-runtime-model-package-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-watch-cycle-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-watch-quarantine-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-watch-state-v1.schema.json" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
     if ! tar -tf "$package_archive" | grep -Fx "$required" >/dev/null; then

@@ -73,6 +73,7 @@ pub mod stft;
 mod stoi_resample;
 pub mod stream;
 pub mod vad;
+pub mod watch;
 pub mod window;
 
 pub use atomic_output::{AtomicOutput, CommitMode};
@@ -157,6 +158,10 @@ pub use resource::{
     estimate_model_session_bytes, estimate_temporary_bytes, metadata_limits_after_retained_memory,
     metadata_limits_for_available_memory, ResourceGovernor, ResourceLimits, ResourcePermit,
     ResourceRequest, ResourceUsage,
+};
+pub use watch::{
+    WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError,
+    WATCH_CYCLE_SCHEMA, WATCH_QUARANTINE_SCHEMA, WATCH_SCHEMA_VERSION, WATCH_STATE_SCHEMA,
 };
 pub use window::{WindowParams, WindowType};
 

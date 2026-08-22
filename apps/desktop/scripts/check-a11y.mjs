@@ -31,7 +31,7 @@ if (start < 0 || end < 0) {
   }
 
   const tabs = [...markup.matchAll(/<button\b[^>]*\brole="tab"[^>]*>/g)].map((match) => match[0]);
-  if (tabs.length !== 6) failures.push(`expected 6 navigation tabs, found ${tabs.length}`);
+  if (tabs.length !== 7) failures.push(`expected 7 navigation tabs, found ${tabs.length}`);
   for (const tab of tabs) {
     const id = /\sid="([^"]+)"/.exec(tab)?.[1];
     const controls = /\saria-controls="([^"]+)"/.exec(tab)?.[1];

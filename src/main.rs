@@ -30,12 +30,14 @@ use denoize::{
     RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
     ResourceRequest, RuntimeModelPackage, SgmseProfile, SignedExecutionReceipt,
     SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
-    StreamSpoolLimits, StreamingBackendSession, WindowType,
+    StreamSpoolLimits, StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig,
+    WatchFolderJob, WatchProcessError, WindowType, WATCH_CYCLE_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_BLOCK_FRAMES: usize = 8192;
@@ -394,6 +396,7 @@ USAGE:
     denoize hardware [--json|--pretty]
     denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
+    denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
@@ -2028,6 +2031,503 @@ fn print_report(
     );
 }
 
+fn watch_usage() -> String {
+    format!(
+        "\
+denoize {VERSION} watch-folder automation
+
+USAGE:
+    denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
+
+WATCH OPTIONS:
+        --once                    settle and scan once, then exit
+        --settle-ms <MS>          unchanged-content interval in 0..2592000000 (default: 2000)
+        --poll-ms <MS>            daemon polling interval in 1..2592000000 (default: 500)
+        --retry-initial-ms <MS>   initial retry delay (default: 1000)
+        --retry-max-ms <MS>       maximum exponential delay (default: 60000)
+        --max-attempts <N>        attempts before quarantine in 1..100 (default: 5)
+        --max-watch-files <N>     bounded directory entries in 1..100000 (default: 10000)
+        --quarantine <DIR>        failed-input root (default: OUTPUT/.denoize-quarantine)
+        --receipt-dir <DIR>       per-item signed receipts (default: OUTPUT/.denoize-receipts)
+        --watch-state <PATH>      durable state (default: OUTPUT/.denoize-watch-state.json)
+
+PROCESSING OPTIONS:
+    File-processing options from `denoize --help` are accepted. `--output-format`
+    defaults to wav. `--recursive` includes subdirectories. Watch mode is
+    sequential and forbids --batch, --stream, --resume, --force, --report,
+    --isolate, --receipt, and --jobs. A receipt key is mandatory; every
+    successful output is atomically paired with a signed receipt.
+
+SETTLE AND FAILURE CONTRACT:
+    A candidate must retain the same regular-file length, modification stamp,
+    and SHA-256 content for the full settle interval. Processing failures use
+    bounded exponential retry. Exhausted or permanent failures are copied to
+    quarantine with a v1 JSON explanation before the source is removed. The
+    durable state and output roots must be outside the input tree. State is
+    bound to the processing, output, signing-key, and explicit-model template;
+    choose a new state path after an intentional template change.
+"
+    )
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct WatchCommandOptions {
+    once: bool,
+    settle_millis: Option<u64>,
+    poll_millis: Option<u64>,
+    retry_initial_millis: Option<u64>,
+    retry_max_millis: Option<u64>,
+    max_attempts: Option<u32>,
+    max_files: Option<usize>,
+    quarantine_root: Option<String>,
+    receipt_root: Option<String>,
+    state_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct WatchCycleJson<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    input: &'a str,
+    output: &'a str,
+    cancelled: bool,
+    #[serde(flatten)]
+    report: &'a WatchCycleReport,
+}
+
+fn parse_watch_args(
+    args: &[String],
+) -> Result<(String, String, Overrides, WatchCommandOptions), String> {
+    if args.is_empty() || (args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help")) {
+        print!("{}", watch_usage());
+        return Err(String::new());
+    }
+    let mut watch = WatchCommandOptions::default();
+    let mut processing = Vec::with_capacity(args.len());
+    let mut index = 0_usize;
+    while index < args.len() {
+        let value = &args[index];
+        match value.as_str() {
+            "--once" => watch.once = true,
+            "--settle-ms" => watch.settle_millis = Some(parse_value(args, &mut index, value)?),
+            "--poll-ms" => watch.poll_millis = Some(parse_value(args, &mut index, value)?),
+            "--retry-initial-ms" => {
+                watch.retry_initial_millis = Some(parse_value(args, &mut index, value)?)
+            }
+            "--retry-max-ms" => {
+                watch.retry_max_millis = Some(parse_value(args, &mut index, value)?)
+            }
+            "--max-attempts" => watch.max_attempts = Some(parse_value(args, &mut index, value)?),
+            "--max-watch-files" => watch.max_files = Some(parse_value(args, &mut index, value)?),
+            "--quarantine" => watch.quarantine_root = Some(parse_value(args, &mut index, value)?),
+            "--receipt-dir" => watch.receipt_root = Some(parse_value(args, &mut index, value)?),
+            "--watch-state" => watch.state_path = Some(parse_value(args, &mut index, value)?),
+            _ => processing.push(value.clone()),
+        }
+        index += 1;
+    }
+    let (input, output, options) = parse_args(&processing)?;
+    Ok((input, output, options, watch))
+}
+
+fn validate_watch_processing_options(options: &Overrides) -> Result<(), String> {
+    if options.batch
+        || options.stream
+        || options.resume
+        || options.force
+        || options.report
+        || options.isolate
+    {
+        return Err(
+            "watch cannot use --batch, --stream, --resume, --force, --report, or --isolate".into(),
+        );
+    }
+    if options.receipt.is_some() {
+        return Err(
+            "watch creates one receipt per item; use --receipt-dir instead of --receipt".into(),
+        );
+    }
+    if options.receipt_key.is_none() {
+        return Err("watch requires --receipt-key for per-item signed receipts".into());
+    }
+    if options.jobs.is_some() {
+        return Err("watch is sequential; --jobs is not supported".into());
+    }
+    if options.input_device.is_some()
+        || options.output_device.is_some()
+        || options.list_devices
+        || options.chunk_ms.is_some()
+        || options.live_latency_ms.is_some()
+        || options.max_drift_ppm.is_some()
+        || options.reconnect_timeout_ms.is_some()
+    {
+        return Err("live-device options cannot be used with watch".into());
+    }
+    Ok(())
+}
+
+fn watch_config(
+    input: &str,
+    output: &str,
+    processing: &Overrides,
+    command: &WatchCommandOptions,
+    processor_identity: Digest,
+) -> WatchFolderConfig {
+    let mut config = WatchFolderConfig::new(input, output, processor_identity.as_bytes())
+        .with_recursive(processing.recursive)
+        .with_output_extension(processing.output_format.as_deref().unwrap_or("wav"));
+    if let Some(path) = &command.quarantine_root {
+        config = config.with_quarantine_root(path);
+    }
+    if let Some(path) = &command.receipt_root {
+        config = config.with_receipt_root(path);
+    }
+    if let Some(path) = &command.state_path {
+        config = config.with_state_path(path);
+    }
+    if let Some(value) = command.settle_millis {
+        config = config.with_settle_duration(Duration::from_millis(value));
+    }
+    if let Some(value) = command.poll_millis {
+        config = config.with_poll_interval(Duration::from_millis(value));
+    }
+    config = config.with_retry_delays(
+        Duration::from_millis(command.retry_initial_millis.unwrap_or(1_000)),
+        Duration::from_millis(command.retry_max_millis.unwrap_or(60_000)),
+    );
+    if let Some(value) = command.max_attempts {
+        config = config.with_max_attempts(value);
+    }
+    if let Some(value) = command.max_files {
+        config = config.with_max_files(value);
+    }
+    config
+}
+
+fn update_watch_identity(hasher: &mut Sha256, label: &str, value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn watch_processor_identity(
+    processing: &Overrides,
+    public_key: &ReceiptPublicKey,
+) -> Result<Digest, String> {
+    let mut material = processing.clone();
+    material.max_memory_mb = None;
+    material.max_process_memory_mb = None;
+    material.max_temporary_mb = None;
+    material.max_gpu_memory_mb = None;
+    material.max_gpu_jobs = None;
+    material.no_progress = false;
+    material.json = false;
+    material.receipt_key = None;
+    let mut hasher = Sha256::new();
+    update_watch_identity(&mut hasher, "domain", b"denoize-watch-processor-v1");
+    update_watch_identity(&mut hasher, "denoize-version", VERSION.as_bytes());
+    update_watch_identity(
+        &mut hasher,
+        "processing-options",
+        format!("{material:#?}").as_bytes(),
+    );
+    update_watch_identity(
+        &mut hasher,
+        "receipt-public-key-id",
+        public_key.key_id.as_bytes(),
+    );
+    for (label, path) in [
+        ("onnx-model", processing.onnx_model.as_deref()),
+        ("model-package", processing.model_package.as_deref()),
+        ("model-package-key", processing.model_package_key.as_deref()),
+    ] {
+        update_watch_identity(
+            &mut hasher,
+            &format!("{label}-present"),
+            &[u8::from(path.is_some())],
+        );
+        if let Some(path) = path {
+            let fingerprint = batch_resume::fingerprint_file(std::path::Path::new(path))
+                .map_err(|error| format!("fingerprint watch {label} {path}: {error}"))?;
+            let mut encoded = [0_u8; 40];
+            encoded[..8].copy_from_slice(&fingerprint.len.to_le_bytes());
+            encoded[8..].copy_from_slice(fingerprint.digest.as_bytes());
+            update_watch_identity(&mut hasher, label, &encoded);
+        }
+    }
+    Ok(Digest::from_bytes(hasher.finalize().into()))
+}
+
+fn classify_watch_process_error(error: String) -> WatchProcessError {
+    let lowercase = error.to_ascii_lowercase();
+    if lowercase.contains("cancelled") || error.contains("キャンセル") {
+        return WatchProcessError::deferred(error);
+    }
+    if [
+        "unsupported",
+        "unknown or ambiguous",
+        "malformed",
+        "truncated",
+        "cannot preserve",
+        "must contain exactly one supported audio track",
+        "invalid audio",
+    ]
+    .iter()
+    .any(|needle| lowercase.contains(needle))
+    {
+        WatchProcessError::permanent(error)
+    } else {
+        WatchProcessError::retryable(error)
+    }
+}
+
+fn path_exists_for_watch(path: &std::path::Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "inspect watch artifact {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn recover_watch_job(job: &WatchFolderJob, public_key: &ReceiptPublicKey) -> Result<bool, String> {
+    let output_exists = path_exists_for_watch(&job.output_path)?;
+    let receipt_exists = path_exists_for_watch(&job.receipt_path)?;
+    match (output_exists, receipt_exists) {
+        (false, false) => return Ok(false),
+        (true, false) => {
+            return Err(format!(
+                "watch output exists without its signed receipt: {}",
+                job.output_path.display()
+            ))
+        }
+        (false, true) => {
+            return Err(format!(
+                "watch receipt exists without its output: {}",
+                job.receipt_path.display()
+            ))
+        }
+        (true, true) => {}
+    }
+    let receipt = SignedExecutionReceipt::from_file(&job.receipt_path)?;
+    let output_root = job
+        .output_path
+        .parent()
+        .ok_or("watch output path has no parent directory")?;
+    receipt.verify_with_key(public_key, None, &job.receipt_path, Some(output_root))?;
+    if receipt.payload.items.len() != 1 {
+        return Err("watch receipt must contain exactly one item".into());
+    }
+    let item = &receipt.payload.items[0];
+    if item.input.fingerprint != job.input_fingerprint {
+        return Err("watch receipt input fingerprint does not match its settled job".into());
+    }
+    let expected_output = denoize::portable_file_locator(&job.output_path)?;
+    if item.output.path != expected_output {
+        return Err("watch receipt output locator does not match its scheduled job".into());
+    }
+    Ok(true)
+}
+
+fn process_watch_job(
+    job: &WatchFolderJob,
+    base_options: &Overrides,
+    receipt_key_path: &std::path::Path,
+    expected_key_fingerprint: FileFingerprint,
+    public_key: &ReceiptPublicKey,
+    expected_processor_identity: Digest,
+) -> Result<(), WatchProcessError> {
+    let current_key = batch_resume::fingerprint_file(receipt_key_path).map_err(|error| {
+        WatchProcessError::deferred(format!(
+            "watch receipt key is temporarily unavailable: {error}"
+        ))
+    })?;
+    if current_key != expected_key_fingerprint {
+        return Err(WatchProcessError::deferred(
+            "watch receipt key changed; restart the watcher to adopt the new key",
+        ));
+    }
+    let current_processor_identity =
+        watch_processor_identity(base_options, public_key).map_err(|error| {
+            WatchProcessError::deferred(format!(
+                "watch processor template is temporarily unavailable: {error}"
+            ))
+        })?;
+    if current_processor_identity != expected_processor_identity {
+        return Err(WatchProcessError::deferred(
+            "watch processor template changed; restart with a fresh state path to adopt it",
+        ));
+    }
+    match recover_watch_job(job, public_key) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => return Err(WatchProcessError::permanent(error)),
+    }
+    let mut options = base_options.clone();
+    options.batch = false;
+    options.stream = false;
+    options.recursive = false;
+    options.resume = false;
+    options.force = false;
+    options.report = false;
+    options.json = false;
+    options.no_progress = true;
+    options.receipt = Some(job.receipt_path.to_string_lossy().into_owned());
+    options.receipt_key = Some(receipt_key_path.to_string_lossy().into_owned());
+    run_one_with_output_format(
+        &job.input_path,
+        &job.output_path,
+        options,
+        None,
+        None,
+        Some(job.input_fingerprint),
+    )
+    .map_err(classify_watch_process_error)?;
+    match recover_watch_job(job, public_key) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WatchProcessError::permanent(
+            "watch processing returned without publishing output and receipt",
+        )),
+        Err(error) => Err(WatchProcessError::permanent(error)),
+    }
+}
+
+fn print_watch_cycle(
+    input: &str,
+    output: &str,
+    options: &Overrides,
+    report: &WatchCycleReport,
+    cancelled: bool,
+) {
+    if options.json {
+        println!(
+            "{}",
+            serialize_json_line(&WatchCycleJson {
+                schema: WATCH_CYCLE_SCHEMA,
+                schema_version: 1,
+                input,
+                output,
+                cancelled,
+                report,
+            })
+        );
+    } else if !options.no_progress
+        && (report.observed != 0
+            || report.attempted != 0
+            || report.quarantined != 0
+            || report.scan_errors != 0
+            || cancelled)
+    {
+        eprintln!(
+            "denoize: watch observed={} attempted={} succeeded={} retrying={} quarantined={} superseded={} scan_errors={} pending={}{}",
+            report.observed,
+            report.attempted,
+            report.succeeded,
+            report.retrying,
+            report.quarantined,
+            report.superseded,
+            report.scan_errors,
+            report.pending,
+            if cancelled { " cancelled" } else { "" }
+        );
+    }
+}
+
+fn wait_watch_interval(duration: Duration) {
+    let started = Instant::now();
+    while !CANCELLED.load(Ordering::SeqCst) {
+        let elapsed = started.elapsed();
+        if elapsed >= duration {
+            break;
+        }
+        std::thread::sleep((duration - elapsed).min(Duration::from_millis(100)));
+    }
+}
+
+fn run_watch(args: &[String]) -> Result<(), String> {
+    let (input, output, mut processing, command) = match parse_watch_args(args) {
+        Ok(values) => values,
+        Err(error) if error.is_empty() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_watch_processing_options(&processing)?;
+    let key_path = std::path::PathBuf::from(
+        processing
+            .receipt_key
+            .as_deref()
+            .ok_or("watch requires --receipt-key")?,
+    );
+    let key = ReceiptSecretKey::from_file(&key_path)?;
+    let public_key = key.public_key()?;
+    drop(key);
+    let key_path = std::fs::canonicalize(&key_path)
+        .map_err(|error| format!("resolve watch receipt key {}: {error}", key_path.display()))?;
+    let normalized_input = normalize_batch_path(std::path::Path::new(&input))?;
+    let normalized_output = normalize_batch_path(std::path::Path::new(&output))?;
+    if key_path.starts_with(&normalized_input) || key_path.starts_with(&normalized_output) {
+        return Err("watch receipt key must be outside the input and output trees".into());
+    }
+    let key_fingerprint = batch_resume::fingerprint_file(&key_path)?;
+    processing.receipt_key = Some(key_path.to_string_lossy().into_owned());
+    let processor_identity = watch_processor_identity(&processing, &public_key)?;
+    let config = watch_config(&input, &output, &processing, &command, processor_identity);
+    let settle_duration = config.settle_duration();
+    let poll_interval = config.poll_interval();
+    let mut watch = WatchFolder::open(config)?;
+    CANCELLED.store(false, Ordering::SeqCst);
+    install_cancel_handler()?;
+    let run_cycle = |watch: &mut WatchFolder| {
+        watch.cycle(|job| {
+            process_watch_job(
+                job,
+                &processing,
+                &key_path,
+                key_fingerprint,
+                &public_key,
+                processor_identity,
+            )
+        })
+    };
+
+    if command.once {
+        let first = run_cycle(&mut watch)?;
+        print_watch_cycle(&input, &output, &processing, &first, false);
+        if first.observed != 0 && settle_duration != Duration::ZERO {
+            wait_watch_interval(settle_duration);
+            if !CANCELLED.load(Ordering::SeqCst) {
+                let second = run_cycle(&mut watch)?;
+                print_watch_cycle(&input, &output, &processing, &second, false);
+            }
+        }
+        return Ok(());
+    }
+
+    while !CANCELLED.load(Ordering::SeqCst) {
+        match run_cycle(&mut watch) {
+            Ok(report) => print_watch_cycle(&input, &output, &processing, &report, false),
+            Err(error) => {
+                if processing.json {
+                    eprintln!("denoize: watch scan failed: {error}");
+                } else {
+                    eprintln!("denoize: watch scan failed; retrying: {error}");
+                }
+            }
+        }
+        wait_watch_interval(poll_interval);
+    }
+    print_watch_cycle(
+        &input,
+        &output,
+        &processing,
+        &WatchCycleReport::default(),
+        true,
+    );
+    Ok(())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     wait_for_isolation_gate()?;
@@ -2042,6 +2542,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("plan") {
         return run_execution_plan(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("watch") {
+        return run_watch(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("live") {
         return run_live(&args[1..]);
@@ -3985,6 +4488,7 @@ fn run_one(input: &str, output: &str, ov: Overrides) -> Result<(), String> {
         ov,
         None,
         None,
+        None,
     )
 }
 
@@ -4035,6 +4539,7 @@ fn run_one_with_output_format(
     ov: Overrides,
     planned_output_format: Option<OutputFormat>,
     pre_resolved_backend_options: Option<BackendOptions>,
+    expected_input_fingerprint: Option<FileFingerprint>,
 ) -> Result<(), String> {
     let governor = resource_governor(&ov, 1)?;
     let commit_mode = if ov.force {
@@ -4080,7 +4585,7 @@ fn run_one_with_output_format(
         None,
         recipe_metadata_policy,
         None,
-        None,
+        expected_input_fingerprint,
         None,
         true,
         Some(&governor),
@@ -11535,6 +12040,13 @@ fn main() {
 #[cfg(all(test, feature = "onnx"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_cancellation_does_not_consume_an_attempt() {
+        let error = classify_watch_process_error("cancelled".into());
+        assert!(error.is_retryable());
+        assert!(!error.counts_attempt());
+    }
 
     #[test]
     fn parses_onnx_model_options() {

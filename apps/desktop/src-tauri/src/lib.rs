@@ -16,20 +16,22 @@ use denoize::{
     AudioStreamWriter, Backend, BackendOptions, BackendSession, ChannelMode, CommitMode,
     DecodeLimits, DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
     ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
-    PlannedResources, ReceiptItem, ReceiptSecretKey, ReceiptTrustPolicy, ReceiptVerificationReport,
-    ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile,
-    SignedExecutionReceipt, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
-    StreamingBackendSession,
+    PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
+    ReceiptVerificationReport, ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest,
+    SgmseProfile, SignedExecutionReceipt, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
+    StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob,
+    WatchProcessError,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as ShaDigest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 mod diagnostics;
@@ -308,10 +310,28 @@ const fn default_max_gpu_jobs() -> usize {
     1
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct DesktopWatchProcessorTemplate {
+    output_format: String,
+    recursive: bool,
+    options: ProcessOptions,
+}
+
+struct DesktopWatchSession {
+    watch: WatchFolder,
+    processor_template: DesktopWatchProcessorTemplate,
+    processor_identity: Digest,
+    key_path: PathBuf,
+    key_fingerprint: batch_resume::FileFingerprint,
+    public_key: ReceiptPublicKey,
+}
+
+#[derive(Clone, Default)]
 struct AppState {
     jobs: Arc<Mutex<HashMap<u64, Arc<JobControl>>>>,
     live: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    watch: Arc<Mutex<Option<DesktopWatchSession>>>,
+    watch_active: Arc<AtomicBool>,
     diagnostics: Arc<diagnostics::DiagnosticLog>,
 }
 
@@ -1023,6 +1043,28 @@ struct BatchRequest {
     receipt: Option<String>,
     #[serde(default)]
     receipt_key: Option<String>,
+    options: ProcessOptions,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WatchRequest {
+    input_dir: String,
+    output_dir: String,
+    receipt_key: String,
+    output_format: String,
+    recursive: bool,
+    settle_millis: u64,
+    retry_initial_millis: u64,
+    retry_max_millis: u64,
+    max_attempts: u32,
+    max_files: usize,
+    #[serde(default)]
+    quarantine_dir: Option<String>,
+    #[serde(default)]
+    receipt_dir: Option<String>,
+    #[serde(default)]
+    state_path: Option<String>,
     options: ProcessOptions,
 }
 
@@ -1958,6 +2000,470 @@ fn start_process_inner(
         }
     });
     Ok(job_id)
+}
+
+fn validate_watch_request(request: &WatchRequest) -> Result<(), String> {
+    validate_process_options(&request.options)?;
+    if request.options.force {
+        return Err("watch-folder automation never replaces an existing output".into());
+    }
+    if request.input_dir.trim().is_empty()
+        || request.output_dir.trim().is_empty()
+        || request.receipt_key.trim().is_empty()
+        || request.output_format.trim().is_empty()
+    {
+        return Err("watch input, output, receipt key, and output format must not be empty".into());
+    }
+    let probe_name = format!("output.{}", request.output_format.trim_start_matches('.'));
+    OutputFormat::from_path(Path::new(&probe_name))?
+        .validate_encoder(parse_aac_encoder(&request.options.aac_encoder)?)?;
+    Ok(())
+}
+
+fn desktop_watch_config(request: &WatchRequest, processor_identity: Digest) -> WatchFolderConfig {
+    let mut config = WatchFolderConfig::new(
+        &request.input_dir,
+        &request.output_dir,
+        processor_identity.as_bytes(),
+    )
+    .with_output_extension(request.output_format.trim_start_matches('.'))
+    .with_recursive(request.recursive)
+    .with_settle_duration(Duration::from_millis(request.settle_millis))
+    .with_retry_delays(
+        Duration::from_millis(request.retry_initial_millis),
+        Duration::from_millis(request.retry_max_millis),
+    )
+    .with_max_attempts(request.max_attempts)
+    .with_max_files(request.max_files);
+    if let Some(path) = request.quarantine_dir.as_deref() {
+        config = config.with_quarantine_root(path);
+    }
+    if let Some(path) = request.receipt_dir.as_deref() {
+        config = config.with_receipt_root(path);
+    }
+    if let Some(path) = request.state_path.as_deref() {
+        config = config.with_state_path(path);
+    }
+    config
+}
+
+fn update_desktop_watch_identity(hasher: &mut Sha256, label: &str, value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn desktop_watch_processor_identity(
+    template: &DesktopWatchProcessorTemplate,
+    public_key: &ReceiptPublicKey,
+) -> Result<Digest, String> {
+    let mut material = template.options.clone();
+    material.force = false;
+    material.max_process_memory_mb = None;
+    material.max_temporary_mb = None;
+    material.max_gpu_memory_mb = None;
+    material.max_gpu_jobs = default_max_gpu_jobs();
+    let processing = serde_json::to_vec(&(
+        env!("CARGO_PKG_VERSION"),
+        &template.output_format,
+        template.recursive,
+        &material,
+    ))
+    .map_err(|error| format!("serialize watch processing template: {error}"))?;
+    let mut hasher = Sha256::new();
+    update_desktop_watch_identity(&mut hasher, "domain", b"denoize-watch-processor-v1");
+    update_desktop_watch_identity(&mut hasher, "processing-options", &processing);
+    update_desktop_watch_identity(
+        &mut hasher,
+        "receipt-public-key-id",
+        public_key.key_id.as_bytes(),
+    );
+    for (label, path) in [
+        ("onnx-model", template.options.onnx_model.as_deref()),
+        ("model-package", template.options.model_package.as_deref()),
+        (
+            "model-package-key",
+            template.options.model_package_key.as_deref(),
+        ),
+    ] {
+        update_desktop_watch_identity(
+            &mut hasher,
+            &format!("{label}-present"),
+            &[u8::from(path.is_some())],
+        );
+        if let Some(path) = path {
+            let fingerprint = batch_resume::fingerprint_file(Path::new(path))
+                .map_err(|error| format!("fingerprint watch {label} {path}: {error}"))?;
+            let mut encoded = [0_u8; 40];
+            encoded[..8].copy_from_slice(&fingerprint.len.to_le_bytes());
+            encoded[8..].copy_from_slice(fingerprint.digest.as_bytes());
+            update_desktop_watch_identity(&mut hasher, label, &encoded);
+        }
+    }
+    Ok(Digest::from_bytes(hasher.finalize().into()))
+}
+
+fn desktop_watch_processor_template(request: &WatchRequest) -> DesktopWatchProcessorTemplate {
+    DesktopWatchProcessorTemplate {
+        output_format: request
+            .output_format
+            .trim_start_matches('.')
+            .to_ascii_lowercase(),
+        recursive: request.recursive,
+        options: request.options.clone(),
+    }
+}
+
+fn desktop_watch_path_exists(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "inspect watch artifact {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn recover_desktop_watch_job(
+    job: &WatchFolderJob,
+    public_key: &ReceiptPublicKey,
+) -> Result<bool, String> {
+    let output_exists = desktop_watch_path_exists(&job.output_path)?;
+    let receipt_exists = desktop_watch_path_exists(&job.receipt_path)?;
+    match (output_exists, receipt_exists) {
+        (false, false) => return Ok(false),
+        (true, false) => {
+            return Err(format!(
+                "watch output exists without its signed receipt: {}",
+                job.output_path.display()
+            ));
+        }
+        (false, true) => {
+            return Err(format!(
+                "watch receipt exists without its output: {}",
+                job.receipt_path.display()
+            ));
+        }
+        (true, true) => {}
+    }
+    let receipt = SignedExecutionReceipt::from_file(&job.receipt_path)?;
+    let output_root = job
+        .output_path
+        .parent()
+        .ok_or("watch output path has no parent directory")?;
+    receipt.verify_with_key(public_key, None, &job.receipt_path, Some(output_root))?;
+    if receipt.payload.items.len() != 1 {
+        return Err("watch receipt must contain exactly one item".into());
+    }
+    let item = &receipt.payload.items[0];
+    if item.input.fingerprint != job.input_fingerprint {
+        return Err("watch receipt input fingerprint does not match its settled job".into());
+    }
+    if item.output.path != denoize::portable_file_locator(&job.output_path)? {
+        return Err("watch receipt output locator does not match its scheduled job".into());
+    }
+    Ok(true)
+}
+
+fn classify_desktop_watch_error(error: String) -> WatchProcessError {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("cancelled") || error.contains("キャンセル") {
+        return WatchProcessError::deferred(error);
+    }
+    if [
+        "unsupported",
+        "unknown or ambiguous",
+        "malformed",
+        "truncated",
+        "cannot preserve",
+        "must contain exactly one supported audio track",
+        "invalid audio",
+        "not a regular file",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || ["不明", "不正", "非対応", "壊れ", "切り詰め"]
+            .iter()
+            .any(|needle| error.contains(needle))
+    {
+        WatchProcessError::permanent(error)
+    } else {
+        WatchProcessError::retryable(error)
+    }
+}
+
+fn run_desktop_watch_job_isolated(
+    app: &AppHandle,
+    state: &AppState,
+    request: ProcessRequest,
+) -> Result<(), String> {
+    validate_request(&request)?;
+    let (job_id, control) = register_watch_job(state)?;
+    let operation = recovery::RecoveryOperation::File(request);
+    let tracker = match recovery::RecoveryTracker::create(app, job_id, operation.clone()) {
+        Ok(tracker) => tracker,
+        Err(error) => {
+            unregister_job(state, job_id);
+            return Err(error);
+        }
+    };
+    if let Err(error) = control.install_recovery(tracker) {
+        unregister_job(state, job_id);
+        return Err(error);
+    }
+    state
+        .diagnostics
+        .record(diagnostics::DiagnosticCode::FileJobStarted);
+    let result = job_worker::run_isolated(app, job_id, operation, &control);
+    let (terminal, outcome) = match result {
+        Ok(progress) if progress.status == "completed" => ("completed", Ok(())),
+        Ok(progress) if progress.status == "cancelled" => {
+            ("cancelled", Err("cancelled".to_string()))
+        }
+        Ok(progress) => (
+            "failed",
+            Err(progress
+                .error
+                .map(|error| error.technical_detail)
+                .unwrap_or_else(|| "isolated watch worker failed".into())),
+        ),
+        Err(error) if error == "cancelled" || control.is_cancelled() => {
+            ("cancelled", Err("cancelled".to_string()))
+        }
+        Err(error) => ("failed", Err(error)),
+    };
+    state.diagnostics.record(match terminal {
+        "completed" => diagnostics::DiagnosticCode::FileJobCompleted,
+        "cancelled" => diagnostics::DiagnosticCode::FileJobCancelled,
+        _ => diagnostics::DiagnosticCode::FileJobFailed,
+    });
+    let cleanup = control.cleanup_isolated_recovery();
+    if cleanup.is_ok() {
+        control.finish_recovery(terminal);
+    }
+    unregister_job(state, job_id);
+    cleanup?;
+    outcome
+}
+
+fn process_desktop_watch_job(
+    app: &AppHandle,
+    state: &AppState,
+    job: &WatchFolderJob,
+    processor_template: &DesktopWatchProcessorTemplate,
+    expected_processor_identity: Digest,
+    key_path: &Path,
+    expected_key_fingerprint: batch_resume::FileFingerprint,
+    public_key: &ReceiptPublicKey,
+) -> Result<(), WatchProcessError> {
+    let current_key = batch_resume::fingerprint_file(key_path).map_err(|error| {
+        WatchProcessError::deferred(format!(
+            "watch receipt key is temporarily unavailable: {error}"
+        ))
+    })?;
+    if current_key != expected_key_fingerprint {
+        return Err(WatchProcessError::deferred(
+            "watch receipt key changed; restart the watcher to adopt the new key",
+        ));
+    }
+    let current_processor_identity =
+        desktop_watch_processor_identity(processor_template, public_key).map_err(|error| {
+            WatchProcessError::deferred(format!(
+                "watch processor template is temporarily unavailable: {error}"
+            ))
+        })?;
+    if current_processor_identity != expected_processor_identity {
+        return Err(WatchProcessError::deferred(
+            "watch processor template changed; restart with a fresh state path to adopt it",
+        ));
+    }
+    match recover_desktop_watch_job(job, public_key) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => return Err(WatchProcessError::permanent(error)),
+    }
+    let mut options = processor_template.options.clone();
+    options.force = false;
+    let request = ProcessRequest {
+        input: job.input_path.to_string_lossy().into_owned(),
+        output: job.output_path.to_string_lossy().into_owned(),
+        expected_input_fingerprint: Some(job.input_fingerprint),
+        expected_recipe: None,
+        stream: false,
+        resume: false,
+        stream_frames: DEFAULT_STREAM_BLOCK_FRAMES,
+        receipt: Some(job.receipt_path.to_string_lossy().into_owned()),
+        receipt_key: Some(key_path.to_string_lossy().into_owned()),
+        options,
+    };
+    run_desktop_watch_job_isolated(app, state, request).map_err(classify_desktop_watch_error)?;
+    match recover_desktop_watch_job(job, public_key) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WatchProcessError::permanent(
+            "watch processing returned without publishing output and receipt",
+        )),
+        Err(error) => Err(WatchProcessError::permanent(error)),
+    }
+}
+
+fn create_desktop_watch_session(request: WatchRequest) -> Result<DesktopWatchSession, String> {
+    validate_watch_request(&request)?;
+    let key_path = PathBuf::from(&request.receipt_key);
+    let key = ReceiptSecretKey::from_file(&key_path)?;
+    let public_key = key.public_key()?;
+    drop(key);
+    let key_path = std::fs::canonicalize(&key_path)
+        .map_err(|error| format!("resolve watch receipt key {}: {error}", key_path.display()))?;
+    let normalized_input = normalize_batch_path(Path::new(&request.input_dir))?;
+    let normalized_output = normalize_batch_path(Path::new(&request.output_dir))?;
+    if key_path.starts_with(&normalized_input) || key_path.starts_with(&normalized_output) {
+        return Err("watch receipt key must be outside the input and output trees".into());
+    }
+    let key_fingerprint = batch_resume::fingerprint_file(&key_path)?;
+    let processor_template = desktop_watch_processor_template(&request);
+    let processor_identity = desktop_watch_processor_identity(&processor_template, &public_key)?;
+    let watch = WatchFolder::open(desktop_watch_config(&request, processor_identity))?;
+    Ok(DesktopWatchSession {
+        watch,
+        processor_template,
+        processor_identity,
+        key_path,
+        key_fingerprint,
+        public_key,
+    })
+}
+
+fn cycle_desktop_watch_session(
+    app: &AppHandle,
+    state: &AppState,
+    session: &mut DesktopWatchSession,
+) -> Result<WatchCycleReport, String> {
+    let DesktopWatchSession {
+        watch,
+        processor_template,
+        processor_identity,
+        key_path,
+        key_fingerprint,
+        public_key,
+    } = session;
+    watch.cycle(|job| {
+        process_desktop_watch_job(
+            app,
+            state,
+            job,
+            processor_template,
+            *processor_identity,
+            key_path,
+            *key_fingerprint,
+            public_key,
+        )
+    })
+}
+
+fn install_desktop_watch_session(state: &AppState, request: WatchRequest) -> Result<(), String> {
+    let mut watch = state
+        .watch
+        .lock()
+        .map_err(|_| "watch-folder state could not be updated")?;
+    if watch.is_some() || state.watch_active.load(Ordering::Acquire) {
+        return Err("watch-folder automation is already running".into());
+    }
+    state.watch_active.store(true, Ordering::Release);
+    let result = (|| {
+        let jobs = state
+            .jobs
+            .lock()
+            .map_err(|_| "job state could not be inspected")?;
+        let live = state
+            .live
+            .lock()
+            .map_err(|_| "live state could not be inspected")?;
+        if !jobs.is_empty() || live.is_some() {
+            return Err("stop the active operation before starting watch-folder automation".into());
+        }
+        drop(live);
+        drop(jobs);
+        *watch = Some(create_desktop_watch_session(request)?);
+        Ok(())
+    })();
+    if result.is_err() {
+        state.watch_active.store(false, Ordering::Release);
+    }
+    result
+}
+
+fn poll_watch_folder_inner(app: &AppHandle, state: &AppState) -> Result<WatchCycleReport, String> {
+    let mut watch = state
+        .watch
+        .lock()
+        .map_err(|_| "watch-folder state could not be updated")?;
+    let session = watch
+        .as_mut()
+        .ok_or("watch-folder automation is not running")?;
+    cycle_desktop_watch_session(app, state, session)
+}
+
+fn stop_watch_folder_inner(state: &AppState) -> Result<(), String> {
+    let mut watch = state
+        .watch
+        .lock()
+        .map_err(|_| "watch-folder state could not be updated")?;
+    *watch = None;
+    state.watch_active.store(false, Ordering::Release);
+    Ok(())
+}
+
+fn start_watch_folder_inner(
+    app: AppHandle,
+    state: AppState,
+    request: WatchRequest,
+) -> Result<WatchCycleReport, String> {
+    install_desktop_watch_session(&state, request)?;
+    match poll_watch_folder_inner(&app, &state) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let _ = stop_watch_folder_inner(&state);
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn start_watch_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: WatchRequest,
+) -> DesktopResult<WatchCycleReport> {
+    let state = state.inner().clone();
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || start_watch_folder_inner(app, state, request))
+            .await
+            .map_err(|error| format!("watch-folder task failed: {error}"))??,
+    )
+}
+
+#[tauri::command]
+async fn poll_watch_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<WatchCycleReport> {
+    let state = state.inner().clone();
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || poll_watch_folder_inner(&app, &state))
+            .await
+            .map_err(|error| format!("watch-folder task failed: {error}"))??,
+    )
+}
+
+#[tauri::command]
+async fn stop_watch_folder(state: State<'_, AppState>) -> DesktopResult<()> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || stop_watch_folder_inner(&state))
+        .await
+        .map_err(|error| format!("watch-folder stop task failed: {error}"))??;
+    Ok(())
 }
 
 #[tauri::command]
@@ -3533,7 +4039,10 @@ fn export_redacted_diagnostics(
     .map_err(DesktopError::from)
 }
 
-fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
+fn register_job_impl(
+    state: &AppState,
+    allow_watch: bool,
+) -> Result<(u64, Arc<JobControl>), String> {
     let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
     let control = Arc::new(JobControl::default());
     let mut jobs = state
@@ -3544,6 +4053,11 @@ fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
         .live
         .lock()
         .map_err(|_| "ライブ状態を取得できません")?;
+    if !allow_watch && state.watch_active.load(Ordering::Acquire) {
+        return Err(
+            "watch-folder automation is running; stop it before starting another job".into(),
+        );
+    }
     if live.is_some() {
         return Err("ライブ処理を停止してから開始してください".into());
     }
@@ -3552,6 +4066,14 @@ fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
     }
     jobs.insert(job_id, Arc::clone(&control));
     Ok((job_id, control))
+}
+
+fn register_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
+    register_job_impl(state, false)
+}
+
+fn register_watch_job(state: &AppState) -> Result<(u64, Arc<JobControl>), String> {
+    register_job_impl(state, true)
 }
 
 fn unregister_job(state: &AppState, job_id: u64) {
@@ -3574,6 +4096,11 @@ fn register_live_session(state: &AppState, running: Arc<AtomicBool>) -> Result<(
         .live
         .lock()
         .map_err(|_| "ライブ状態を更新できません")?;
+    if state.watch_active.load(Ordering::Acquire) {
+        return Err(
+            "watch-folder automation is running; stop it before starting live processing".into(),
+        );
+    }
     if !jobs.is_empty() {
         return Err("ファイル処理の完了後に開始してください".into());
     }
@@ -4633,8 +5160,8 @@ fn validate_batch_receipt_output_paths(
 fn validate_request(request: &ProcessRequest) -> Result<(), String> {
     validate_process_options(&request.options)?;
     validate_receipt_pair(request.receipt.as_deref(), request.receipt_key.as_deref())?;
-    if request.expected_input_fingerprint.is_some() != request.expected_recipe.is_some() {
-        return Err("採用したプレビューの入力fingerprintとrecipeは両方指定してください".into());
+    if request.expected_recipe.is_some() && request.expected_input_fingerprint.is_none() {
+        return Err("期待recipeには期待入力fingerprintも指定してください".into());
     }
     let format = OutputFormat::from_path(Path::new(&request.output))?;
     if request.stream {
@@ -4675,21 +5202,15 @@ fn validate_expected_preview_binding(
     input_fingerprint: batch_resume::FileFingerprint,
     recipe: Digest,
 ) -> Result<(), String> {
-    let (expected_input, expected_recipe) =
-        match (request.expected_input_fingerprint, request.expected_recipe) {
-            (None, None) => return Ok(()),
-            (Some(input), Some(recipe)) => (input, recipe),
-            _ => {
-                return Err(
-                    "採用したプレビューの入力fingerprintとrecipeは両方指定してください".into(),
-                );
-            }
-        };
-    if input_fingerprint != expected_input {
-        return Err("採用したプレビューと最終処理の入力fingerprintが一致しません".into());
+    if let Some(expected_input) = request.expected_input_fingerprint {
+        if input_fingerprint != expected_input {
+            return Err("期待した入力fingerprintと最終処理の入力fingerprintが一致しません".into());
+        }
     }
-    if recipe != expected_recipe {
-        return Err("採用したプレビューと最終処理のrecipeが一致しません".into());
+    if let Some(expected_recipe) = request.expected_recipe {
+        if recipe != expected_recipe {
+            return Err("採用したプレビューと最終処理のrecipeが一致しません".into());
+        }
     }
     Ok(())
 }
@@ -7126,6 +7647,9 @@ pub fn run() {
             create_receipt_policy,
             verify_execution_receipt,
             start_process,
+            start_watch_folder,
+            poll_watch_folder,
+            stop_watch_folder,
             start_batch,
             list_recoveries,
             retry_recovery,
@@ -7504,6 +8028,95 @@ mod tests {
         }
     }
 
+    fn watch_request() -> WatchRequest {
+        WatchRequest {
+            input_dir: "input".into(),
+            output_dir: "output".into(),
+            receipt_key: "receipt-secret.json".into(),
+            output_format: "flac".into(),
+            recursive: true,
+            settle_millis: 2_500,
+            retry_initial_millis: 750,
+            retry_max_millis: 30_000,
+            max_attempts: 7,
+            max_files: 123,
+            quarantine_dir: Some("output/quarantine".into()),
+            receipt_dir: Some("output/receipts".into()),
+            state_path: Some("output/state.json".into()),
+            options: classical_options(false),
+        }
+    }
+
+    #[test]
+    fn desktop_watch_request_maps_to_the_bounded_library_engine() {
+        let request = watch_request();
+
+        validate_watch_request(&request).unwrap();
+        let config = desktop_watch_config(&request, Digest::from_bytes([0x57; 32]));
+
+        assert_eq!(config.input_root(), Path::new("input"));
+        assert_eq!(config.output_root(), Path::new("output"));
+        assert_eq!(config.quarantine_root(), Path::new("output/quarantine"));
+        assert_eq!(config.receipt_root(), Path::new("output/receipts"));
+        assert_eq!(config.state_path(), Path::new("output/state.json"));
+        assert_eq!(config.output_extension(), "flac");
+        assert!(config.recursive());
+        assert_eq!(config.settle_duration(), Duration::from_millis(2_500));
+        assert_eq!(config.max_attempts(), 7);
+    }
+
+    #[test]
+    fn desktop_watch_identity_tracks_audio_settings_but_not_resource_caps() {
+        let request = watch_request();
+        let public_key = ReceiptPublicKey {
+            schema: "denoize-receipt-public-key-v1".into(),
+            schema_version: 1,
+            algorithm: "Ed25519".into(),
+            key_id: "11".repeat(32),
+            public_key_base64: "unused-by-template-hash".into(),
+        };
+        let base = desktop_watch_processor_template(&request);
+        let base_identity = desktop_watch_processor_identity(&base, &public_key).unwrap();
+
+        let mut resource_change = base.clone();
+        resource_change.options.max_process_memory_mb = Some(512);
+        resource_change.options.max_temporary_mb = Some(1_024);
+        resource_change.options.max_gpu_jobs = 4;
+        assert_eq!(
+            desktop_watch_processor_identity(&resource_change, &public_key).unwrap(),
+            base_identity
+        );
+
+        let mut audio_change = base;
+        audio_change.options.strength += 0.1;
+        assert_ne!(
+            desktop_watch_processor_identity(&audio_change, &public_key).unwrap(),
+            base_identity
+        );
+    }
+
+    #[test]
+    fn desktop_watch_rejects_overwrite_and_invalid_output_before_scanning() {
+        let mut request = watch_request();
+        request.options.force = true;
+        assert!(validate_watch_request(&request)
+            .unwrap_err()
+            .contains("never replaces"));
+
+        request.options.force = false;
+        request.output_format = "missing".into();
+        assert!(validate_watch_request(&request)
+            .unwrap_err()
+            .contains("unsupported output format"));
+    }
+
+    #[test]
+    fn desktop_watch_cancellation_does_not_consume_an_attempt() {
+        let error = classify_desktop_watch_error("cancelled".into());
+        assert!(error.is_retryable());
+        assert!(!error.counts_attempt());
+    }
+
     fn gui_config() -> GuiConfig {
         GuiConfig {
             backend: "auto".into(),
@@ -7747,9 +8360,12 @@ deterministic = false
         directory.assert_no_staged_outputs();
 
         mismatched.expected_recipe = None;
+        validate_request(&mismatched).unwrap();
+        mismatched.expected_input_fingerprint = None;
+        mismatched.expected_recipe = Some(item.recipe);
         assert!(validate_request(&mismatched)
             .unwrap_err()
-            .contains("両方指定"));
+            .contains("期待入力fingerprint"));
     }
 
     #[test]
@@ -8648,6 +9264,27 @@ deterministic = false
             .unwrap_err()
             .contains("ファイル処理の完了後"));
         state.jobs.lock().unwrap().remove(&job_id);
+    }
+
+    #[test]
+    fn watch_registration_excludes_manual_file_and_live_operations() {
+        let state = AppState::default();
+        state.watch_active.store(true, Ordering::Release);
+
+        assert!(register_job(&state)
+            .err()
+            .expect("watch automation must exclude a manual file job")
+            .contains("watch-folder automation is running"));
+        assert!(
+            register_live_session(&state, Arc::new(AtomicBool::new(true)))
+                .unwrap_err()
+                .contains("watch-folder automation is running")
+        );
+
+        let (job_id, _) = register_watch_job(&state).unwrap();
+        unregister_job(&state, job_id);
+        state.watch_active.store(false, Ordering::Release);
+        assert!(register_job(&state).is_ok());
     }
 
     #[test]

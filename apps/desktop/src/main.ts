@@ -197,6 +197,10 @@ type ReceiptVerificationReport = {
   schema: string; schema_version: number; receipt_schema: string; key_id: string;
   plan_digest: string; kind: "file" | "batch" | "stream"; verified_items: Array<Record<string, unknown>>;
 };
+type WatchCycleReport = {
+  observed: number; pending: number; attempted: number; succeeded: number;
+  retrying: number; quarantined: number; superseded: number; scan_errors: number;
+};
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
 let appInfo: AppInfo;
@@ -225,6 +229,16 @@ let currentRecommendation: RecommendationReport | null = null;
 let recommendationRunning = false;
 let processPlan: ExecutionPlan | null = null;
 let batchPlan: ExecutionPlan | null = null;
+let watchRunning = false;
+let watchStopping = false;
+let watchActiveJob: number | null = null;
+let watchInput = "";
+let watchOutput = "";
+let watchReceiptKey = "";
+let watchQuarantine = "";
+let watchReceiptDir = "";
+let watchStatePath = "";
+let watchTotals = { attempted: 0, succeeded: 0, retrying: 0, quarantined: 0, superseded: 0, scan_errors: 0 };
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <a class="skip-link" href="#main-content">メイン内容へ移動</a>
@@ -234,6 +248,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <nav role="tablist" aria-label="主ナビゲーション" aria-orientation="vertical">
         <button id="nav-process" class="nav-item active" role="tab" data-page="process" aria-controls="page-process" aria-current="page" aria-selected="true" tabindex="0"><span aria-hidden="true">◈</span>ノイズ除去</button>
         <button id="nav-batch" class="nav-item" role="tab" data-page="batch" aria-controls="page-batch" aria-selected="false" tabindex="-1"><span aria-hidden="true">▦</span>バッチ</button>
+        <button id="nav-watch" class="nav-item" role="tab" data-page="watch" aria-controls="page-watch" aria-selected="false" tabindex="-1"><span aria-hidden="true">◌</span>監視フォルダ</button>
         <button id="nav-live" class="nav-item" role="tab" data-page="live" aria-controls="page-live" aria-selected="false" tabindex="-1"><span aria-hidden="true">◉</span>リアルタイム</button>
         <button id="nav-compare" class="nav-item" role="tab" data-page="compare" aria-controls="page-compare" aria-selected="false" tabindex="-1"><span aria-hidden="true">◒</span>品質比較</button>
         <button id="nav-models" class="nav-item" role="tab" data-page="models" aria-controls="page-models" aria-selected="false" tabindex="-1"><span aria-hidden="true">⬡</span>モデル</button>
@@ -363,6 +378,39 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         </div>
       </section>
 
+      <section class="page" id="page-watch" role="tabpanel" aria-labelledby="nav-watch" aria-hidden="true">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">WATCH</span><h2>入出力と署名</h2></div><span class="hint">LOCAL · DURABLE</span></div>
+              <p class="section-copy">安定した通常ファイルだけを順次処理し、出力と署名付き実行証明をペアで公開します。</p>
+              <div class="file-row"><div><label>入力フォルダ</label><div id="watch-input-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-watch-input">選択</button></div>
+              <div class="file-row"><div><label>出力フォルダ</label><div id="watch-output-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-watch-output">選択</button></div>
+              <div class="file-row"><div><label>署名鍵</label><div id="watch-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-watch-key">選択</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">POLICY</span><h2>安定待ちと再試行</h2></div></div>
+              <div class="form-grid three"><label>形式<select id="watch-format"><option>wav</option><option>flac</option><option>opus</option><option>mp3</option><option>m4a</option><option>aac</option></select></label><label>安定待ち ms<input id="watch-settle" type="number" value="2000" min="0" max="2592000000"></label><label>最大試行回数<input id="watch-attempts" type="number" value="5" min="1" max="100"></label></div>
+              <div class="form-grid three"><label>初回再試行 ms<input id="watch-retry-initial" type="number" value="1000" min="1" max="2592000000"></label><label>最大再試行 ms<input id="watch-retry-max" type="number" value="60000" min="1" max="2592000000"></label><label>最大走査エントリ<input id="watch-max-files" type="number" value="10000" min="1" max="100000"></label></div>
+              <label class="toggle inline"><input id="watch-recursive" type="checkbox" checked><span></span><div><b>サブフォルダ</b><small>相対構造を維持</small></div></label>
+              <details class="watch-advanced"><summary>制御パス（任意）</summary>
+                <div class="file-row"><div><label>Quarantine</label><div id="watch-quarantine-display" class="path empty">出力フォルダ内の既定値</div></div><button class="secondary" id="choose-watch-quarantine">選択</button></div>
+                <div class="file-row"><div><label>実行証明フォルダ</label><div id="watch-receipt-dir-display" class="path empty">出力フォルダ内の既定値</div></div><button class="secondary" id="choose-watch-receipt-dir">選択</button></div>
+                <div class="file-row"><div><label>耐久状態 JSON</label><div id="watch-state-display" class="path empty">出力フォルダ内の既定値</div></div><button class="secondary" id="choose-watch-state">選択</button></div>
+              </details>
+            </article>
+          </div>
+          <article class="card action-card watch-monitor">
+            <div class="ready-icon">◌</div><h3 id="watch-status" role="status" aria-live="polite">停止中</h3>
+            <p id="watch-summary">開始すると安定待ち、再試行、quarantineの件数を表示します。</p>
+            <div class="metric-pair"><div><span>監視 / 待機</span><b id="watch-observed">0 / 0</b></div><div><span>成功 / 再試行</span><b id="watch-outcomes">0 / 0</b></div></div>
+            <p class="field-hint watch-safety">入力と出力は分離し、署名鍵は両方の外に保存してください。片方だけの出力 / receipt は自動置換しません。</p>
+            <button class="primary wide" id="start-watch">監視を開始 <span>→</span></button>
+            <button class="danger wide hidden" id="stop-watch">停止</button>
+          </article>
+        </div>
+      </section>
+
       <section class="page" id="page-live" role="tabpanel" aria-labelledby="nav-live" aria-hidden="true">
         <div class="grid two-col">
           <article class="card">
@@ -481,7 +529,7 @@ const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
 const PREVIEW_CHOICE_KEY = "denoize.desktop.preview-choice.v1";
-const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "runtime-package", "runtime-package-key", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk", "live-latency", "live-drift", "live-reconnect"];
+const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "runtime-package", "runtime-package-key", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "watch-format", "watch-settle", "watch-attempts", "watch-retry-initial", "watch-retry-max", "watch-max-files", "watch-recursive", "live-input", "live-output", "live-backend", "live-chunk", "live-latency", "live-drift", "live-reconnect"];
 type SavedValues = Record<string, string | number | boolean>;
 type PersistedPreviewChoice = {
   schema: "denoize-desktop-preview-choice-v1"; schemaVersion: 1;
@@ -859,7 +907,7 @@ async function loadRecoveries() {
 async function retryRecoveryJob(recovery: RecoverySummary) {
   await jobProgressReady;
   if (recovery.kind !== "file" && recovery.kind !== "batch") throw new Error(tr("破損した復旧レコードは再実行できません", "A corrupt recovery record cannot be retried"));
-  if (activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) {
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) {
     throw new Error(tr("別の処理が実行中です", "Another job is running"));
   }
   const kind = recovery.kind;
@@ -1251,7 +1299,7 @@ const previewProgressReady = listen<PreviewProgress>("preview-progress", ({ payl
 
 async function startPreviewRender() {
   await previewProgressReady;
-  if (activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) {
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) {
     throw new Error(tr("別の処理が実行中です", "Another job is running"));
   }
   if (previewCandidates.length >= 3) throw new Error(tr("比較候補は3件までです。候補をクリアしてから追加してください", "You can compare up to three candidates. Clear the candidates before adding another."));
@@ -1585,7 +1633,7 @@ $("#analyze-recommendation").addEventListener("click", async () => {
   const button = $<HTMLButtonElement>("#analyze-recommendation");
   const input = $<HTMLInputElement>("#input-path").value;
   if (!input) return showToast(tr("先に入力ファイルを選択してください", "Select an input file first"), true);
-  if (activeJob !== null || pendingJobKind !== null || recommendationRunning) return showToast(tr("実行中の処理が終わってから推奨を解析してください", "Wait for the running job to finish before analyzing recommendations"), true);
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || recommendationRunning) return showToast(tr("実行中の処理が終わってから推奨を解析してください", "Wait for the running job to finish before analyzing recommendations"), true);
   clearRecommendation();
   recommendationRunning = true;
   button.disabled = true;
@@ -1737,6 +1785,136 @@ function renderBatch() {
   $("#batch-files").classList.toggle("empty-panel", !batchInputDir && !batchInputs.length);
 }
 $("#batch-recursive").addEventListener("change", renderBatch);
+
+function setWatchPath(display: string, path: string) {
+  const view = $(display);
+  view.textContent = path || tr("選択されていません", "Not selected");
+  view.classList.toggle("empty", !path);
+}
+
+function watchRequest() {
+  if (!watchInput || !watchOutput || !watchReceiptKey) {
+    throw new Error(tr(
+      "監視の入力、出力、署名鍵を選択してください",
+      "Select the watch input, output, and signing key",
+    ));
+  }
+  return {
+    inputDir: watchInput,
+    outputDir: watchOutput,
+    receiptKey: watchReceiptKey,
+    outputFormat: $<HTMLSelectElement>("#watch-format").value,
+    recursive: $<HTMLInputElement>("#watch-recursive").checked,
+    settleMillis: Number($<HTMLInputElement>("#watch-settle").value),
+    retryInitialMillis: Number($<HTMLInputElement>("#watch-retry-initial").value),
+    retryMaxMillis: Number($<HTMLInputElement>("#watch-retry-max").value),
+    maxAttempts: Number($<HTMLInputElement>("#watch-attempts").value),
+    maxFiles: Number($<HTMLInputElement>("#watch-max-files").value),
+    quarantineDir: watchQuarantine || null,
+    receiptDir: watchReceiptDir || null,
+    statePath: watchStatePath || null,
+    options: { ...options(), force: false },
+  };
+}
+
+function renderWatchReport(report: WatchCycleReport) {
+  watchTotals.attempted += report.attempted;
+  watchTotals.succeeded += report.succeeded;
+  watchTotals.retrying += report.retrying;
+  watchTotals.quarantined += report.quarantined;
+  watchTotals.superseded += report.superseded;
+  watchTotals.scan_errors += report.scan_errors;
+  $("#watch-observed").textContent = `${report.observed} / ${report.pending}`;
+  $("#watch-outcomes").textContent = `${watchTotals.succeeded} / ${watchTotals.retrying}`;
+  $("#watch-summary").textContent = tr(
+    `試行 ${watchTotals.attempted} · quarantine ${watchTotals.quarantined} · 変更検出 ${watchTotals.superseded} · scan error ${watchTotals.scan_errors}`,
+    `Attempted ${watchTotals.attempted} · quarantined ${watchTotals.quarantined} · superseded ${watchTotals.superseded} · scan errors ${watchTotals.scan_errors}`,
+  );
+}
+
+function setWatchRunning(running: boolean) {
+  $("#page-watch").setAttribute("aria-busy", String(running));
+  $("#start-watch").classList.toggle("hidden", running);
+  $("#stop-watch").classList.toggle("hidden", !running);
+  $("#watch-status").textContent = running ? tr("監視中", "Watching") : tr("停止中", "Stopped");
+}
+
+const watchDelay = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+
+async function startWatchAutomation() {
+  await jobProgressReady;
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning
+    || !$("#stop-live").classList.contains("hidden")) {
+    throw new Error(tr("別の処理が実行中です", "Another job is running"));
+  }
+  const request = watchRequest();
+  watchRunning = true;
+  watchStopping = false;
+  watchActiveJob = null;
+  watchTotals = { attempted: 0, succeeded: 0, retrying: 0, quarantined: 0, superseded: 0, scan_errors: 0 };
+  setWatchRunning(true);
+  let backendStarted = false;
+  try {
+    const initialReport = await invoke<WatchCycleReport>("start_watch_folder", { request });
+    backendStarted = true;
+    renderWatchReport(initialReport);
+    while (watchRunning && !watchStopping) {
+      await watchDelay(500);
+      if (!watchRunning || watchStopping) break;
+      renderWatchReport(await invoke<WatchCycleReport>("poll_watch_folder"));
+    }
+  } catch (error) {
+    if (watchRunning && !watchStopping) {
+      $("#watch-status").textContent = tr("監視を停止しました", "Watch stopped");
+      showToast(errorText(error), true);
+    }
+  } finally {
+    watchRunning = false;
+    watchStopping = false;
+    watchActiveJob = null;
+    if (backendStarted) {
+      try { await invoke("stop_watch_folder"); }
+      catch (error) { showToast(errorText(error), true); }
+    }
+    setWatchRunning(false);
+  }
+}
+
+async function stopWatchAutomation() {
+  watchStopping = true;
+  $("#watch-status").textContent = tr("停止中です", "Stopping");
+  if (watchActiveJob !== null) {
+    try { await invoke("cancel_job", { jobId: watchActiveJob }); }
+    catch { /* The isolated watch item may already be terminal. */ }
+  }
+}
+
+$("#choose-watch-input").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") { watchInput = path; setWatchPath("#watch-input-display", path); }
+});
+$("#choose-watch-output").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") { watchOutput = path; setWatchPath("#watch-output-display", path); }
+});
+$("#choose-watch-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Receipt secret key", extensions: ["json"] }] });
+  if (typeof path === "string") { watchReceiptKey = path; setWatchPath("#watch-key-display", path); }
+});
+$("#choose-watch-quarantine").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") { watchQuarantine = path; setWatchPath("#watch-quarantine-display", path); }
+});
+$("#choose-watch-receipt-dir").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") { watchReceiptDir = path; setWatchPath("#watch-receipt-dir-display", path); }
+});
+$("#choose-watch-state").addEventListener("click", async () => {
+  const path = await save({ defaultPath: ".denoize-watch-state.json", filters: [{ name: "Watch state", extensions: ["json"] }] });
+  if (path) { watchStatePath = path; setWatchPath("#watch-state-display", path); }
+});
+$("#start-watch").addEventListener("click", () => void startWatchAutomation().catch((error) => showToast(errorText(error), true)));
+$("#stop-watch").addEventListener("click", () => void stopWatchAutomation());
 
 $("#generate-receipt-keypair").addEventListener("click", async () => {
   try {
@@ -2273,6 +2451,7 @@ async function loadLiveDevices() {
 $("#refresh-live-devices").addEventListener("click", () => void loadLiveDevices());
 $("#start-live").addEventListener("click", async () => {
   try {
+    if (watchRunning) throw new Error(tr("監視フォルダを停止してから開始してください", "Stop watch-folder automation before starting live processing"));
     if (recommendationRunning) throw new Error(tr("推奨分析の完了後に開始してください", "Wait for recommendation analysis to finish before starting"));
     const backend = $<HTMLSelectElement>("#live-backend").value;
     await invoke("start_live", { request: {
@@ -2314,6 +2493,18 @@ listen<LiveEvent>("live-status", ({ payload }) => {
 const jobProgressReady = listen<JobProgress>("job-progress", ({ payload }) => {
   if (payload.jobId === activeJob) {
     handleJobProgress(payload);
+  } else if (watchRunning && payload.kind === "file" && pendingJobKind === null) {
+    watchActiveJob = payload.status === "running" ? payload.jobId : null;
+    if (watchStopping && payload.status === "running") {
+      void invoke("cancel_job", { jobId: payload.jobId }).catch(() => {
+        /* The isolated watch item may already be terminal. */
+      });
+    }
+    $("#watch-status").textContent = payload.status === "running"
+      ? tr(payload.message)
+      : payload.status === "completed"
+        ? tr("監視を継続中", "Watching")
+        : payload.error ? errorText(payload.error) : tr(payload.message);
   } else if (payload.kind === pendingJobKind) {
     pendingJobEvents.push(payload);
   }
@@ -2328,7 +2519,7 @@ function handleJobProgress(payload: JobProgress) {
 }
 async function beginJob(kind: "file" | "batch", command: "start_process" | "start_batch", request: unknown) {
   await jobProgressReady;
-  if (activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) throw new Error(tr("別の処理が実行中です", "Another job is running"));
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) throw new Error(tr("別の処理が実行中です", "Another job is running"));
   pendingJobKind = kind;
   pendingJobEvents = [];
   setJobUi(true, kind);
