@@ -28,9 +28,9 @@ use denoize::{
     ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
     PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
     RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
-    ResourceRequest, SgmseProfile, SignedExecutionReceipt, SpooledAudioStreamWriter,
-    StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool, StreamSpoolLimits,
-    StreamingBackendSession, WindowType,
+    ResourceRequest, RuntimeModelPackage, SgmseProfile, SignedExecutionReceipt,
+    SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
+    StreamSpoolLimits, StreamingBackendSession, WindowType,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -441,6 +441,8 @@ OPTIONS:
         --true-peak <DBTP>    finite ceiling in -20..0 dBTP with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
+        --model-package <PATH> signed custom-model runtime package (.dmp; -b onnx)
+        --model-package-key <PATH> trusted Minisign public key for --model-package
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --accelerator <NAME>  cpu|auto|gpu|metal|cuda (default: cpu)
@@ -537,6 +539,8 @@ struct Overrides {
     true_peak_dbtp: Option<f64>,
     onnx_model: Option<String>,
     onnx_sample_rate: Option<u32>,
+    model_package: Option<String>,
+    model_package_key: Option<String>,
     channel_mode: Option<ChannelMode>,
     sgmse_profile: Option<SgmseProfile>,
     accelerator: Option<AcceleratorPreference>,
@@ -596,6 +600,8 @@ struct FileConfig {
     true_peak_dbtp: Option<f64>,
     onnx_model: Option<String>,
     onnx_rate: Option<u32>,
+    model_package: Option<String>,
+    model_package_key: Option<String>,
     channels: Option<String>,
     sgmse_profile: Option<String>,
     accelerator: Option<String>,
@@ -731,6 +737,8 @@ fn parse_config(source: &str, path: &str) -> Result<Overrides, String> {
     };
     ov.onnx_model = config.onnx_model;
     ov.onnx_sample_rate = config.onnx_rate;
+    ov.model_package = config.model_package;
+    ov.model_package_key = config.model_package_key;
     ov.deterministic = config.deterministic;
     ov.seed = config.seed;
     if ov.seed.is_some() {
@@ -794,6 +802,8 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
         Some(path) => load_config(path)?,
         None => Overrides::default(),
     };
+    let mut cli_raw_model = false;
+    let mut cli_runtime_package = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -891,8 +901,38 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             }
             "--loudness" => ov.loudness_lufs = Some(parse_value(args, &mut i, a)?),
             "--true-peak" => ov.true_peak_dbtp = Some(parse_value(args, &mut i, a)?),
-            "--onnx-model" => ov.onnx_model = Some(parse_value(args, &mut i, a)?),
-            "--onnx-rate" => ov.onnx_sample_rate = Some(parse_value(args, &mut i, a)?),
+            "--onnx-model" => {
+                if !cli_runtime_package {
+                    ov.model_package = None;
+                    ov.model_package_key = None;
+                }
+                cli_raw_model = true;
+                ov.onnx_model = Some(parse_value(args, &mut i, a)?);
+            }
+            "--onnx-rate" => {
+                if !cli_runtime_package {
+                    ov.model_package = None;
+                    ov.model_package_key = None;
+                }
+                cli_raw_model = true;
+                ov.onnx_sample_rate = Some(parse_value(args, &mut i, a)?);
+            }
+            "--model-package" => {
+                if !cli_raw_model {
+                    ov.onnx_model = None;
+                    ov.onnx_sample_rate = None;
+                }
+                cli_runtime_package = true;
+                ov.model_package = Some(parse_value(args, &mut i, a)?);
+            }
+            "--model-package-key" => {
+                if !cli_raw_model {
+                    ov.onnx_model = None;
+                    ov.onnx_sample_rate = None;
+                }
+                cli_runtime_package = true;
+                ov.model_package_key = Some(parse_value(args, &mut i, a)?);
+            }
             "--channels" => {
                 let mode: String = parse_value(args, &mut i, a)?;
                 ov.channel_mode = Some(ChannelMode::parse(&mode).ok_or_else(|| {
@@ -1092,6 +1132,11 @@ fn worker_resource_request(
 ) -> Result<ResourceRequest, String> {
     let memory_bytes = estimate_audio_working_set_bytes(audio)
         .checked_add(metadata_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(denoize::estimate_backend_worker_memory_bytes(
+                &processing.backend_options,
+            ))
+        })
         .ok_or_else(|| "worker memory reservation overflow".to_string())?
         .max(decode_reservation_bytes.unwrap_or(0));
     let mut request = ResourceRequest::worker(
@@ -1103,9 +1148,12 @@ fn worker_resource_request(
         },
     );
     if processing.accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
-        request = request
-            .with_gpu_jobs(1)
-            .with_gpu_memory_bytes(denoize::estimate_gpu_worker_bytes(audio)?);
+        let gpu_bytes = denoize::estimate_gpu_worker_bytes(audio)?
+            .checked_add(denoize::estimate_backend_worker_gpu_memory_bytes(
+                &processing.backend_options,
+            ))
+            .ok_or_else(|| "worker GPU memory reservation overflow".to_string())?;
+        request = request.with_gpu_jobs(1).with_gpu_memory_bytes(gpu_bytes);
     }
     Ok(request)
 }
@@ -1326,9 +1374,10 @@ fn preflight_batch_items(
         let processing_options = build_processing_options(
             ov,
             audio.sample_rate,
-            pre_resolved_backend_options
-                .cloned()
-                .unwrap_or_else(|| build_backend_options(ov)),
+            match pre_resolved_backend_options {
+                Some(options) => options.clone(),
+                None => build_backend_options(ov)?,
+            },
         );
         let resolved_processing = if read_only {
             service::resolve_processing_options_read_only(&audio, processing_options)
@@ -1347,16 +1396,20 @@ fn preflight_batch_items(
                 let model = match model_fingerprints.get(&key) {
                     Some(model) => model.clone(),
                     None => {
-                        let model = if ov.resume {
-                            batch_resume::fingerprint_resumable_model(config)
+                        let model = (if ov.resume {
+                            batch_resume::resumable_consumed_model(&resolved_processing)
                         } else {
-                            batch_resume::fingerprint_consumed_model(config)
-                        }
+                            batch_resume::consumed_model(&resolved_processing)
+                        })
                         .map_err(|error| {
                             format!(
                                 "fingerprint selected backend model {}: {error}",
                                 config.path.display()
                             )
+                        })?
+                        .ok_or_else(|| {
+                            "resolved backend lost its consumed model during fingerprinting"
+                                .to_string()
                         })?;
                         model_fingerprints.insert(key, model.clone());
                         model
@@ -1579,18 +1632,30 @@ fn effective_batch_jobs(ov: &Overrides) -> usize {
     })
 }
 
-fn build_backend_options(ov: &Overrides) -> BackendOptions {
-    BackendOptions {
+fn build_backend_options(ov: &Overrides) -> Result<BackendOptions, String> {
+    let runtime_package = match (&ov.model_package, &ov.model_package_key) {
+        (Some(package), Some(key)) => Some(RuntimeModelPackage::open(package, key)?),
+        (None, None) => None,
+        _ => {
+            return Err("--model-package and --model-package-key must be supplied together".into())
+        }
+    };
+    let mut options = BackendOptions {
         onnx: ov.onnx_model.as_ref().map(|path| OnnxModelConfig {
             path: path.into(),
             sample_rate: ov.onnx_sample_rate.unwrap_or(16_000),
         }),
+        runtime_package: None,
         channel_mode: ov.channel_mode.unwrap_or_default(),
         sgmse_profile: ov.sgmse_profile.unwrap_or_default(),
         deterministic: ov.deterministic,
         accelerator: ov.accelerator.unwrap_or_default(),
         seed: ov.seed,
+    };
+    if let Some(package) = runtime_package {
+        options = options.with_runtime_model_package(package);
     }
+    Ok(options)
 }
 
 fn processing_backend_choice(ov: &Overrides) -> BackendChoice {
@@ -1598,6 +1663,18 @@ fn processing_backend_choice(ov: &Overrides) -> BackendChoice {
         BackendChoice::Auto
     } else {
         BackendChoice::Explicit(ov.backend.unwrap_or(Backend::Classical))
+    }
+}
+
+fn generic_onnx_backend_selected(ov: &Overrides) -> bool {
+    #[cfg(feature = "onnx")]
+    {
+        !ov.auto_backend && ov.backend == Some(Backend::Onnx)
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = ov;
+        false
     }
 }
 
@@ -1621,8 +1698,8 @@ fn resolve_explicit_backend_options(ov: &Overrides) -> Result<Option<BackendOpti
         return Ok(None);
     }
     let backend = ov.backend.unwrap_or(Backend::Classical);
-    let options = service::resolve_backend_options(backend, build_backend_options(ov))?;
-    denoize::select_accelerator(backend, options.accelerator, options.deterministic)?;
+    let options = service::resolve_backend_options(backend, build_backend_options(ov)?)?;
+    denoize::select_accelerator_for_options(backend, &options)?;
     Ok(Some(options))
 }
 
@@ -1633,8 +1710,8 @@ fn resolve_explicit_backend_options_read_only(
         return Ok(None);
     }
     let backend = ov.backend.unwrap_or(Backend::Classical);
-    let options = service::resolve_backend_options_read_only(backend, build_backend_options(ov))?;
-    denoize::select_accelerator(backend, options.accelerator, options.deterministic)?;
+    let options = service::resolve_backend_options_read_only(backend, build_backend_options(ov)?)?;
+    denoize::select_accelerator_for_options(backend, &options)?;
     Ok(Some(options))
 }
 
@@ -1669,10 +1746,27 @@ fn validate_effective_options(ov: &Overrides, sample_rate: u32) -> Result<(), St
             ));
         }
     }
-    if !ov.auto_backend {
-        build_backend_options(ov)
-            .validate_config(ov.backend.unwrap_or(Backend::Classical))
-            .map_err(|error| error.to_string())?;
+    match (&ov.model_package, &ov.model_package_key) {
+        (Some(_), Some(_)) => {
+            if ov.onnx_model.is_some() || ov.onnx_sample_rate.is_some() {
+                return Err(
+                    "--model-package cannot be combined with --onnx-model or --onnx-rate".into(),
+                );
+            }
+            if !generic_onnx_backend_selected(ov) {
+                return Err("--model-package requires --backend onnx".into());
+            }
+        }
+        (None, None) => {
+            if !ov.auto_backend {
+                build_backend_options(ov)?
+                    .validate_config(ov.backend.unwrap_or(Backend::Classical))
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        _ => {
+            return Err("--model-package and --model-package-key must be supplied together".into())
+        }
     }
     if let Some(stream_frames) = ov.stream_frames {
         if !(MIN_STREAM_BLOCK_FRAMES..=MAX_STREAM_BLOCK_FRAMES).contains(&stream_frames) {
@@ -2791,12 +2885,8 @@ fn build_stream_execution_plan(
         ));
     }
     let backend_options =
-        service::resolve_backend_options_read_only(backend, build_backend_options(options))?;
-    let accelerator = denoize::select_accelerator(
-        backend,
-        backend_options.accelerator,
-        backend_options.deterministic,
-    )?;
+        service::resolve_backend_options_read_only(backend, build_backend_options(options)?)?;
+    let accelerator = denoize::select_accelerator_for_options(backend, &backend_options)?;
     let initial_publication = if options.resume {
         None
     } else if standard_output {
@@ -2892,6 +2982,11 @@ fn build_stream_execution_plan(
         .and_then(|bytes| bytes.checked_add(loudness_stream_state))
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_stream_state))
+        .and_then(|bytes| {
+            bytes.checked_add(denoize::estimate_backend_worker_memory_bytes(
+                &backend_options,
+            ))
+        })
         .and_then(|bytes| {
             bytes.checked_add(if options.resume {
                 batch_resume::STREAM_CHECKPOINT_SCRATCH_BYTES
@@ -3007,11 +3102,17 @@ fn build_stream_execution_plan(
     };
     let mut worker_request = ResourceRequest::worker(worker_memory_bytes, admitted_temporary_bytes);
     if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
-        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
-            stream_working_set
-                .checked_mul(2)
-                .ok_or_else(|| "stream plan GPU reservation overflow".to_string())?,
-        );
+        let gpu_memory = stream_working_set
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(denoize::estimate_backend_worker_gpu_memory_bytes(
+                    &backend_options,
+                ))
+            })
+            .ok_or_else(|| "stream plan GPU reservation overflow".to_string())?;
+        worker_request = worker_request
+            .with_gpu_jobs(1)
+            .with_gpu_memory_bytes(gpu_memory);
     }
     let admission_request = worker_request.checked_add(backend_resource_request(
         backend,
@@ -3032,10 +3133,10 @@ fn build_stream_execution_plan(
         true_peak_dbtp: options.true_peak_dbtp.unwrap_or(-1.0),
     };
     resolved.validate_config()?;
-    let model = match batch_resume::consumed_model_config(&resolved)? {
-        Some(config) if options.resume => Some(batch_resume::fingerprint_resumable_model(config)?),
-        Some(config) => Some(batch_resume::fingerprint_consumed_model(config)?),
-        None => None,
+    let model = if options.resume {
+        batch_resume::resumable_consumed_model(&resolved)?
+    } else {
+        batch_resume::consumed_model(&resolved)?
     };
     let _processor = StreamingBackendSession::new_with_accelerator(
         backend,
@@ -3235,11 +3336,9 @@ fn build_single_execution_plan(
     };
     let resolved = service::resolve_processing_options_read_only(
         &audio,
-        build_processing_options(options, audio.sample_rate, build_backend_options(options)),
+        build_processing_options(options, audio.sample_rate, build_backend_options(options)?),
     )?;
-    let model = batch_resume::consumed_model_config(&resolved)?
-        .map(batch_resume::fingerprint_consumed_model)
-        .transpose()?;
+    let model = batch_resume::consumed_model(&resolved)?;
     let session_request = backend_session_request(&resolved)?;
     let worker_request = worker_resource_request(
         input_session.len(),
@@ -3684,7 +3783,7 @@ fn run_live(args: &[String]) -> Result<(), String> {
     };
     let sample_rate = 48_000;
     let denoiser = build_config(&ov, sample_rate);
-    let backend_options = build_backend_options(&ov);
+    let backend_options = build_backend_options(&ov)?;
     let governor = resource_governor(&ov, 1)?;
     let resilience = denoize::live::LiveResilienceConfig::new()
         .with_target_latency_ms(ov.live_latency_ms.unwrap_or(0))
@@ -4540,7 +4639,10 @@ fn process_one_to_staged_output(
             build_processing_options(
                 &ov,
                 audio.sample_rate,
-                resolved_backend_options.unwrap_or_else(|| build_backend_options(&ov)),
+                match resolved_backend_options {
+                    Some(options) => options,
+                    None => build_backend_options(&ov)?,
+                },
             ),
         )?,
     };
@@ -5088,12 +5190,8 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             service::backend_name(backend)
         ));
     }
-    let backend_options = service::resolve_backend_options(backend, build_backend_options(&ov))?;
-    let accelerator = denoize::select_accelerator(
-        backend,
-        backend_options.accelerator,
-        backend_options.deterministic,
-    )?;
+    let backend_options = service::resolve_backend_options(backend, build_backend_options(&ov)?)?;
+    let accelerator = denoize::select_accelerator_for_options(backend, &backend_options)?;
     if !ov.resume && !standard_output {
         ensure_output_available(output_path, ov.force)?;
     }
@@ -5190,6 +5288,11 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
+        .and_then(|bytes| {
+            bytes.checked_add(denoize::estimate_backend_worker_memory_bytes(
+                &backend_options,
+            ))
+        })
         .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
     let verification_block_frames = block_frames.min(STREAM_BLOCK_FRAMES);
     let initial_verification_working_set = denoize::estimate_stream_output_verification_bytes(
@@ -5226,6 +5329,11 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
         .and_then(|bytes| bytes.checked_add(stream_info.decoder_additional_bytes))
         .and_then(|bytes| bytes.checked_add(encoder_stream_state))
         .and_then(|bytes| bytes.checked_add(checkpoint_scratch))
+        .and_then(|bytes| {
+            bytes.checked_add(denoize::estimate_backend_worker_memory_bytes(
+                &backend_options,
+            ))
+        })
         .ok_or_else(|| "streaming working-set estimate overflow".to_string())?;
     let verification_working_set = denoize::estimate_stream_output_verification_bytes(
         output_format,
@@ -5276,10 +5384,10 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
             true_peak_dbtp: ov.true_peak_dbtp.unwrap_or(-1.0),
         };
         resolved.validate_config()?;
-        let model = match batch_resume::consumed_model_config(&resolved)? {
-            Some(config) if ov.resume => Some(batch_resume::fingerprint_resumable_model(config)?),
-            Some(config) => Some(batch_resume::fingerprint_consumed_model(config)?),
-            None => None,
+        let model = if ov.resume {
+            batch_resume::resumable_consumed_model(&resolved)?
+        } else {
+            batch_resume::consumed_model(&resolved)?
         };
         let base_recipe = batch_resume::recipe_digest(
             &resolved,
@@ -5364,11 +5472,17 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
     let mut worker_request =
         ResourceRequest::worker(worker_memory_bytes, admitted_worker_temporary_bytes);
     if accelerator.effective() != denoize::AcceleratorRuntime::Cpu {
-        worker_request = worker_request.with_gpu_jobs(1).with_gpu_memory_bytes(
-            stream_working_set
-                .checked_mul(2)
-                .ok_or_else(|| "streaming GPU reservation overflow".to_string())?,
-        );
+        let gpu_memory = stream_working_set
+            .checked_mul(2)
+            .and_then(|bytes| {
+                bytes.checked_add(denoize::estimate_backend_worker_gpu_memory_bytes(
+                    &backend_options,
+                ))
+            })
+            .ok_or_else(|| "streaming GPU reservation overflow".to_string())?;
+        worker_request = worker_request
+            .with_gpu_jobs(1)
+            .with_gpu_memory_bytes(gpu_memory);
     }
     let request = worker_request.checked_add(backend_resource_request(
         backend,
@@ -8986,6 +9100,19 @@ deterministic = true
         assert!(options.deterministic);
     }
 
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn parses_runtime_model_package_config_paths() {
+        let options = parse_config(
+            "backend = \"onnx\"\nmodel_package = \"voice.dmp\"\nmodel_package_key = \"vendor.pub\"\n",
+            "runtime-package.toml",
+        )
+        .unwrap();
+        assert_eq!(options.backend, Some(Backend::Onnx));
+        assert_eq!(options.model_package.as_deref(), Some("voice.dmp"));
+        assert_eq!(options.model_package_key.as_deref(), Some("vendor.pub"));
+    }
+
     #[test]
     fn explicit_false_config_overrides_mode_boolean_defaults() {
         let options = parse_config(
@@ -9125,6 +9252,54 @@ vad = false
         assert!(!options.auto_backend);
         assert_eq!(options.strength, Some(0.75));
         assert_eq!(options.dpss_nw, Some(4.0));
+    }
+
+    #[test]
+    fn command_line_model_selection_replaces_the_other_config_representation() {
+        if Backend::parse("onnx").is_none() {
+            return;
+        }
+        let raw = write_test_config(
+            "backend = \"onnx\"\nonnx_model = \"raw.onnx\"\nonnx_rate = 48000\n",
+            "raw-model-config",
+        );
+        let (_, _, package) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--config".into(),
+            raw.to_string_lossy().into_owned(),
+            "--model-package".into(),
+            "voice.dmp".into(),
+            "--model-package-key".into(),
+            "vendor.pub".into(),
+        ])
+        .unwrap();
+        std::fs::remove_file(raw).unwrap();
+        assert!(package.onnx_model.is_none());
+        assert!(package.onnx_sample_rate.is_none());
+        assert_eq!(package.model_package.as_deref(), Some("voice.dmp"));
+        assert_eq!(package.model_package_key.as_deref(), Some("vendor.pub"));
+
+        let packaged = write_test_config(
+            "backend = \"onnx\"\nmodel_package = \"old.dmp\"\nmodel_package_key = \"old.pub\"\n",
+            "package-model-config",
+        );
+        let (_, _, raw) = parse_args(&[
+            "input.wav".into(),
+            "output.wav".into(),
+            "--config".into(),
+            packaged.to_string_lossy().into_owned(),
+            "--onnx-model".into(),
+            "replacement.onnx".into(),
+            "--onnx-rate".into(),
+            "16000".into(),
+        ])
+        .unwrap();
+        std::fs::remove_file(packaged).unwrap();
+        assert_eq!(raw.onnx_model.as_deref(), Some("replacement.onnx"));
+        assert_eq!(raw.onnx_sample_rate, Some(16_000));
+        assert!(raw.model_package.is_none());
+        assert!(raw.model_package_key.is_none());
     }
 
     #[test]
@@ -9613,6 +9788,9 @@ USAGE:
     denoize models bundle inspect <BUNDLE.dmb>
     denoize models bundle import <BUNDLE.dmb>
     denoize models bundle create <OUTPUT.dmb> <CATALOG.json> <CATALOG.json.sig> <TRUST-ROOT.json> <COMPONENTS-DIR>
+    denoize models package inspect <PACKAGE.dmp> <MINISIGN.pub>
+    denoize models package license <PACKAGE.dmp> <MINISIGN.pub>
+    denoize models package create <OUTPUT.dmp> <MANIFEST.json> <MANIFEST.json.sig> <MINISIGN.pub> <MODEL.onnx> <LICENSE>
     denoize models snapshot [--json] [--pretty]
     denoize models cache-dir
 
@@ -10305,6 +10483,98 @@ fn run_model_bundle(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn print_runtime_model_package_info(info: &denoize::RuntimeModelPackageInfo) {
+    println!("format-version: {}", info.format_version);
+    println!("package-sha256: {}", info.package_sha256);
+    println!("size-bytes: {}", info.size_bytes);
+    println!("package-id: {}", info.package_id);
+    println!("package-revision: {}", info.package_revision);
+    println!("signing-key: {}", info.signing_key_id);
+    println!("sample-rate-hz: {}", info.sample_rate_hz);
+    println!("tensor-layout: {}", info.tensor_layout);
+    println!(
+        "fixed-input-samples: {}",
+        info.fixed_input_samples
+            .map_or_else(|| "dynamic".into(), |value| value.to_string())
+    );
+    println!(
+        "fixed-output-samples: {}",
+        info.fixed_output_samples
+            .map_or_else(|| "dynamic".into(), |value| value.to_string())
+    );
+    println!(
+        "model: {}\t{}\t{}",
+        info.model_filename, info.model_size_bytes, info.model_sha256
+    );
+    println!(
+        "license: {}\t{}\t{}\t{}",
+        info.license_spdx, info.license_filename, info.license_size_bytes, info.license_sha256
+    );
+    println!("accelerators: {}", info.accelerators.join(","));
+    println!(
+        "max-session-memory-bytes: {}",
+        info.max_session_memory_bytes
+    );
+    println!("max-worker-memory-bytes: {}", info.max_worker_memory_bytes);
+    println!(
+        "max-gpu-session-memory-bytes: {}",
+        info.max_gpu_session_memory_bytes
+    );
+    println!(
+        "max-gpu-worker-memory-bytes: {}",
+        info.max_gpu_worker_memory_bytes
+    );
+}
+
+fn run_runtime_model_package(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .skip(1)
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        || args.get(1).map(String::as_str) == Some("help")
+    {
+        print!("{}", models_usage());
+        return Ok(());
+    }
+    match args.get(1).map(String::as_str).unwrap_or("inspect") {
+        "inspect" => {
+            if args.len() != 4 {
+                return Err("models package inspect requires PACKAGE.dmp and MINISIGN.pub".into());
+            }
+            let info = denoize::inspect_runtime_model_package(&args[2], &args[3])?;
+            print_runtime_model_package_info(&info);
+        }
+        "license" => {
+            if args.len() != 4 {
+                return Err("models package license requires PACKAGE.dmp and MINISIGN.pub".into());
+            }
+            let package = RuntimeModelPackage::open(&args[2], &args[3])?;
+            let mut license = package.open_license_reader()?;
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            std::io::copy(&mut license, &mut output)
+                .map_err(|error| format!("write runtime model license to stdout: {error}"))?;
+            std::io::Write::flush(&mut output)
+                .map_err(|error| format!("flush runtime model license to stdout: {error}"))?;
+        }
+        "create" => {
+            if args.len() != 8 {
+                return Err("models package create requires OUTPUT.dmp MANIFEST.json MANIFEST.json.sig MINISIGN.pub MODEL.onnx LICENSE".into());
+            }
+            let info = denoize::build_runtime_model_package(
+                &args[2], &args[3], &args[4], &args[5], &args[6], &args[7],
+            )?;
+            print_runtime_model_package_info(&info);
+            eprintln!(
+                "created authenticated runtime model package {} ({})",
+                args[2], info.package_sha256
+            );
+        }
+        value => return Err(format!("unknown models package command: {value}")),
+    }
+    Ok(())
+}
+
 fn run_model_catalog_trust(args: &[String]) -> Result<(), String> {
     let command = args.get(2).map(String::as_str).unwrap_or("status");
     match command {
@@ -10502,6 +10772,9 @@ fn run_models(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("bundle") {
         return run_model_bundle(args);
+    }
+    if args.first().map(String::as_str) == Some("package") {
+        return run_runtime_model_package(args);
     }
     let help_requested = args
         .iter()
@@ -11080,6 +11353,9 @@ mod model_command_tests {
             "bundle inspect",
             "bundle import",
             "bundle create",
+            "package inspect",
+            "package license",
+            "package create",
             "models snapshot",
         ] {
             assert!(models_usage().contains(flag));
@@ -11141,6 +11417,27 @@ mod model_command_tests {
             ),
         ];
         for (args, expected) in cases {
+            let error = run_models(&args).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn runtime_model_package_commands_reject_bad_arity_before_file_io() {
+        for (args, expected) in [
+            (
+                vec!["package".into(), "inspect".into()],
+                "models package inspect requires PACKAGE.dmp and MINISIGN.pub",
+            ),
+            (
+                vec!["package".into(), "create".into(), "output.dmp".into()],
+                "models package create requires OUTPUT.dmp",
+            ),
+            (
+                vec!["package".into(), "license".into()],
+                "models package license requires PACKAGE.dmp and MINISIGN.pub",
+            ),
+        ] {
             let error = run_models(&args).unwrap_err();
             assert!(error.contains(expected), "{error}");
         }
@@ -11255,6 +11552,67 @@ mod tests {
         assert_eq!(options.backend, Some(Backend::Onnx));
         assert_eq!(options.onnx_model.as_deref(), Some("model.onnx"));
         assert_eq!(options.onnx_sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn parses_signed_runtime_model_package_options_without_opening_paths() {
+        let args = vec![
+            "input.wav".into(),
+            "output.wav".into(),
+            "--backend".into(),
+            "onnx".into(),
+            "--model-package".into(),
+            "missing.dmp".into(),
+            "--model-package-key".into(),
+            "missing.pub".into(),
+        ];
+        let (_, _, options) = parse_args(&args).unwrap();
+        assert_eq!(options.backend, Some(Backend::Onnx));
+        assert_eq!(options.model_package.as_deref(), Some("missing.dmp"));
+        assert_eq!(options.model_package_key.as_deref(), Some("missing.pub"));
+    }
+
+    #[test]
+    fn runtime_model_package_options_reject_partial_conflicting_or_auto_selection() {
+        for (args, expected) in [
+            (
+                vec![
+                    "--backend".into(),
+                    "onnx".into(),
+                    "--model-package".into(),
+                    "missing.dmp".into(),
+                ],
+                "must be supplied together",
+            ),
+            (
+                vec![
+                    "--backend".into(),
+                    "onnx".into(),
+                    "--model-package".into(),
+                    "missing.dmp".into(),
+                    "--model-package-key".into(),
+                    "missing.pub".into(),
+                    "--onnx-model".into(),
+                    "raw.onnx".into(),
+                ],
+                "cannot be combined",
+            ),
+            (
+                vec![
+                    "--backend".into(),
+                    "auto".into(),
+                    "--model-package".into(),
+                    "missing.dmp".into(),
+                    "--model-package-key".into(),
+                    "missing.pub".into(),
+                ],
+                "requires --backend onnx",
+            ),
+        ] {
+            let error = parse_args(&args).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("missing INPUT"), "{error}");
+        }
     }
 
     #[test]

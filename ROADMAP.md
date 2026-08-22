@@ -250,7 +250,7 @@ unreviewable release.
 | 14 | Desktop isolation, recovery, bounded non-destructive preview and A/B comparison, redacted diagnostics, accessibility, and localization | Released in v0.62.0 |
 | 15 | Streaming feature parity: bounded VAD, two-pass loudness, metadata, and additional AI backends | Released in v0.63.0 |
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Released in v0.64.0 |
-| 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Planned |
+| 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Implemented (pending release) |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Planned |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Planned |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
@@ -302,6 +302,25 @@ hash-identified Classical Hi-Fi workload locally and preserves the raw timing
 evidence; backend headroom is an explainable cost-class estimate, not a claim
 that every neural candidate was executed or that wall-clock time is
 deterministic.
+
+Stage 17 introduces a separate trust boundary for operator-selected custom
+models. A `.dmp` is a signed, length-delimited container rather than an archive:
+its manifest binds exact model and license bytes, SPDX identity, runtime and
+sample rate, waveform frontend, float32 tensor geometry, permitted
+accelerators, and conservative session/worker CPU/GPU reservations. The trust
+key is supplied separately, so replacing a key embedded beside hostile bytes
+cannot make those bytes authoritative. CLI, desktop, and library entry points
+all use the same verifier and show the authenticated identity before execution.
+
+The generic ONNX adapter reads the verified model range without extraction or
+path-based sidecars, compares the signed tensor declaration with the parsed
+graph, and re-hashes the package when preparing a session. Resource admission
+uses signed values only after enforcing denoize's own conservative model and
+GPU baselines. Resume and execution evidence bind the whole package
+fingerprint; changing model, notice, signature, or contract changes that
+identity. V1 intentionally supports the reproducible mono waveform frontend
+only—spectral, recurrent multi-input, or code-bearing packages require a future
+versioned adapter rather than weakening the v1 contract.
 
 Every stage from Stage 12 onward also carries an upgrade-compatibility gate:
 persisted presets, journals, checkpoints, receipts, and automation schemas must

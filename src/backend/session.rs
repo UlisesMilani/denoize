@@ -3,7 +3,7 @@
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::audio::sanitize_sample;
 use crate::denoiser::DenoiserConfig;
-use crate::{select_accelerator, AcceleratorSelection};
+use crate::{select_accelerator_for_options, AcceleratorSelection};
 
 /// A prepared denoising backend that can process multiple independent files.
 ///
@@ -54,7 +54,7 @@ enum PreparedBackend {
 impl BackendSession {
     /// Validate the resolved options and load the selected backend once.
     pub fn prepare(backend: Backend, options: BackendOptions) -> Result<Self, String> {
-        let accelerator = select_accelerator(backend, options.accelerator, options.deterministic)?;
+        let accelerator = select_accelerator_for_options(backend, &options)?;
         Self::prepare_with_accelerator(backend, options, accelerator)
     }
 
@@ -84,10 +84,26 @@ impl BackendSession {
             }
             #[cfg(feature = "onnx")]
             Backend::Onnx => {
-                PreparedBackend::Onnx(super::onnx::OnnxWaveformModel::load_with_accelerator(
-                    required_model(&options, "ONNX")?.clone(),
-                    accelerator.effective(),
-                )?)
+                let model = match options.runtime_package.as_ref() {
+                    Some(package) => {
+                        if !package.supports_accelerator(accelerator.effective()) {
+                            return Err(format!(
+                                "runtime model package {} does not permit the {} accelerator",
+                                package.package_path().display(),
+                                accelerator.effective().name()
+                            ));
+                        }
+                        super::onnx::OnnxWaveformModel::load_runtime_package_with_accelerator(
+                            package,
+                            accelerator.effective(),
+                        )?
+                    }
+                    None => super::onnx::OnnxWaveformModel::load_with_accelerator(
+                        required_model(&options, "ONNX")?.clone(),
+                        accelerator.effective(),
+                    )?,
+                };
+                PreparedBackend::Onnx(model)
             }
             #[cfg(feature = "mpsenet")]
             Backend::MpSenet => PreparedBackend::MpSenet(super::mpsenet::MpSenetModel::load(

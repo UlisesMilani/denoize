@@ -1,0 +1,43 @@
+{
+  "schema": "denoize-runtime-model-package-v1",
+  "format_version": 1,
+  "package_id": "denoize.test.signed-fixture",
+  "package_revision": "1",
+  "signing_key_id": "7AF4B3E5A8E37758",
+  "runtime": {
+    "kind": "onnx-waveform-v1",
+    "sample_rate_hz": 16000
+  },
+  "frontend": {
+    "channel_mapping": "independent-mono-v1",
+    "normalization": "pcm-f32-minus-one-to-one-v1",
+    "resampling": "bandlimited-waveform-v1",
+    "duration": "preserve-input-frames-v1"
+  },
+  "tensor": {
+    "element_type": "float32",
+    "layout": "batch-samples",
+    "fixed_input_samples": null,
+    "fixed_output_samples": null
+  },
+  "resources": {
+    "max_session_memory_bytes": 68000000,
+    "max_worker_memory_bytes": 8388608,
+    "max_gpu_session_memory_bytes": 0,
+    "max_gpu_worker_memory_bytes": 0,
+    "accelerators": ["cpu"]
+  },
+  "model": {
+    "filename": "model.onnx",
+    "size_bytes": 143,
+    "sha256": "7a64648372a6300cc962152b4abfb30ccf61850db296a3e3ac6e8e6cebc0667c"
+  },
+  "license": {
+    "spdx": "MIT",
+    "file": {
+      "filename": "LICENSE.txt",
+      "size_bytes": 15,
+      "sha256": "20e2adbd8bf0da66031f56b084da95de2088fb6fa41a05a8174c6f6a027563fc"
+    }
+  }
+}

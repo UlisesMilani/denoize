@@ -59,6 +59,7 @@ expected_assets=(
   "denoize-execution-receipt-v1.schema.json"
   "denoize-execution-receipt-v2.schema.json"
   "denoize-hardware-v1.schema.json"
+  "denoize-presentation-region-v1.schema.json"
   "denoize-receipt-public-key-v1.schema.json"
   "denoize-receipt-secret-key-v1.schema.json"
   "denoize-receipt-trust-policy-v1.schema.json"
@@ -66,6 +67,7 @@ expected_assets=(
   "denoize-receipt-verification-v2.schema.json"
   "denoize-recommendation-v1.schema.json"
   "denoize-release-evidence-v1.schema.json"
+  "denoize-runtime-model-package-v1.schema.json"
   "denoize-models-${tag}.dmb"
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
@@ -150,6 +152,7 @@ gh release download "$tag" \
   --pattern 'denoize-execution-receipt-v1.schema.json' \
   --pattern 'denoize-execution-receipt-v2.schema.json' \
   --pattern 'denoize-hardware-v1.schema.json' \
+  --pattern 'denoize-presentation-region-v1.schema.json' \
   --pattern 'denoize-receipt-public-key-v1.schema.json' \
   --pattern 'denoize-receipt-secret-key-v1.schema.json' \
   --pattern 'denoize-receipt-trust-policy-v1.schema.json' \
@@ -157,6 +160,7 @@ gh release download "$tag" \
   --pattern 'denoize-receipt-verification-v2.schema.json' \
   --pattern 'denoize-recommendation-v1.schema.json' \
   --pattern 'denoize-release-evidence-v1.schema.json' \
+  --pattern 'denoize-runtime-model-package-v1.schema.json' \
   --pattern 'latest.json' \
   --dir "$tmp_dir" \
   --clobber >/dev/null
@@ -191,13 +195,15 @@ for schema in \
   denoize-execution-receipt-v1.schema.json \
   denoize-execution-receipt-v2.schema.json \
   denoize-hardware-v1.schema.json \
+  denoize-presentation-region-v1.schema.json \
   denoize-receipt-public-key-v1.schema.json \
   denoize-receipt-secret-key-v1.schema.json \
   denoize-receipt-trust-policy-v1.schema.json \
   denoize-receipt-verification-v1.schema.json \
   denoize-receipt-verification-v2.schema.json \
   denoize-recommendation-v1.schema.json \
-  denoize-release-evidence-v1.schema.json; do
+  denoize-release-evidence-v1.schema.json \
+  denoize-runtime-model-package-v1.schema.json; do
   if ! cmp -s "schemas/$schema" "$tmp_dir/$schema"; then
     echo "release JSON Schema differs from tagged schemas/$schema" >&2
     exit 1

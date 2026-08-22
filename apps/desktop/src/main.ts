@@ -28,7 +28,8 @@ type GuiConfig = {
   backend: string; preset: string; mode: string; strength: number; adaptive_noise: boolean; vad: boolean;
   channels: string; downmix: string; loudness_lufs?: number | null; true_peak_dbtp?: number | null;
   preserve_metadata: boolean; force: boolean; mp3_bitrate_kbps: number; m4a_bitrate_kbps: number;
-  aac_encoder: string; onnx_model?: string | null; onnx_rate: number; sgmse_profile: string;
+  aac_encoder: string; onnx_model?: string | null; onnx_rate?: number | null;
+  model_package?: string | null; model_package_key?: string | null; sgmse_profile: string;
   accelerator: string; deterministic: boolean;
   max_process_memory_mb?: number | null; max_temporary_mb?: number | null;
   max_gpu_memory_mb?: number | null; max_gpu_jobs: number;
@@ -141,6 +142,15 @@ type OfflineBundleRow = {
 };
 type OfflineBundleImportRow = {
   bundle: OfflineBundleRow; installed: string[]; alreadyPresent: string[];
+};
+type RuntimeModelPackageInfo = {
+  formatVersion: number; packageSha256: string; sizeBytes: number; packageId: string;
+  packageRevision: string; signingKeyId: string; sampleRateHz: number; tensorLayout: string;
+  fixedInputSamples: number | null; fixedOutputSamples: number | null; modelFilename: string;
+  modelSha256: string; modelSizeBytes: number; licenseFilename: string; licenseSha256: string;
+  licenseSizeBytes: number; licenseSpdx: string; maxSessionMemoryBytes: number;
+  maxWorkerMemoryBytes: number; maxGpuSessionMemoryBytes: number;
+  maxGpuWorkerMemoryBytes: number; accelerators: string[];
 };
 type FileFingerprint = { len: number; digest: string };
 type PresentationRegion = {
@@ -276,6 +286,12 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               </div>
               <div id="backend-settings" class="backend-settings hidden">
                 <div class="file-row"><div><label>ONNXモデル</label><div id="model-path-display" class="path empty">モデルファイルを選択</div></div><button class="secondary" id="choose-model">選択</button></div>
+                <div id="runtime-package-settings" class="runtime-package-settings hidden">
+                  <div class="file-row"><div><label>署名付きモデルパッケージ</label><div id="runtime-package-display" class="path empty">.dmp を選択（任意）</div></div><button class="secondary" id="choose-runtime-package">選択</button></div>
+                  <div class="file-row"><div><label>信頼済み Minisign 公開鍵</label><div id="runtime-package-key-display" class="path empty">公開鍵を選択</div></div><button class="secondary" id="choose-runtime-package-key">選択</button></div>
+                  <input type="hidden" id="runtime-package"><input type="hidden" id="runtime-package-key">
+                  <p id="runtime-package-status" class="field-hint" role="status" aria-live="polite">パッケージは署名、モデル、ライセンス、frontend/tensor/resource 契約を実行前に検証します。</p>
+                </div>
                 <div class="form-grid two"><label>モデルレート Hz<input id="onnx-rate" type="number" value="16000" min="1" max="768000"></label><label id="sgmse-profile-field" class="hidden">SGMSE品質<select id="sgmse-profile"><option value="fast">Fast</option><option value="balanced" selected>Balanced</option><option value="quality">Quality</option></select></label></div>
                 <input type="hidden" id="model-path"><p id="backend-hint" class="field-hint"></p>
               </div>
@@ -465,7 +481,7 @@ const SETTINGS_KEY = "denoize.desktop.settings.v1";
 const PRESETS_KEY = "denoize.desktop.presets.v1";
 const RECENT_KEY = "denoize.desktop.recent.v1";
 const PREVIEW_CHOICE_KEY = "denoize.desktop.preview-choice.v1";
-const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk", "live-latency", "live-drift", "live-reconnect"];
+const settingIds = ["mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata", "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate", "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "runtime-package", "runtime-package-key", "onnx-rate", "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory", "resource-gpu-jobs", "file-stream", "file-stream-resume", "file-stream-frames", "batch-format", "batch-jobs", "batch-recursive", "batch-resume", "batch-force", "live-input", "live-output", "live-backend", "live-chunk", "live-latency", "live-drift", "live-reconnect"];
 type SavedValues = Record<string, string | number | boolean>;
 type PersistedPreviewChoice = {
   schema: "denoize-desktop-preview-choice-v1"; schemaVersion: 1;
@@ -512,6 +528,10 @@ function commitSettings(updates: SettingUpdate[]) {
   $("#loudness-fields").classList.toggle("enabled", $<HTMLInputElement>("#loudness-enabled").checked);
   const modelPath = $<HTMLInputElement>("#model-path").value || null;
   setPath("#model-path", "#model-path-display", modelPath);
+  setPath("#runtime-package", "#runtime-package-display", $<HTMLInputElement>("#runtime-package").value || null);
+  setPath("#runtime-package-key", "#runtime-package-key-display", $<HTMLInputElement>("#runtime-package-key").value || null);
+  resetRuntimePackageStatus();
+  void verifySelectedRuntimePackage();
   updateBackendSettings(); updateFileStreamSettings(); renderBatch();
 }
 
@@ -651,7 +671,26 @@ void getCurrentWebview().onDragDropEvent(async ({ payload }) => {
 
 function onnxModelForBackend(backend: string, modelPath = $<HTMLInputElement>("#model-path").value) {
   const descriptor = appInfo.backends.find(({ name }) => name === backend);
-  return descriptor?.externalModel === true ? modelPath || null : null;
+  const packagePath = $<HTMLInputElement>("#runtime-package").value;
+  return descriptor?.externalModel === true && !(backend === "onnx" && packagePath) ? modelPath || null : null;
+}
+
+function runtimePackageForBackend(backend: string) {
+  if (backend !== "onnx") return { modelPackage: null, modelPackageKey: null };
+  return {
+    modelPackage: $<HTMLInputElement>("#runtime-package").value || null,
+    modelPackageKey: $<HTMLInputElement>("#runtime-package-key").value || null,
+  };
+}
+
+let runtimePackageVerificationGeneration = 0;
+
+function resetRuntimePackageStatus() {
+  runtimePackageVerificationGeneration += 1;
+  $("#runtime-package-status").textContent = tr(
+    "パッケージは署名、モデル、ライセンス、frontend/tensor/resource 契約を実行前に検証します。",
+    "The package signature, model, license, and frontend/tensor/resource contracts are verified before use.",
+  );
 }
 
 function onnxRateForBackend(backend: string, modelRate = Number($<HTMLInputElement>("#onnx-rate").value)) {
@@ -665,6 +704,7 @@ function optionalPositiveNumber(selector: string): number | null {
 }
 
 function options(backend = $<HTMLSelectElement>("#backend").value) {
+  const runtimePackage = runtimePackageForBackend(backend);
   return {
     backend,
     preset: $<HTMLSelectElement>("#preset").value,
@@ -683,6 +723,8 @@ function options(backend = $<HTMLSelectElement>("#backend").value) {
     aacEncoder: $<HTMLSelectElement>("#aac-encoder").value,
     onnxModel: onnxModelForBackend(backend),
     onnxSampleRate: onnxRateForBackend(backend),
+    modelPackage: runtimePackage.modelPackage,
+    modelPackageKey: runtimePackage.modelPackageKey,
     sgmseProfile: $<HTMLSelectElement>("#sgmse-profile").value,
     accelerator: $<HTMLSelectElement>("#accelerator").value,
     deterministic: $<HTMLInputElement>("#deterministic").checked,
@@ -878,7 +920,10 @@ function updateBackendSettings(useDescriptorRate = false) {
   }
   if (accelerator.selectedOptions[0]?.disabled) accelerator.value = "auto";
   $("#backend-settings").classList.toggle("hidden", !needsModel);
+  $("#runtime-package-settings").classList.toggle("hidden", selected !== "onnx");
   $("#sgmse-profile-field").classList.toggle("hidden", selected !== "sgmse");
+  $<HTMLInputElement>("#onnx-rate").disabled = selected === "onnx"
+    && Boolean($<HTMLInputElement>("#runtime-package").value);
   if (useDescriptorRate && descriptor?.sampleRate) $<HTMLInputElement>("#onnx-rate").value = String(descriptor.sampleRate);
   $("#backend-hint").textContent = selected === "sgmse"
     ? tr("変換済みSGMSE+モデルと推論ステップ数を指定します。", "Select a converted SGMSE+ model and inference step profile.")
@@ -887,12 +932,61 @@ function updateBackendSettings(useDescriptorRate = false) {
 
 $("#backend").addEventListener("change", () => {
   setPath("#model-path", "#model-path-display", null);
+  setPath("#runtime-package", "#runtime-package-display", null);
+  setPath("#runtime-package-key", "#runtime-package-key-display", null);
+  resetRuntimePackageStatus();
   updateBackendSettings(true);
 });
 $("#choose-model").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: [{ name: "ONNX model", extensions: ["onnx"] }] });
   if (typeof path !== "string") return;
+  setPath("#runtime-package", "#runtime-package-display", null);
+  setPath("#runtime-package-key", "#runtime-package-key-display", null);
+  resetRuntimePackageStatus();
   setPath("#model-path", "#model-path-display", path);
+  updateBackendSettings();
+});
+
+async function verifySelectedRuntimePackage() {
+  const path = $<HTMLInputElement>("#runtime-package").value;
+  const publicKey = $<HTMLInputElement>("#runtime-package-key").value;
+  if (!path || !publicKey) return;
+  const generation = runtimePackageVerificationGeneration;
+  const selectionIsCurrent = () => generation === runtimePackageVerificationGeneration
+    && $<HTMLInputElement>("#runtime-package").value === path
+    && $<HTMLInputElement>("#runtime-package-key").value === publicKey;
+  try {
+    const info = await invoke<RuntimeModelPackageInfo>("inspect_runtime_model_package", { path, publicKey });
+    if (!selectionIsCurrent()) return;
+    $<HTMLInputElement>("#onnx-rate").value = String(info.sampleRateHz);
+    $("#runtime-package-status").textContent = tr(
+      `認証済みパッケージ · ${info.packageId}@${info.packageRevision} · ${info.licenseSpdx} · ${info.tensorLayout} · ${info.accelerators.join(",")} · SHA-256 ${info.packageSha256.slice(0, 16)}… · graph契約は処理開始時に確認`,
+      `Authenticated package · ${info.packageId}@${info.packageRevision} · ${info.licenseSpdx} · ${info.tensorLayout} · ${info.accelerators.join(",")} · SHA-256 ${info.packageSha256.slice(0, 16)}… · graph contract checked when processing`,
+    );
+    showToast(tr("署名付きモデルパッケージを認証しました", "Signed model package authenticated"));
+  } catch (error) {
+    if (!selectionIsCurrent()) return;
+    $("#runtime-package-status").textContent = errorText(error);
+    showToast(errorText(error), true);
+  }
+}
+
+$("#choose-runtime-package").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize runtime model package", extensions: ["dmp"] }] });
+  if (typeof path !== "string") return;
+  setPath("#model-path", "#model-path-display", null);
+  setPath("#runtime-package", "#runtime-package-display", path);
+  resetRuntimePackageStatus();
+  updateBackendSettings();
+  await verifySelectedRuntimePackage();
+});
+
+$("#choose-runtime-package-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Minisign public key", extensions: ["pub"] }] });
+  if (typeof path !== "string") return;
+  setPath("#runtime-package-key", "#runtime-package-key-display", path);
+  resetRuntimePackageStatus();
+  await verifySelectedRuntimePackage();
 });
 
 document.addEventListener("change", (event) => {
@@ -919,6 +1013,8 @@ function exportConfig() {
   const values = captureSettings();
   const loudnessEnabled = values["loudness-enabled"] === true;
   const backend = String(values.backend);
+  const packageForBackend = backend === "onnx" ? String(values["runtime-package"] || "") || null : null;
+  const packageKeyForBackend = backend === "onnx" ? String(values["runtime-package-key"] || "") || null : null;
   return {
     backend, preset: values.preset, mode: values.mode, strength: Number(values.strength),
     adaptive_noise: values.adaptive, vad: values.vad, channels: values.channels, downmix: values.downmix,
@@ -926,7 +1022,9 @@ function exportConfig() {
     true_peak_dbtp: loudnessEnabled ? Number(values["true-peak"]) : null, preserve_metadata: values.metadata, force: values.force,
     mp3_bitrate_kbps: Number(values["mp3-bitrate"]), m4a_bitrate_kbps: Number(values["aac-bitrate"]),
     aac_encoder: values["aac-encoder"], onnx_model: onnxModelForBackend(backend, String(values["model-path"])),
-    onnx_rate: onnxRateForBackend(backend, Number(values["onnx-rate"])), sgmse_profile: values["sgmse-profile"],
+    model_package: packageForBackend, model_package_key: packageKeyForBackend,
+    onnx_rate: packageForBackend ? null : onnxRateForBackend(backend, Number(values["onnx-rate"])),
+    sgmse_profile: values["sgmse-profile"],
     accelerator: values.accelerator, deterministic: values.deterministic,
     max_process_memory_mb: values["resource-process-memory"] === "" ? null : Number(values["resource-process-memory"]),
     max_temporary_mb: values["resource-temp-space"] === "" ? null : Number(values["resource-temp-space"]),
@@ -949,7 +1047,8 @@ $("#import-config").addEventListener("click", async () => {
       "true-peak": config.true_peak_dbtp ?? -1, metadata: config.preserve_metadata, force: config.force,
       "mp3-bitrate": config.mp3_bitrate_kbps, "aac-bitrate": config.m4a_bitrate_kbps,
       "aac-encoder": config.aac_encoder, "model-path": config.onnx_model ?? "",
-      "onnx-rate": config.onnx_rate, "sgmse-profile": config.sgmse_profile,
+      "runtime-package": config.model_package ?? "", "runtime-package-key": config.model_package_key ?? "",
+      "onnx-rate": config.onnx_rate ?? 16000, "sgmse-profile": config.sgmse_profile,
       accelerator: config.accelerator, deterministic: config.deterministic,
       "resource-process-memory": config.max_process_memory_mb ?? "",
       "resource-temp-space": config.max_temporary_mb ?? "",
@@ -1215,6 +1314,7 @@ function settingsForPreviewOptions(value: PreviewResult["options"]): SavedValues
     "aac-encoder": value.aacEncoder, "loudness-enabled": value.loudnessLufs != null,
     loudness: value.loudnessLufs ?? $<HTMLInputElement>("#loudness").value,
     "true-peak": value.truePeakDbtp, "model-path": value.onnxModel ?? "",
+    "runtime-package": value.modelPackage ?? "", "runtime-package-key": value.modelPackageKey ?? "",
     "onnx-rate": value.onnxSampleRate, "sgmse-profile": value.sgmseProfile,
     "resource-process-memory": value.maxProcessMemoryMb ?? "",
     "resource-temp-space": value.maxTemporaryMb ?? "",
@@ -1226,7 +1326,7 @@ function settingsForPreviewOptions(value: PreviewResult["options"]): SavedValues
 const previewChoiceSettingIds = new Set([
   "mode", "preset", "backend", "accelerator", "strength", "adaptive", "vad", "metadata",
   "force", "deterministic", "channels", "downmix", "mp3-bitrate", "aac-bitrate",
-  "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "onnx-rate",
+  "aac-encoder", "loudness-enabled", "loudness", "true-peak", "model-path", "runtime-package", "runtime-package-key", "onnx-rate",
   "sgmse-profile", "resource-process-memory", "resource-temp-space", "resource-gpu-memory",
   "resource-gpu-jobs",
 ]);

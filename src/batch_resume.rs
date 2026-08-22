@@ -184,6 +184,29 @@ pub fn consumed_model(
         .transpose()
 }
 
+/// Fingerprint the model consumed by a resumable resolved configuration.
+///
+/// A verified runtime package is already a single authenticated container, so
+/// its complete package bytes are the resumable identity. Raw ONNX paths retain
+/// the stricter external-data rejection because one file fingerprint cannot
+/// bind tensor sidecars.
+pub fn resumable_consumed_model(
+    resolved: &ResolvedProcessingOptions,
+) -> Result<Option<ConsumedModel>, String> {
+    let Some(config) = consumed_model_config(resolved)? else {
+        return Ok(None);
+    };
+    if let Some(package) = resolved.backend_options.runtime_package.as_ref() {
+        if config != &package.model_config() {
+            return Err(
+                "resolved runtime model package does not match its consumed model identity".into(),
+            );
+        }
+        return fingerprint_consumed_model(config).map(Some);
+    }
+    fingerprint_resumable_model(config).map(Some)
+}
+
 /// Fingerprint the main model file consumed by one resolved configuration.
 pub fn fingerprint_consumed_model(
     config: &crate::OnnxModelConfig,
@@ -3283,6 +3306,46 @@ mod tests {
             assert!(error.contains("external sidecar"), "{error}");
             assert!(error.contains("self-contained"), "{error}");
         }
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn resumable_runtime_package_binds_the_container_without_scanning_it_as_onnx() {
+        let directory = tempdir().unwrap();
+        let package_path = directory.path().join("model.dmp");
+        write(
+            &package_path,
+            b"authenticated package framing, not protobuf",
+        );
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(
+            package_path.clone(),
+            crate::RuntimeModelTensorContract {
+                element_type: "float32".into(),
+                layout: "batch-samples".into(),
+                fixed_input_samples: None,
+                fixed_output_samples: None,
+            },
+        );
+        let resolved = ResolvedProcessingOptions {
+            backend: Backend::Onnx,
+            denoiser: DenoiserConfig::default(48_000).sanitized(),
+            backend_options: BackendOptions::default().with_runtime_model_package(package),
+            accelerator: crate::AcceleratorSelection::default(),
+            loudness_lufs: None,
+            true_peak_dbtp: -1.0,
+        };
+        resolved.validate_config().unwrap();
+
+        let consumed = resumable_consumed_model(&resolved).unwrap().unwrap();
+        assert_eq!(consumed.path, package_path);
+        assert_eq!(
+            consumed.fingerprint,
+            fingerprint_file(&consumed.path).unwrap()
+        );
+        assert!(
+            fingerprint_resumable_model(consumed_model_config(&resolved).unwrap().unwrap())
+                .is_err()
+        );
     }
 
     #[cfg(feature = "onnx")]

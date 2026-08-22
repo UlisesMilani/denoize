@@ -61,6 +61,8 @@ OPTIONS:
         --true-peak <DBTP>    finite ceiling in -20..0 dBTP with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
+        --model-package <PATH> signed custom-model runtime package (.dmp; -b onnx)
+        --model-package-key <PATH> trusted Minisign public key for --model-package
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
         --accelerator <NAME>  cpu|auto|gpu|metal|cuda (default: cpu)
@@ -143,6 +145,9 @@ USAGE:
     denoize models bundle inspect <BUNDLE.dmb>
     denoize models bundle import <BUNDLE.dmb>
     denoize models bundle create <OUTPUT.dmb> <CATALOG.json> <CATALOG.json.sig> <TRUST-ROOT.json> <COMPONENTS-DIR>
+    denoize models package inspect <PACKAGE.dmp> <MINISIGN.pub>
+    denoize models package license <PACKAGE.dmp> <MINISIGN.pub>
+    denoize models package create <OUTPUT.dmp> <MANIFEST.json> <MANIFEST.json.sig> <MINISIGN.pub> <MODEL.onnx> <LICENSE>
     denoize models snapshot [--json] [--pretty]
     denoize models cache-dir
 
@@ -354,7 +359,9 @@ saved recipe; subsequent identical runs skip it normally.
 Resumable ONNX-backed batches require a self-contained `.onnx` file. Models
 that declare external tensor sidecars can still be used without `--resume`, but
 are rejected for resume because the v3 model digest cannot represent every
-consumed sidecar byte.
+consumed sidecar byte. A signed `.dmp` package is already one authenticated
+container identity and remains resumable without treating its framing as raw
+ONNX protobuf.
 
 Every batch completes input/codec/configuration preflight before creating the
 output directory. It then acquires `.denoize-batch.lock` before resume or output

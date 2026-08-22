@@ -128,6 +128,15 @@ pub fn estimate_backend_session_request(
     if backend == crate::Backend::Classical {
         return Ok(ResourceRequest::new());
     }
+    if let Some(package) = options.runtime_package.as_ref() {
+        let resources = &package.manifest().resources;
+        let mut request =
+            ResourceRequest::new().with_memory_bytes(resources.max_session_memory_bytes);
+        if accelerator.effective() != crate::AcceleratorRuntime::Cpu {
+            request = request.with_gpu_memory_bytes(resources.max_gpu_session_memory_bytes);
+        }
+        return Ok(request);
+    }
     let model_file_bytes = match options.onnx.as_ref() {
         Some(model) => std::fs::metadata(&model.path)
             .map(|metadata| metadata.len())
@@ -140,6 +149,26 @@ pub fn estimate_backend_session_request(
         request = request.with_gpu_memory_bytes(estimate_gpu_session_bytes(model_file_bytes)?);
     }
     Ok(request)
+}
+
+/// Package-declared inference scratch retained by one active worker.
+#[must_use]
+pub fn estimate_backend_worker_memory_bytes(options: &crate::BackendOptions) -> u64 {
+    options
+        .runtime_package
+        .as_ref()
+        .map(|package| package.manifest().resources.max_worker_memory_bytes)
+        .unwrap_or(0)
+}
+
+/// Package-declared GPU scratch retained by one active worker.
+#[must_use]
+pub fn estimate_backend_worker_gpu_memory_bytes(options: &crate::BackendOptions) -> u64 {
+    options
+        .runtime_package
+        .as_ref()
+        .map(|package| package.manifest().resources.max_gpu_worker_memory_bytes)
+        .unwrap_or(0)
 }
 
 /// Aggregate resource ceilings for one process.
@@ -865,6 +894,64 @@ mod tests {
             estimate_model_session_bytes(17).unwrap()
         );
         assert_eq!(request.gpu_memory_bytes(), 0);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn authenticated_package_estimates_use_signed_session_and_worker_ceilings() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("model.onnx");
+        std::fs::write(&model, [0_u8; 17]).unwrap();
+        let resources = crate::RuntimeModelResourceContract {
+            max_session_memory_bytes: 80 * 1024 * 1024,
+            max_worker_memory_bytes: 12 * 1024 * 1024,
+            max_gpu_session_memory_bytes: 384 * 1024 * 1024,
+            max_gpu_worker_memory_bytes: 7 * 1024 * 1024,
+            accelerators: vec!["cpu".into(), "cuda".into()],
+        };
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(
+            model,
+            crate::RuntimeModelTensorContract {
+                element_type: "float32".into(),
+                layout: "batch-samples".into(),
+                fixed_input_samples: None,
+                fixed_output_samples: None,
+            },
+        )
+        .with_resources_for_test(resources.clone());
+        let options = crate::BackendOptions::default().with_runtime_model_package(package);
+
+        let cpu = estimate_backend_session_request(
+            crate::Backend::Onnx,
+            &options,
+            crate::AcceleratorSelection::default(),
+        )
+        .unwrap();
+        assert_eq!(cpu.memory_bytes(), resources.max_session_memory_bytes);
+        assert_eq!(cpu.gpu_memory_bytes(), 0);
+
+        let cuda = estimate_backend_session_request(
+            crate::Backend::Onnx,
+            &options,
+            crate::hardware::test_selection(
+                crate::AcceleratorPreference::Cuda,
+                crate::AcceleratorRuntime::Cuda,
+            ),
+        )
+        .unwrap();
+        assert_eq!(cuda.memory_bytes(), resources.max_session_memory_bytes);
+        assert_eq!(
+            cuda.gpu_memory_bytes(),
+            resources.max_gpu_session_memory_bytes
+        );
+        assert_eq!(
+            estimate_backend_worker_memory_bytes(&options),
+            resources.max_worker_memory_bytes
+        );
+        assert_eq!(
+            estimate_backend_worker_gpu_memory_bytes(&options),
+            resources.max_gpu_worker_memory_bytes
+        );
     }
 
     #[test]

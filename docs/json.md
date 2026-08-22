@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes fifteen versioned JSON contracts for local automation. Their
+denoize publishes sixteen versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -41,15 +41,18 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-release-evidence-v1.schema.json`](../schemas/denoize-release-evidence-v1.schema.json)
   describes the release SBOM, provenance, asset-digest, and source-tree
   evidence bundle verified before publication.
+- [`denoize-runtime-model-package-v1.schema.json`](../schemas/denoize-runtime-model-package-v1.schema.json)
+  describes the signed identity, license, frontend, tensor, accelerator, and
+  resource manifest embedded in a custom-model `.dmp` package.
 
 Within a schema version, required field names, field types, digest encoding, and
 documented enum/string values are stable. A future release may add fields, so
 consumers must ignore unknown fields unless the contract explicitly says they
 are rejected. Removing a field, changing its type, or changing a documented
 value requires a new schema identifier and version. Execution plans, receipts,
-keys, policies, verification reports, and presentation regions deliberately
-reject unknown fields: their exact typed representation participates in
-signing, trust, or source-binding decisions.
+keys, policies, verification reports, presentation regions, and runtime model
+package manifests deliberately reject unknown fields: their exact typed
+representation participates in signing, trust, or source-binding decisions.
 
 ## Model and provenance snapshot
 

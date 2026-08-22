@@ -126,6 +126,86 @@ For every catalog model, `COMPONENTS-DIR` must contain
 the signature, and trust root are checked before the atomically replaced output
 is committed. The same inputs produce identical bundle bytes.
 
+## Signed custom-model runtime packages
+
+Custom waveform models can be distributed as one authenticated `.dmp` runtime
+package instead of an untyped ONNX path and an out-of-band sample rate. The
+trusted Minisign public key remains a separate operator input:
+
+```sh
+# Verify without loading the graph or changing model/cache state.
+denoize models package inspect voice-cleaner.dmp vendor-model.pub
+
+# Print the authenticated license notice without extracting the package.
+denoize models package license voice-cleaner.dmp vendor-model.pub
+
+# Process only after the complete package and graph contracts pass.
+denoize input.wav output.wav --backend onnx \
+  --model-package voice-cleaner.dmp \
+  --model-package-key vendor-model.pub
+```
+
+The package uses the `denoize-runtime-model-package-v1` manifest described by
+[`schemas/denoize-runtime-model-package-v1.schema.json`](../schemas/denoize-runtime-model-package-v1.schema.json).
+Its signature authenticates package identity/revision, signing-key ID, exact
+ONNX and license filename/length/SHA-256, SPDX expression, runtime and sample
+rate, audio frontend transformations, float32 tensor layout and fixed or
+dynamic sample axes, permitted CPU/Metal/CUDA runtimes, and conservative
+session/worker CPU/GPU memory declarations.
+
+The host and GPU session fields are total conservative reservations for one
+prepared graph and must meet denoize's model-size baselines. Worker fields are
+package-specific scratch added to the normal per-audio buffers for each active
+inference worker. They are admission contracts supplied by the trusted model
+producer, not measurements of an allocator or driver.
+
+The v1 frontend is deliberately narrow and reproducible: normalized float32
+PCM, band-limited resampling to the signed model rate, mono waveform inference,
+and restoration of the original presentation duration. Tensor layouts are
+`[batch, samples]` or `[batch, channels, samples]`, with batch/channel fixed to
+one. At preparation denoize parses the authenticated model range directly from
+the package, rejects ONNX external-data sidecars, and requires the graph's
+element type, layout, and fixed input/output lengths to equal the signed tensor
+contract. A package cannot opt out of CPU compatibility, and a selected GPU
+runtime must be listed by the manifest. `--accelerator auto` skips available
+GPU runtimes omitted by that allowlist and falls back to CPU; a strict `gpu`,
+`metal`, or `cuda` request fails instead.
+
+`.dmp` is a fixed magic value, four bounded big-endian lengths, then manifest,
+detached signature, model, and license bytes. It is not an archive, chooses no
+extraction path, and invokes no decompressor. Every input is a validated regular
+file; malformed/trailing lengths, unsafe component basenames, unknown JSON
+fields, repeated/unknown accelerators, underreported session/GPU baselines, a
+key-ID mismatch, signature failure, or component hash mismatch fail before ONNX
+parsing. Session preparation re-hashes the full package before reading the
+model range and authenticates that range again as the parser consumes it, so
+pathname replacement or same-inode mutation cannot substitute different bytes
+after planning. Resume recipes and signed execution evidence bind the whole
+`.dmp` fingerprint just as they bind a raw model file.
+
+Producers first serialize and sign the manifest with Minisign, then assemble
+the verified components atomically:
+
+```text
+denoize models package create OUTPUT.dmp MANIFEST.json MANIFEST.json.sig \
+  MINISIGN.pub MODEL.onnx LICENSE
+```
+
+Standard Minisign text files and the outer Base64 wrappers emitted by Tauri's
+updater signer are both accepted for the public key and detached signature.
+
+Manifest filenames must equal the two source basenames. The builder checks the
+trusted key, signature, manifest contracts, sizes, and hashes before staging,
+then reopens the staged framing through the same verifier before no-clobber
+publication; an existing output is never replaced. Graph/tensor equality is
+checked later when a backend session prepares the model. The same inputs
+produce identical bytes. Packages are intentionally not added to the
+managed-model catalog: selecting a custom trust key is an explicit local
+operator decision.
+Desktop users make the same two-file selection and see the authenticated
+identity, license, tensor layout, accelerators, and package digest before
+processing.
+
 ## Catalog trust, rotation, expiry, and rollback safety
 
 The production trust root is compiled into denoize. Catalog JSON has its own

@@ -58,6 +58,7 @@ pub mod input;
 pub mod live;
 pub mod loudness;
 pub mod metadata;
+pub mod model_package;
 pub mod models;
 pub mod noise;
 pub mod perceptual;
@@ -125,12 +126,20 @@ pub use execution::{
 };
 pub use gain::{Algorithm, SpecSubLaw};
 pub use hardware::{
-    backend_supports_acceleration, hardware_capabilities, select_accelerator, AcceleratorFallback,
-    AcceleratorPreference, AcceleratorRuntime, AcceleratorSelection, BackendCapability,
-    HardwareCapabilities, RuntimeCapability, HARDWARE_SCHEMA, HARDWARE_SCHEMA_VERSION,
+    backend_supports_acceleration, hardware_capabilities, select_accelerator,
+    select_accelerator_for_options, AcceleratorFallback, AcceleratorPreference, AcceleratorRuntime,
+    AcceleratorSelection, BackendCapability, HardwareCapabilities, RuntimeCapability,
+    HARDWARE_SCHEMA, HARDWARE_SCHEMA_VERSION,
 };
 pub use input::AudioInputSession;
 pub use input::StreamSpoolLimits;
+pub use model_package::{
+    build_runtime_model_package, inspect_runtime_model_package, RuntimeModelFileContract,
+    RuntimeModelFrontendContract, RuntimeModelLicenseContract, RuntimeModelPackage,
+    RuntimeModelPackageInfo, RuntimeModelPackageManifest, RuntimeModelPackageReader,
+    RuntimeModelResourceContract, RuntimeModelRuntimeContract, RuntimeModelTensorContract,
+    RUNTIME_MODEL_PACKAGE_SCHEMA, RUNTIME_MODEL_PACKAGE_VERSION,
+};
 pub use quality::QualityMetrics;
 pub use recommendation::{
     recommend_audio, recommend_file, recommend_file_with_options, run_device_calibration,
@@ -143,7 +152,8 @@ pub use region::{
     PresentationRegion, PRESENTATION_REGION_SCHEMA, PRESENTATION_REGION_SCHEMA_VERSION,
 };
 pub use resource::{
-    estimate_backend_session_request, estimate_gpu_session_bytes, estimate_gpu_worker_bytes,
+    estimate_backend_session_request, estimate_backend_worker_gpu_memory_bytes,
+    estimate_backend_worker_memory_bytes, estimate_gpu_session_bytes, estimate_gpu_worker_bytes,
     estimate_model_session_bytes, estimate_temporary_bytes, metadata_limits_after_retained_memory,
     metadata_limits_for_available_memory, ResourceGovernor, ResourceLimits, ResourcePermit,
     ResourceRequest, ResourceUsage,

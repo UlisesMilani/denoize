@@ -331,6 +331,46 @@ pub fn select_accelerator(
     })
 }
 
+/// Resolve an accelerator request while honoring a verified runtime package's
+/// signed accelerator allowlist.
+///
+/// An `auto` request skips package-disallowed GPU runtimes and falls back to
+/// CPU. Strict GPU requests fail if their concrete runtime is not authorized by
+/// the package.
+pub fn select_accelerator_for_options(
+    backend: Backend,
+    options: &crate::BackendOptions,
+) -> Result<AcceleratorSelection, String> {
+    select_accelerator_for_options_with(backend, options, |runtime| {
+        probe_runtime(runtime).map_err(|error| error.to_string())
+    })
+}
+
+fn select_accelerator_for_options_with(
+    backend: Backend,
+    options: &crate::BackendOptions,
+    mut probe: impl FnMut(AcceleratorRuntime) -> Result<(), String>,
+) -> Result<AcceleratorSelection, String> {
+    select_accelerator_with(
+        backend,
+        options.accelerator,
+        options.deterministic,
+        |runtime| {
+            if options
+                .runtime_package
+                .as_ref()
+                .is_some_and(|package| !package.supports_accelerator(runtime))
+            {
+                return Err(format!(
+                    "runtime model package does not permit the {} accelerator",
+                    runtime.name()
+                ));
+            }
+            probe(runtime)
+        },
+    )
+}
+
 pub(crate) fn select_accelerator_from_capabilities(
     backend: Backend,
     requested: AcceleratorPreference,
@@ -948,6 +988,61 @@ mod tests {
             fallback.fallback(),
             Some(AcceleratorFallback::NoAvailableGpu)
         );
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn runtime_package_allowlist_filters_auto_and_strict_gpu_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let model = directory.path().join("model.onnx");
+        std::fs::write(&model, b"model").unwrap();
+        let package = crate::RuntimeModelPackage::for_onnx_contract_test(
+            model,
+            crate::RuntimeModelTensorContract {
+                element_type: "float32".into(),
+                layout: "batch-samples".into(),
+                fixed_input_samples: None,
+                fixed_output_samples: None,
+            },
+        );
+        let mut options =
+            crate::BackendOptions::default().with_runtime_model_package(package.clone());
+        options.accelerator = AcceleratorPreference::Auto;
+        let fallback = select_accelerator_for_options_with(Backend::Onnx, &options, |_| {
+            panic!("a CPU-only package must filter GPU probes")
+        })
+        .unwrap();
+        assert_eq!(fallback.effective(), AcceleratorRuntime::Cpu);
+        assert_eq!(
+            fallback.fallback(),
+            Some(AcceleratorFallback::NoAvailableGpu)
+        );
+
+        options.accelerator = AcceleratorPreference::Cuda;
+        let error = select_accelerator_for_options_with(Backend::Onnx, &options, |_| {
+            panic!("a disallowed strict runtime must fail before probing")
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("does not permit the cuda accelerator"),
+            "{error}"
+        );
+
+        let mut resources = package.manifest().resources.clone();
+        resources.accelerators.push("cuda".into());
+        resources.max_gpu_session_memory_bytes =
+            crate::estimate_gpu_session_bytes(package.manifest().model.size_bytes).unwrap();
+        let cuda_package = package.with_resources_for_test(resources);
+        options = crate::BackendOptions::default().with_runtime_model_package(cuda_package);
+        options.accelerator = AcceleratorPreference::Auto;
+        let mut probes = Vec::new();
+        let selected = select_accelerator_for_options_with(Backend::Onnx, &options, |runtime| {
+            probes.push(runtime);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(selected.effective(), AcceleratorRuntime::Cuda);
+        assert_eq!(probes, vec![AcceleratorRuntime::Cuda]);
     }
 
     #[cfg(feature = "onnx")]
