@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-evaluation-corpus-verification-v1.schema.json",
+  "title": "denoize evaluation corpus verification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "manifest_digest", "corpus_id", "corpus_version", "cases", "total_artifact_bytes", "total_audio_seconds", "listening_protocol_digest"],
+  "properties": {
+    "schema": { "const": "denoize-evaluation-corpus-verification-v1" },
+    "schema_version": { "const": 1 },
+    "manifest_digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "corpus_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "corpus_version": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "cases": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "total_artifact_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "total_audio_seconds": { "type": "number", "exclusiveMinimum": 0 },
+    "listening_protocol_digest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    }
+  }
+}

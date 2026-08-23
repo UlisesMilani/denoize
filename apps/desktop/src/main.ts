@@ -216,6 +216,23 @@ type ReceiptVerificationReport = {
   schema: string; schema_version: number; receipt_schema: string; key_id: string;
   plan_digest: string; kind: "file" | "batch" | "stream"; verified_items: Array<Record<string, unknown>>;
 };
+type EvaluationCorpusValidation = {
+  schema: string; schema_version: number; manifest_digest: string; corpus_id: string;
+  corpus_version: string; cases: number; total_artifact_bytes: number; total_audio_seconds: number;
+};
+type EvaluationRunResult = {
+  schema: string; schema_version: number;
+  payload: { accepted: boolean; corpus_id: string; cases: Array<Record<string, unknown>>; threshold_outcomes: Array<{ metric: string; passed: boolean }> };
+  signature: { key_id: string };
+};
+type EvaluationVerificationReport = {
+  schema: string; schema_version: number; key_id: string; manifest_digest: string;
+  corpus_id: string; cases: number; accepted: boolean;
+};
+type EvaluationComparisonReport = {
+  schema: string; schema_version: number; baseline_version: string; candidate_version: string;
+  environment_comparable: boolean; regressions: Array<Record<string, unknown>>; passed: boolean;
+};
 type WatchCycleReport = {
   observed: number; pending: number; attempted: number; succeeded: number;
   retrying: number; quarantined: number; superseded: number; scan_errors: number;
@@ -248,6 +265,7 @@ let acceptedPreview: {
 } | null = null;
 let currentRecommendation: RecommendationReport | null = null;
 let recommendationRunning = false;
+let evaluationRunning = false;
 let processPlan: ExecutionPlan | null = null;
 let batchPlan: ExecutionPlan | null = null;
 let watchRunning = false;
@@ -284,6 +302,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="nav-live" class="nav-item" role="tab" data-page="live" aria-controls="page-live" aria-selected="false" tabindex="-1"><span aria-hidden="true">◉</span>リアルタイム</button>
         <button id="nav-plugin" class="nav-item" role="tab" data-page="plugin" aria-controls="page-plugin" aria-selected="false" tabindex="-1"><span aria-hidden="true">◫</span>DAW プラグイン</button>
         <button id="nav-compare" class="nav-item" role="tab" data-page="compare" aria-controls="page-compare" aria-selected="false" tabindex="-1"><span aria-hidden="true">◒</span>品質比較</button>
+        <button id="nav-evaluation" class="nav-item" role="tab" data-page="evaluation" aria-controls="page-evaluation" aria-selected="false" tabindex="-1"><span aria-hidden="true">◇</span>評価証跡</button>
         <button id="nav-models" class="nav-item" role="tab" data-page="models" aria-controls="page-models" aria-selected="false" tabindex="-1"><span aria-hidden="true">⬡</span>モデル</button>
         <button id="nav-automation" class="nav-item" role="tab" data-page="automation" aria-controls="page-automation" aria-selected="false" tabindex="-1"><span aria-hidden="true">⌁</span>IPC 自動化</button>
         <button id="nav-receipts" class="nav-item" role="tab" data-page="receipts" aria-controls="page-receipts" aria-selected="false" tabindex="-1"><span aria-hidden="true">✓</span>実行証明</button>
@@ -587,6 +606,45 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             </article>
           </div>
           <article class="card result-card"><div class="card-heading"><div><span class="step">RESULT</span><h2>IPC 応答</h2></div></div><div id="ipc-result-empty" class="empty-panel">接続確認または dry run を実行してください</div><pre id="ipc-result" class="json-preview hidden" aria-live="polite"></pre></article>
+        </div>
+      </section>
+
+      <section class="page" id="page-evaluation" role="tabpanel" aria-labelledby="nav-evaluation" aria-hidden="true">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">RUN</span><h2>コーパス評価を実行</h2></div></div>
+              <p class="section-copy">ライセンス、取得元 revision、前処理、SHA-256 を固定した manifest だけを実行し、品質・出力健全性・速度を署名付き JSON に保存します。</p>
+              <div class="file-row"><div><label>評価 manifest</label><div id="evaluation-manifest-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-manifest">選択</button></div>
+              <div class="file-row"><div><label>コーパスルート</label><div id="evaluation-root-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-root">選択</button></div>
+              <div class="file-row"><div><label>署名鍵</label><div id="evaluation-secret-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-secret">選択</button></div>
+              <div class="file-row"><div><label>人手評価結果（必要時）</label><div id="evaluation-listening-display" class="path empty">指定なし</div></div><button class="secondary" id="choose-evaluation-listening">選択</button></div>
+              <div class="file-row"><div><label>評価証跡の保存先</label><div id="evaluation-output-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-output">保存先</button></div>
+              <input type="hidden" id="evaluation-manifest-path"><input type="hidden" id="evaluation-root-path"><input type="hidden" id="evaluation-secret-path"><input type="hidden" id="evaluation-listening-path"><input type="hidden" id="evaluation-output-path">
+              <div class="button-row"><button class="secondary" id="validate-evaluation">コーパスを検証</button><button class="primary" id="run-evaluation">署名付き評価を実行</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">VERIFY</span><h2>評価証跡を検証</h2></div></div>
+              <div class="file-row"><div><label>署名付き評価結果</label><div id="evaluation-verify-result-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-verify-result">選択</button></div>
+              <div class="file-row"><div><label>公開鍵</label><div id="evaluation-verify-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-verify-key">選択</button></div>
+              <div class="file-row"><div><label>評価 manifest（任意）</label><div id="evaluation-verify-manifest-display" class="path empty">指定なし</div></div><button class="secondary" id="choose-evaluation-verify-manifest">選択</button></div>
+              <input type="hidden" id="evaluation-verify-result-path"><input type="hidden" id="evaluation-verify-key-path"><input type="hidden" id="evaluation-verify-manifest-path">
+              <button class="primary wide" id="verify-evaluation">署名と manifest を検証</button>
+            </article>
+          </div>
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">REGRESSION</span><h2>リグレッション比較</h2></div></div>
+              <p class="section-copy">両方の署名を認証し、同じ corpus・model・hardware・runtime・計測条件である場合だけ比較します。</p>
+              <div class="file-row"><div><label>ベースライン結果</label><div id="evaluation-baseline-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-baseline">選択</button></div>
+              <div class="file-row"><div><label>候補結果</label><div id="evaluation-candidate-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-candidate">選択</button></div>
+              <div class="file-row"><div><label>ベースライン公開鍵</label><div id="evaluation-baseline-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-baseline-key">選択</button></div>
+              <div class="file-row"><div><label>候補公開鍵</label><div id="evaluation-candidate-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-candidate-key">選択</button></div>
+              <input type="hidden" id="evaluation-baseline-path"><input type="hidden" id="evaluation-candidate-path"><input type="hidden" id="evaluation-baseline-key-path"><input type="hidden" id="evaluation-candidate-key-path">
+              <button class="primary wide" id="compare-evaluation">比較を実行</button>
+            </article>
+            <article class="card result-card"><div class="card-heading"><div><span class="step">RESULT</span><h2>評価結果</h2></div></div><div id="evaluation-result-empty" class="empty-panel">manifest と corpus を選んでください</div><pre id="evaluation-result" class="json-preview hidden" aria-live="polite"></pre></article>
+          </div>
         </div>
       </section>
 
@@ -1028,7 +1086,7 @@ async function loadRecoveries() {
 async function retryRecoveryJob(recovery: RecoverySummary) {
   await jobProgressReady;
   if (recovery.kind !== "file" && recovery.kind !== "batch") throw new Error(tr("破損した復旧レコードは再実行できません", "A corrupt recovery record cannot be retried"));
-  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) {
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning || evaluationRunning) {
     throw new Error(tr("別の処理が実行中です", "Another job is running"));
   }
   const kind = recovery.kind;
@@ -1678,7 +1736,7 @@ const previewProgressReady = listen<PreviewProgress>("preview-progress", ({ payl
 
 async function startPreviewRender() {
   await previewProgressReady;
-  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) {
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning || evaluationRunning) {
     throw new Error(tr("別の処理が実行中です", "Another job is running"));
   }
   if (previewCandidates.length >= 3) throw new Error(tr("比較候補は3件までです。候補をクリアしてから追加してください", "You can compare up to three candidates. Clear the candidates before adding another."));
@@ -2012,7 +2070,7 @@ $("#analyze-recommendation").addEventListener("click", async () => {
   const button = $<HTMLButtonElement>("#analyze-recommendation");
   const input = $<HTMLInputElement>("#input-path").value;
   if (!input) return showToast(tr("先に入力ファイルを選択してください", "Select an input file first"), true);
-  if (watchRunning || activeJob !== null || pendingJobKind !== null || recommendationRunning) return showToast(tr("実行中の処理が終わってから推奨を解析してください", "Wait for the running job to finish before analyzing recommendations"), true);
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || recommendationRunning || evaluationRunning) return showToast(tr("実行中の処理が終わってから推奨を解析してください", "Wait for the running job to finish before analyzing recommendations"), true);
   clearRecommendation();
   recommendationRunning = true;
   button.disabled = true;
@@ -2222,7 +2280,7 @@ const watchDelay = (milliseconds: number) => new Promise<void>((resolve) => wind
 
 async function startWatchAutomation() {
   await jobProgressReady;
-  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning || evaluationRunning
     || !$("#stop-live").classList.contains("hidden")) {
     throw new Error(tr("別の処理が実行中です", "Another job is running"));
   }
@@ -2294,6 +2352,130 @@ $("#choose-watch-state").addEventListener("click", async () => {
 });
 $("#start-watch").addEventListener("click", () => void startWatchAutomation().catch((error) => showToast(errorText(error), true)));
 $("#stop-watch").addEventListener("click", () => void stopWatchAutomation());
+
+const evaluationJsonSelectors: Array<[string, string, string]> = [
+  ["#choose-evaluation-manifest", "#evaluation-manifest-path", "#evaluation-manifest-display"],
+  ["#choose-evaluation-secret", "#evaluation-secret-path", "#evaluation-secret-display"],
+  ["#choose-evaluation-listening", "#evaluation-listening-path", "#evaluation-listening-display"],
+  ["#choose-evaluation-verify-result", "#evaluation-verify-result-path", "#evaluation-verify-result-display"],
+  ["#choose-evaluation-verify-key", "#evaluation-verify-key-path", "#evaluation-verify-key-display"],
+  ["#choose-evaluation-verify-manifest", "#evaluation-verify-manifest-path", "#evaluation-verify-manifest-display"],
+  ["#choose-evaluation-baseline", "#evaluation-baseline-path", "#evaluation-baseline-display"],
+  ["#choose-evaluation-candidate", "#evaluation-candidate-path", "#evaluation-candidate-display"],
+  ["#choose-evaluation-baseline-key", "#evaluation-baseline-key-path", "#evaluation-baseline-key-display"],
+  ["#choose-evaluation-candidate-key", "#evaluation-candidate-key-path", "#evaluation-candidate-key-display"],
+];
+for (const [button, input, display] of evaluationJsonSelectors) {
+  $(button).addEventListener("click", async () => {
+    const path = await open({ multiple: false, filters: jsonFilters });
+    if (typeof path === "string") setPath(input, display, path);
+  });
+}
+
+$("#choose-evaluation-root").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") setPath("#evaluation-root-path", "#evaluation-root-display", path);
+});
+
+$("#choose-evaluation-output").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "denoize-evaluation-result.json", filters: jsonFilters });
+  if (path) setPath("#evaluation-output-path", "#evaluation-output-display", path);
+});
+
+function evaluationPath(selector: string, message: string): string {
+  const value = $<HTMLInputElement>(selector).value;
+  if (!value) throw new Error(message);
+  return value;
+}
+
+function renderEvaluationResult(value: unknown) {
+  $("#evaluation-result-empty").classList.add("hidden");
+  $("#evaluation-result").textContent = JSON.stringify(value, null, 2);
+  $("#evaluation-result").classList.remove("hidden");
+}
+
+function setEvaluationBusy(running: boolean) {
+  evaluationRunning = running;
+  for (const selector of ["#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
+    $<HTMLButtonElement>(selector).disabled = running;
+  }
+}
+
+$("#validate-evaluation").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  setEvaluationBusy(true);
+  try {
+    const report = await invoke<EvaluationCorpusValidation>("validate_evaluation_corpus", { request: {
+      manifest: evaluationPath("#evaluation-manifest-path", tr("評価 manifest を選択してください", "Select an evaluation manifest")),
+      corpusRoot: evaluationPath("#evaluation-root-path", tr("コーパスルートを選択してください", "Select a corpus root")),
+    } });
+    renderEvaluationResult(report);
+    showToast(tr(`コーパス ${report.corpus_id} を検証しました`, `Validated corpus ${report.corpus_id}`));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
+$("#run-evaluation").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning
+    || !$("#stop-live").classList.contains("hidden")) {
+    return showToast(tr("別の処理が実行中です", "Another job is running"), true);
+  }
+  setEvaluationBusy(true);
+  try {
+    const listeningResult = $<HTMLInputElement>("#evaluation-listening-path").value || null;
+    const result = await invoke<EvaluationRunResult>("run_release_evaluation", { request: {
+      manifest: evaluationPath("#evaluation-manifest-path", tr("評価 manifest を選択してください", "Select an evaluation manifest")),
+      corpusRoot: evaluationPath("#evaluation-root-path", tr("コーパスルートを選択してください", "Select a corpus root")),
+      secretKey: evaluationPath("#evaluation-secret-path", tr("署名鍵を選択してください", "Select a signing key")),
+      output: evaluationPath("#evaluation-output-path", tr("評価証跡の保存先を選択してください", "Select an evaluation evidence destination")),
+      listeningResult,
+    } });
+    renderEvaluationResult(result);
+    showToast(result.payload.accepted
+      ? tr("署名付き評価証跡を保存しました", "Signed evaluation evidence saved")
+      : tr("評価証跡を保存しましたが、受入基準を満たしていません", "Evaluation evidence was saved, but its acceptance policy failed"),
+      !result.payload.accepted);
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
+$("#verify-evaluation").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  setEvaluationBusy(true);
+  try {
+    const report = await invoke<EvaluationVerificationReport>("verify_evaluation_evidence", { request: {
+      result: evaluationPath("#evaluation-verify-result-path", tr("署名付き評価結果を選択してください", "Select a signed evaluation result")),
+      publicKey: evaluationPath("#evaluation-verify-key-path", tr("公開鍵を選択してください", "Select a public key")),
+      manifest: $<HTMLInputElement>("#evaluation-verify-manifest-path").value || null,
+    } });
+    renderEvaluationResult(report);
+    showToast(report.accepted
+      ? tr("評価証跡の署名と受入結果を検証しました", "Verified the evaluation signature and acceptance result")
+      : tr("署名は有効ですが、評価は不合格です", "The signature is valid, but the evaluation is not accepted"),
+      !report.accepted);
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
+$("#compare-evaluation").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  setEvaluationBusy(true);
+  try {
+    const report = await invoke<EvaluationComparisonReport>("compare_evaluation_evidence", { request: {
+      baseline: evaluationPath("#evaluation-baseline-path", tr("ベースライン結果を選択してください", "Select a baseline result")),
+      candidate: evaluationPath("#evaluation-candidate-path", tr("候補結果を選択してください", "Select a candidate result")),
+      baselineKey: evaluationPath("#evaluation-baseline-key-path", tr("ベースライン公開鍵を選択してください", "Select the baseline public key")),
+      candidateKey: evaluationPath("#evaluation-candidate-key-path", tr("候補公開鍵を選択してください", "Select the candidate public key")),
+    } });
+    renderEvaluationResult(report);
+    showToast(report.passed
+      ? tr("リグレッション基準を満たしています", "The regression policy passed")
+      : tr("リグレッション基準を満たしていません", "The regression policy failed"),
+      !report.passed);
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
 
 $("#generate-receipt-keypair").addEventListener("click", async () => {
   try {
@@ -2832,6 +3014,7 @@ $("#start-live").addEventListener("click", async () => {
   try {
     if (watchRunning) throw new Error(tr("監視フォルダを停止してから開始してください", "Stop watch-folder automation before starting live processing"));
     if (recommendationRunning) throw new Error(tr("推奨分析の完了後に開始してください", "Wait for recommendation analysis to finish before starting"));
+    if (evaluationRunning) throw new Error(tr("評価の完了後に開始してください", "Wait for evaluation to finish before starting"));
     const backend = $<HTMLSelectElement>("#live-backend").value;
     await invoke("start_live", { request: {
       inputDevice: $<HTMLSelectElement>("#live-input").value || null,
@@ -2898,7 +3081,7 @@ function handleJobProgress(payload: JobProgress) {
 }
 async function beginJob(kind: "file" | "batch", command: "start_process" | "start_batch", request: unknown) {
   await jobProgressReady;
-  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning) throw new Error(tr("別の処理が実行中です", "Another job is running"));
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning || evaluationRunning) throw new Error(tr("別の処理が実行中です", "Another job is running"));
   pendingJobKind = kind;
   pendingJobEvents = [];
   setJobUi(true, kind);

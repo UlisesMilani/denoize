@@ -48,6 +48,7 @@ pub mod daw;
 pub mod decode;
 pub mod denoiser;
 pub mod encode;
+pub mod evaluation;
 pub mod execution;
 #[doc(hidden)]
 pub mod fault_injection;
@@ -120,6 +121,20 @@ pub use encode::{
     estimate_stream_output_verification_bytes, verify_stream_output_file, AacEncoder,
     AudioStreamWriter, DownmixMode, EncodeOptions, OutputFormat, SpooledAudioStreamWriter,
     StreamEncodeLimits, StreamEncodeSpec, StreamOutputVerification, StreamPcmSpool,
+};
+pub use evaluation::{
+    compare_evaluation_results, run_evaluation, validate_evaluation_corpus,
+    verify_evaluation_result, write_signed_evaluation_result, EvaluationArtifact, EvaluationCase,
+    EvaluationCaseResult, EvaluationComparisonReport, EvaluationCorpusValidation,
+    EvaluationEnvironment, EvaluationLicense, EvaluationManifest, EvaluationPolicy,
+    EvaluationRecipe, EvaluationResultPayload, EvaluationSource, EvaluationThreshold,
+    EvaluationVerificationReport, ListeningEvidence, ListeningPolicy, ListeningProtocol,
+    ListeningTestResult, ObjectiveEvaluationMetrics, OutputQualityMetrics, PerformanceMetrics,
+    RegressionDirection, RegressionOutcome, RegressionTolerance, SignalPreparation,
+    SignedEvaluationResult, ThresholdAggregation, ThresholdOperator, ThresholdOutcome,
+    EVALUATION_COMPARISON_SCHEMA, EVALUATION_CORPUS_SCHEMA, EVALUATION_CORPUS_VERIFICATION_SCHEMA,
+    EVALUATION_RESULT_SCHEMA, EVALUATION_SCHEMA_VERSION, EVALUATION_VERIFICATION_SCHEMA,
+    LISTENING_RESULT_SCHEMA,
 };
 pub use execution::{
     execution_item_id, export_receipt_public_key, generate_receipt_keypair, portable_file_locator,

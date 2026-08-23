@@ -72,6 +72,12 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```text'
   "$binary" plugin --help
   echo '```'
+  echo
+  echo '## Signed licensed-corpus evaluation evidence'
+  echo
+  echo '```text'
+  "$binary" evaluate --help
+  echo '```'
   cat <<'EOF'
 
 Watch mode uses portable bounded polling. A regular audio file becomes eligible

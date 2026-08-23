@@ -46,6 +46,7 @@ pub use preview::{preview_worker_request_from_args, run_preview_worker};
 
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static ACCESSIBILITY_E2E_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EVALUATION_RUNNING: AtomicBool = AtomicBool::new(false);
 const ACCESSIBILITY_E2E_ARGUMENT: &str = "--denoize-desktop-a11y-e2e";
 const MAX_DESKTOP_ERROR_DETAIL_BYTES: usize = 4 * 1024;
 const MAX_DESKTOP_ERROR_PARAMETERS: usize = 16;
@@ -107,6 +108,11 @@ impl DesktopError {
             "resource.temporary"
         } else if lower.contains("worker") || lower.contains("隔離") {
             "worker.failed"
+        } else if lower.contains("evaluation")
+            || lower.contains("corpus")
+            || lower.contains("評価証跡")
+        {
+            "evaluation.failed"
         } else if lower.contains("receipt") || lower.contains("実行証明") {
             "receipt.failed"
         } else if lower.contains("ipc") || lower.contains("capability") {
@@ -156,6 +162,7 @@ impl DesktopError {
                 | "resource.temporary"
                 | "resource.accelerator"
                 | "worker.failed"
+                | "evaluation.failed"
                 | "receipt.failed"
                 | "ipc.failed"
                 | "model.failed"
@@ -1065,6 +1072,40 @@ struct RecommendationRequest {
     deterministic: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvaluationValidationRequest {
+    manifest: String,
+    corpus_root: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvaluationRunRequest {
+    manifest: String,
+    corpus_root: String,
+    secret_key: String,
+    output: String,
+    listening_result: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvaluationVerificationRequest {
+    result: String,
+    public_key: String,
+    manifest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvaluationComparisonRequest {
+    baseline: String,
+    candidate: String,
+    baseline_key: String,
+    candidate_key: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchRequest {
@@ -1868,6 +1909,114 @@ async fn plan_batch(request: BatchRequest) -> DesktopResult<ExecutionPlan> {
 #[tauri::command]
 fn save_execution_plan(path: String, plan: ExecutionPlan) -> DesktopResult<()> {
     denoize::write_execution_plan(path, &plan).map_err(DesktopError::from)
+}
+
+struct EvaluationRunGuard;
+
+impl EvaluationRunGuard {
+    fn acquire() -> Result<Self, String> {
+        EVALUATION_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "another evaluation is already running".to_string())?;
+        Ok(Self)
+    }
+}
+
+impl Drop for EvaluationRunGuard {
+    fn drop(&mut self) {
+        EVALUATION_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+#[tauri::command]
+async fn validate_evaluation_corpus(
+    request: EvaluationValidationRequest,
+) -> DesktopResult<denoize::EvaluationCorpusValidation> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        if request.manifest.trim().is_empty() || request.corpus_root.trim().is_empty() {
+            return Err("evaluation manifest and corpus root must not be empty".into());
+        }
+        let manifest = denoize::EvaluationManifest::from_file(&request.manifest)?;
+        denoize::validate_evaluation_corpus(&manifest, &request.corpus_root)
+    })
+    .await
+    .map_err(|error| format!("evaluation validation task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn run_release_evaluation(
+    request: EvaluationRunRequest,
+) -> DesktopResult<denoize::SignedEvaluationResult> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = EvaluationRunGuard::acquire()?;
+        if request.manifest.trim().is_empty()
+            || request.corpus_root.trim().is_empty()
+            || request.secret_key.trim().is_empty()
+            || request.output.trim().is_empty()
+        {
+            return Err(
+                "evaluation manifest, corpus root, secret key, and output must not be empty"
+                    .to_string(),
+            );
+        }
+        let manifest = denoize::EvaluationManifest::from_file(&request.manifest)?;
+        let key = ReceiptSecretKey::from_file(&request.secret_key)?;
+        let result = denoize::run_evaluation(
+            &manifest,
+            &request.corpus_root,
+            &key,
+            request.listening_result.as_deref().map(Path::new),
+        )?;
+        denoize::write_signed_evaluation_result(&request.output, &result)?;
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("evaluation runner task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn verify_evaluation_evidence(
+    request: EvaluationVerificationRequest,
+) -> DesktopResult<denoize::EvaluationVerificationReport> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        if request.result.trim().is_empty() || request.public_key.trim().is_empty() {
+            return Err("evaluation result and public key must not be empty".into());
+        }
+        let result = denoize::SignedEvaluationResult::from_file(&request.result)?;
+        let key = ReceiptPublicKey::from_file(&request.public_key)?;
+        let manifest = request
+            .manifest
+            .as_deref()
+            .map(denoize::EvaluationManifest::from_file)
+            .transpose()?;
+        denoize::verify_evaluation_result(&result, &key, manifest.as_ref())
+    })
+    .await
+    .map_err(|error| format!("evaluation verification task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn compare_evaluation_evidence(
+    request: EvaluationComparisonRequest,
+) -> DesktopResult<denoize::EvaluationComparisonReport> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        if request.baseline.trim().is_empty()
+            || request.candidate.trim().is_empty()
+            || request.baseline_key.trim().is_empty()
+            || request.candidate_key.trim().is_empty()
+        {
+            return Err(
+                "evaluation baseline, candidate, and both public keys must not be empty".into(),
+            );
+        }
+        let baseline = denoize::SignedEvaluationResult::from_file(&request.baseline)?;
+        let candidate = denoize::SignedEvaluationResult::from_file(&request.candidate)?;
+        let baseline_key = ReceiptPublicKey::from_file(&request.baseline_key)?;
+        let candidate_key = ReceiptPublicKey::from_file(&request.candidate_key)?;
+        denoize::compare_evaluation_results(&baseline, &baseline_key, &candidate, &candidate_key)
+    })
+    .await
+    .map_err(|error| format!("evaluation comparison task failed: {error}"))??)
 }
 
 #[tauri::command]
@@ -7794,6 +7943,10 @@ pub fn run() {
             plan_process,
             plan_batch,
             save_execution_plan,
+            validate_evaluation_corpus,
+            run_release_evaluation,
+            verify_evaluation_evidence,
+            compare_evaluation_evidence,
             generate_receipt_key,
             export_receipt_public_key,
             create_receipt_policy,
@@ -7933,7 +8086,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "15a5484ef746e7721b3006f603b0a0867b516912c5ea5cc0e67d80f2551865e2";
+        "4d9d8d69d59e4a3409ed262492410075b0161f01ea3bd7f27f4f3b4ac42b2f0f";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

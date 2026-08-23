@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.68.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.69.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -17,6 +17,7 @@ USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
+    denoize evaluate <COMMAND> [OPTIONS]  (run `denoize evaluate --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
     denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
@@ -125,7 +126,7 @@ CONFIGURATION:
 ## Watch-folder automation
 
 ```text
-denoize 0.68.0 watch-folder automation
+denoize 0.69.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -326,6 +327,26 @@ SESSION CREATE OPTIONS:
 
 CLAP state and these JSON contracts use the same stable parameter IDs, fixed
 10 ms latency policy, and deterministic compact serialization.
+```
+
+## Signed licensed-corpus evaluation evidence
+
+```text
+Run reproducible licensed-corpus release evaluation.
+
+USAGE:
+    denoize evaluate validate <MANIFEST.json> --corpus-root <DIR> [--json|--pretty]
+    denoize evaluate run <MANIFEST.json> --corpus-root <DIR> --key <SECRET_KEY.json> --output <RESULT.json> [--listening-result <RESULT.json>] [--json|--pretty]
+    denoize evaluate verify <RESULT.json> --key <PUBLIC_KEY.json> [--manifest <MANIFEST.json>] [--json|--pretty]
+    denoize evaluate compare <BASELINE.json> <CANDIDATE.json> (--key <PUBLIC_KEY.json> | --baseline-key <PUBLIC_KEY.json> --candidate-key <PUBLIC_KEY.json>) [--json|--pretty]
+
+The manifest pins every corpus/model artifact by license, immutable source
+revision, preparation digest, byte length, and SHA-256. Artifact paths must be
+portable regular files below --corpus-root and may not traverse symlinks.
+
+`run` always writes a signed result before returning a non-zero status for a
+missed threshold or rejected listening test. `compare` authenticates both
+results and rejects incomparable hardware/runtime/recipe contexts.
 ```
 
 Watch mode uses portable bounded polling. A regular audio file becomes eligible

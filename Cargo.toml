@@ -1,6 +1,6 @@
 [package]
 name = "denoize"
-version = "0.68.0"
+version = "0.69.0"
 edition = "2021"
 authors = ["denoize"]
 description = "Pure-Rust audio denoiser for the world's highest sound quality. Classical DSP + optional RNNoise / DeepFilterNet backends."
@@ -63,7 +63,7 @@ rayon = "1.11.0"
 ebur128 = "0.1.10"
 lofty = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 toml = "0.8"
 fdk-aac-rust = { version = "0.2.2", optional = true, default-features = false }
 cpal = { version = "0.15.3", optional = true }

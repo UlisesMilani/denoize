@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes twenty-nine versioned JSON contracts for local automation. Their
+denoize publishes thirty-five versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -25,6 +25,25 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes the Ed25519-signed result of a successfully published plan.
 - [`denoize-execution-receipt-v2.schema.json`](../schemas/denoize-execution-receipt-v2.schema.json)
   describes an Ed25519-signed bounded-stream result.
+- [`denoize-evaluation-corpus-v1.schema.json`](../schemas/denoize-evaluation-corpus-v1.schema.json)
+  describes a licensed, checksum-pinned corpus, deterministic preparation,
+  fixed denoize recipe, accepted thresholds, regression tolerances, and any
+  required human listening protocol.
+- [`denoize-evaluation-corpus-verification-v1.schema.json`](../schemas/denoize-evaluation-corpus-verification-v1.schema.json)
+  describes successful offline provenance, containment, hash, decode, and
+  clean/noisy geometry validation.
+- [`denoize-evaluation-result-v1.schema.json`](../schemas/denoize-evaluation-result-v1.schema.json)
+  describes signed objective, perceptual, output-quality, performance,
+  listening, threshold, and output-fingerprint evidence.
+- [`denoize-evaluation-verification-v1.schema.json`](../schemas/denoize-evaluation-verification-v1.schema.json)
+  describes successful authentication and optional manifest binding of an
+  evaluation result.
+- [`denoize-evaluation-comparison-v1.schema.json`](../schemas/denoize-evaluation-comparison-v1.schema.json)
+  describes an authenticated, environment-comparable baseline/candidate
+  regression decision.
+- [`denoize-listening-result-v1.schema.json`](../schemas/denoize-listening-result-v1.schema.json)
+  describes the bounded human outcome supplied when automation cannot replace
+  a manifest-pinned listening protocol.
 - [`denoize-hardware-v1.schema.json`](../schemas/denoize-hardware-v1.schema.json)
   describes a network-free snapshot of CPU features, compiled accelerator
   runtimes, runtime availability, and backend accelerator support.

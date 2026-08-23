@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-listening-result-v1.schema.json",
+  "title": "denoize human listening-test result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "corpus_id", "manifest_digest", "protocol_digest", "listener_count", "aggregate_score", "accepted"],
+  "properties": {
+    "schema": { "const": "denoize-listening-result-v1" },
+    "schema_version": { "const": 1 },
+    "corpus_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9._+\\-]+$" },
+    "manifest_digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "protocol_digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "listener_count": { "type": "integer", "minimum": 1, "maximum": 100000 },
+    "aggregate_score": { "type": "number" },
+    "accepted": { "type": "boolean" }
+  }
+}

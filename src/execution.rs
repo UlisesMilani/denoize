@@ -860,6 +860,43 @@ impl ReceiptPublicKey {
         }
         Ok(public)
     }
+
+    /// Verify a detached signature over one domain-separated canonical
+    /// document owned by another denoize evidence schema.
+    ///
+    /// Receipt keys are intentionally shared with release-evaluation evidence
+    /// so operators can keep one rotation and revocation policy.  The caller's
+    /// domain separator prevents a valid signature for one schema from being
+    /// replayed as another.
+    pub(crate) fn verify_domain_document(
+        &self,
+        domain: &[u8],
+        document: &[u8],
+        signature: &ReceiptSignature,
+        context: &str,
+    ) -> Result<(), String> {
+        self.validate()?;
+        if signature.algorithm != ED25519_ALGORITHM {
+            return Err(format!(
+                "unsupported {context} signature algorithm: {}",
+                signature.algorithm
+            ));
+        }
+        if signature.key_id != self.key_id {
+            return Err(format!(
+                "{context} key {} does not match supplied key {}",
+                signature.key_id, self.key_id
+            ));
+        }
+        let bytes = decode_base64(&format!("{context} signature"), &signature.value_base64)?;
+        if bytes.len() != 64 {
+            return Err(format!("{context} signature must contain exactly 64 bytes"));
+        }
+        let message = domain_message(domain, document)?;
+        UnparsedPublicKey::new(&ED25519, self.decode_public_key()?)
+            .verify(&message, &bytes)
+            .map_err(|_| format!("{context} signature verification failed"))
+    }
 }
 
 fn validate_public_key(key: ReceiptPublicKey) -> Result<ReceiptPublicKey, String> {
@@ -947,6 +984,28 @@ impl ReceiptSecretKey {
         };
         receipt.validate_structure()?;
         Ok(receipt)
+    }
+
+    /// Sign one canonical document owned by another denoize evidence schema.
+    pub(crate) fn sign_domain_document(
+        &self,
+        domain: &[u8],
+        document: &[u8],
+        context: &str,
+    ) -> Result<ReceiptSignature, String> {
+        self.validate()?;
+        let mut secret = decode_base64("receipt secret key", &self.secret_key_base64)?;
+        let pair = Ed25519KeyPair::from_pkcs8(&secret)
+            .map_err(|error| format!("parse {context} signing key: {error}"));
+        secret.zeroize();
+        let pair = pair?;
+        let message = domain_message(domain, document)?;
+        let value = pair.sign(&message);
+        Ok(ReceiptSignature {
+            algorithm: ED25519_ALGORITHM.into(),
+            key_id: self.key_id.clone(),
+            value_base64: base64::engine::general_purpose::STANDARD.encode(value.as_ref()),
+        })
     }
 
     fn validate(&self) -> Result<(), String> {

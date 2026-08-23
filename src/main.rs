@@ -408,6 +408,7 @@ USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
+    denoize evaluate <COMMAND> [OPTIONS]  (run `denoize evaluate --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
     denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
@@ -3489,6 +3490,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("models") {
         return run_models(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("evaluate") {
+        return run_evaluate(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("metrics") {
         return run_metrics(&args[1..]);
@@ -8596,7 +8600,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "15a5484ef746e7721b3006f603b0a0867b516912c5ea5cc0e67d80f2551865e2";
+        "4d9d8d69d59e4a3409ed262492410075b0161f01ea3bd7f27f4f3b4ac42b2f0f";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {
@@ -11211,6 +11215,413 @@ reconnect_timeout_ms = 300001
         assert!(options.deterministic);
         assert_eq!(options.seed, Some(42));
     }
+
+    #[test]
+    fn evaluation_cli_rejects_ambiguous_or_incomplete_contracts_before_io() {
+        let arguments = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let error = run_evaluate(&arguments(&["validate", "manifest.json"])).unwrap_err();
+        assert_eq!(error, "evaluate validate requires --corpus-root");
+
+        let error = run_evaluate(&arguments(&[
+            "run",
+            "manifest.json",
+            "--corpus-root",
+            "corpus",
+            "--key",
+            "secret.json",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "evaluate run requires --output");
+
+        let error = run_evaluate(&arguments(&[
+            "compare",
+            "baseline.json",
+            "candidate.json",
+            "--key",
+            "shared.json",
+            "--baseline-key",
+            "baseline-key.json",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("either --key or separate"));
+
+        let error = run_evaluate(&arguments(&[
+            "verify",
+            "result.json",
+            "--key",
+            "public.json",
+            "--json",
+            "--pretty",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "evaluate accepts only one of --json or --pretty");
+
+        let error =
+            run_evaluate(&arguments(&["validate", "manifest.json", "--corpus-root"])).unwrap_err();
+        assert_eq!(error, "missing value for --corpus-root");
+    }
+}
+
+fn evaluation_usage() -> &'static str {
+    "\
+Run reproducible licensed-corpus release evaluation.
+
+USAGE:
+    denoize evaluate validate <MANIFEST.json> --corpus-root <DIR> [--json|--pretty]
+    denoize evaluate run <MANIFEST.json> --corpus-root <DIR> --key <SECRET_KEY.json> --output <RESULT.json> [--listening-result <RESULT.json>] [--json|--pretty]
+    denoize evaluate verify <RESULT.json> --key <PUBLIC_KEY.json> [--manifest <MANIFEST.json>] [--json|--pretty]
+    denoize evaluate compare <BASELINE.json> <CANDIDATE.json> (--key <PUBLIC_KEY.json> | --baseline-key <PUBLIC_KEY.json> --candidate-key <PUBLIC_KEY.json>) [--json|--pretty]
+
+The manifest pins every corpus/model artifact by license, immutable source
+revision, preparation digest, byte length, and SHA-256. Artifact paths must be
+portable regular files below --corpus-root and may not traverse symlinks.
+
+`run` always writes a signed result before returning a non-zero status for a
+missed threshold or rejected listening test. `compare` authenticates both
+results and rejects incomparable hardware/runtime/recipe contexts.
+"
+}
+
+#[derive(Clone, Copy, Default)]
+struct EvaluationPrintMode {
+    json: bool,
+    pretty: bool,
+}
+
+fn run_evaluate(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("evaluate --help accepts no other arguments".into());
+        }
+        print!("{}", evaluation_usage());
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("validate") => run_evaluate_validate(&args[1..]),
+        Some("run") => run_evaluate_run(&args[1..]),
+        Some("verify") => run_evaluate_verify(&args[1..]),
+        Some("compare") => run_evaluate_compare(&args[1..]),
+        Some(command) => Err(format!("unknown evaluate command: {command}")),
+        None => Err("evaluate requires a command (run `denoize evaluate --help`)".into()),
+    }
+}
+
+fn run_evaluate_validate(args: &[String]) -> Result<(), String> {
+    let manifest_path = evaluation_positional(args, 0, "evaluate validate requires MANIFEST.json")?;
+    let mut corpus_root = None;
+    let mut mode = EvaluationPrintMode::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--corpus-root" => {
+                set_evaluation_option(
+                    &mut corpus_root,
+                    evaluation_value(args, &mut index, "--corpus-root")?,
+                    "--corpus-root",
+                )?;
+            }
+            "--json" => set_evaluation_print_mode(&mut mode, false)?,
+            "--pretty" => set_evaluation_print_mode(&mut mode, true)?,
+            value => return Err(format!("unknown evaluate validate option: {value}")),
+        }
+        index += 1;
+    }
+    let corpus_root = corpus_root.ok_or("evaluate validate requires --corpus-root")?;
+    let manifest = denoize::EvaluationManifest::from_file(manifest_path)?;
+    let report = denoize::validate_evaluation_corpus(&manifest, corpus_root)?;
+    if mode.json || mode.pretty {
+        print_evaluation_json(&report, mode)?;
+    } else {
+        println!(
+            "validated corpus {} {}: {} cases, {:.3}s audio, manifest {}",
+            report.corpus_id,
+            report.corpus_version,
+            report.cases,
+            report.total_audio_seconds,
+            report.manifest_digest
+        );
+    }
+    Ok(())
+}
+
+fn run_evaluate_run(args: &[String]) -> Result<(), String> {
+    let manifest_path = evaluation_positional(args, 0, "evaluate run requires MANIFEST.json")?;
+    let mut corpus_root = None;
+    let mut secret_key = None;
+    let mut output = None;
+    let mut listening_result = None;
+    let mut mode = EvaluationPrintMode::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--corpus-root" => set_evaluation_option(
+                &mut corpus_root,
+                evaluation_value(args, &mut index, "--corpus-root")?,
+                "--corpus-root",
+            )?,
+            "--key" => set_evaluation_option(
+                &mut secret_key,
+                evaluation_value(args, &mut index, "--key")?,
+                "--key",
+            )?,
+            "--output" => set_evaluation_option(
+                &mut output,
+                evaluation_value(args, &mut index, "--output")?,
+                "--output",
+            )?,
+            "--listening-result" => set_evaluation_option(
+                &mut listening_result,
+                evaluation_value(args, &mut index, "--listening-result")?,
+                "--listening-result",
+            )?,
+            "--json" => set_evaluation_print_mode(&mut mode, false)?,
+            "--pretty" => set_evaluation_print_mode(&mut mode, true)?,
+            value => return Err(format!("unknown evaluate run option: {value}")),
+        }
+        index += 1;
+    }
+    let corpus_root = corpus_root.ok_or("evaluate run requires --corpus-root")?;
+    let secret_key = secret_key.ok_or("evaluate run requires --key")?;
+    let output = output.ok_or("evaluate run requires --output")?;
+    let manifest = denoize::EvaluationManifest::from_file(manifest_path)?;
+    let key = ReceiptSecretKey::from_file(secret_key)?;
+    let result = denoize::run_evaluation(
+        &manifest,
+        corpus_root,
+        &key,
+        listening_result.as_deref().map(std::path::Path::new),
+    )?;
+    denoize::write_signed_evaluation_result(&output, &result)?;
+    if mode.json || mode.pretty {
+        print_evaluation_json(&result, mode)?;
+    } else {
+        println!(
+            "wrote {} evaluation evidence for {} cases: {}",
+            if result.payload.accepted {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            result.payload.cases.len(),
+            output
+        );
+        for outcome in result
+            .payload
+            .threshold_outcomes
+            .iter()
+            .filter(|outcome| !outcome.passed)
+        {
+            println!(
+                "failed threshold {}: observed {}, limit {}",
+                outcome.metric, outcome.observed, outcome.limit
+            );
+        }
+    }
+    if !result.payload.accepted {
+        return Err(format!(
+            "evaluation evidence was published to {output}, but its acceptance policy failed"
+        ));
+    }
+    Ok(())
+}
+
+fn run_evaluate_verify(args: &[String]) -> Result<(), String> {
+    let result_path = evaluation_positional(args, 0, "evaluate verify requires RESULT.json")?;
+    let mut public_key = None;
+    let mut manifest_path = None;
+    let mut mode = EvaluationPrintMode::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--key" => set_evaluation_option(
+                &mut public_key,
+                evaluation_value(args, &mut index, "--key")?,
+                "--key",
+            )?,
+            "--manifest" => set_evaluation_option(
+                &mut manifest_path,
+                evaluation_value(args, &mut index, "--manifest")?,
+                "--manifest",
+            )?,
+            "--json" => set_evaluation_print_mode(&mut mode, false)?,
+            "--pretty" => set_evaluation_print_mode(&mut mode, true)?,
+            value => return Err(format!("unknown evaluate verify option: {value}")),
+        }
+        index += 1;
+    }
+    let public_key = public_key.ok_or("evaluate verify requires --key")?;
+    let result = denoize::SignedEvaluationResult::from_file(result_path)?;
+    let key = ReceiptPublicKey::from_file(public_key)?;
+    let manifest = manifest_path
+        .as_deref()
+        .map(denoize::EvaluationManifest::from_file)
+        .transpose()?;
+    let report = denoize::verify_evaluation_result(&result, &key, manifest.as_ref())?;
+    if mode.json || mode.pretty {
+        print_evaluation_json(&report, mode)?;
+    } else {
+        println!(
+            "verified {} evaluation result for {} cases with key {}",
+            if report.accepted {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            report.cases,
+            report.key_id
+        );
+    }
+    if !report.accepted {
+        return Err("verified evaluation result is not accepted".into());
+    }
+    Ok(())
+}
+
+fn run_evaluate_compare(args: &[String]) -> Result<(), String> {
+    let baseline_path = evaluation_positional(
+        args,
+        0,
+        "evaluate compare requires BASELINE.json and CANDIDATE.json",
+    )?;
+    let candidate_path = evaluation_positional(
+        args,
+        1,
+        "evaluate compare requires BASELINE.json and CANDIDATE.json",
+    )?;
+    let mut shared_key = None;
+    let mut baseline_key = None;
+    let mut candidate_key = None;
+    let mut mode = EvaluationPrintMode::default();
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--key" => set_evaluation_option(
+                &mut shared_key,
+                evaluation_value(args, &mut index, "--key")?,
+                "--key",
+            )?,
+            "--baseline-key" => set_evaluation_option(
+                &mut baseline_key,
+                evaluation_value(args, &mut index, "--baseline-key")?,
+                "--baseline-key",
+            )?,
+            "--candidate-key" => set_evaluation_option(
+                &mut candidate_key,
+                evaluation_value(args, &mut index, "--candidate-key")?,
+                "--candidate-key",
+            )?,
+            "--json" => set_evaluation_print_mode(&mut mode, false)?,
+            "--pretty" => set_evaluation_print_mode(&mut mode, true)?,
+            value => return Err(format!("unknown evaluate compare option: {value}")),
+        }
+        index += 1;
+    }
+    if shared_key.is_some() && (baseline_key.is_some() || candidate_key.is_some()) {
+        return Err(
+            "evaluate compare accepts either --key or separate baseline/candidate keys".into(),
+        );
+    }
+    let baseline_key_path = shared_key
+        .as_deref()
+        .or(baseline_key.as_deref())
+        .ok_or("evaluate compare requires --key or --baseline-key")?;
+    let candidate_key_path = shared_key
+        .as_deref()
+        .or(candidate_key.as_deref())
+        .ok_or("evaluate compare requires --key or --candidate-key")?;
+    let baseline = denoize::SignedEvaluationResult::from_file(baseline_path)?;
+    let candidate = denoize::SignedEvaluationResult::from_file(candidate_path)?;
+    let baseline_key = ReceiptPublicKey::from_file(baseline_key_path)?;
+    let candidate_key = ReceiptPublicKey::from_file(candidate_key_path)?;
+    let report =
+        denoize::compare_evaluation_results(&baseline, &baseline_key, &candidate, &candidate_key)?;
+    if mode.json || mode.pretty {
+        print_evaluation_json(&report, mode)?;
+    } else {
+        println!(
+            "evaluation regression comparison: {} ({} -> {})",
+            if report.passed { "passed" } else { "failed" },
+            report.baseline_version,
+            report.candidate_version
+        );
+        for regression in &report.regressions {
+            println!(
+                "{}: baseline {}, candidate {}, regression {} <= {} ({})",
+                regression.metric,
+                regression.baseline,
+                regression.candidate,
+                regression.regression,
+                regression.limit,
+                if regression.passed { "pass" } else { "fail" }
+            );
+        }
+    }
+    if !report.passed {
+        return Err("evaluation regression policy failed".into());
+    }
+    Ok(())
+}
+
+fn evaluation_positional<'a>(
+    args: &'a [String],
+    index: usize,
+    error: &str,
+) -> Result<&'a str, String> {
+    args.get(index)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .map(String::as_str)
+        .ok_or_else(|| error.to_string())
+}
+
+fn evaluation_value(args: &[String], index: &mut usize, option: &str) -> Result<String, String> {
+    *index = index
+        .checked_add(1)
+        .ok_or("evaluation argument index overflow")?;
+    args.get(*index)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .cloned()
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn set_evaluation_option(
+    target: &mut Option<String>,
+    value: String,
+    option: &str,
+) -> Result<(), String> {
+    if target.replace(value).is_some() {
+        Err(format!("{option} may be supplied only once"))
+    } else {
+        Ok(())
+    }
+}
+
+fn set_evaluation_print_mode(mode: &mut EvaluationPrintMode, pretty: bool) -> Result<(), String> {
+    if mode.json || mode.pretty {
+        return Err("evaluate accepts only one of --json or --pretty".into());
+    }
+    mode.json = !pretty;
+    mode.pretty = pretty;
+    Ok(())
+}
+
+fn print_evaluation_json<T: Serialize>(value: &T, mode: EvaluationPrintMode) -> Result<(), String> {
+    let json = if mode.pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .map_err(|error| format!("serialize evaluation CLI result: {error}"))?;
+    println!("{json}");
+    Ok(())
 }
 
 fn run_metrics(args: &[String]) -> Result<(), String> {
