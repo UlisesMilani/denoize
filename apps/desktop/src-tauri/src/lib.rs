@@ -15,13 +15,14 @@ use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
     AacEncoder, AcceleratorPreference, AtomicOutput, AudioStreamInfo, AudioStreamReader,
     AudioStreamWriter, Backend, BackendOptions, BackendSession, ChannelMode, CommitMode,
-    DecodeLimits, DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
+    DawPortConfiguration, DawPreset, DawRealtimeProcessor, DawSessionState, DecodeLimits,
+    DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
     ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
     PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
     ReceiptVerificationReport, ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest,
     SgmseProfile, SignedExecutionReceipt, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
     StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob,
-    WatchProcessError,
+    WatchProcessError, DAW_LATENCY_POLICY, DAW_PLUGIN_ID,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -3673,6 +3674,122 @@ async fn save_automation_snapshot(path: String) -> DesktopResult<()> {
             .await
             .map_err(|error| format!("自動化JSONの書出タスクに失敗しました: {error}"))??,
     )
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DawPluginInfo {
+    plugin_id: &'static str,
+    version: &'static str,
+    format: &'static str,
+    latency_policy: &'static str,
+    sample_rate: f64,
+    latency_frames: u32,
+    measured_latency_frames: u32,
+    matches_reported: bool,
+    latency_millis: f64,
+    port_configurations: [&'static str; 2],
+    sample_formats: [&'static str; 2],
+    realtime_allocations: u32,
+}
+
+#[tauri::command]
+fn daw_plugin_info(sample_rate: f64) -> DesktopResult<DawPluginInfo> {
+    let mut processor = DawRealtimeProcessor::new(sample_rate, 2)?;
+    let latency_frames = processor.latency_frames();
+    let runtime = processor.prepare_parameters(&denoize::DawParameters {
+        bypass: true,
+        ..denoize::DawParameters::default()
+    })?;
+    let measured_latency_frames = (0..=latency_frames.saturating_add(1))
+        .find(|&frame| {
+            let input = if frame == 0 { 1.0 } else { 0.0 };
+            processor.process_frame_f64([input, input], &runtime)[0] != 0.0
+        })
+        .ok_or_else(|| {
+            DesktopError::new(
+                "operation.failed",
+                "DAW impulse latency measurement produced no output",
+            )
+        })?;
+    let matches_reported = measured_latency_frames == latency_frames;
+    if !matches_reported {
+        return Err(DesktopError::new(
+            "operation.failed",
+            format!(
+                "DAW measured latency {measured_latency_frames} frames differs from reported latency {latency_frames} frames"
+            ),
+        ));
+    }
+    Ok(DawPluginInfo {
+        plugin_id: DAW_PLUGIN_ID,
+        version: env!("CARGO_PKG_VERSION"),
+        format: "CLAP",
+        latency_policy: DAW_LATENCY_POLICY,
+        sample_rate,
+        latency_frames,
+        measured_latency_frames,
+        matches_reported,
+        latency_millis: processor.latency_millis(),
+        port_configurations: ["mono", "stereo"],
+        sample_formats: ["f32", "f64"],
+        realtime_allocations: 0,
+    })
+}
+
+#[tauri::command]
+fn daw_factory_preset(factory: String) -> DesktopResult<DawPreset> {
+    DawPreset::factory(&factory).ok_or_else(|| {
+        DesktopError::new(
+            "validation.invalid",
+            format!("unknown DAW factory preset {factory}; expected speech, gentle, or music"),
+        )
+    })
+}
+
+#[tauri::command]
+fn import_daw_preset(path: String) -> DesktopResult<DawPreset> {
+    denoize::read_daw_preset(path).map_err(DesktopError::from)
+}
+
+#[tauri::command]
+fn export_daw_preset(path: String, preset: DawPreset, replace: bool) -> DesktopResult<DawPreset> {
+    preset.validate()?;
+    denoize::write_daw_preset(
+        path,
+        &preset,
+        if replace {
+            CommitMode::Replace
+        } else {
+            CommitMode::NoClobber
+        },
+    )?;
+    Ok(preset)
+}
+
+#[tauri::command]
+fn import_daw_session(path: String) -> DesktopResult<DawSessionState> {
+    denoize::read_daw_session(path).map_err(DesktopError::from)
+}
+
+#[tauri::command]
+fn export_daw_session(
+    path: String,
+    preset: DawPreset,
+    port_configuration: DawPortConfiguration,
+    replace: bool,
+) -> DesktopResult<DawSessionState> {
+    let state = DawSessionState::new(preset, port_configuration)?;
+    denoize::write_daw_session(
+        path,
+        &state,
+        if replace {
+            CommitMode::Replace
+        } else {
+            CommitMode::NoClobber
+        },
+    )?;
+    Ok(state)
 }
 
 #[tauri::command]
@@ -7706,6 +7823,12 @@ pub fn run() {
             reset_model_trust_time_floor,
             model_cache_doctor,
             save_automation_snapshot,
+            daw_plugin_info,
+            daw_factory_preset,
+            import_daw_preset,
+            export_daw_preset,
+            import_daw_session,
+            export_daw_session,
             prune_model_cache,
             model_action,
             start_preview,
@@ -7745,6 +7868,47 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn daw_desktop_contract_round_trips_portable_state() {
+        let info = daw_plugin_info(44_100.0).unwrap();
+        assert_eq!(info.plugin_id, DAW_PLUGIN_ID);
+        assert_eq!(info.latency_frames, 441);
+        assert_eq!(info.measured_latency_frames, 441);
+        assert!(info.matches_reported);
+        assert_eq!(info.realtime_allocations, 0);
+
+        let directory = tempfile::tempdir().unwrap();
+        let preset_path = directory.path().join("studio.json");
+        let session_path = directory.path().join("session.json");
+        let mut preset = daw_factory_preset("speech".into()).unwrap();
+        preset.name = "Studio".into();
+        preset.parameters.amount = 0.8;
+        let exported = export_daw_preset(
+            preset_path.to_string_lossy().into_owned(),
+            preset.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(exported, preset);
+        assert_eq!(
+            import_daw_preset(preset_path.to_string_lossy().into_owned()).unwrap(),
+            preset
+        );
+
+        let state = export_daw_session(
+            session_path.to_string_lossy().into_owned(),
+            preset,
+            DawPortConfiguration::Mono,
+            false,
+        )
+        .unwrap();
+        assert_eq!(state.port_configuration, DawPortConfiguration::Mono);
+        assert_eq!(
+            import_daw_session(session_path.to_string_lossy().into_owned()).unwrap(),
+            state
+        );
+    }
+
     struct ResetDesktopStreamHooks;
 
     impl Drop for ResetDesktopStreamHooks {
@@ -7769,7 +7933,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "29f848b60e2bdd3969b6d6135ab5c096b5a8f96a6d41bc7db2d86a6791f6233b";
+        "15a5484ef746e7721b3006f603b0a0867b516912c5ea5cc0e67d80f2551865e2";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

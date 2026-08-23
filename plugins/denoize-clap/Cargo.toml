@@ -1,0 +1,31 @@
+[package]
+name = "denoize-clap"
+version = "0.68.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+description = "Real-time-safe CLAP plug-in for denoize"
+
+[lib]
+name = "denoize_clap"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+denoize = { path = "../..", version = "0.68.0", default-features = false }
+clack-plugin = "0.1.1"
+clack-extensions = { version = "0.1.1", features = [
+    "audio-ports",
+    "audio-ports-config",
+    "clack-plugin",
+    "latency",
+    "params",
+    "state",
+] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

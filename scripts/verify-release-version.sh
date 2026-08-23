@@ -94,6 +94,7 @@ else
 fi
 
 root_lock_version=$(workspace_lock_version Cargo.lock denoize)
+plugin_lock_version=$(workspace_lock_version Cargo.lock denoize-clap)
 tauri_denoize_lock_version=$(workspace_lock_version apps/desktop/src-tauri/Cargo.lock denoize)
 tauri_desktop_lock_version=$(workspace_lock_version apps/desktop/src-tauri/Cargo.lock denoize-desktop)
 
@@ -110,6 +111,8 @@ check_version() {
 check_version "Cargo.toml package" "$package_version"
 check_version "Cargo.crates-io.toml package" "$(manifest_version Cargo.crates-io.toml)"
 check_version "Cargo.lock denoize package" "$root_lock_version"
+check_version "plugins/denoize-clap/Cargo.toml package" "$(manifest_version plugins/denoize-clap/Cargo.toml)"
+check_version "Cargo.lock denoize-clap package" "$plugin_lock_version"
 check_version "apps/desktop/package.json" "$(jq -r '.version // empty' apps/desktop/package.json)"
 check_version "apps/desktop/package-lock.json root" "$(jq -r '.version // empty' apps/desktop/package-lock.json)"
 check_version "apps/desktop/package-lock.json workspace" "$(jq -r '.packages[""].version // empty' apps/desktop/package-lock.json)"
@@ -124,4 +127,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "release version $expected is synchronized across 11 fields"
+echo "release version $expected is synchronized across 13 fields"

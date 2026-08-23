@@ -7,7 +7,11 @@
     { "$ref": "#/$defs/streamResult" },
     { "$ref": "#/$defs/batchProgress" },
     { "$ref": "#/$defs/batchSummary" },
-    { "$ref": "#/$defs/liveStatus" }
+    { "$ref": "#/$defs/liveStatus" },
+    { "$ref": "#/$defs/pluginInfo" },
+    { "$ref": "#/$defs/pluginLatency" },
+    { "$ref": "#/$defs/pluginPresetValidation" },
+    { "$ref": "#/$defs/pluginSessionValidation" }
   ],
   "$defs": {
     "recipe": {
@@ -171,6 +175,94 @@
           }
         }
       ]
+    },
+    "pluginInfo": {
+      "type": "object",
+      "required": [
+        "schema", "schema_version", "event", "plugin_id", "name", "version",
+        "format", "port_configurations", "sample_formats", "factory_presets",
+        "latency_policy", "latency_millis", "realtime_contract"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-info" },
+        "plugin_id": { "const": "org.penguin425.denoize" },
+        "name": { "const": "denoize" },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "format": { "const": "CLAP" },
+        "port_configurations": { "const": ["mono", "stereo"] },
+        "sample_formats": { "const": ["f32", "f64"] },
+        "factory_presets": { "const": ["speech", "gentle", "music"] },
+        "latency_policy": { "const": "fixed-10ms-v1" },
+        "latency_millis": { "const": 10 },
+        "realtime_contract": {
+          "type": "object",
+          "required": ["allocations", "locks", "file_io", "system_calls"],
+          "properties": {
+            "allocations": { "const": 0 },
+            "locks": { "const": 0 },
+            "file_io": { "const": false },
+            "system_calls": { "const": false }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "pluginLatency": {
+      "type": "object",
+      "required": [
+        "schema", "schema_version", "event", "plugin_id", "latency_policy",
+        "sample_rate", "latency_frames", "latency_millis",
+        "measured_latency_frames", "matches_reported", "measurement"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-latency" },
+        "plugin_id": { "const": "org.penguin425.denoize" },
+        "latency_policy": { "const": "fixed-10ms-v1" },
+        "sample_rate": { "type": "number", "exclusiveMinimum": 0, "maximum": 768000 },
+        "latency_frames": { "type": "integer", "minimum": 1 },
+        "latency_millis": { "type": "number", "exclusiveMinimum": 0 },
+        "measured_latency_frames": { "type": "integer", "minimum": 1 },
+        "matches_reported": { "const": true },
+        "measurement": { "const": "f64-bypass-impulse-v1" }
+      },
+      "additionalProperties": false
+    },
+    "pluginPresetValidation": {
+      "type": "object",
+      "required": ["schema", "schema_version", "event", "valid", "path", "plugin_id", "name"],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-preset-validation" },
+        "valid": { "const": true },
+        "path": { "type": "string", "minLength": 1 },
+        "plugin_id": { "const": "org.penguin425.denoize" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 }
+      },
+      "additionalProperties": false
+    },
+    "pluginSessionValidation": {
+      "type": "object",
+      "required": [
+        "schema", "schema_version", "event", "valid", "path", "plugin_id",
+        "port_configuration", "latency_policy"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-session-validation" },
+        "valid": { "const": true },
+        "path": { "type": "string", "minLength": 1 },
+        "plugin_id": { "const": "org.penguin425.denoize" },
+        "port_configuration": { "enum": ["mono", "stereo"] },
+        "latency_policy": { "const": "fixed-10ms-v1" }
+      },
+      "additionalProperties": false
     },
     "liveStatus": {
       "type": "object",

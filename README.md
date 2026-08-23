@@ -675,10 +675,58 @@ denoize long-noisy.flac long-clean.wav --stream --resume \
   --stream-frames 4096 --max-memory 64 --max-temp-space 8192
 ```
 
+## DAW plug-in
+
+The first DAW integration is a CLAP audio effect with the stable plug-in ID
+`org.penguin425.denoize`. It supports mono and stereo ports, `f32` and `f64`
+audio, in-place and out-of-place buffers, sample-accurate automation, bypass,
+stereo linking, dry/wet mix, and output gain. Activation allocates all delay
+and DSP state up front. The audio callback performs no allocation, locking,
+filesystem or network I/O, or system calls. v0.68 uses host-rendered parameter
+controls; it does not yet provide a custom in-host editor.
+
+The plug-in reports the fixed `fixed-10ms-v1` latency policy to the host. The
+exact frame count is `ceil(sample_rate * 0.010)`: 441 frames at 44.1 kHz, 480
+at 48 kHz, and 960 at 96 kHz. `denoize plugin latency` independently sends an
+impulse through the bypassed `f64` processor and fails if the measured first
+output frame differs from the reported value:
+
+```sh
+denoize plugin info --pretty
+denoize plugin latency --sample-rate 48000 --pretty
+
+denoize plugin preset create speech speech.json --name "Dialogue" --pretty
+denoize plugin preset validate speech.json --json
+denoize plugin session create speech.json session.json --stereo --pretty
+denoize plugin session validate session.json --json
+```
+
+Portable presets use
+[`denoize-daw-preset-v1`](schemas/denoize-daw-preset-v1.schema.json). Complete
+session state uses
+[`denoize-daw-session-v1`](schemas/denoize-daw-session-v1.schema.json) and
+binds the plug-in ID, latency policy, mono/stereo port configuration, and every
+parameter. Both formats reject unknown fields and future versions, are bounded
+to 64 KiB, read only regular non-symlink files, and publish atomically with
+no-clobber as the default. CLAP host state serializes the same deterministic
+session document, so standalone files and DAW restoration cannot drift into
+separate state formats.
+
+From a repository checkout, build a local plug-in with
+`cargo build --release -p denoize-clap`. On Linux,
+copy `target/release/libdenoize_clap.so` to `~/.clap/denoize.clap`. Tagged
+releases provide ready-to-copy archives for Linux x86-64, macOS Intel and Apple
+Silicon, and Windows x86-64. macOS archives contain a complete
+`denoize.clap` bundle. After copying it to a standard CLAP directory, restart
+the DAW or run its plug-in rescan. CI and the tagged release workflow verify
+the plug-in with the pinned official CLAP validator 0.4.1: 44 tests, 36
+applicable passes, no failures or warnings, and 8 capability-based skips.
+
 ## Desktop app
 
-The Tauri desktop app exposes single-file denoising, batch conversion, quality
-comparison, and model management without sending audio off the computer. Its
+The Tauri desktop app exposes single-file denoising, batch conversion, DAW
+plug-in state management, quality comparison, and model management without
+sending audio off the computer. Its
 default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
@@ -739,6 +787,12 @@ model to be installed (or an explicit model path) and keeps one optimized graph
 with independent recurrent state per processed channel. Headphones help
 prevent acoustic feedback.
 
+The DAW plug-in page displays the exact reported and measured latency for a
+selected sample rate, loads the three factory presets, edits every stable
+parameter, and imports or atomically exports portable preset and deterministic
+session JSON. All validation and file publication remain in Rust; the WebView
+does not implement a second parser or state contract.
+
 File and batch jobs keep owner-private recovery records while their exact
 denoize staging files are live. After a crash, the desktop can retry the saved
 request or discard the record and only those verified private stage files;
@@ -794,18 +848,22 @@ prebuilt `full`-feature binaries for:
 - macOS Intel and Apple Silicon
 - Windows x86-64
 
+The same release also includes CLAP plug-in archives for those four target
+architectures. Extract the matching `denoize-plugin-<tag>-<target>` archive and
+copy its `denoize.clap` file or macOS bundle into a standard CLAP directory.
+
 Every archive has a matching `.sha256` checksum file. Releases also publish the
 exact embedded model catalog, its detached signature, the exact embedded model
 trust-root document, and `denoize-models-<tag>.dmb` plus its checksum. The signed
 bundle contains the catalog models, upstream licenses, and provenance for
 closed-network installation; the standalone catalog/root assets remain
-available for independent audit and recovery tooling. Releases also publish the
-every versioned JSON Schema used by automation, monitoring, and verification
-clients.
+available for independent audit and recovery tooling. Releases also publish
+every versioned JSON Schema used by automation, monitoring, DAW state, and
+verification clients.
 
-Every installable CLI archive, desktop package, crates.io archive, and offline
-model bundle also has a per-artifact CycloneDX SBOM. The release evidence
-archive binds those 14 artifacts and SBOMs to their sizes and SHA-256 digests,
+Every installable CLI archive, CLAP archive, desktop package, crates.io archive,
+and offline model bundle also has a per-artifact CycloneDX SBOM. The release
+evidence archive binds those 18 artifacts and SBOMs to their sizes and SHA-256 digests,
 while companion GitHub Sigstore/SLSA bundles prove the exact tag commit and
 release workflow. See [release evidence and offline verification](docs/release-evidence.md)
 for the trust model and an air-gapped verification procedure.
@@ -826,7 +884,7 @@ this repository with its primary `Cargo.toml`.
 
 1. Synchronize the root/crates.io manifests and lockfile, the desktop npm and
    Tauri manifests/configuration and lockfiles, and the generated CLI banner.
-2. Run `bash scripts/verify-release-version.sh` to check all 11 version fields.
+2. Run `bash scripts/verify-release-version.sh` to check all 13 version fields.
 3. Commit and push the version change.
 4. Create the tag from a commit on the default branch and push it:
 
@@ -837,7 +895,7 @@ git push origin v0.1.0
 
 The `GitHub Release` workflow verifies that the tag is on the default branch and
 matches every release version field, runs the full test suite, and builds all
-CLI and desktop targets before publishing the crates.io package. It then checks
+CLI, CLAP, and desktop targets before publishing the crates.io package. It then checks
 all archives, checksums, signatures, per-artifact SBOMs, build provenance, and
 updater metadata before publishing the draft release and generated notes. The
 exact `.crate` archive is attested before publication and its checksum must

@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.67.1 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.68.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -19,6 +19,7 @@ USAGE:
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
+    denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
 
 LIVE:
@@ -124,7 +125,7 @@ CONFIGURATION:
 ## Watch-folder automation
 
 ```text
-denoize 0.67.1 watch-folder automation
+denoize 0.68.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -295,6 +296,38 @@ options are rejected. File jobs are cancel-and-retry only; batch and stream
 pause at verified durable checkpoint/publication boundaries.
 ```
 
+## DAW plug-in contracts
+
+```text
+USAGE:
+    denoize plugin info [--json|--pretty]
+    denoize plugin latency [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin preset create <speech|gentle|music> <OUTPUT.json> [OPTIONS]
+    denoize plugin preset inspect|validate <PRESET.json> [--json|--pretty]
+    denoize plugin session create <PRESET.json> <OUTPUT.json> [--mono|--stereo] [OPTIONS]
+    denoize plugin session inspect|validate <SESSION.json> [--json|--pretty]
+
+PRESET CREATE OPTIONS:
+    --name <NAME>             portable preset display name
+    --amount <0..1>           suppression amount
+    --threshold-dbfs <-96..-18>
+    --release-ms <20..1000>
+    --mix <0..1>
+    --output-gain-db <-24..24>
+    --bypass|--no-bypass
+    --stereo-link|--no-stereo-link
+    --replace                 atomically replace an existing output
+    --json|--pretty           print the created contract as JSON
+
+SESSION CREATE OPTIONS:
+    --mono|--stereo           restored port layout (default: stereo)
+    --replace                 atomically replace an existing output
+    --json|--pretty           print the created contract as JSON
+
+CLAP state and these JSON contracts use the same stable parameter IDs, fixed
+10 ms latency policy, and deterministic compact serialization.
+```
+
 Watch mode uses portable bounded polling. A regular audio file becomes eligible
 only after its length, modification stamp, filesystem identity, and SHA-256
 remain unchanged for the complete settle interval. Every processing transition
@@ -380,6 +413,22 @@ Revoking a grant blocks new requests but does not erase admitted work, so cancel
 first when queued or running jobs must stop. The versioned discovery,
 capability, request/response, dry-run, status, and history schemas are documented
 in `docs/json.md` and shipped in both release assets and the crates.io package.
+
+## DAW plug-in contracts
+
+`denoize plugin info` reports the CLAP identity, mono/stereo and f32/f64
+capabilities, factory presets, fixed latency policy, and zero-allocation audio
+callback contract. `plugin latency` sends an f64 bypass impulse through the
+same processor, reports both the host frame count and measured first-output
+frame, and fails if they differ. It accepts every finite sample rate supported
+by CLAP validation up to 768 kHz.
+
+Preset and session creation is no-clobber by default; `--replace` is explicit.
+Both readers accept only bounded regular non-symlink JSON files. Preset v1
+contains every stable parameter. Session v1 adds the plug-in identity,
+`fixed-10ms-v1` policy, mono/stereo port configuration, and the preset. CLAP
+host snapshots use the same canonical session bytes, so file and host state
+round trips restore one deterministic contract.
 
 ## Stable JSON automation
 

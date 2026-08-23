@@ -21,6 +21,10 @@ denoize_release_primary_assets() {
     cli x86_64-apple-darwin "denoize-${tag}-x86_64-apple-darwin.tar.gz" \
     cli x86_64-pc-windows-msvc "denoize-${tag}-x86_64-pc-windows-msvc.zip" \
     cli x86_64-unknown-linux-gnu "denoize-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+    plugin aarch64-apple-darwin "denoize-plugin-${tag}-aarch64-apple-darwin.tar.gz" \
+    plugin x86_64-apple-darwin "denoize-plugin-${tag}-x86_64-apple-darwin.tar.gz" \
+    plugin x86_64-pc-windows-msvc "denoize-plugin-${tag}-x86_64-pc-windows-msvc.zip" \
+    plugin x86_64-unknown-linux-gnu "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.app.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.dmg" \
     desktop x86_64-apple-darwin "denoize_${version}_x64.app.tar.gz" \

@@ -189,6 +189,25 @@ type LiveEvent = {
   accelerator?: AcceleratorSelection | null;
   error?: StructuredDesktopError | null;
 };
+type DawParameters = {
+  bypass: boolean; amount: number; threshold_dbfs: number; release_ms: number;
+  mix: number; output_gain_db: number; stereo_link: boolean;
+};
+type DawPreset = {
+  schema: "denoize-daw-preset-v1"; schema_version: 1; plugin_id: string;
+  name: string; parameters: DawParameters;
+};
+type DawSessionState = {
+  schema: "denoize-daw-session-v1"; schema_version: 1; plugin_id: string;
+  latency_policy: "fixed-10ms-v1"; port_configuration: "mono" | "stereo";
+  preset: DawPreset;
+};
+type DawPluginInfo = {
+  pluginId: string; version: string; format: "CLAP"; latencyPolicy: string;
+  sampleRate: number; latencyFrames: number; latencyMillis: number;
+  measuredLatencyFrames: number; matchesReported: boolean;
+  portConfigurations: string[]; sampleFormats: string[]; realtimeAllocations: number;
+};
 type ExecutionPlan = {
   schema: string; schema_version: number; denoize_version: string; kind: "file" | "batch" | "stream";
   deterministic: boolean; metadata_policy: string; items: Array<Record<string, unknown>>;
@@ -204,6 +223,7 @@ type WatchCycleReport = {
 type IpcResult = { type: string; value?: unknown };
 
 const audioFilters = [{ name: "Audio", extensions: ["wav", "flac", "opus", "ogg", "mp3", "m4a", "aac"] }];
+const jsonFilters = [{ name: "JSON", extensions: ["json"] }];
 let appInfo: AppInfo;
 let activeJob: number | null = null;
 let pendingJobKind: "file" | "batch" | null = null;
@@ -240,6 +260,17 @@ let watchQuarantine = "";
 let watchReceiptDir = "";
 let watchStatePath = "";
 let watchTotals = { attempted: 0, succeeded: 0, retrying: 0, quarantined: 0, superseded: 0, scan_errors: 0 };
+let dawPreset: DawPreset = {
+  schema: "denoize-daw-preset-v1",
+  schema_version: 1,
+  plugin_id: "org.penguin425.denoize",
+  name: "Speech",
+  parameters: {
+    bypass: false, amount: 0.65, threshold_dbfs: -54, release_ms: 160,
+    mix: 1, output_gain_db: 0, stereo_link: true,
+  },
+};
+let dawSession: DawSessionState | null = null;
 
 document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
   <a class="skip-link" href="#main-content">メイン内容へ移動</a>
@@ -251,6 +282,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="nav-batch" class="nav-item" role="tab" data-page="batch" aria-controls="page-batch" aria-selected="false" tabindex="-1"><span aria-hidden="true">▦</span>バッチ</button>
         <button id="nav-watch" class="nav-item" role="tab" data-page="watch" aria-controls="page-watch" aria-selected="false" tabindex="-1"><span aria-hidden="true">◌</span>監視フォルダ</button>
         <button id="nav-live" class="nav-item" role="tab" data-page="live" aria-controls="page-live" aria-selected="false" tabindex="-1"><span aria-hidden="true">◉</span>リアルタイム</button>
+        <button id="nav-plugin" class="nav-item" role="tab" data-page="plugin" aria-controls="page-plugin" aria-selected="false" tabindex="-1"><span aria-hidden="true">◫</span>DAW プラグイン</button>
         <button id="nav-compare" class="nav-item" role="tab" data-page="compare" aria-controls="page-compare" aria-selected="false" tabindex="-1"><span aria-hidden="true">◒</span>品質比較</button>
         <button id="nav-models" class="nav-item" role="tab" data-page="models" aria-controls="page-models" aria-selected="false" tabindex="-1"><span aria-hidden="true">⬡</span>モデル</button>
         <button id="nav-automation" class="nav-item" role="tab" data-page="automation" aria-controls="page-automation" aria-selected="false" tabindex="-1"><span aria-hidden="true">⌁</span>IPC 自動化</button>
@@ -434,6 +466,60 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <button class="primary wide" id="start-live">ライブ処理を開始 <span>→</span></button>
             <button class="danger wide hidden" id="stop-live">停止</button>
           </article>
+        </div>
+      </section>
+
+      <section class="page" id="page-plugin" role="tabpanel" aria-labelledby="nav-plugin" aria-hidden="true">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">CLAP</span><h2>プラグイン契約</h2></div><span class="hint">RT SAFE · FIXED LATENCY</span></div>
+              <p class="section-copy">DAW が補正できる固定レイテンシと、オーディオコールバック内のゼロ allocation 契約を表示します。</p>
+              <div class="form-grid two"><label>サンプルレート Hz<input id="daw-sample-rate" type="number" value="48000" min="1" max="768000" step="1" inputmode="decimal"></label><label>プラグイン ID<input id="daw-plugin-id" type="text" value="org.penguin425.denoize" readonly></label></div>
+              <div class="metric-pair"><div><span>報告レイテンシ</span><b id="daw-latency-frames">480 frames</b></div><div><span>測定レイテンシ</span><b id="daw-latency-ms">480 frames · 10.000 ms</b></div></div>
+              <p id="daw-plugin-status" class="field-hint" role="status" aria-live="polite">CLAP 契約を確認しています。</p>
+              <button type="button" class="secondary" id="refresh-daw-plugin">レイテンシを再計測</button>
+            </article>
+
+            <article class="card">
+              <div class="card-heading"><div><span class="step">PRESET</span><h2>ポータブルプリセット</h2></div><span class="hint">JSON · HOST INDEPENDENT</span></div>
+              <p class="section-copy">factory 設定を編集し、別の DAW や OS でも使える厳密な JSON 契約として読み書きします。</p>
+              <div class="form-grid two"><label>Factory<select id="daw-factory"><option value="speech">音声</option><option value="gentle">穏やか</option><option value="music">音楽</option></select></label><label>プリセット名<input id="daw-preset-name" type="text" value="Speech" maxlength="80"></label></div>
+              <div class="button-row"><button type="button" class="secondary" id="load-daw-factory">Factory を読込</button><button type="button" class="secondary" id="import-daw-preset">プリセットを読込</button><button type="button" class="secondary" id="export-daw-preset">プリセットを書出</button></div>
+              <div class="form-grid three daw-parameter-grid">
+                <label>Amount<input id="daw-amount" type="number" value="0.65" min="0" max="1" step="0.01" inputmode="decimal"></label>
+                <label>Threshold dBFS<input id="daw-threshold" type="number" value="-54" min="-96" max="-18" step="0.1" inputmode="decimal"></label>
+                <label>Release ms<input id="daw-release" type="number" value="160" min="20" max="1000" step="1" inputmode="decimal"></label>
+                <label>Mix<input id="daw-mix" type="number" value="1" min="0" max="1" step="0.01" inputmode="decimal"></label>
+                <label>Output gain dB<input id="daw-gain" type="number" value="0" min="-24" max="24" step="0.1" inputmode="decimal"></label>
+              </div>
+              <div class="toggle-grid daw-toggle-grid">
+                <label class="toggle"><input id="daw-bypass" type="checkbox"><span></span><div><b>Bypass</b><small>遅延を維持した dry 出力</small></div></label>
+                <label class="toggle"><input id="daw-stereo-link" type="checkbox" checked><span></span><div><b>ステレオリンク</b><small>左右の gain reduction を共有</small></div></label>
+              </div>
+            </article>
+          </div>
+
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">STATE</span><h2>セッション復元</h2></div><span class="hint">DETERMINISTIC</span></div>
+              <p class="section-copy">ポート構成と全 parameter を保存し、再読込時に同じ音声状態へ決定論的に戻します。</p>
+              <div class="form-grid two"><label>ポート構成<select id="daw-port-configuration"><option value="stereo">Stereo</option><option value="mono">Mono</option></select></label><label class="toggle"><input id="daw-replace" type="checkbox"><span></span><div><b>既存を上書き</b><small>未選択時は no-clobber</small></div></label></div>
+              <div class="button-row"><button type="button" class="secondary" id="import-daw-session">セッションを読込</button><button type="button" class="secondary" id="export-daw-session">セッションを書出</button></div>
+              <p id="daw-session-status" class="field-hint" role="status" aria-live="polite">未保存の編集内容です。</p>
+            </article>
+
+            <article class="card result-card">
+              <div class="card-heading"><div><span class="step">JSON</span><h2>復元状態プレビュー</h2></div><span class="hint">SCHEMA V1</span></div>
+              <pre id="daw-state-preview" class="json-preview" aria-live="polite"></pre>
+            </article>
+
+            <article class="card">
+              <div class="card-heading"><div><span class="step">INSTALL</span><h2>DAW へ導入</h2></div><span class="hint">COPY · RESCAN</span></div>
+              <p class="section-copy">リリース archive の denoize.clap を標準 CLAP フォルダへコピーし、DAW を再起動または plug-in rescan してください。</p>
+              <div class="daw-install-paths" data-i18n-skip><code>Linux · ~/.clap/denoize.clap</code><code>macOS · ~/Library/Audio/Plug-Ins/CLAP/denoize.clap</code><code>Windows · %COMMONPROGRAMFILES%\CLAP\denoize.clap</code></div>
+            </article>
+          </div>
         </div>
       </section>
 
@@ -893,6 +979,8 @@ async function init() {
     return;
   }
   await loadLiveDevices();
+  try { await initializeDawPlugin(); }
+  catch (error) { showToast(tr(`DAW プラグイン契約を読み込めません: ${errorText(error)}`, `Could not load the DAW plug-in contract: ${errorText(error)}`), true); }
   restoreSettings();
   updateBackendSettings();
   updateFileStreamSettings();
@@ -1176,6 +1264,182 @@ navigationTabs.forEach((button) => {
     selectNavigation(navigationTabs[next]!, false);
   });
 });
+
+function dawNumber(selector: string, minimum: number, maximum: number): number {
+  const value = Number($<HTMLInputElement>(selector).value);
+  if (!Number.isFinite(value) || value < minimum || value > maximum) {
+    throw new Error(tr(
+      `プラグイン parameter は ${minimum}〜${maximum} の有限値で指定してください`,
+      `Plug-in parameter must be a finite value from ${minimum} to ${maximum}`,
+    ));
+  }
+  return value;
+}
+
+function dawPresetFromForm(): DawPreset {
+  const name = $<HTMLInputElement>("#daw-preset-name").value.trim();
+  if (!name) throw new Error(tr("プリセット名を入力してください", "Enter a preset name"));
+  return {
+    schema: "denoize-daw-preset-v1",
+    schema_version: 1,
+    plugin_id: dawPreset.plugin_id,
+    name,
+    parameters: {
+      bypass: $<HTMLInputElement>("#daw-bypass").checked,
+      amount: dawNumber("#daw-amount", 0, 1),
+      threshold_dbfs: dawNumber("#daw-threshold", -96, -18),
+      release_ms: dawNumber("#daw-release", 20, 1000),
+      mix: dawNumber("#daw-mix", 0, 1),
+      output_gain_db: dawNumber("#daw-gain", -24, 24),
+      stereo_link: $<HTMLInputElement>("#daw-stereo-link").checked,
+    },
+  };
+}
+
+function dawDraftSession(preset: DawPreset): DawSessionState {
+  return {
+    schema: "denoize-daw-session-v1",
+    schema_version: 1,
+    plugin_id: preset.plugin_id,
+    latency_policy: "fixed-10ms-v1",
+    port_configuration: $<HTMLSelectElement>("#daw-port-configuration").value as "mono" | "stereo",
+    preset,
+  };
+}
+
+function renderDawStatePreview(markDirty = true) {
+  try {
+    const preset = dawPresetFromForm();
+    dawPreset = preset;
+    if (markDirty) {
+      dawSession = null;
+      $("#daw-session-status").textContent = tr("未保存の編集内容です。", "These edits have not been saved.");
+    }
+    const state = dawSession ?? dawDraftSession(preset);
+    $("#daw-state-preview").textContent = JSON.stringify(state, null, 2);
+  } catch (error) {
+    dawSession = null;
+    $("#daw-state-preview").textContent = tr(
+      `入力値を確認してください: ${errorText(error)}`,
+      `Check the input values: ${errorText(error)}`,
+    );
+  }
+}
+
+function renderDawPreset(preset: DawPreset, markDirty = true) {
+  dawPreset = preset;
+  $<HTMLInputElement>("#daw-preset-name").value = preset.name;
+  $<HTMLInputElement>("#daw-amount").value = String(preset.parameters.amount);
+  $<HTMLInputElement>("#daw-threshold").value = String(preset.parameters.threshold_dbfs);
+  $<HTMLInputElement>("#daw-release").value = String(preset.parameters.release_ms);
+  $<HTMLInputElement>("#daw-mix").value = String(preset.parameters.mix);
+  $<HTMLInputElement>("#daw-gain").value = String(preset.parameters.output_gain_db);
+  $<HTMLInputElement>("#daw-bypass").checked = preset.parameters.bypass;
+  $<HTMLInputElement>("#daw-stereo-link").checked = preset.parameters.stereo_link;
+  renderDawStatePreview(markDirty);
+}
+
+async function refreshDawPluginInfo() {
+  const sampleRate = Number($<HTMLInputElement>("#daw-sample-rate").value);
+  if (!Number.isFinite(sampleRate) || sampleRate <= 0 || sampleRate > 768000) {
+    throw new Error(tr(
+      "サンプルレートは 0 より大きく 768000 以下の有限値で指定してください",
+      "Sample rate must be a finite value greater than 0 and no greater than 768000",
+    ));
+  }
+  const info = await invoke<DawPluginInfo>("daw_plugin_info", { sampleRate });
+  $<HTMLInputElement>("#daw-plugin-id").value = info.pluginId;
+  $("#daw-latency-frames").textContent = `${info.latencyFrames} frames`;
+  $("#daw-latency-ms").textContent = `${info.measuredLatencyFrames} frames · ${info.latencyMillis.toFixed(3)} ms`;
+  $("#daw-plugin-status").textContent = tr(
+    `${info.format} v${info.version} · ${info.sampleFormats.join("/")} · ${info.portConfigurations.join("/")} · 実測一致 ${info.matchesReported} · RT allocation ${info.realtimeAllocations}`,
+    `${info.format} v${info.version} · ${info.sampleFormats.join("/")} · ${info.portConfigurations.join("/")} · measured match ${info.matchesReported} · RT allocations ${info.realtimeAllocations}`,
+  );
+}
+
+async function loadDawFactoryPreset() {
+  const factory = $<HTMLSelectElement>("#daw-factory").value;
+  const preset = await invoke<DawPreset>("daw_factory_preset", { factory });
+  renderDawPreset(preset);
+  showToast(tr("Factory プリセットを読み込みました", "Factory preset loaded"));
+}
+
+async function initializeDawPlugin() {
+  renderDawPreset(dawPreset, false);
+  await Promise.all([refreshDawPluginInfo(), (async () => {
+    const preset = await invoke<DawPreset>("daw_factory_preset", { factory: "speech" });
+    renderDawPreset(preset, false);
+  })()]);
+}
+
+for (const selector of [
+  "#daw-preset-name", "#daw-amount", "#daw-threshold", "#daw-release", "#daw-mix",
+  "#daw-gain", "#daw-bypass", "#daw-stereo-link", "#daw-port-configuration",
+]) {
+  $(selector).addEventListener("input", () => renderDawStatePreview());
+  $(selector).addEventListener("change", () => renderDawStatePreview());
+}
+
+$("#refresh-daw-plugin").addEventListener("click", () => {
+  void refreshDawPluginInfo().catch((error) => showToast(errorText(error), true));
+});
+$("#load-daw-factory").addEventListener("click", () => {
+  void loadDawFactoryPreset().catch((error) => showToast(errorText(error), true));
+});
+$("#import-daw-preset").addEventListener("click", async () => {
+  try {
+    const path = await open({ multiple: false, filters: jsonFilters });
+    if (typeof path !== "string") return;
+    const preset = await invoke<DawPreset>("import_daw_preset", { path });
+    renderDawPreset(preset);
+    showToast(tr("プリセットを読み込みました", "Preset imported"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+$("#export-daw-preset").addEventListener("click", async () => {
+  try {
+    const path = await save({ defaultPath: "denoize-preset.json", filters: jsonFilters });
+    if (!path) return;
+    const preset = dawPresetFromForm();
+    const saved = await invoke<DawPreset>("export_daw_preset", {
+      path, preset, replace: $<HTMLInputElement>("#daw-replace").checked,
+    });
+    renderDawPreset(saved);
+    showToast(tr("プリセットを書き出しました", "Preset exported"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+$("#import-daw-session").addEventListener("click", async () => {
+  try {
+    const path = await open({ multiple: false, filters: jsonFilters });
+    if (typeof path !== "string") return;
+    const state = await invoke<DawSessionState>("import_daw_session", { path });
+    $<HTMLSelectElement>("#daw-port-configuration").value = state.port_configuration;
+    renderDawPreset(state.preset, false);
+    dawSession = state;
+    renderDawStatePreview(false);
+    $("#daw-session-status").textContent = tr("検証済みセッションを読み込みました。", "Verified session imported.");
+    showToast(tr("セッションを読み込みました", "Session imported"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+$("#export-daw-session").addEventListener("click", async () => {
+  try {
+    const path = await save({ defaultPath: "denoize-session.json", filters: jsonFilters });
+    if (!path) return;
+    const preset = dawPresetFromForm();
+    const state = await invoke<DawSessionState>("export_daw_session", {
+      path,
+      preset,
+      portConfiguration: $<HTMLSelectElement>("#daw-port-configuration").value,
+      replace: $<HTMLInputElement>("#daw-replace").checked,
+    });
+    dawSession = state;
+    renderDawPreset(state.preset, false);
+    renderDawStatePreview(false);
+    $("#daw-session-status").textContent = tr("検証済みセッションを書き出しました。", "Verified session exported.");
+    showToast(tr("セッションを書き出しました", "Session exported"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+renderDawPreset(dawPreset, false);
 
 function ipcConnectionPaths() {
   const discovery = $<HTMLInputElement>("#ipc-discovery-path").value;
