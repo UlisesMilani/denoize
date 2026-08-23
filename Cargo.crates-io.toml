@@ -8,7 +8,7 @@
 
 [package]
 name = "denoize"
-version = "0.68.0"
+version = "0.69.0"
 edition = "2021"
 rust-version = "1.96"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
@@ -45,12 +45,14 @@ include = [
     "/scripts/export-sgmse.py",
     "/scripts/validate-sgmse.py",
     "/scripts/generate-cli-docs.sh",
+    "/scripts/test-evaluation-evidence.sh",
     "/scripts/build-offline-model-bundle.sh",
     "/scripts/generate-release-evidence.py",
     "/scripts/package-release-evidence.sh",
     "/scripts/release-evidence-assets.sh",
     "/scripts/verify-release-evidence.sh",
     "/docs/cli.md",
+    "/docs/evaluation.md",
     "/docs/json.md",
     "/docs/models.md",
     "/docs/resilience.md",
@@ -86,7 +88,7 @@ rayon = "1.11.0"
 ebur128 = "0.1.10"
 lofty = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 toml = "0.8"
 cpal = { version = "0.15.3", optional = true }
 ctrlc = "3.4.5"

@@ -150,6 +150,7 @@ if [[ "$is_dry_run" == true ]]; then
   for required in \
     "denoize-${package_version}/src/automation.rs" \
     "denoize-${package_version}/src/daw.rs" \
+    "denoize-${package_version}/src/evaluation.rs" \
     "denoize-${package_version}/src/model_package/testdata/manifest.json" \
     "denoize-${package_version}/src/model_package/testdata/manifest.json.sig" \
     "denoize-${package_version}/src/model_package/testdata/minisign.pub" \
@@ -159,6 +160,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/LICENSES/clack-0.1.1-MIT.txt" \
     "denoize-${package_version}/LICENSES/clap-sys-0.5.0-MIT.txt" \
     "denoize-${package_version}/docs/json.md" \
+    "denoize-${package_version}/docs/evaluation.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
@@ -168,6 +170,11 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-execution-plan-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v2.schema.json" \
+    "denoize-${package_version}/schemas/denoize-evaluation-comparison-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-evaluation-corpus-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-evaluation-corpus-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-evaluation-result-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-evaluation-verification-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-hardware-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-ipc-capability-summary-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-ipc-capability-v1.schema.json" \
@@ -177,6 +184,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-job-dry-run-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-job-history-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-job-status-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-listening-result-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-presentation-region-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-public-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-secret-key-v1.schema.json" \
@@ -189,6 +197,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-watch-cycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-quarantine-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-state-v1.schema.json" \
+    "denoize-${package_version}/scripts/test-evaluation-evidence.sh" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
     if ! tar -tf "$package_archive" | grep -Fx "$required" >/dev/null; then

@@ -68,6 +68,11 @@ expected_assets=(
   "denoize-execution-plan-v2.schema.json"
   "denoize-execution-receipt-v1.schema.json"
   "denoize-execution-receipt-v2.schema.json"
+  "denoize-evaluation-comparison-v1.schema.json"
+  "denoize-evaluation-corpus-v1.schema.json"
+  "denoize-evaluation-corpus-verification-v1.schema.json"
+  "denoize-evaluation-result-v1.schema.json"
+  "denoize-evaluation-verification-v1.schema.json"
   "denoize-hardware-v1.schema.json"
   "denoize-ipc-capability-summary-v1.schema.json"
   "denoize-ipc-capability-v1.schema.json"
@@ -77,6 +82,7 @@ expected_assets=(
   "denoize-job-dry-run-v1.schema.json"
   "denoize-job-history-v1.schema.json"
   "denoize-job-status-v1.schema.json"
+  "denoize-listening-result-v1.schema.json"
   "denoize-presentation-region-v1.schema.json"
   "denoize-receipt-public-key-v1.schema.json"
   "denoize-receipt-secret-key-v1.schema.json"
@@ -174,6 +180,11 @@ gh release download "$tag" \
   --pattern 'denoize-execution-plan-v2.schema.json' \
   --pattern 'denoize-execution-receipt-v1.schema.json' \
   --pattern 'denoize-execution-receipt-v2.schema.json' \
+  --pattern 'denoize-evaluation-comparison-v1.schema.json' \
+  --pattern 'denoize-evaluation-corpus-v1.schema.json' \
+  --pattern 'denoize-evaluation-corpus-verification-v1.schema.json' \
+  --pattern 'denoize-evaluation-result-v1.schema.json' \
+  --pattern 'denoize-evaluation-verification-v1.schema.json' \
   --pattern 'denoize-hardware-v1.schema.json' \
   --pattern 'denoize-ipc-capability-summary-v1.schema.json' \
   --pattern 'denoize-ipc-capability-v1.schema.json' \
@@ -183,6 +194,7 @@ gh release download "$tag" \
   --pattern 'denoize-job-dry-run-v1.schema.json' \
   --pattern 'denoize-job-history-v1.schema.json' \
   --pattern 'denoize-job-status-v1.schema.json' \
+  --pattern 'denoize-listening-result-v1.schema.json' \
   --pattern 'denoize-presentation-region-v1.schema.json' \
   --pattern 'denoize-receipt-public-key-v1.schema.json' \
   --pattern 'denoize-receipt-secret-key-v1.schema.json' \
@@ -230,6 +242,11 @@ for schema in \
   denoize-execution-plan-v2.schema.json \
   denoize-execution-receipt-v1.schema.json \
   denoize-execution-receipt-v2.schema.json \
+  denoize-evaluation-comparison-v1.schema.json \
+  denoize-evaluation-corpus-v1.schema.json \
+  denoize-evaluation-corpus-verification-v1.schema.json \
+  denoize-evaluation-result-v1.schema.json \
+  denoize-evaluation-verification-v1.schema.json \
   denoize-hardware-v1.schema.json \
   denoize-ipc-capability-summary-v1.schema.json \
   denoize-ipc-capability-v1.schema.json \
@@ -239,6 +256,7 @@ for schema in \
   denoize-job-dry-run-v1.schema.json \
   denoize-job-history-v1.schema.json \
   denoize-job-status-v1.schema.json \
+  denoize-listening-result-v1.schema.json \
   denoize-presentation-region-v1.schema.json \
   denoize-receipt-public-key-v1.schema.json \
   denoize-receipt-secret-key-v1.schema.json \

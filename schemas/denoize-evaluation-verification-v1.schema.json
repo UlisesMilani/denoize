@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-evaluation-verification-v1.schema.json",
+  "title": "denoize signed evaluation verification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "key_id", "manifest_digest", "corpus_id", "cases", "accepted"],
+  "properties": {
+    "schema": { "const": "denoize-evaluation-verification-v1" },
+    "schema_version": { "const": 1 },
+    "key_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "manifest_digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "corpus_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9._+\\-]+$" },
+    "cases": { "type": "integer", "minimum": 1, "maximum": 10000 },
+    "accepted": { "type": "boolean" }
+  }
+}

@@ -1323,6 +1323,39 @@ material require a separately licensed external adapter and are not bundled
 with denoize. Inputs that are too short or a disabled optional implementation
 are represented as `null` rather than preventing the rest of the report.
 
+### Licensed-corpus release evaluation
+
+`denoize evaluate` turns quality, output-integrity, and speed claims into one
+reproducible, signed release gate. The same strict manifest and runner are
+available in the CLI, library, and Desktop app:
+
+```sh
+denoize receipts keygen evaluation-secret.json evaluation-public.json
+denoize evaluate validate corpus.json --corpus-root /datasets/release --pretty
+denoize evaluate run corpus.json --corpus-root /datasets/release \
+  --key evaluation-secret.json --output candidate.evaluation.json
+denoize evaluate verify candidate.evaluation.json \
+  --key evaluation-public.json --manifest corpus.json --pretty
+denoize evaluate compare baseline.evaluation.json candidate.evaluation.json \
+  --key evaluation-public.json --pretty
+```
+
+Each clean/noisy/model artifact pins a portable path, byte length, SHA-256,
+SPDX license, source URI and immutable revision, and signal-preparation digest.
+Audio stays below the caller-selected corpus root and is never embedded in the
+result or release artifacts. Symlinks, escaping paths, changed files, missing
+provenance, incomparable PCM geometry, unavailable metrics, and mismatched
+hardware/runtime/model contexts fail closed.
+
+Signed results include objective and perceptual metrics, duration/rate/channel
+agreement, clipping, sample and true peak, DC offset, silence/dropout ratios,
+integrated loudness, decode integrity, the canonical output fingerprint,
+sorted performance samples, real-time factor, throughput, peak RSS when the OS
+exposes it, and every threshold outcome. A required listening protocol cannot
+be replaced by automation: `run` requires a matching, manifest-bound human
+result. See [reproducible evaluation evidence](docs/evaluation.md) and the
+[stable JSON contracts](docs/json.md).
+
 ### Configuration file
 
 Reusable defaults can be stored in TOML and loaded with `--config`. TOML syntax

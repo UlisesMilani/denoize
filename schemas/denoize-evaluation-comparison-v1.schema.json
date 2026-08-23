@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-evaluation-comparison-v1.schema.json",
+  "title": "denoize authenticated evaluation regression comparison v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "manifest_digest", "baseline_key_id", "candidate_key_id", "baseline_version", "candidate_version", "environment_comparable", "regressions", "passed"],
+  "properties": {
+    "schema": { "const": "denoize-evaluation-comparison-v1" },
+    "schema_version": { "const": 1 },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "baseline_key_id": { "$ref": "#/$defs/keyId" },
+    "candidate_key_id": { "$ref": "#/$defs/keyId" },
+    "baseline_version": { "$ref": "#/$defs/text" },
+    "candidate_version": { "$ref": "#/$defs/text" },
+    "environment_comparable": { "const": true },
+    "regressions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/regression" } },
+    "passed": { "type": "boolean" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "keyId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "metric": { "type": "string", "pattern": "^(objective|perceptual|output|performance)\\.[a-z0-9-]+$" },
+    "regression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "aggregation", "baseline", "candidate", "regression", "limit", "passed"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/metric" },
+        "aggregation": { "enum": ["minimum", "maximum", "mean"] },
+        "baseline": { "type": "number" },
+        "candidate": { "type": "number" },
+        "regression": { "type": "number" },
+        "limit": { "type": "number", "minimum": 0 },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}

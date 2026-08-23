@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-evaluation-corpus-v1.schema.json",
+  "title": "denoize licensed-corpus evaluation manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "corpus_id", "corpus_version", "title", "cases", "recipe", "policy"],
+  "properties": {
+    "schema": { "const": "denoize-evaluation-corpus-v1" },
+    "schema_version": { "const": 1 },
+    "corpus_id": { "$ref": "#/$defs/id" },
+    "corpus_version": { "$ref": "#/$defs/text" },
+    "title": { "$ref": "#/$defs/text" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "recipe": { "$ref": "#/$defs/recipe" },
+    "policy": { "$ref": "#/$defs/policy" }
+  },
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9._+\\-]+$"
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+    },
+    "uri": {
+      "allOf": [
+        { "$ref": "#/$defs/text" },
+        { "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:.+$" }
+      ]
+    },
+    "locator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*//)(?!.*[\\\\:\\u0000-\\u001F\\u007F-\\u009F])[^/]{1,255}(?:/[^/]{1,255})*$"
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx_id", "name", "url"],
+      "properties": {
+        "spdx_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9.+-]+$" },
+        "name": { "$ref": "#/$defs/text" },
+        "url": { "$ref": "#/$defs/uri" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "revision"],
+      "properties": {
+        "uri": { "$ref": "#/$defs/uri" },
+        "revision": { "$ref": "#/$defs/text" }
+      }
+    },
+    "preparation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "tool", "tool_version", "parameters_digest"],
+      "properties": {
+        "description": { "$ref": "#/$defs/text" },
+        "tool": { "$ref": "#/$defs/text" },
+        "tool_version": { "$ref": "#/$defs/text" },
+        "parameters_digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "fingerprint", "license", "source", "preparation"],
+      "properties": {
+        "path": { "$ref": "#/$defs/locator" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "license": { "$ref": "#/$defs/license" },
+        "source": { "$ref": "#/$defs/source" },
+        "preparation": { "$ref": "#/$defs/preparation" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "clean", "noisy", "tags"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "clean": { "$ref": "#/$defs/artifact" },
+        "noisy": { "$ref": "#/$defs/artifact" },
+        "tags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        }
+      }
+    },
+    "recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["backend", "preset", "accelerator", "deterministic", "seed", "channel_mode", "sgmse_profile", "model", "model_sample_rate"],
+      "properties": {
+        "backend": { "enum": ["classical", "rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn"] },
+        "preset": { "enum": ["speech", "music", "aggressive", "gentle", "restore", "hifi"] },
+        "accelerator": { "enum": ["cpu", "auto"] },
+        "deterministic": { "const": true },
+        "seed": { "type": ["integer", "null"], "minimum": 0, "maximum": 9007199254740991 },
+        "channel_mode": { "enum": ["independent", "stereo-linked", "mid-side"] },
+        "sgmse_profile": { "enum": ["fast", "balanced", "quality"] },
+        "model": { "oneOf": [{ "$ref": "#/$defs/artifact" }, { "type": "null" }] },
+        "model_sample_rate": { "type": ["integer", "null"], "minimum": 1, "maximum": 768000 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "backend": { "const": "sgmse" } }, "required": ["backend"] },
+          "then": { "properties": { "seed": { "type": "integer" } } },
+          "else": { "properties": { "seed": { "type": "null" } } }
+        }
+      ]
+    },
+    "metric": {
+      "enum": [
+        "objective.si-sdr-db", "objective.si-sdr-improvement-db", "objective.si-snr-db", "objective.snr-db", "objective.segmental-snr-db",
+        "perceptual.stoi", "perceptual.stoi-improvement", "perceptual.musical-noise", "perceptual.pumping", "perceptual.transient-loss", "perceptual.phase-distortion",
+        "output.duration-error-frames", "output.sample-rate-mismatch", "output.channel-mismatch", "output.clipping-ratio", "output.sample-peak-dbfs", "output.true-peak-dbtp", "output.dc-offset-abs", "output.silence-ratio", "output.dropout-ratio", "output.integrated-lufs", "output.non-finite-samples", "output.decode-integrity",
+        "performance.realtime-factor", "performance.throughput-x", "performance.elapsed-ms", "performance.peak-rss-bytes"
+      ]
+    },
+    "aggregation": { "enum": ["minimum", "maximum", "mean"] },
+    "threshold": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "aggregation", "operator", "value"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/metric" },
+        "aggregation": { "$ref": "#/$defs/aggregation" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "value": { "type": "number" }
+      }
+    },
+    "regression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "aggregation", "direction", "max_regression"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/metric" },
+        "aggregation": { "$ref": "#/$defs/aggregation" },
+        "direction": { "enum": ["higher-is-better", "lower-is-better"] },
+        "max_regression": { "type": "number", "minimum": 0 }
+      }
+    },
+    "listeningProtocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_id", "revision", "method", "instructions_uri", "instructions_digest", "scale_min", "scale_max", "minimum_listeners", "acceptance_score"],
+      "properties": {
+        "protocol_id": { "$ref": "#/$defs/id" },
+        "revision": { "$ref": "#/$defs/text" },
+        "method": { "$ref": "#/$defs/text" },
+        "instructions_uri": { "$ref": "#/$defs/uri" },
+        "instructions_digest": { "$ref": "#/$defs/digest" },
+        "scale_min": { "type": "number" },
+        "scale_max": { "type": "number" },
+        "minimum_listeners": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "acceptance_score": { "type": "number" }
+      }
+    },
+    "listeningPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "rationale", "protocol"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "rationale": { "$ref": "#/$defs/text" },
+        "protocol": { "oneOf": [{ "$ref": "#/$defs/listeningProtocol" }, { "type": "null" }] }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["warmup_runs", "measured_runs", "silence_threshold_dbfs", "dropout_window_ms", "thresholds", "regression_tolerances", "listening"],
+      "properties": {
+        "warmup_runs": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "measured_runs": { "type": "integer", "minimum": 1, "maximum": 50 },
+        "silence_threshold_dbfs": { "type": "number", "minimum": -200, "maximum": -20 },
+        "dropout_window_ms": { "type": "integer", "minimum": 10, "maximum": 1000 },
+        "thresholds": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/threshold" } },
+        "regression_tolerances": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/regression" } },
+        "listening": { "$ref": "#/$defs/listeningPolicy" }
+      }
+    }
+  }
+}

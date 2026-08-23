@@ -254,7 +254,7 @@ unreviewable release.
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Released in v0.66.0 |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Released in v0.67.0 |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Released in v0.68.0 |
-| 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Planned |
+| 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Released in v0.69.0 |
 | 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Planned |
 | 23 | Portable projects and sample-accurate region/timeline workflows with bounded edit graphs, deterministic assembly, and signed provenance | Planned |
 
