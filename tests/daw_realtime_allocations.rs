@@ -1,10 +1,13 @@
 use denoize::{DawParameters, DawRealtimeProcessor};
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct CountingAllocator;
 
-static RECORDING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static RECORDING: Cell<bool> = const { Cell::new(false) };
+}
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -34,7 +37,10 @@ unsafe impl GlobalAlloc for CountingAllocator {
 
 #[inline]
 fn record_allocation() {
-    if RECORDING.load(Ordering::Relaxed) {
+    if RECORDING
+        .try_with(|recording| recording.get())
+        .unwrap_or(false)
+    {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -51,7 +57,10 @@ fn callback_processing_performs_zero_allocations() {
     let mut output_left = vec![0.0_f32; 256];
     let mut output_right = vec![0.0_f32; 256];
 
-    // Initialize code paths and thread-local counters before measuring.
+    // Initialize code paths and the thread-local gate before measuring. Only
+    // allocations on this callback thread belong to the real-time contract;
+    // libtest and other process threads may allocate concurrently.
+    RECORDING.with(|recording| recording.set(false));
     {
         let inputs = [input_left.as_slice(), input_right.as_slice()];
         let mut outputs = [output_left.as_mut_slice(), output_right.as_mut_slice()];
@@ -61,7 +70,7 @@ fn callback_processing_performs_zero_allocations() {
     }
 
     ALLOCATIONS.store(0, Ordering::Relaxed);
-    RECORDING.store(true, Ordering::SeqCst);
+    RECORDING.with(|recording| recording.set(true));
     let result = 'processing: {
         let inputs = [input_left.as_slice(), input_right.as_slice()];
         let mut outputs = [output_left.as_mut_slice(), output_right.as_mut_slice()];
@@ -72,7 +81,7 @@ fn callback_processing_performs_zero_allocations() {
         }
         break 'processing Ok::<(), String>(());
     };
-    RECORDING.store(false, Ordering::SeqCst);
+    RECORDING.with(|recording| recording.set(false));
 
     result.unwrap();
     let allocations = ALLOCATIONS.load(Ordering::Relaxed);
