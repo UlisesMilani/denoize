@@ -252,7 +252,7 @@ unreviewable release.
 | 16 | Live-device resilience: asynchronous resampling, clock-drift correction, hotplug recovery, and latency diagnostics | Released in v0.64.0 |
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Released in v0.65.0 |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Released in v0.66.0 |
-| 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Implemented (pending release) |
+| 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Released in v0.67.0 |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
 | 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Planned |
 | 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Planned |
