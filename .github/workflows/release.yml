@@ -92,12 +92,15 @@ jobs:
             scripts/verify-release-evidence.sh
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
+          python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
+          python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
               "$schema" >/dev/null
           done
           python3 scripts/test-release-updater-metadata.py
+          python3 scripts/test-application-update-manifest.py
           DENOIZE_BIN=target/debug/denoize bash scripts/test-evaluation-evidence.sh
           bash scripts/test-release-evidence.sh
 
@@ -535,6 +538,9 @@ jobs:
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
+          for update_schema in schemas/denoize-update-*.schema.json; do
+            cp "$update_schema" "$asset_dir/"
+          done
           (
             cd apps/desktop
             # The existing updater key is passwordless. The standalone signer
@@ -564,6 +570,7 @@ jobs:
             "$runtime_model_package_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
+            "$asset_dir"/denoize-update-*.schema.json \
             "$bundle" "$bundle_checksum" --clobber
 
   release-evidence:
@@ -703,6 +710,191 @@ jobs:
             "$trusted_root" \
             --clobber
 
+  application-update:
+    name: Build signed recoverable application updates
+    needs: release-evidence
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Install Tauri signer
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Assemble signed manifest and offline rollback bundles
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          update_dir=$(mktemp -d /tmp/denoize-application-update.XXXXXX)
+          candidate_dir="$update_dir/candidate"
+          candidate_sbom_dir="$update_dir/candidate-sbom"
+          rollback_root="$update_dir/rollback"
+          mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
+          version=${GITHUB_REF_NAME#v}
+          rollback_versions=(0.68.0 0.69.0)
+          desktop_names=(
+            "denoize_${version}_aarch64.app.tar.gz"
+            "denoize_${version}_x64.app.tar.gz"
+            "denoize_${version}_amd64.AppImage"
+            "denoize_${version}_amd64.deb"
+            "denoize_${version}_x64-setup.exe"
+            "denoize_${version}_x64_en-US.msi"
+          )
+          for name in "${desktop_names[@]}"; do
+            gh release download "$GITHUB_REF_NAME" --pattern "$name" --dir "$candidate_dir"
+          done
+          current_evidence="$update_dir/denoize-release-evidence-${GITHUB_REF_NAME}.tar.gz"
+          current_provenance="$update_dir/denoize-release-subjects-${GITHUB_REF_NAME}.sigstore.json"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "$(basename "$current_evidence")" \
+            --pattern "$(basename "$current_provenance")" \
+            --dir "$update_dir"
+          current_extract="$update_dir/current-evidence"
+          mkdir "$current_extract"
+          tar -xzf "$current_evidence" -C "$current_extract" --no-same-owner --no-same-permissions
+          for name in "${desktop_names[@]}"; do
+            cp "$current_extract/denoize-release-evidence-v1/sbom/${name}.cdx.json" \
+              "$candidate_sbom_dir/${name}.cdx.json"
+          done
+
+          rollback_args=()
+          for rollback_version in "${rollback_versions[@]}"; do
+            rollback_tag="v${rollback_version}"
+            rollback_dir="$rollback_root/$rollback_version"
+            rollback_artifact_dir="$rollback_dir/artifacts"
+            rollback_sbom_dir="$rollback_dir/sbom"
+            mkdir -p "$rollback_artifact_dir" "$rollback_sbom_dir"
+            rollback_names=(
+              "denoize_${rollback_version}_aarch64.app.tar.gz"
+              "denoize_${rollback_version}_x64.app.tar.gz"
+              "denoize_${rollback_version}_amd64.AppImage"
+              "denoize_${rollback_version}_amd64.deb"
+              "denoize_${rollback_version}_x64-setup.exe"
+              "denoize_${rollback_version}_x64_en-US.msi"
+            )
+            for name in "${rollback_names[@]}"; do
+              gh release download "$rollback_tag" --pattern "$name" --dir "$rollback_artifact_dir"
+            done
+            rollback_evidence="$rollback_dir/denoize-release-evidence-${rollback_tag}.tar.gz"
+            rollback_provenance="$rollback_dir/denoize-release-subjects-${rollback_tag}.sigstore.json"
+            gh release download "$rollback_tag" \
+              --pattern "$(basename "$rollback_evidence")" \
+              --pattern "$(basename "$rollback_provenance")" \
+              --dir "$rollback_dir"
+            rollback_extract="$rollback_dir/evidence"
+            mkdir "$rollback_extract"
+            tar -xzf "$rollback_evidence" -C "$rollback_extract" --no-same-owner --no-same-permissions
+            for name in "${rollback_names[@]}"; do
+              cp "$rollback_extract/denoize-release-evidence-v1/sbom/${name}.cdx.json" \
+                "$rollback_sbom_dir/${name}.cdx.json"
+            done
+            rollback_args+=(
+              --rollback
+              "${rollback_version}|${rollback_artifact_dir}|${rollback_sbom_dir}|${rollback_provenance}"
+            )
+          done
+
+          manifest="$update_dir/denoize-update-manifest-v1.json"
+          plan="$update_dir/denoize-update-bundle-build-plan-v1.json"
+          python3 scripts/assemble-application-update.py \
+            --tag "$GITHUB_REF_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$(git rev-parse HEAD)" \
+            --published-unix-seconds "$(git show -s --format=%ct HEAD)" \
+            --candidate-dir "$candidate_dir" \
+            --candidate-sbom-dir "$candidate_sbom_dir" \
+            --candidate-provenance "$current_provenance" \
+            "${rollback_args[@]}" \
+            --output "$manifest" \
+            --plan-output "$plan"
+          (
+            cd apps/desktop
+            npm run tauri -- signer sign --password "" "$manifest"
+          )
+          cargo build --locked --release --no-default-features --bin denoize
+          while IFS=$'\t' read -r platform from_version bundle_name \
+            candidate_artifact candidate_sbom candidate_provenance \
+            rollback_artifact rollback_sbom rollback_provenance; do
+            target/release/denoize update bundle build "$update_dir/$bundle_name" \
+              --manifest "$manifest" \
+              --signature "$manifest.sig" \
+              --platform "$platform" \
+              --from-version "$from_version" \
+              --candidate-artifact "$candidate_artifact" \
+              --candidate-sbom "$candidate_sbom" \
+              --candidate-provenance "$candidate_provenance" \
+              --rollback-artifact "$rollback_artifact" \
+              --rollback-sbom "$rollback_sbom" \
+              --rollback-provenance "$rollback_provenance" >/dev/null
+          done < <(jq -r '.entries[] | [
+            .platform,
+            .from_version,
+            .bundle_name,
+            .candidate_artifact,
+            .candidate_sbom,
+            .candidate_provenance,
+            .rollback_artifact,
+            .rollback_sbom,
+            .rollback_provenance
+          ] | @tsv' "$plan")
+          if [[ $(find "$update_dir" -maxdepth 1 -type f -name '*.dub' | wc -l) != 12 ]]; then
+            echo "application update build did not produce exactly 12 bundles" >&2
+            exit 1
+          fi
+
+          asset_list="$RUNNER_TEMP/denoize-application-update-assets.txt"
+          subject_checksums="$RUNNER_TEMP/denoize-application-update-subjects.sha256"
+          {
+            printf '%s\n' "$manifest" "$manifest.sig"
+            find "$update_dir" -maxdepth 1 -type f -name '*.dub' -print | sort
+            find "$candidate_sbom_dir" -maxdepth 1 -type f -name '*.cdx.json' -print | sort
+            find "$rollback_root" -mindepth 3 -maxdepth 3 -type f -path '*/sbom/*.cdx.json' -print | sort
+          } > "$asset_list"
+          : > "$subject_checksums"
+          while IFS= read -r asset; do
+            (
+              cd "$(dirname "$asset")"
+              sha256sum "$(basename "$asset")"
+            ) >> "$subject_checksums"
+          done < "$asset_list"
+          {
+            echo "DENOIZE_APPLICATION_UPDATE_DIR=$update_dir"
+            echo "DENOIZE_APPLICATION_UPDATE_ASSETS=$asset_list"
+            echo "DENOIZE_APPLICATION_UPDATE_SUBJECTS=$subject_checksums"
+          } >> "$GITHUB_ENV"
+
+      - name: Attest application update assets
+        id: attest-updates
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-checksums: ${{ runner.temp }}/denoize-application-update-subjects.sha256
+
+      - name: Upload application update assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          update_provenance="$DENOIZE_APPLICATION_UPDATE_DIR/denoize-update-subjects-${GITHUB_REF_NAME}.sigstore.json"
+          cp "${{ steps.attest-updates.outputs.bundle-path }}" "$update_provenance"
+          mapfile -t update_assets < "$DENOIZE_APPLICATION_UPDATE_ASSETS"
+          gh release upload "$GITHUB_REF_NAME" \
+            "${update_assets[@]}" "$update_provenance" --clobber
+
   publish:
     name: Publish release
     needs: publish-crate
@@ -715,7 +907,7 @@ jobs:
 
   verify-assets:
     name: Verify release assets
-    needs: release-evidence
+    needs: application-update
     runs-on: ubuntu-latest
     steps:
       - name: Check out tagged source

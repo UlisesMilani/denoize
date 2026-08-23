@@ -23,7 +23,7 @@ rust_version=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"$/\1/p' \
   "$repo_dir/Cargo.toml" | head -n 1)
 release_toolchain="${rust_version}.0"
 if [[ $(grep -Fc "rustup toolchain install $release_toolchain " \
-  "$repo_dir/.github/workflows/release.yml") != 6 ]]; then
+  "$repo_dir/.github/workflows/release.yml") != 7 ]]; then
   echo "release-producing jobs do not all pin Rust $release_toolchain" >&2
   exit 1
 fi

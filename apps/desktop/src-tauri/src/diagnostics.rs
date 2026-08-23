@@ -31,6 +31,10 @@ pub(crate) enum DiagnosticCode {
     PreviewCancelled,
     RecoveryRetried,
     RecoveryDiscarded,
+    UpdateStaged,
+    UpdateConfirmed,
+    UpdateRecovered,
+    UpdateFailed,
 }
 
 #[derive(Clone, Debug, Serialize)]

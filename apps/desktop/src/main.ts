@@ -3,8 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check } from "@tauri-apps/plugin-updater";
+import { exit, relaunch } from "@tauri-apps/plugin-process";
 import { runAccessibilityE2e } from "./a11y-e2e";
 import {
   isStructuredDesktopError,
@@ -117,6 +116,51 @@ type ModelCacheReportRow = {
 type ModelLibraryRow = { models: ModelRow[]; health: ModelCacheReportRow };
 type ModelPruneReportRow = {
   dryRun: boolean; wouldRemove: string[]; removed: string[]; retained: ModelCacheIssueRow[];
+};
+type UpdateBundleInfo = {
+  schema: string; schema_version: number; bundle_sha256: string; size_bytes: number;
+  platform: string; channel: string; from_version: string; from_sequence: number;
+  candidate_version: string; candidate_sequence: number; manifest_sha256: string;
+  signing_key_id: string; evidence_bytes: number;
+};
+type UpdateStatusReport = {
+  schema: string; schema_version: number; managed: boolean; generation: number;
+  channel: string | null; platform: string | null; phase: string;
+  highest_accepted_sequence: number | null; active: { version: string; artifact_name: string; activation: string } | null;
+  last_known_good: { version: string; artifact_name: string; activation: string } | null;
+  health_deadline_unix_seconds: number | null; start_attempts: number | null;
+  maximum_start_attempts: number | null; failed_slot_count: number;
+  diagnostics: Array<{ generation: number; unix_seconds: number; code: string; from_version: string | null; to_version: string | null }>;
+};
+type UpdateCheckReport = {
+  schema: string; schema_version: number; channel: string; platform: string;
+  current_version: string; candidate_version: string; candidate_sequence: number;
+  manifest_sha256: string; signing_key_id: string; decision: string;
+  reason_codes: string[]; bundle_url: string | null; download_upper_bound_bytes: number | null;
+  read_only: true;
+};
+type UpdateDownloadReport = {
+  schema: string; schema_version: number; platform: string; from_version: string;
+  candidate_version: string; candidate_sequence: number; manifest_sha256: string;
+  signing_key_id: string; bundle_sha256: string; size_bytes: number;
+  output_file_name: string; outcome: string;
+};
+type UpdateDryRunReport = {
+  schema: string; schema_version: number; current_version: string; candidate_version: string;
+  decision: string; reason_codes: string[]; staging_bytes: number; maximum_staging_bytes: number;
+  preserves_last_known_good: boolean; recovery_requires_network: boolean; read_only: true;
+};
+type UpdateApplyReport = {
+  schema: string; schema_version: number; from_version: string; candidate_version: string;
+  candidate_sequence: number; bundle_sha256: string; manifest_sha256: string;
+  active_slot_id: string; last_known_good_slot_id: string;
+  health_deadline_unix_seconds: number; activation: string; outcome: string;
+  relaunch_required: boolean;
+};
+type UpdateHealthReport = {
+  schema: string; schema_version: number; action: string; running_version: string;
+  active_version: string | null; last_known_good_version: string | null;
+  relaunch_required: boolean;
 };
 type ModelProgress = {
   jobId: number; name: string; status: "running" | "completed" | "failed" | "cancelled";
@@ -305,6 +349,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="nav-evaluation" class="nav-item" role="tab" data-page="evaluation" aria-controls="page-evaluation" aria-selected="false" tabindex="-1"><span aria-hidden="true">◇</span>評価証跡</button>
         <button id="nav-models" class="nav-item" role="tab" data-page="models" aria-controls="page-models" aria-selected="false" tabindex="-1"><span aria-hidden="true">⬡</span>モデル</button>
         <button id="nav-automation" class="nav-item" role="tab" data-page="automation" aria-controls="page-automation" aria-selected="false" tabindex="-1"><span aria-hidden="true">⌁</span>IPC 自動化</button>
+        <button id="nav-update" class="nav-item" role="tab" data-page="update" aria-controls="page-update" aria-selected="false" tabindex="-1"><span aria-hidden="true">↻</span>アプリ更新</button>
         <button id="nav-receipts" class="nav-item" role="tab" data-page="receipts" aria-controls="page-receipts" aria-selected="false" tabindex="-1"><span aria-hidden="true">✓</span>実行証明</button>
       </nav>
       <div class="sidebar-foot"><span class="status-dot"></span><span id="engine-label">エンジンを確認中</span><small id="version"></small></div>
@@ -645,6 +690,35 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             </article>
             <article class="card result-card"><div class="card-heading"><div><span class="step">RESULT</span><h2>評価結果</h2></div></div><div id="evaluation-result-empty" class="empty-panel">manifest と corpus を選んでください</div><pre id="evaluation-result" class="json-preview hidden" aria-live="polite"></pre></article>
           </div>
+        </div>
+      </section>
+
+      <section class="page" id="page-update" role="tabpanel" aria-labelledby="nav-update" aria-hidden="true">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">CHECK</span><h2>署名マニフェストを確認</h2></div><span class="hint">READ ONLY</span></div>
+              <p class="section-copy">release channel、platform、SBOM、provenance、互換範囲、rollback policy を結ぶ署名を検証します。確認だけでは状態やインストールを変更しません。</p>
+              <div class="file-row"><div><label>更新マニフェスト</label><div id="update-manifest-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-update-manifest">選択</button></div>
+              <div class="file-row"><div><label>マニフェスト署名</label><div id="update-signature-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-update-signature">選択</button></div>
+              <input type="hidden" id="update-manifest-path"><input type="hidden" id="update-signature-path">
+              <div class="button-row"><button class="primary" id="check-online-update">公式リリースを確認</button><button class="secondary" id="check-signed-update" disabled>ローカル署名を確認</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">STAGE</span><h2>復旧可能バンドル</h2></div><span class="hint">OFFLINE · BOUNDED</span></div>
+              <p class="section-copy">候補と last-known-good の成果物・SBOM・provenance を含む .dub を全バイト検証します。dry-run は読み取り専用です。</p>
+              <div class="file-row"><div><label>オフライン更新バンドル</label><div id="update-bundle-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="clear-update-bundle" disabled>解除</button><button class="secondary" id="choose-update-bundle">選択・検証</button></div></div>
+              <input type="hidden" id="update-bundle-path">
+              <div class="button-row"><button class="secondary" id="download-update-bundle" disabled>認証済みバンドルを取得</button><button class="secondary" id="dry-run-update" disabled>Dry run</button><button class="primary" id="apply-update" disabled>明示的に適用</button></div>
+              <p class="field-hint">適用後は候補を pending-health とし、正常起動が確認されるまで last-known-good を削除しません。復旧時も anti-rollback floor は下げません。</p>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">RECOVER</span><h2>オフライン復旧</h2></div><span class="hint">NO NETWORK</span></div>
+              <p class="section-copy">ヘルス確認待ちの候補だけを破棄し、検証済み last-known-good を再び active にします。ネットワークやダウングレード例外は使いません。</p>
+              <div class="button-row"><button class="secondary" id="refresh-update-status">状態を再読込</button><button class="danger" id="recover-application-update" disabled>Last-known-good へ復旧</button></div>
+            </article>
+          </div>
+          <article class="card result-card"><div class="card-heading"><div><span class="step">STATUS</span><h2>更新トランザクション</h2></div></div><div id="update-result-empty" class="empty-panel">更新状態を読み込んでいます</div><pre id="update-result" class="json-preview hidden" aria-live="polite"></pre></article>
         </div>
       </section>
 
@@ -1046,7 +1120,8 @@ async function init() {
   try { await loadRecoveries(); }
   catch (error) { showToast(tr(`復旧状態を読み込めません: ${errorText(error)}`, `Could not load recovery state: ${errorText(error)}`), true); }
   await loadModels();
-  window.setTimeout(() => void checkForUpdate(false), 1500);
+  await confirmApplicationUpdateStartup();
+  await refreshApplicationUpdateStatus().catch(() => undefined);
 }
 
 let recoveries: RecoverySummary[] = [];
@@ -2971,29 +3046,228 @@ async function beginModelJob(name: string, action: string, options: ModelActionO
   buffered.forEach(handleModelProgress);
 }
 
-let checkingUpdate = false;
-async function checkForUpdate(interactive: boolean) {
-  if (checkingUpdate) return;
-  checkingUpdate = true; const button = $<HTMLButtonElement>("#check-update"); button.disabled = true;
-  try {
-    const update = await check();
-    if (!update) { if (interactive) showToast(tr("最新版を使用しています", "You are using the latest version")); return; }
-    const accepted = window.confirm(tr(`denoize ${update.version} を利用できます。ダウンロードして再起動しますか？\n\n${update.body ?? ""}`, `denoize ${update.version} is available. Download and restart?\n\n${update.body ?? ""}`));
-    if (!accepted) return;
-    let downloaded = 0; let total = 0;
-    await update.downloadAndInstall((event) => {
-      if (event.event === "Started") total = event.data.contentLength ?? 0;
-      if (event.event === "Progress") downloaded += event.data.chunkLength;
-      if (event.event === "Finished") showToast(tr("更新をインストールしました。再起動します", "Update installed. Restarting."));
-      else if (total) button.textContent = tr(`更新 ${Math.min(100, Math.round(downloaded / total * 100))}%`, `Update ${Math.min(100, Math.round(downloaded / total * 100))}%`);
-      else button.textContent = tr("更新をダウンロード中", "Downloading update");
-    });
-    await relaunch();
-  } catch (error) {
-    if (interactive) showToast(tr(`更新確認: ${errorText(error)}`, `Update check: ${errorText(error)}`), true);
-  } finally { checkingUpdate = false; button.disabled = false; button.textContent = tr("更新を確認", "Check for updates"); }
+let updateUiBusy = false;
+let selectedUpdateBundle: UpdateBundleInfo | null = null;
+let onlineUpdateCandidate: UpdateCheckReport | null = null;
+let applicationUpdatePhase = "unmanaged";
+
+function renderUpdateResult(value: unknown) {
+  $("#update-result-empty").classList.add("hidden");
+  const result = $("#update-result");
+  result.classList.remove("hidden");
+  result.textContent = JSON.stringify(value, null, 2);
 }
-$("#check-update").addEventListener("click", () => void checkForUpdate(true));
+
+async function finishApplicationUpdateActivation(activation: string) {
+  if (activation === "nsis-installer" || activation === "msi-installer") {
+    await exit(0);
+  } else {
+    await relaunch();
+  }
+}
+
+function setUpdateUiBusy(busy: boolean) {
+  updateUiBusy = busy;
+  for (const id of ["check-online-update", "choose-update-manifest", "choose-update-signature", "check-signed-update", "download-update-bundle", "choose-update-bundle", "clear-update-bundle", "dry-run-update", "apply-update", "refresh-update-status", "recover-application-update"]) {
+    $<HTMLButtonElement>(`#${id}`).disabled = busy;
+  }
+  const hasBundle = Boolean($<HTMLInputElement>("#update-bundle-path").value && selectedUpdateBundle);
+  $<HTMLButtonElement>("#dry-run-update").disabled = busy || !hasBundle;
+  $<HTMLButtonElement>("#apply-update").disabled = busy || !hasBundle;
+  $<HTMLButtonElement>("#clear-update-bundle").disabled = busy || !hasBundle;
+  $<HTMLButtonElement>("#download-update-bundle").disabled = busy || onlineUpdateCandidate?.decision !== "available";
+  $<HTMLButtonElement>("#recover-application-update").disabled = busy || applicationUpdatePhase !== "pending-health";
+  $<HTMLButtonElement>("#check-signed-update").disabled = busy
+    || !$<HTMLInputElement>("#update-manifest-path").value
+    || !$<HTMLInputElement>("#update-signature-path").value;
+}
+
+async function refreshApplicationUpdateStatus() {
+  try {
+    const status = await invoke<UpdateStatusReport>("application_update_status");
+    applicationUpdatePhase = status.phase;
+    renderUpdateResult(status);
+    $<HTMLButtonElement>("#recover-application-update").disabled = updateUiBusy || status.phase !== "pending-health";
+    return status;
+  } catch (error) {
+    renderUpdateResult({ error: errorText(error) });
+    throw error;
+  }
+}
+
+async function confirmApplicationUpdateStartup() {
+  try {
+    const health = await invoke<UpdateHealthReport>("confirm_application_update_startup");
+    if (health.action === "confirmed") {
+      showToast(tr("更新後の正常起動を確認しました", "Confirmed healthy startup after the update"));
+    } else if (health.action === "recovered-last-known-good" || health.action === "reactivate-managed-version") {
+      showToast(health.action === "recovered-last-known-good"
+        ? tr("正常起動を確認できない候補を last-known-good へ戻しました", "Restored last-known-good after the candidate did not become healthy")
+        : tr("実行版と管理状態が異なるため、検証済み管理版を再有効化しました", "Reactivated the verified managed version after detecting a runtime mismatch"), true);
+      if (health.relaunch_required) {
+        const status = await invoke<UpdateStatusReport>("application_update_status");
+        if (status.active) await finishApplicationUpdateActivation(status.active.activation);
+      }
+    }
+  } catch (error) {
+    showToast(tr(`更新ヘルス確認: ${errorText(error)}`, `Update health check: ${errorText(error)}`), true);
+  }
+}
+
+const updateCheckReady = () => {
+  setUpdateUiBusy(updateUiBusy);
+};
+
+async function checkOnlineApplicationUpdate() {
+  try {
+    setUpdateUiBusy(true);
+    const report = await invoke<UpdateCheckReport>("check_application_update_online");
+    onlineUpdateCandidate = report.decision === "available" ? report : null;
+    renderUpdateResult(report);
+    showToast(report.decision === "available"
+      ? tr(`署名済み候補 ${report.candidate_version} を確認しました`, `Verified signed candidate ${report.candidate_version}`)
+      : tr(`更新判定: ${report.decision}`, `Update decision: ${report.decision}`));
+  } catch (error) {
+    onlineUpdateCandidate = null;
+    showToast(errorText(error), true);
+  } finally {
+    setUpdateUiBusy(false);
+  }
+}
+
+$("#check-online-update").addEventListener("click", () => {
+  void checkOnlineApplicationUpdate();
+});
+
+$("#choose-update-manifest").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize update manifest", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#update-manifest-path", "#update-manifest-display", path);
+  updateCheckReady();
+});
+$("#choose-update-signature").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Minisign signature", extensions: ["sig"] }] });
+  if (typeof path === "string") setPath("#update-signature-path", "#update-signature-display", path);
+  updateCheckReady();
+});
+$("#check-signed-update").addEventListener("click", async () => {
+  try {
+    setUpdateUiBusy(true);
+    onlineUpdateCandidate = null;
+    const report = await invoke<UpdateCheckReport>("check_application_update", {
+      manifest: $<HTMLInputElement>("#update-manifest-path").value,
+      signature: $<HTMLInputElement>("#update-signature-path").value,
+    });
+    renderUpdateResult(report);
+    showToast(report.decision === "available"
+      ? tr(`署名済み候補 ${report.candidate_version} を確認しました`, `Verified signed candidate ${report.candidate_version}`)
+      : tr(`更新判定: ${report.decision}`, `Update decision: ${report.decision}`));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setUpdateUiBusy(false); }
+});
+
+$("#download-update-bundle").addEventListener("click", async () => {
+  const candidate = onlineUpdateCandidate;
+  if (!candidate?.bundle_url) return;
+  const defaultName = decodeURIComponent(new URL(candidate.bundle_url).pathname.split("/").pop() || "denoize-update.dub");
+  const path = await save({
+    defaultPath: defaultName,
+    filters: [{ name: "denoize offline update bundle", extensions: ["dub"] }],
+  });
+  if (typeof path !== "string") return;
+  try {
+    setUpdateUiBusy(true);
+    const download = await invoke<UpdateDownloadReport>("download_application_update_bundle", { path });
+    selectedUpdateBundle = await invoke<UpdateBundleInfo>("inspect_application_update_bundle", { path });
+    setPath("#update-bundle-path", "#update-bundle-display", path);
+    renderUpdateResult({ download, bundle: selectedUpdateBundle });
+    showToast(tr(
+      `更新バンドル ${download.from_version} → ${download.candidate_version} を取得・認証しました`,
+      `Downloaded and authenticated update bundle ${download.from_version} → ${download.candidate_version}`,
+    ));
+  } catch (error) {
+    selectedUpdateBundle = null;
+    setPath("#update-bundle-path", "#update-bundle-display", null);
+    showToast(errorText(error), true);
+  } finally {
+    setUpdateUiBusy(false);
+  }
+});
+
+$("#choose-update-bundle").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize offline update bundle", extensions: ["dub"] }] });
+  if (typeof path !== "string") return;
+  try {
+    setUpdateUiBusy(true);
+    selectedUpdateBundle = await invoke<UpdateBundleInfo>("inspect_application_update_bundle", { path });
+    setPath("#update-bundle-path", "#update-bundle-display", path);
+    $<HTMLButtonElement>("#clear-update-bundle").disabled = false;
+    renderUpdateResult(selectedUpdateBundle);
+    showToast(tr(`更新バンドル ${selectedUpdateBundle.from_version} → ${selectedUpdateBundle.candidate_version} を認証しました`, `Authenticated update bundle ${selectedUpdateBundle.from_version} → ${selectedUpdateBundle.candidate_version}`));
+  } catch (error) {
+    selectedUpdateBundle = null;
+    setPath("#update-bundle-path", "#update-bundle-display", null);
+    showToast(errorText(error), true);
+  } finally { setUpdateUiBusy(false); }
+});
+$("#clear-update-bundle").addEventListener("click", () => {
+  selectedUpdateBundle = null;
+  setPath("#update-bundle-path", "#update-bundle-display", null);
+  $<HTMLButtonElement>("#clear-update-bundle").disabled = true;
+  setUpdateUiBusy(false);
+});
+$("#dry-run-update").addEventListener("click", async () => {
+  try {
+    setUpdateUiBusy(true);
+    const report = await invoke<UpdateDryRunReport>("dry_run_application_update_bundle", { path: $<HTMLInputElement>("#update-bundle-path").value });
+    renderUpdateResult(report);
+    showToast(report.decision === "ready"
+      ? tr("更新 dry-run は適用可能です", "The update dry run is ready to apply")
+      : tr(`更新 dry-run を拒否しました: ${report.reason_codes.join(", ")}`, `Update dry run rejected: ${report.reason_codes.join(", ")}`),
+      report.decision !== "ready");
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setUpdateUiBusy(false); }
+});
+$("#apply-update").addEventListener("click", async () => {
+  if (!selectedUpdateBundle) return;
+  if (!window.confirm(tr(
+    `${selectedUpdateBundle.candidate_version} を候補としてステージし、現在の ${selectedUpdateBundle.from_version} を last-known-good として保持します。続行しますか？`,
+    `Stage ${selectedUpdateBundle.candidate_version} as the candidate and retain ${selectedUpdateBundle.from_version} as last-known-good. Continue?`,
+  ))) return;
+  try {
+    setUpdateUiBusy(true);
+    const report = await invoke<UpdateApplyReport>("apply_application_update_bundle", { path: $<HTMLInputElement>("#update-bundle-path").value });
+    renderUpdateResult(report);
+    showToast(tr("候補を認証・有効化しました。再起動後に正常起動を確認します", "Authenticated and activated the candidate. Startup health will be confirmed after restart"));
+    await refreshApplicationUpdateStatus();
+    if (report.relaunch_required) await finishApplicationUpdateActivation(report.activation);
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setUpdateUiBusy(false); }
+});
+$("#refresh-update-status").addEventListener("click", async () => {
+  try { setUpdateUiBusy(true); await refreshApplicationUpdateStatus(); }
+  catch (error) { showToast(errorText(error), true); }
+  finally { setUpdateUiBusy(false); }
+});
+$("#recover-application-update").addEventListener("click", async () => {
+  if (!window.confirm(tr("pending-health の候補を停止し、検証済み last-known-good へ復旧しますか？", "Stop the pending-health candidate and recover the verified last-known-good installation?"))) return;
+  try {
+    setUpdateUiBusy(true);
+    const report = await invoke<UpdateHealthReport>("recover_application_update");
+    renderUpdateResult(report);
+    showToast(tr("last-known-good へオフライン復旧しました", "Recovered last-known-good offline"));
+    if (report.relaunch_required) {
+      const status = await invoke<UpdateStatusReport>("application_update_status");
+      if (status.active) await finishApplicationUpdateActivation(status.active.activation);
+    }
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setUpdateUiBusy(false); await refreshApplicationUpdateStatus().catch(() => undefined); }
+});
+$("#check-update").addEventListener("click", () => {
+  activatePage("update");
+  void refreshApplicationUpdateStatus()
+    .then(() => checkOnlineApplicationUpdate())
+    .catch((error) => showToast(errorText(error), true));
+});
 
 async function loadLiveDevices() {
   const message = $("#live-device-message");

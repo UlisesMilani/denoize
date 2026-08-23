@@ -43,6 +43,7 @@ the repository's built-in `GITHUB_TOKEN`.
    python3 scripts/validate-deepfilter.py --denoize target/debug/denoize
    bash scripts/publish-crates-io.sh --dry-run
    bash scripts/test-release-evidence.sh
+   python3 scripts/test-application-update-manifest.py
    ```
 
 5. Commit and push the release change.
@@ -67,6 +68,11 @@ uploaded assets. Each desktop matrix job emits target-local updater metadata;
 a downstream job waits for all four targets, validates their uploaded payloads
 and signature digests, and atomically replaces `latest.json` with the complete
 ten-platform manifest before evidence generation or release verification.
+After primary evidence is uploaded, the application-update job downloads the
+two declared rollback releases, extracts their verified SBOMs, signs the v1
+recoverable manifest, builds all 12 platform/source `.dub` bundles, and attests
+those transport assets. Release verification authenticates every bundle and
+requires exact v0.68.0/v0.69.0 compatibility before publication.
 Only then can the exact pre-attested crate be published; its
 crates.io checksum must match before the GitHub draft becomes public. If any
 step fails, the GitHub release remains a draft.

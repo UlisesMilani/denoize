@@ -413,6 +413,7 @@ USAGE:
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
     denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
+    denoize update <COMMAND> [OPTIONS]  (run `denoize update --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -3464,6 +3465,631 @@ where
         .map_err(|error| format!("invalid value for {option}: {error}"))
 }
 
+fn update_usage() -> &'static str {
+    "\
+Recoverable signed application updates
+
+USAGE:
+    denoize update manifest verify <MANIFEST.json> <MANIFEST.sig> [--public-key PATH] [--pretty]
+    denoize update bundle inspect <BUNDLE.dub> [--public-key PATH] [--pretty]
+    denoize update bundle download <OUTPUT.dub> --platform ID --from-version VERSION \\
+        [--manifest-url URL --signature-url URL] [--public-key PATH] [--pretty]
+    denoize update bundle build <OUTPUT.dub> --manifest PATH --signature PATH \\
+        --platform ID --from-version VERSION --candidate-artifact PATH \\
+        --candidate-sbom PATH --candidate-provenance PATH --rollback-artifact PATH \\
+        --rollback-sbom PATH --rollback-provenance PATH [--public-key PATH] [--pretty]
+    denoize update check <MANIFEST.json> <MANIFEST.sig> --state-dir DIR \\
+        --channel CHANNEL --platform ID --current-version VERSION [--public-key PATH] [--pretty]
+    denoize update check-online --state-dir DIR --channel CHANNEL --platform ID \\
+        --current-version VERSION [--manifest-url URL --signature-url URL] \\
+        [--public-key PATH] [--pretty]
+    denoize update dry-run <BUNDLE.dub> --state-dir DIR --current-version VERSION \\
+        [--max-staging-bytes N] [--public-key PATH] [--pretty]
+    denoize update apply <BUNDLE.dub> --state-dir DIR --current-version VERSION \\
+        [--max-staging-bytes N] [--public-key PATH] [--pretty]
+    denoize update status --state-dir DIR [--pretty]
+    denoize update health begin --state-dir DIR --running-version VERSION [--pretty]
+    denoize update health confirm --state-dir DIR --running-version VERSION --token TOKEN [--pretty]
+    denoize update recover --state-dir DIR [--reason CODE] [--pretty]
+
+All successful commands emit one versioned JSON document. `check` and `dry-run`
+are read-only. `apply` stages the authenticated candidate and an offline
+last-known-good installation, then waits for explicit startup health confirmation.
+Recovery never lowers the accepted-version floor and never requires a network.
+"
+}
+
+fn update_option_value(args: &[String], index: &mut usize, option: &str) -> Result<String, String> {
+    *index = index
+        .checked_add(1)
+        .ok_or("update argument index overflow")?;
+    args.get(*index)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn set_update_option<T>(slot: &mut Option<T>, value: T, option: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{option} specified more than once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn mark_update_output(flag: &str, pretty: &mut bool, json: &mut bool) -> Result<(), String> {
+    match flag {
+        "--pretty" if !*pretty => *pretty = true,
+        "--json" if !*json => *json = true,
+        "--pretty" | "--json" => return Err(format!("{flag} specified more than once")),
+        _ => return Err(format!("unknown update output option: {flag}")),
+    }
+    Ok(())
+}
+
+fn required_update_option<T>(value: Option<T>, option: &str) -> Result<T, String> {
+    value.ok_or_else(|| format!("missing required update option {option}"))
+}
+
+fn absolute_update_state_path(raw: String) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(path))
+            .map_err(|error| format!("resolve update state directory: {error}"))
+    }
+}
+
+fn print_update_document<T: Serialize>(value: &T, pretty: bool) -> Result<(), String> {
+    let mut document = if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .map_err(|error| format!("serialize update result: {error}"))?;
+    document.push('\n');
+    std::io::stdout()
+        .lock()
+        .write_all(document.as_bytes())
+        .map_err(|error| format!("write update result: {error}"))
+}
+
+fn run_update(args: &[String]) -> Result<(), String> {
+    if args.is_empty()
+        || args.first().map(String::as_str) == Some("help")
+        || args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        print!("{}", update_usage());
+        return Ok(());
+    }
+    match args[0].as_str() {
+        "manifest" => run_update_manifest(&args[1..]),
+        "bundle" => run_update_bundle(&args[1..]),
+        "check" => run_update_check(&args[1..]),
+        "check-online" => run_update_check_online(&args[1..]),
+        "dry-run" => run_update_bundle_action(&args[1..], false),
+        "apply" => run_update_bundle_action(&args[1..], true),
+        "status" => run_update_status(&args[1..]),
+        "health" => run_update_health(&args[1..]),
+        "recover" => run_update_recover(&args[1..]),
+        command => Err(format!("unknown update command: {command}")),
+    }
+}
+
+fn run_update_manifest(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("verify") || args.len() < 3 {
+        return Err("update manifest requires `verify MANIFEST.json MANIFEST.sig`".into());
+    }
+    let manifest = &args[1];
+    let signature = &args[2];
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 3;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, "--public-key")?;
+                set_update_option(
+                    &mut public_key,
+                    std::path::PathBuf::from(value),
+                    "--public-key",
+                )?;
+            }
+            "--pretty" | "--json" => mark_update_output(&args[index], &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update manifest verify option: {value}")),
+        }
+        index += 1;
+    }
+    let verified =
+        denoize::update::UpdateManifest::from_file(manifest, signature, public_key.as_deref())?;
+    print_update_document(&verified.verification, pretty)
+}
+
+fn run_update_bundle(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("inspect") => run_update_bundle_inspect(&args[1..]),
+        Some("build") => run_update_bundle_build(&args[1..]),
+        Some("download") => run_update_bundle_download(&args[1..]),
+        _ => Err("update bundle requires `inspect`, `download`, or `build`".into()),
+    }
+}
+
+fn run_update_bundle_inspect(args: &[String]) -> Result<(), String> {
+    let bundle = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("update bundle inspect requires BUNDLE.dub")?;
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, "--public-key")?;
+                set_update_option(
+                    &mut public_key,
+                    std::path::PathBuf::from(value),
+                    "--public-key",
+                )?;
+            }
+            "--pretty" | "--json" => mark_update_output(&args[index], &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update bundle inspect option: {value}")),
+        }
+        index += 1;
+    }
+    let info = denoize::update::inspect_update_bundle(bundle, public_key.as_deref())?;
+    print_update_document(&info, pretty)
+}
+
+fn run_update_bundle_download(args: &[String]) -> Result<(), String> {
+    let output = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("update bundle download requires OUTPUT.dub")?;
+    let mut platform = None;
+    let mut from_version = None;
+    let mut manifest_url = None;
+    let mut signature_url = None;
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--platform" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut platform, value, option)?;
+            }
+            "--from-version" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut from_version, value, option)?;
+            }
+            "--manifest-url" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut manifest_url, value, option)?;
+            }
+            "--signature-url" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut signature_url, value, option)?;
+            }
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut public_key, std::path::PathBuf::from(value), option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update bundle download option: {value}")),
+        }
+        index += 1;
+    }
+    let verified = denoize::update::fetch_update_manifest(
+        manifest_url
+            .as_deref()
+            .unwrap_or(denoize::update::DEFAULT_UPDATE_MANIFEST_URL),
+        signature_url
+            .as_deref()
+            .unwrap_or(denoize::update::DEFAULT_UPDATE_MANIFEST_SIGNATURE_URL),
+        public_key.as_deref(),
+    )?;
+    let report = denoize::update::download_update_bundle(
+        &verified,
+        &required_update_option(platform, "--platform")?,
+        &required_update_option(from_version, "--from-version")?,
+        output,
+        public_key.as_deref(),
+    )?;
+    print_update_document(&report, pretty)
+}
+
+fn run_update_bundle_build(args: &[String]) -> Result<(), String> {
+    let output = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("update bundle build requires OUTPUT.dub")?;
+    let mut platform = None;
+    let mut from_version = None;
+    let mut manifest = None;
+    let mut signature = None;
+    let mut candidate_artifact = None;
+    let mut candidate_sbom = None;
+    let mut candidate_provenance = None;
+    let mut rollback_artifact = None;
+    let mut rollback_sbom = None;
+    let mut rollback_provenance = None;
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--platform" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut platform, value, option)?;
+            }
+            "--from-version" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut from_version, value, option)?;
+            }
+            "--manifest" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut manifest, value.into(), option)?;
+            }
+            "--signature" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut signature, value.into(), option)?;
+            }
+            "--candidate-artifact" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut candidate_artifact, value.into(), option)?;
+            }
+            "--candidate-sbom" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut candidate_sbom, value.into(), option)?;
+            }
+            "--candidate-provenance" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut candidate_provenance, value.into(), option)?;
+            }
+            "--rollback-artifact" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut rollback_artifact, value.into(), option)?;
+            }
+            "--rollback-sbom" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut rollback_sbom, value.into(), option)?;
+            }
+            "--rollback-provenance" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut rollback_provenance, value.into(), option)?;
+            }
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut public_key, value.into(), option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update bundle build option: {value}")),
+        }
+        index += 1;
+    }
+    let request = denoize::update::UpdateBundleBuildRequest {
+        platform: required_update_option(platform, "--platform")?,
+        from_version: required_update_option(from_version, "--from-version")?,
+        manifest_path: required_update_option(manifest, "--manifest")?,
+        signature_path: required_update_option(signature, "--signature")?,
+        candidate_artifact_path: required_update_option(
+            candidate_artifact,
+            "--candidate-artifact",
+        )?,
+        candidate_sbom_path: required_update_option(candidate_sbom, "--candidate-sbom")?,
+        candidate_provenance_path: required_update_option(
+            candidate_provenance,
+            "--candidate-provenance",
+        )?,
+        rollback_artifact_path: required_update_option(rollback_artifact, "--rollback-artifact")?,
+        rollback_sbom_path: required_update_option(rollback_sbom, "--rollback-sbom")?,
+        rollback_provenance_path: required_update_option(
+            rollback_provenance,
+            "--rollback-provenance",
+        )?,
+        public_key_path: public_key,
+    };
+    let info = denoize::update::build_update_bundle(output, &request)?;
+    print_update_document(&info, pretty)
+}
+
+fn run_update_check(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("update check requires MANIFEST.json MANIFEST.sig".into());
+    }
+    let manifest = &args[0];
+    let signature = &args[1];
+    let mut state_dir = None;
+    let mut channel = None;
+    let mut platform = None;
+    let mut current_version = None;
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut state_dir, absolute_update_state_path(value)?, option)?;
+            }
+            "--channel" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut channel, value, option)?;
+            }
+            "--platform" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut platform, value, option)?;
+            }
+            "--current-version" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut current_version, value, option)?;
+            }
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut public_key, std::path::PathBuf::from(value), option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update check option: {value}")),
+        }
+        index += 1;
+    }
+    let verified =
+        denoize::update::UpdateManifest::from_file(manifest, signature, public_key.as_deref())?;
+    let report = denoize::update::check_update_manifest(
+        &verified,
+        required_update_option(state_dir, "--state-dir")?,
+        &required_update_option(channel, "--channel")?,
+        &required_update_option(platform, "--platform")?,
+        &required_update_option(current_version, "--current-version")?,
+    )?;
+    print_update_document(&report, pretty)
+}
+
+fn run_update_check_online(args: &[String]) -> Result<(), String> {
+    let mut state_dir = None;
+    let mut channel = None;
+    let mut platform = None;
+    let mut current_version = None;
+    let mut manifest_url = None;
+    let mut signature_url = None;
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut state_dir, absolute_update_state_path(value)?, option)?;
+            }
+            "--channel" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut channel, value, option)?;
+            }
+            "--platform" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut platform, value, option)?;
+            }
+            "--current-version" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut current_version, value, option)?;
+            }
+            "--manifest-url" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut manifest_url, value, option)?;
+            }
+            "--signature-url" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut signature_url, value, option)?;
+            }
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut public_key, std::path::PathBuf::from(value), option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update check-online option: {value}")),
+        }
+        index += 1;
+    }
+    let verified = denoize::update::fetch_update_manifest(
+        manifest_url
+            .as_deref()
+            .unwrap_or(denoize::update::DEFAULT_UPDATE_MANIFEST_URL),
+        signature_url
+            .as_deref()
+            .unwrap_or(denoize::update::DEFAULT_UPDATE_MANIFEST_SIGNATURE_URL),
+        public_key.as_deref(),
+    )?;
+    let report = denoize::update::check_update_manifest(
+        &verified,
+        required_update_option(state_dir, "--state-dir")?,
+        &required_update_option(channel, "--channel")?,
+        &required_update_option(platform, "--platform")?,
+        &required_update_option(current_version, "--current-version")?,
+    )?;
+    print_update_document(&report, pretty)
+}
+
+fn run_update_bundle_action(args: &[String], apply: bool) -> Result<(), String> {
+    let command = if apply { "apply" } else { "dry-run" };
+    let bundle = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or_else(|| format!("update {command} requires BUNDLE.dub"))?;
+    let mut state_dir = None;
+    let mut current_version = None;
+    let mut maximum_staging_bytes = None;
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut state_dir, absolute_update_state_path(value)?, option)?;
+            }
+            "--current-version" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut current_version, value, option)?;
+            }
+            "--max-staging-bytes" => {
+                let raw = update_option_value(args, &mut index, option)?;
+                let value = raw
+                    .parse::<u64>()
+                    .map_err(|error| format!("invalid {option}: {error}"))?;
+                if value == 0 {
+                    return Err("--max-staging-bytes must be positive".into());
+                }
+                set_update_option(&mut maximum_staging_bytes, value, option)?;
+            }
+            "--public-key" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut public_key, std::path::PathBuf::from(value), option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update {command} option: {value}")),
+        }
+        index += 1;
+    }
+    let state_dir = required_update_option(state_dir, "--state-dir")?;
+    let current_version = required_update_option(current_version, "--current-version")?;
+    if apply {
+        let report = denoize::update::apply_update_bundle(
+            bundle,
+            state_dir,
+            &current_version,
+            maximum_staging_bytes,
+            public_key.as_deref(),
+        )?;
+        print_update_document(&report, pretty)
+    } else {
+        let report = denoize::update::dry_run_update_bundle(
+            bundle,
+            state_dir,
+            &current_version,
+            maximum_staging_bytes,
+            public_key.as_deref(),
+        )?;
+        print_update_document(&report, pretty)
+    }
+}
+
+fn run_update_status(args: &[String]) -> Result<(), String> {
+    let mut state_dir = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut state_dir, absolute_update_state_path(value)?, option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update status option: {value}")),
+        }
+        index += 1;
+    }
+    let report = denoize::update::update_status(required_update_option(state_dir, "--state-dir")?)?;
+    print_update_document(&report, pretty)
+}
+
+fn run_update_health(args: &[String]) -> Result<(), String> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("update health requires `begin` or `confirm`")?;
+    if !matches!(action, "begin" | "confirm") {
+        return Err(format!("unknown update health command: {action}"));
+    }
+    let mut state_dir = None;
+    let mut running_version = None;
+    let mut token = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut state_dir, absolute_update_state_path(value)?, option)?;
+            }
+            "--running-version" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut running_version, value, option)?;
+            }
+            "--token" if action == "confirm" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut token, value, option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update health {action} option: {value}")),
+        }
+        index += 1;
+    }
+    let state_dir = required_update_option(state_dir, "--state-dir")?;
+    let running_version = required_update_option(running_version, "--running-version")?;
+    let report = if action == "begin" {
+        denoize::update::begin_update_startup_health(state_dir, &running_version, None)?
+    } else {
+        denoize::update::confirm_update_health(
+            state_dir,
+            &running_version,
+            &required_update_option(token, "--token")?,
+            None,
+        )?
+    };
+    print_update_document(&report, pretty)
+}
+
+fn run_update_recover(args: &[String]) -> Result<(), String> {
+    let mut state_dir = None;
+    let mut reason = None;
+    let mut pretty = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut state_dir, absolute_update_state_path(value)?, option)?;
+            }
+            "--reason" => {
+                let value = update_option_value(args, &mut index, option)?;
+                set_update_option(&mut reason, value, option)?;
+            }
+            "--pretty" | "--json" => mark_update_output(option, &mut pretty, &mut json)?,
+            value => return Err(format!("unknown update recover option: {value}")),
+        }
+        index += 1;
+    }
+    let report = denoize::update::recover_update(
+        required_update_option(state_dir, "--state-dir")?,
+        reason.as_deref().unwrap_or("manual-recovery"),
+        None,
+    )?;
+    print_update_document(&report, pretty)
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     wait_for_isolation_gate()?;
@@ -3502,6 +4128,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("plugin") {
         return run_plugin(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("update") {
+        return run_update(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
     if ov.resume && !ov.batch && !ov.stream {
@@ -8600,7 +9229,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "4d9d8d69d59e4a3409ed262492410075b0161f01ea3bd7f27f4f3b4ac42b2f0f";
+        "fbcc5581afebfe2dc826006e8420c2c7c16ea87ebbd3bbf5ceb88edc15a994fb";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

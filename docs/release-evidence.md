@@ -35,6 +35,15 @@ that signed installers are byte-for-byte reproducible without the private
 platform signing keys. The evidence archive itself has a separate provenance
 bundle so its embedded manifest and SBOMs are authenticated before extraction.
 
+Starting with v0.70.0, the release additionally publishes 12 recoverable `.dub`
+transitions, the signed update manifest, and the six current plus twelve
+rollback SBOM documents referenced by that manifest. A separate
+`denoize-update-subjects-vTAG.sigstore.json` bundle attests the manifest,
+signature, SBOM copies, and `.dub` transport assets. Each `.dub` independently
+authenticates its embedded candidate, last-known-good artifact, SBOMs, and
+original artifact provenance against the signed manifest; these secondary
+transport assets do not change the 18 primary installable subjects above.
+
 ## Prepare an offline verification set
 
 On a connected, trusted machine, download all assets from one release. Also

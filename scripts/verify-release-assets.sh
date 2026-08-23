@@ -92,6 +92,15 @@ expected_assets=(
   "denoize-recommendation-v1.schema.json"
   "denoize-release-evidence-v1.schema.json"
   "denoize-runtime-model-package-v1.schema.json"
+  "denoize-update-apply-v1.schema.json"
+  "denoize-update-bundle-v1.schema.json"
+  "denoize-update-check-v1.schema.json"
+  "denoize-update-download-v1.schema.json"
+  "denoize-update-dry-run-v1.schema.json"
+  "denoize-update-health-v1.schema.json"
+  "denoize-update-manifest-v1.schema.json"
+  "denoize-update-manifest-verification-v1.schema.json"
+  "denoize-update-status-v1.schema.json"
   "denoize-watch-cycle-v1.schema.json"
   "denoize-watch-quarantine-v1.schema.json"
   "denoize-watch-state-v1.schema.json"
@@ -99,6 +108,41 @@ expected_assets=(
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
+update_rollback_versions=(0.68.0 0.69.0)
+update_platforms=(
+  "darwin-aarch64-app"
+  "darwin-x86_64-app"
+  "linux-x86_64-appimage"
+  "linux-x86_64-deb"
+  "windows-x86_64-msi"
+  "windows-x86_64-nsis"
+)
+update_asset_templates=(
+  "denoize_%s_aarch64.app.tar.gz"
+  "denoize_%s_x64.app.tar.gz"
+  "denoize_%s_amd64.AppImage"
+  "denoize_%s_amd64.deb"
+  "denoize_%s_x64_en-US.msi"
+  "denoize_%s_x64-setup.exe"
+)
+expected_assets+=(
+  "denoize-update-manifest-v1.json"
+  "denoize-update-manifest-v1.json.sig"
+  "denoize-update-subjects-${tag}.sigstore.json"
+)
+for update_version in "$version" "${update_rollback_versions[@]}"; do
+  for template in "${update_asset_templates[@]}"; do
+    printf -v update_asset "$template" "$update_version"
+    expected_assets+=("${update_asset}.cdx.json")
+  done
+done
+for update_platform in "${update_platforms[@]}"; do
+  for rollback_version in "${update_rollback_versions[@]}"; do
+    expected_assets+=(
+      "denoize-update-${tag}-${update_platform}-from-v${rollback_version}.dub"
+    )
+  done
+done
 while IFS= read -r evidence_asset; do
   expected_assets+=("$evidence_asset")
 done < <(bash scripts/release-evidence-assets.sh evidence "$tag")
@@ -167,6 +211,8 @@ gh release download "$tag" \
   --pattern '*.msi' \
   --pattern '*.sha256' \
   --pattern '*.dmb' \
+  --pattern '*.dub' \
+  --pattern '*.cdx.json' \
   --pattern '*.crate' \
   --pattern '*.sigstore.json' \
   --pattern '*.jsonl' \
@@ -204,6 +250,8 @@ gh release download "$tag" \
   --pattern 'denoize-recommendation-v1.schema.json' \
   --pattern 'denoize-release-evidence-v1.schema.json' \
   --pattern 'denoize-runtime-model-package-v1.schema.json' \
+  --pattern 'denoize-update-*.schema.json' \
+  --pattern 'denoize-update-manifest-v1.json' \
   --pattern 'denoize-watch-cycle-v1.schema.json' \
   --pattern 'denoize-watch-quarantine-v1.schema.json' \
   --pattern 'denoize-watch-state-v1.schema.json' \
@@ -266,6 +314,15 @@ for schema in \
   denoize-recommendation-v1.schema.json \
   denoize-release-evidence-v1.schema.json \
   denoize-runtime-model-package-v1.schema.json \
+  denoize-update-apply-v1.schema.json \
+  denoize-update-bundle-v1.schema.json \
+  denoize-update-check-v1.schema.json \
+  denoize-update-download-v1.schema.json \
+  denoize-update-dry-run-v1.schema.json \
+  denoize-update-health-v1.schema.json \
+  denoize-update-manifest-v1.schema.json \
+  denoize-update-manifest-verification-v1.schema.json \
+  denoize-update-status-v1.schema.json \
   denoize-watch-cycle-v1.schema.json \
   denoize-watch-quarantine-v1.schema.json \
   denoize-watch-state-v1.schema.json; do
@@ -275,6 +332,125 @@ for schema in \
   fi
   jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
     "$tmp_dir/$schema" >/dev/null
+done
+
+cargo build --locked --no-default-features --bin denoize
+manifest_report="$tmp_dir/denoize-update-manifest-verification-v1.json"
+target/debug/denoize update manifest verify \
+  "$tmp_dir/denoize-update-manifest-v1.json" \
+  "$tmp_dir/denoize-update-manifest-v1.json.sig" > "$manifest_report"
+python3 - \
+  schemas/denoize-update-manifest-v1.schema.json \
+  "$tmp_dir/denoize-update-manifest-v1.json" \
+  schemas/denoize-update-manifest-verification-v1.schema.json \
+  "$manifest_report" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator
+
+for schema_path, document_path in zip(sys.argv[1::2], sys.argv[2::2]):
+    schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
+    document = json.loads(Path(document_path).read_text(encoding="utf-8"))
+    Draft202012Validator(schema).validate(document)
+PY
+source_commit=$(git rev-parse HEAD)
+jq -e \
+  --arg version "$version" \
+  --arg commit "$source_commit" \
+  --arg repository "$repo" '
+  .schema == "denoize-update-manifest-v1" and
+  .schema_version == 1 and
+  .channel == "stable" and
+  .version == $version and
+  .source_commit == $commit and
+  .compatibility.accepted_from_versions == ["0.68.0", "0.69.0"] and
+  .rollback_policy.retained_last_known_good == 1 and
+  .rollback_policy.manual_recovery == true and
+  .rollback_policy.network_required_for_recovery == false and
+  ([.platforms[].platform] == [
+    "darwin-aarch64-app",
+    "darwin-x86_64-app",
+    "linux-x86_64-appimage",
+    "linux-x86_64-deb",
+    "windows-x86_64-msi",
+    "windows-x86_64-nsis"
+  ]) and
+  all(.platforms[];
+    . as $platform_row |
+    $platform_row.candidate.version == $version and
+    (([$platform_row.platform, $platform_row.candidate.activation] | @tsv) | IN(
+      "darwin-aarch64-app\tmacos-app-archive",
+      "darwin-x86_64-app\tmacos-app-archive",
+      "linux-x86_64-appimage\tapp-image",
+      "linux-x86_64-deb\tdeb-package",
+      "windows-x86_64-msi\tmsi-installer",
+      "windows-x86_64-nsis\tnsis-installer"
+    )) and
+    ($platform_row.candidate.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
+    ($platform_row.candidate.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
+    ($platform_row.candidate.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
+    ([$platform_row.rollbacks[].from_version] == ["0.68.0", "0.69.0"]) and
+    all($platform_row.rollbacks[]; . as $rollback |
+      $rollback.payload.activation == $platform_row.candidate.activation and
+      (.bundle_url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
+      (.payload.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $rollback.from_version + "/")) and
+      (.payload.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
+      (.payload.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $rollback.from_version + "/"))
+    )
+  )
+' "$tmp_dir/denoize-update-manifest-v1.json" >/dev/null
+
+manifest_sha256=$(jq -r '.manifest_sha256' "$manifest_report")
+bundle_reports=()
+for update_platform in "${update_platforms[@]}"; do
+  for rollback_version in "${update_rollback_versions[@]}"; do
+    bundle="$tmp_dir/denoize-update-${tag}-${update_platform}-from-v${rollback_version}.dub"
+    report="$tmp_dir/update-bundle-${update_platform}-from-${rollback_version}.json"
+    target/debug/denoize update bundle inspect "$bundle" > "$report"
+    jq -e \
+      --arg platform "$update_platform" \
+      --arg from "$rollback_version" \
+      --arg candidate "$version" \
+      --arg manifest "$manifest_sha256" '
+      .schema == "denoize-update-bundle-v1" and
+      .schema_version == 1 and
+      .platform == $platform and
+      .from_version == $from and
+      .candidate_version == $candidate and
+      .manifest_sha256 == $manifest and
+      .size_bytes > 0 and
+      .evidence_bytes > 0
+    ' "$report" >/dev/null
+    bundle_reports+=("$report")
+  done
+done
+python3 - schemas/denoize-update-bundle-v1.schema.json "${bundle_reports[@]}" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+validator = Draft202012Validator(schema)
+for report_path in sys.argv[2:]:
+    validator.validate(json.loads(Path(report_path).read_text(encoding="utf-8")))
+PY
+
+update_subjects="$tmp_dir/denoize-update-subjects-${tag}.sigstore.json"
+for update_subject in \
+  "$tmp_dir/denoize-update-manifest-v1.json" \
+  "$tmp_dir/denoize-update-manifest-v1.json.sig" \
+  "$tmp_dir"/*.dub \
+  "$tmp_dir"/*.cdx.json; do
+  gh attestation verify "$update_subject" \
+    --repo "$repo" \
+    --bundle "$update_subjects" \
+    --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
+    --source-digest "$source_commit" \
+    --source-ref "refs/tags/$tag" \
+    --signer-workflow "$repo/.github/workflows/release.yml" \
+    --deny-self-hosted-runners >/dev/null
 done
 
 DENOIZE_MODEL_DIR="$tmp_dir/model-cache" \

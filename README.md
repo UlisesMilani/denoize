@@ -861,6 +861,12 @@ available for independent audit and recovery tooling. Releases also publish
 every versioned JSON Schema used by automation, monitoring, DAW state, and
 verification clients.
 
+Desktop releases also publish a signed recoverable-update manifest, exact
+per-platform SBOMs, two authenticated `.dub` migration bundles per platform,
+and a separate update-asset attestation. A bundle contains both the candidate
+and its verified last-known-good installation, so startup-health or explicit
+recovery does not require a network. See [recoverable application updates](docs/updates.md).
+
 Every installable CLI archive, CLAP archive, desktop package, crates.io archive,
 and offline model bundle also has a per-artifact CycloneDX SBOM. The release
 evidence archive binds those 18 artifacts and SBOMs to their sizes and SHA-256 digests,
@@ -896,13 +902,15 @@ git push origin v0.1.0
 The `GitHub Release` workflow verifies that the tag is on the default branch and
 matches every release version field, runs the full test suite, and builds all
 CLI, CLAP, and desktop targets before publishing the crates.io package. It then checks
-all archives, checksums, signatures, per-artifact SBOMs, build provenance, and
-updater metadata before publishing the draft release and generated notes. The
+all archives, checksums, signatures, per-artifact SBOMs, build provenance,
+recoverable update bundles, and updater metadata before publishing the draft release and generated notes. The
 exact `.crate` archive is attested before publication and its checksum must
 match the crates.io API afterward. When `docs/releases/vTAG.md` exists, its
-curated notes are prepended to the generated notes. Installed desktop apps
-check the signed `latest.json` feed on startup; updates are only installed after
-user confirmation. The updater private key is kept in the
+curated notes are prepended to the generated notes. Desktop startup performs
+only local update-health and managed-version repair; an online check, bounded
+bundle download, and candidate activation each require an explicit user action.
+The legacy `latest.json`
+feed and the recoverable manifest use the same repository signing key. The updater private key is kept in the
 `TAURI_SIGNING_PRIVATE_KEY` repository secret. A failed build leaves the release
 as a draft and cannot publish the crate before every target and its evidence
 have been verified.

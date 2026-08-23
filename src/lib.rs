@@ -75,6 +75,7 @@ pub mod service;
 pub mod stft;
 mod stoi_resample;
 pub mod stream;
+pub mod update;
 pub mod vad;
 pub mod watch;
 pub mod window;

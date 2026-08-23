@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.69.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.70.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -22,6 +22,7 @@ USAGE:
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
     denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
+    denoize update <COMMAND> [OPTIONS]  (run `denoize update --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -126,7 +127,7 @@ CONFIGURATION:
 ## Watch-folder automation
 
 ```text
-denoize 0.69.0 watch-folder automation
+denoize 0.70.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -347,6 +348,40 @@ portable regular files below --corpus-root and may not traverse symlinks.
 `run` always writes a signed result before returning a non-zero status for a
 missed threshold or rejected listening test. `compare` authenticates both
 results and rejects incomparable hardware/runtime/recipe contexts.
+```
+
+## Recoverable application updates
+
+```text
+Recoverable signed application updates
+
+USAGE:
+    denoize update manifest verify <MANIFEST.json> <MANIFEST.sig> [--public-key PATH] [--pretty]
+    denoize update bundle inspect <BUNDLE.dub> [--public-key PATH] [--pretty]
+    denoize update bundle download <OUTPUT.dub> --platform ID --from-version VERSION \
+        [--manifest-url URL --signature-url URL] [--public-key PATH] [--pretty]
+    denoize update bundle build <OUTPUT.dub> --manifest PATH --signature PATH \
+        --platform ID --from-version VERSION --candidate-artifact PATH \
+        --candidate-sbom PATH --candidate-provenance PATH --rollback-artifact PATH \
+        --rollback-sbom PATH --rollback-provenance PATH [--public-key PATH] [--pretty]
+    denoize update check <MANIFEST.json> <MANIFEST.sig> --state-dir DIR \
+        --channel CHANNEL --platform ID --current-version VERSION [--public-key PATH] [--pretty]
+    denoize update check-online --state-dir DIR --channel CHANNEL --platform ID \
+        --current-version VERSION [--manifest-url URL --signature-url URL] \
+        [--public-key PATH] [--pretty]
+    denoize update dry-run <BUNDLE.dub> --state-dir DIR --current-version VERSION \
+        [--max-staging-bytes N] [--public-key PATH] [--pretty]
+    denoize update apply <BUNDLE.dub> --state-dir DIR --current-version VERSION \
+        [--max-staging-bytes N] [--public-key PATH] [--pretty]
+    denoize update status --state-dir DIR [--pretty]
+    denoize update health begin --state-dir DIR --running-version VERSION [--pretty]
+    denoize update health confirm --state-dir DIR --running-version VERSION --token TOKEN [--pretty]
+    denoize update recover --state-dir DIR [--reason CODE] [--pretty]
+
+All successful commands emit one versioned JSON document. `check` and `dry-run`
+are read-only. `apply` stages the authenticated candidate and an offline
+last-known-good installation, then waits for explicit startup health confirmation.
+Recovery never lowers the accepted-version floor and never requires a network.
 ```
 
 Watch mode uses portable bounded polling. A regular audio file becomes eligible

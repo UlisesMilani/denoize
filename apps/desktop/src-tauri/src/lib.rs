@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tauri::utils::config::BundleType;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 mod diagnostics;
@@ -119,6 +120,8 @@ impl DesktopError {
             "ipc.failed"
         } else if lower.contains("model") || lower.contains("モデル") {
             "model.failed"
+        } else if lower.contains("update") || lower.contains("アプリ更新") {
+            "update.failed"
         } else if lower.contains("復旧") || lower.contains("recovery") {
             "recovery.failed"
         } else if lower.contains("regular file") || lower.contains("regular-file") {
@@ -166,6 +169,7 @@ impl DesktopError {
                 | "receipt.failed"
                 | "ipc.failed"
                 | "model.failed"
+                | "update.failed"
                 | "recovery.failed"
                 | "validation.invalid"
                 | "io.failed"
@@ -376,6 +380,7 @@ struct AppState {
     watch: Arc<Mutex<Option<DesktopWatchSession>>>,
     watch_active: Arc<AtomicBool>,
     diagnostics: Arc<diagnostics::DiagnosticLog>,
+    startup_update_health: Arc<Mutex<Option<denoize::update::UpdateHealthReport>>>,
 }
 
 struct IsolatedChild {
@@ -3800,6 +3805,521 @@ async fn model_cache_doctor() -> DesktopResult<ModelCacheReportRow> {
     })
     .await
     .map_err(|error| format!("モデルキャッシュ診断タスクに失敗しました: {error}"))??)
+}
+
+fn application_update_state_root(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map(|path| path.join("application-update-v1"))
+        .map_err(|error| format!("resolve application update state directory: {error}"))
+}
+
+fn application_update_platform() -> Result<&'static str, String> {
+    let bundle_type = tauri::utils::platform::bundle_type();
+    let legacy_appimage = std::env::var_os("APPIMAGE").is_some();
+    application_update_platform_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        bundle_type,
+        legacy_appimage,
+    )
+}
+
+fn application_update_platform_for(
+    os: &str,
+    architecture: &str,
+    bundle_type: Option<BundleType>,
+    legacy_appimage: bool,
+) -> Result<&'static str, String> {
+    match (os, architecture, bundle_type) {
+        ("macos", "aarch64", Some(BundleType::App | BundleType::Dmg) | None) => {
+            Ok("darwin-aarch64-app")
+        }
+        ("macos", "x86_64", Some(BundleType::App | BundleType::Dmg) | None) => {
+            Ok("darwin-x86_64-app")
+        }
+        ("windows", "x86_64", Some(BundleType::Msi)) => Ok("windows-x86_64-msi"),
+        ("windows", "x86_64", Some(BundleType::Nsis)) => Ok("windows-x86_64-nsis"),
+        ("linux", "x86_64", Some(BundleType::AppImage)) => Ok("linux-x86_64-appimage"),
+        ("linux", "x86_64", Some(BundleType::Deb)) => Ok("linux-x86_64-deb"),
+        ("linux", "x86_64", None) if legacy_appimage => Ok("linux-x86_64-appimage"),
+        (_, _, Some(bundle_type)) => Err(format!(
+            "application update bundle type is unsupported on {os}-{architecture}: {bundle_type}"
+        )),
+        _ => Err(format!(
+            "application update requires a packaged Desktop build: {os}-{architecture}"
+        )),
+    }
+}
+
+fn application_update_activation_for_platform(
+    platform: &str,
+) -> Result<denoize::update::UpdateActivationKind, String> {
+    match platform {
+        "darwin-aarch64-app" | "darwin-x86_64-app" => {
+            Ok(denoize::update::UpdateActivationKind::MacosAppArchive)
+        }
+        "linux-x86_64-appimage" => Ok(denoize::update::UpdateActivationKind::AppImage),
+        "linux-x86_64-deb" => Ok(denoize::update::UpdateActivationKind::DebPackage),
+        "windows-x86_64-msi" => Ok(denoize::update::UpdateActivationKind::MsiInstaller),
+        "windows-x86_64-nsis" => Ok(denoize::update::UpdateActivationKind::NsisInstaller),
+        _ => Err(format!(
+            "application update platform has no activation contract: {platform}"
+        )),
+    }
+}
+
+fn activate_application_update_target(
+    target: denoize::update::UpdateActivationTarget,
+    recovery: bool,
+) -> Result<denoize::update::UpdateActivationTarget, String> {
+    let expected_platform = application_update_platform()?;
+    if target.platform != expected_platform {
+        return Err(format!(
+            "staged update platform {} does not match {expected_platform}",
+            target.platform
+        ));
+    }
+    let expected_activation = application_update_activation_for_platform(expected_platform)?;
+    if target.activation != expected_activation {
+        return Err(format!(
+            "staged update activation {:?} does not match {expected_platform}",
+            target.activation
+        ));
+    }
+    match target.activation {
+        #[cfg(target_os = "linux")]
+        denoize::update::UpdateActivationKind::AppImage => {
+            activate_appimage_update(&target)?;
+        }
+        #[cfg(target_os = "linux")]
+        denoize::update::UpdateActivationKind::DebPackage => {
+            activate_deb_update(&target, recovery)?;
+        }
+        #[cfg(target_os = "macos")]
+        denoize::update::UpdateActivationKind::MacosAppArchive => {
+            activate_macos_update(&target)?;
+        }
+        #[cfg(windows)]
+        denoize::update::UpdateActivationKind::NsisInstaller => {
+            activate_windows_nsis_update(&target)?;
+        }
+        #[cfg(windows)]
+        denoize::update::UpdateActivationKind::MsiInstaller => {
+            activate_windows_msi_update(&target)?;
+        }
+        activation => {
+            return Err(format!(
+                "staged activation {activation:?} is unsupported by this Desktop package"
+            ));
+        }
+    }
+    Ok(target)
+}
+
+fn begin_application_update_startup(
+    state_root: &Path,
+) -> Result<denoize::update::UpdateHealthReport, String> {
+    let report =
+        denoize::update::begin_update_startup_health(state_root, env!("CARGO_PKG_VERSION"), None)?;
+    if matches!(
+        report.action.as_str(),
+        "recovered-last-known-good" | "reactivate-managed-version"
+    ) {
+        let target = denoize::update::active_update_target(state_root)?;
+        activate_application_update_target(target, true)?;
+    }
+    Ok(report)
+}
+
+#[cfg(target_os = "linux")]
+fn activate_appimage_update(
+    target: &denoize::update::UpdateActivationTarget,
+) -> Result<(), String> {
+    let current = std::env::var_os("APPIMAGE")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "AppImage activation requires the APPIMAGE environment path".to_string())?;
+    let current = std::fs::canonicalize(PathBuf::from(current))
+        .map_err(|error| format!("resolve current AppImage: {error}"))?;
+    let mut source = File::open(&target.artifact_path)
+        .map_err(|error| format!("open authenticated staged AppImage: {error}"))?;
+    let source_len = source
+        .metadata()
+        .map_err(|error| format!("inspect authenticated staged AppImage: {error}"))?
+        .len();
+    if source_len != target.artifact.len {
+        return Err("authenticated staged AppImage length changed before activation".into());
+    }
+    let mut output = AtomicOutput::new(&current)?;
+    let copied = std::io::copy(&mut source, output.file_mut())
+        .map_err(|error| format!("stage replacement AppImage: {error}"))?;
+    if copied != target.artifact.len {
+        return Err("replacement AppImage copy ended at the wrong length".into());
+    }
+    output.commit(CommitMode::Replace)
+}
+
+#[cfg(target_os = "linux")]
+fn activate_deb_update(
+    target: &denoize::update::UpdateActivationTarget,
+    recovery: bool,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new("pkexec");
+    command.arg("dpkg");
+    if recovery {
+        command.arg("--force-downgrade");
+    }
+    let status = command
+        .arg("-i")
+        .arg(&target.artifact_path)
+        .status()
+        .map_err(|error| format!("start authenticated deb installer with pkexec: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "authenticated deb installer exited with status {status}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn activate_macos_update(target: &denoize::update::UpdateActivationTarget) -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("resolve current application executable: {error}"))?;
+    let current_app = executable
+        .ancestors()
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == std::ffi::OsStr::new("app"))
+        })
+        .ok_or_else(|| "current executable is not contained in a macOS app bundle".to_string())?;
+    let parent = current_app
+        .parent()
+        .ok_or_else(|| "current macOS app bundle has no parent directory".to_string())?;
+    let transaction = tempfile::Builder::new()
+        .prefix(".denoize-update-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("create macOS update transaction directory: {error}"))?;
+    let extracted = transaction.path().join("extracted");
+    std::fs::create_dir(&extracted)
+        .map_err(|error| format!("create macOS update extraction directory: {error}"))?;
+    let status = std::process::Command::new("/usr/bin/tar")
+        .arg("-xzf")
+        .arg(&target.artifact_path)
+        .arg("-C")
+        .arg(&extracted)
+        .status()
+        .map_err(|error| format!("extract authenticated macOS app archive: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "macOS app archive extraction exited with status {status}"
+        ));
+    }
+    let candidate = extracted.join("denoize.app");
+    let candidate_metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|error| format!("inspect extracted macOS app bundle: {error}"))?;
+    if !candidate_metadata.is_dir() || candidate_metadata.file_type().is_symlink() {
+        return Err("authenticated macOS archive did not contain one regular denoize.app".into());
+    }
+    let backup = transaction.path().join("last-known-good.app");
+    std::fs::rename(current_app, &backup)
+        .map_err(|error| format!("stage current macOS app for rollback: {error}"))?;
+    if let Err(error) = std::fs::rename(&candidate, current_app) {
+        let restore = std::fs::rename(&backup, current_app);
+        return Err(match restore {
+            Ok(()) => format!("activate authenticated macOS app: {error}; restored current app"),
+            Err(restore) => format!(
+                "activate authenticated macOS app: {error}; restoring current app failed: {restore}"
+            ),
+        });
+    }
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync macOS application directory: {error}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn activate_windows_nsis_update(
+    target: &denoize::update::UpdateActivationTarget,
+) -> Result<(), String> {
+    std::process::Command::new(&target.artifact_path)
+        // Match Tauri's passive NSIS updater contract. No current-process
+        // arguments are forwarded, so /ARGS deliberately terminates the list.
+        .args(["/P", "/R", "/UPDATE", "/ARGS"])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("start authenticated NSIS updater: {error}"))
+}
+
+#[cfg(windows)]
+fn activate_windows_msi_update(
+    target: &denoize::update::UpdateActivationTarget,
+) -> Result<(), String> {
+    std::process::Command::new("msiexec.exe")
+        .arg("/i")
+        .arg(&target.artifact_path)
+        .args(["/passive", "/promptrestart", "AUTOLAUNCHAPP=True"])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("start authenticated MSI updater: {error}"))
+}
+
+#[tauri::command]
+async fn application_update_status(
+    app: AppHandle,
+) -> DesktopResult<denoize::update::UpdateStatusReport> {
+    let state_root = application_update_state_root(&app)?;
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || denoize::update::update_status(state_root))
+            .await
+            .map_err(|error| format!("application update status task failed: {error}"))??,
+    )
+}
+
+#[tauri::command]
+async fn inspect_application_update_bundle(
+    path: String,
+) -> DesktopResult<denoize::update::UpdateBundleInfo> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        denoize::update::inspect_update_bundle(path, None)
+    })
+    .await
+    .map_err(|error| format!("application update bundle inspection task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn check_application_update(
+    app: AppHandle,
+    manifest: String,
+    signature: String,
+) -> DesktopResult<denoize::update::UpdateCheckReport> {
+    let state_root = application_update_state_root(&app)?;
+    let platform = application_update_platform()?.to_string();
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let verified = denoize::update::UpdateManifest::from_file(manifest, signature, None)?;
+        denoize::update::check_update_manifest(
+            &verified,
+            state_root,
+            "stable",
+            &platform,
+            env!("CARGO_PKG_VERSION"),
+        )
+    })
+    .await
+    .map_err(|error| format!("application update check task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn check_application_update_online(
+    app: AppHandle,
+) -> DesktopResult<denoize::update::UpdateCheckReport> {
+    let state_root = application_update_state_root(&app)?;
+    let platform = application_update_platform()?.to_string();
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let verified = denoize::update::fetch_update_manifest(
+            denoize::update::DEFAULT_UPDATE_MANIFEST_URL,
+            denoize::update::DEFAULT_UPDATE_MANIFEST_SIGNATURE_URL,
+            None,
+        )?;
+        denoize::update::check_update_manifest(
+            &verified,
+            state_root,
+            "stable",
+            &platform,
+            env!("CARGO_PKG_VERSION"),
+        )
+    })
+    .await
+    .map_err(|error| format!("online application update check task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn download_application_update_bundle(
+    path: String,
+) -> DesktopResult<denoize::update::UpdateDownloadReport> {
+    let platform = application_update_platform()?.to_string();
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let verified = denoize::update::fetch_update_manifest(
+            denoize::update::DEFAULT_UPDATE_MANIFEST_URL,
+            denoize::update::DEFAULT_UPDATE_MANIFEST_SIGNATURE_URL,
+            None,
+        )?;
+        denoize::update::download_update_bundle(
+            &verified,
+            &platform,
+            env!("CARGO_PKG_VERSION"),
+            path,
+            None,
+        )
+    })
+    .await
+    .map_err(|error| format!("application update download task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn dry_run_application_update_bundle(
+    app: AppHandle,
+    path: String,
+) -> DesktopResult<denoize::update::UpdateDryRunReport> {
+    let state_root = application_update_state_root(&app)?;
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        denoize::update::dry_run_update_bundle(
+            path,
+            state_root,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|error| format!("application update dry-run task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn apply_application_update_bundle(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> DesktopResult<denoize::update::UpdateApplyReport> {
+    let state_root = application_update_state_root(&app)?;
+    if let Some(parent) = state_root.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "create application update data directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let report = denoize::update::apply_update_bundle(
+            path,
+            &state_root,
+            env!("CARGO_PKG_VERSION"),
+            None,
+            None,
+        )?;
+        let target = denoize::update::active_update_target(&state_root)?;
+        if let Err(activation_error) = activate_application_update_target(target, false) {
+            let recovery = denoize::update::recover_update(
+                &state_root,
+                "activation-failed",
+                None,
+            );
+            return Err(match recovery {
+                Ok(_) => format!(
+                    "application update activation failed and state recovered last-known-good: {activation_error}"
+                ),
+                Err(recovery_error) => format!(
+                    "application update activation failed: {activation_error}; state recovery also failed: {recovery_error}"
+                ),
+            });
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|error| format!("application update apply task failed: {error}"))?;
+    match result {
+        Ok(report) => {
+            state
+                .diagnostics
+                .record(diagnostics::DiagnosticCode::UpdateStaged);
+            Ok(report)
+        }
+        Err(error) => {
+            state
+                .diagnostics
+                .record(diagnostics::DiagnosticCode::UpdateFailed);
+            Err(DesktopError::from(error))
+        }
+    }
+}
+
+#[tauri::command]
+async fn recover_application_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<denoize::update::UpdateHealthReport> {
+    let state_root = application_update_state_root(&app)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let target = denoize::update::last_known_good_update_target(&state_root)?;
+        activate_application_update_target(target, true)?;
+        denoize::update::recover_update(state_root, "desktop-manual-recovery", None)
+    })
+    .await
+    .map_err(|error| format!("application update recovery task failed: {error}"))?;
+    match result {
+        Ok(report) => {
+            state
+                .diagnostics
+                .record(diagnostics::DiagnosticCode::UpdateRecovered);
+            Ok(report)
+        }
+        Err(error) => {
+            state
+                .diagnostics
+                .record(diagnostics::DiagnosticCode::UpdateFailed);
+            Err(DesktopError::from(error))
+        }
+    }
+}
+
+#[tauri::command]
+async fn confirm_application_update_startup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<denoize::update::UpdateHealthReport> {
+    let startup = state
+        .startup_update_health
+        .lock()
+        .map_err(|_| {
+            DesktopError::new(
+                "update.failed",
+                "application update health state is poisoned",
+            )
+        })?
+        .take();
+    let state_root = application_update_state_root(&app)?;
+    let report = match startup {
+        Some(report) if report.action == "confirm-required" => {
+            let token = report.health_token.ok_or_else(|| {
+                DesktopError::new(
+                    "update.failed",
+                    "pending application update has no startup health token",
+                )
+            })?;
+            tauri::async_runtime::spawn_blocking(move || {
+                denoize::update::confirm_update_health(
+                    state_root,
+                    env!("CARGO_PKG_VERSION"),
+                    &token,
+                    None,
+                )
+            })
+            .await
+            .map_err(|error| format!("application update health task failed: {error}"))??
+        }
+        Some(report) => report,
+        None => tauri::async_runtime::spawn_blocking(move || {
+            begin_application_update_startup(&state_root)
+        })
+        .await
+        .map_err(|error| format!("application update health task failed: {error}"))??,
+    };
+    if report.action == "confirmed" {
+        state
+            .diagnostics
+            .record(diagnostics::DiagnosticCode::UpdateConfirmed);
+    } else if matches!(
+        report.action.as_str(),
+        "recovered-last-known-good" | "reactivate-managed-version"
+    ) {
+        state
+            .diagnostics
+            .record(diagnostics::DiagnosticCode::UpdateRecovered);
+    }
+    Ok(report)
 }
 
 fn write_automation_json(path: &Path, json: &str) -> Result<(), String> {
@@ -7933,7 +8453,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             accessibility_e2e_active,
@@ -7975,6 +8494,15 @@ pub fn run() {
             recover_model_trust_root,
             reset_model_trust_time_floor,
             model_cache_doctor,
+            application_update_status,
+            inspect_application_update_bundle,
+            check_application_update,
+            check_application_update_online,
+            download_application_update_bundle,
+            dry_run_application_update_bundle,
+            apply_application_update_bundle,
+            recover_application_update,
+            confirm_application_update_startup,
             save_automation_snapshot,
             daw_plugin_info,
             daw_factory_preset,
@@ -7992,9 +8520,33 @@ pub fn run() {
             save_text_file
         ])
         .setup(|app| {
-            app.state::<AppState>()
+            let app_state = app.state::<AppState>();
+            app_state
                 .diagnostics
                 .record(diagnostics::DiagnosticCode::ApplicationStarted);
+            match application_update_state_root(app.handle())
+                .and_then(|state_root| begin_application_update_startup(&state_root))
+            {
+                Ok(report) => {
+                    if matches!(
+                        report.action.as_str(),
+                        "recovered-last-known-good" | "reactivate-managed-version"
+                    ) {
+                        app_state
+                            .diagnostics
+                            .record(diagnostics::DiagnosticCode::UpdateRecovered);
+                    }
+                    if let Ok(mut startup) = app_state.startup_update_health.lock() {
+                        *startup = Some(report);
+                    }
+                }
+                Err(error) => {
+                    app_state
+                        .diagnostics
+                        .record(diagnostics::DiagnosticCode::UpdateFailed);
+                    eprintln!("denoize desktop: application update health check failed: {error}");
+                }
+            }
             if let Err(error) = preview::cleanup_preview_root() {
                 eprintln!("denoize desktop: stale preview cleanup failed: {error}");
             }
@@ -8020,6 +8572,53 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_update_platform_tracks_the_packaged_bundle_type() {
+        assert_eq!(
+            application_update_platform_for("linux", "x86_64", Some(BundleType::AppImage), false,)
+                .unwrap(),
+            "linux-x86_64-appimage"
+        );
+        assert_eq!(
+            application_update_platform_for("linux", "x86_64", Some(BundleType::Deb), false,)
+                .unwrap(),
+            "linux-x86_64-deb"
+        );
+        assert_eq!(
+            application_update_platform_for("windows", "x86_64", Some(BundleType::Msi), false,)
+                .unwrap(),
+            "windows-x86_64-msi"
+        );
+        assert_eq!(
+            application_update_platform_for("windows", "x86_64", Some(BundleType::Nsis), false,)
+                .unwrap(),
+            "windows-x86_64-nsis"
+        );
+        assert_eq!(
+            application_update_platform_for("macos", "aarch64", Some(BundleType::Dmg), false,)
+                .unwrap(),
+            "darwin-aarch64-app"
+        );
+        assert_eq!(
+            application_update_activation_for_platform("linux-x86_64-appimage").unwrap(),
+            denoize::update::UpdateActivationKind::AppImage
+        );
+        assert_eq!(
+            application_update_activation_for_platform("linux-x86_64-deb").unwrap(),
+            denoize::update::UpdateActivationKind::DebPackage
+        );
+        assert_eq!(
+            application_update_activation_for_platform("windows-x86_64-msi").unwrap(),
+            denoize::update::UpdateActivationKind::MsiInstaller
+        );
+        assert_eq!(
+            application_update_activation_for_platform("windows-x86_64-nsis").unwrap(),
+            denoize::update::UpdateActivationKind::NsisInstaller
+        );
+        assert!(application_update_platform_for("linux", "x86_64", None, false).is_err());
+        assert!(application_update_activation_for_platform("portable-test").is_err());
+    }
 
     #[test]
     fn daw_desktop_contract_round_trips_portable_state() {
@@ -8086,7 +8685,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "4d9d8d69d59e4a3409ed262492410075b0161f01ea3bd7f27f4f3b4ac42b2f0f";
+        "fbcc5581afebfe2dc826006e8420c2c7c16ea87ebbd3bbf5ceb88edc15a994fb";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

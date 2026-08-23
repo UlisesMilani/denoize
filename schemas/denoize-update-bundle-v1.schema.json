@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-update-bundle-v1.schema.json",
+  "title": "denoize offline recoverable update bundle report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "bundle_sha256",
+    "size_bytes",
+    "platform",
+    "channel",
+    "from_version",
+    "from_sequence",
+    "candidate_version",
+    "candidate_sequence",
+    "manifest_sha256",
+    "signing_key_id",
+    "candidate_artifact",
+    "rollback_artifact",
+    "evidence_bytes"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-update-bundle-v1" },
+    "schema_version": { "const": 1 },
+    "bundle_sha256": { "$ref": "#/$defs/sha256" },
+    "size_bytes": { "type": "integer", "minimum": 1, "maximum": 5368709120 },
+    "platform": { "$ref": "#/$defs/identifier" },
+    "channel": { "$ref": "#/$defs/identifier" },
+    "from_version": { "$ref": "#/$defs/version" },
+    "from_sequence": { "type": "integer", "minimum": 0 },
+    "candidate_version": { "$ref": "#/$defs/version" },
+    "candidate_sequence": { "type": "integer", "minimum": 1 },
+    "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "signing_key_id": { "type": "string", "pattern": "^[0-9A-F]{16}$" },
+    "candidate_artifact": { "$ref": "#/$defs/fingerprint" },
+    "rollback_artifact": { "$ref": "#/$defs/fingerprint" },
+    "evidence_bytes": { "type": "integer", "minimum": 4, "maximum": 536870912 }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z0-9._+-]{1,128}$" },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "sha256"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 2147483648 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

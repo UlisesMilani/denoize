@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-update-apply-v1.schema.json",
+  "title": "denoize recoverable update apply report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "channel",
+    "platform",
+    "from_version",
+    "candidate_version",
+    "candidate_sequence",
+    "bundle_sha256",
+    "manifest_sha256",
+    "active_slot_id",
+    "last_known_good_slot_id",
+    "health_token",
+    "health_deadline_unix_seconds",
+    "activation",
+    "outcome",
+    "relaunch_required"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-update-apply-v1" },
+    "schema_version": { "const": 1 },
+    "channel": { "$ref": "#/$defs/identifier" },
+    "platform": { "$ref": "#/$defs/identifier" },
+    "from_version": { "$ref": "#/$defs/version" },
+    "candidate_version": { "$ref": "#/$defs/version" },
+    "candidate_sequence": { "type": "integer", "minimum": 1 },
+    "bundle_sha256": { "$ref": "#/$defs/sha256" },
+    "manifest_sha256": { "$ref": "#/$defs/sha256" },
+    "active_slot_id": { "$ref": "#/$defs/identifier" },
+    "last_known_good_slot_id": { "$ref": "#/$defs/identifier" },
+    "health_token": { "$ref": "#/$defs/sha256" },
+    "health_deadline_unix_seconds": { "type": "integer", "minimum": 1 },
+    "activation": { "$ref": "#/$defs/activation" },
+    "outcome": { "const": "pending-health-confirmation" },
+    "relaunch_required": { "const": true }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z0-9._+-]{1,128}$" },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "activation": {
+      "enum": [
+        "portable-executable",
+        "macos-app-archive",
+        "app-image",
+        "deb-package",
+        "nsis-installer",
+        "msi-installer"
+      ]
+    }
+  }
+}

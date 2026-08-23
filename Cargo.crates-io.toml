@@ -8,7 +8,7 @@
 
 [package]
 name = "denoize"
-version = "0.69.0"
+version = "0.70.0"
 edition = "2021"
 rust-version = "1.96"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
@@ -57,6 +57,7 @@ include = [
     "/docs/models.md",
     "/docs/resilience.md",
     "/docs/release-evidence.md",
+    "/docs/updates.md",
     "/schemas/*.json",
     "/models/*.json",
     "/models/licenses/*.txt",
@@ -148,6 +149,7 @@ live = ["dep:cpal"]
 full = ["rnnoise", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol", "live"]
 
 [dev-dependencies]
+minisign = "0.9.1"
 prost = "0.14"
 
 [package.metadata.docs.rs]

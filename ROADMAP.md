@@ -255,7 +255,7 @@ unreviewable release.
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Released in v0.67.0 |
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Released in v0.68.0 |
 | 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Released in v0.69.0 |
-| 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Planned |
+| 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Released in v0.70.0 |
 | 23 | Portable projects and sample-accurate region/timeline workflows with bounded edit graphs, deterministic assembly, and signed provenance | Planned |
 
 Stage 8 accepts regular-file WAV, FLAC, and Ogg Vorbis input, writes an atomic

@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-update-status-v1.schema.json",
+  "title": "denoize recoverable update status report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "managed",
+    "generation",
+    "channel",
+    "platform",
+    "phase",
+    "highest_accepted_sequence",
+    "active",
+    "last_known_good",
+    "health_deadline_unix_seconds",
+    "start_attempts",
+    "maximum_start_attempts",
+    "failed_slot_count",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-update-status-v1" },
+    "schema_version": { "const": 1 },
+    "managed": { "type": "boolean" },
+    "generation": { "type": "integer", "minimum": 0 },
+    "channel": { "$ref": "#/$defs/nullableIdentifier" },
+    "platform": { "$ref": "#/$defs/nullableIdentifier" },
+    "phase": { "enum": ["unmanaged", "pending-health", "healthy"] },
+    "highest_accepted_sequence": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 0 }]
+    },
+    "active": { "$ref": "#/$defs/nullableSlot" },
+    "last_known_good": { "$ref": "#/$defs/nullableSlot" },
+    "health_deadline_unix_seconds": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1 }]
+    },
+    "start_attempts": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 0, "maximum": 16 }]
+    },
+    "maximum_start_attempts": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1, "maximum": 16 }]
+    },
+    "failed_slot_count": { "type": "integer", "minimum": 0, "maximum": 8 },
+    "diagnostics": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/diagnostic" }
+    }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[a-z0-9._+-]{1,128}$" },
+    "nullableIdentifier": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/identifier" }]
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullableSha256": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+    },
+    "nullableVersion": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/version" }]
+    },
+    "activation": {
+      "enum": [
+        "portable-executable",
+        "macos-app-archive",
+        "app-image",
+        "deb-package",
+        "nsis-installer",
+        "msi-installer"
+      ]
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "sha256"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 2147483648 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "slot_id",
+        "version",
+        "sequence",
+        "platform",
+        "activation",
+        "manifest_sha256",
+        "artifact_name",
+        "artifact",
+        "sbom",
+        "provenance"
+      ],
+      "properties": {
+        "slot_id": { "$ref": "#/$defs/identifier" },
+        "version": { "$ref": "#/$defs/version" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "platform": { "$ref": "#/$defs/identifier" },
+        "activation": { "$ref": "#/$defs/activation" },
+        "manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "artifact": { "$ref": "#/$defs/fingerprint" },
+        "sbom": { "$ref": "#/$defs/fingerprint" },
+        "provenance": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "nullableSlot": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/slot" }]
+    },
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generation",
+        "unix_seconds",
+        "code",
+        "from_version",
+        "to_version",
+        "manifest_sha256",
+        "artifact_sha256"
+      ],
+      "properties": {
+        "generation": { "type": "integer", "minimum": 1 },
+        "unix_seconds": { "type": "integer", "minimum": 1 },
+        "code": { "$ref": "#/$defs/identifier" },
+        "from_version": { "$ref": "#/$defs/nullableVersion" },
+        "to_version": { "$ref": "#/$defs/nullableVersion" },
+        "manifest_sha256": { "$ref": "#/$defs/nullableSha256" },
+        "artifact_sha256": { "$ref": "#/$defs/nullableSha256" }
+      }
+    }
+  }
+}
