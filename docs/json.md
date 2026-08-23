@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes nineteen versioned JSON contracts for local automation. Their
+denoize publishes twenty-seven versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -21,6 +21,24 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-hardware-v1.schema.json`](../schemas/denoize-hardware-v1.schema.json)
   describes a network-free snapshot of CPU features, compiled accelerator
   runtimes, runtime availability, and backend accelerator support.
+- [`denoize-ipc-discovery-v1.schema.json`](../schemas/denoize-ipc-discovery-v1.schema.json)
+  describes the owner-private loopback endpoint and every finite server limit.
+- [`denoize-ipc-capability-v1.schema.json`](../schemas/denoize-ipc-capability-v1.schema.json)
+  describes an owner-private bearer capability with explicit roots, actions,
+  priority ceiling, and optional expiry.
+- [`denoize-ipc-capability-summary-v1.schema.json`](../schemas/denoize-ipc-capability-summary-v1.schema.json)
+  describes the corresponding token-free capability inventory entry.
+- [`denoize-ipc-request-v1.schema.json`](../schemas/denoize-ipc-request-v1.schema.json)
+  describes every authenticated local IPC request and bounded job specification.
+- [`denoize-ipc-response-v1.schema.json`](../schemas/denoize-ipc-response-v1.schema.json)
+  describes success and structured failure responses for every IPC operation.
+- [`denoize-job-dry-run-v1.schema.json`](../schemas/denoize-job-dry-run-v1.schema.json)
+  describes admitted memory, temporary-space, GPU, destination, overwrite,
+  pause, and exact execution-plan decisions before queueing.
+- [`denoize-job-status-v1.schema.json`](../schemas/denoize-job-status-v1.schema.json)
+  describes one durable queued, running, controlled, recovering, or terminal job.
+- [`denoize-job-history-v1.schema.json`](../schemas/denoize-job-history-v1.schema.json)
+  describes bounded, path-free terminal history linked to plan and receipt digests.
 - [`denoize-presentation-region-v1.schema.json`](../schemas/denoize-presentation-region-v1.schema.json)
   describes one exact, source-bound interval on the decoded presentation
   timeline.
@@ -58,9 +76,30 @@ documented enum/string values are stable. A future release may add fields, so
 consumers must ignore unknown fields unless the contract explicitly says they
 are rejected. Removing a field, changing its type, or changing a documented
 value requires a new schema identifier and version. Execution plans, receipts,
-keys, policies, verification reports, presentation regions, and runtime model
-package manifests deliberately reject unknown fields: their exact typed
-representation participates in signing, trust, or source-binding decisions.
+keys, policies, verification reports, presentation regions, runtime model
+package manifests, and IPC documents deliberately reject unknown fields: their
+exact typed representation participates in signing, authorization, admission,
+trust, or source-binding decisions.
+
+## Local IPC contracts
+
+IPC v1 uses length-prefixed JSON over a loopback-only TCP endpoint. The
+owner-private discovery document publishes the endpoint and all request,
+response, timeout, connection, queue, history, concurrency, memory, temporary,
+and GPU limits. Bearer capability documents are secrets: clients should pass
+their file path to the CLI or desktop backend and must not copy the token into a
+browser context, log, command line, or history. Revocation blocks new requests;
+already admitted work remains governed by its durable queue state and explicit
+control operations.
+
+`denoize-job-dry-run-v1` is the admission record. It binds an exact v1 finite or
+v2 stream execution plan digest to conservative resource totals, destination
+actions, overwrite policy, and pause support. File jobs are non-resumable:
+after an uncertain daemon/child failure they are not retried automatically.
+Batch and durable stream jobs use verified checkpoints and signed receipts for
+recovery. Terminal history retains bounded resource/destination summaries and
+plan/receipt fingerprints, but deliberately removes input and output paths;
+receipt artifacts that age out of the history bound are pruned as well.
 
 ## Watch-folder state and quarantine records
 

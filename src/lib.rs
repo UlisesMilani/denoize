@@ -54,6 +54,7 @@ pub mod fft;
 pub mod gain;
 pub mod hardware;
 pub mod input;
+pub mod ipc;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod loudness;

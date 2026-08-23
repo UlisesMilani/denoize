@@ -19,6 +19,7 @@ USAGE:
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
+    denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -85,6 +86,7 @@ OPTIONS:
         --resume              resume a stream checkpoint or verify exact v3 batch outputs
         --receipt <PATH>      publish a signed execution receipt after finite output succeeds
         --receipt-key <PATH>  owner-only Ed25519 key used with --receipt
+        --plan <PATH>         require exact correspondence to a read-only execution plan
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork/chapters to the output
@@ -250,6 +252,49 @@ policy. Without --output-root, file locators are anchored beside the receipt.
 Stdout stream receipts use the `-` locator and require --output during verification.
 ```
 
+## Local authenticated IPC and durable jobs
+
+```text
+USAGE:
+    denoize ipc init --state-dir <DIR> --admin-grant <GRANT.json> [LIMITS]
+    denoize ipc serve --state-dir <DIR> [--discovery <DISCOVERY.json>]
+    denoize ipc ping --discovery <DISCOVERY.json> --grant <GRANT.json>
+    denoize ipc dry-run <file|batch|stream> <INPUT> <OUTPUT> [CLIENT OPTIONS] [-- PROCESSING OPTIONS]
+    denoize ipc submit <file|batch|stream> <INPUT> <OUTPUT> [CLIENT OPTIONS] [-- PROCESSING OPTIONS]
+    denoize ipc status <JOB_ID> [CLIENT OPTIONS]
+    denoize ipc list|history [--limit <N>] [CLIENT OPTIONS]
+    denoize ipc cancel|pause|resume <JOB_ID> [CLIENT OPTIONS]
+    denoize ipc grant create <POLICY.json> <GRANT.json> [CLIENT OPTIONS]
+    denoize ipc grant revoke <GRANT_ID> [CLIENT OPTIONS]
+    denoize ipc grant list [--limit <N>] [CLIENT OPTIONS]
+    denoize ipc shutdown [--force] [CLIENT OPTIONS]
+
+CLIENT OPTIONS:
+    --discovery <PATH>        owner-private server discovery document
+    --grant <PATH>            owner-private bearer capability document
+    --priority <-100..100>    durable queue priority for dry-run/submit (default: 0)
+    --pretty                  emit indented JSON instead of compact JSON
+
+INIT LIMITS:
+    --max-request-bytes <N>   framed request limit (default: 1048576)
+    --max-response-bytes <N>  framed response limit (default: 16777216)
+    --request-timeout-ms <N>  connection/request timeout (default: 900000)
+    --planning-timeout-ms <N> bounded plan child timeout (default: 900000)
+    --job-timeout-ms <N>      finite execution timeout (default: 86400000)
+    --max-connections <N>     concurrent loopback connections (default: 8)
+    --max-queue <N>           durable nonterminal jobs (default: 1024)
+    --max-history <N>         terminal history records (default: 1024)
+    --max-memory <MiB>        optional per-input denoize working-set limit
+    --max-temp-space <MiB>    optional aggregate temporary-space limit
+    --max-gpu-memory <MiB>    optional GPU-memory limit
+
+The v1 service binds only 127.0.0.1, executes one finite job at a time, and
+requires a capability for every request. Processing options begin after `--`;
+server-controlled publication, receipt, isolation, model-path, and resource
+options are rejected. File jobs are cancel-and-retry only; batch and stream
+pause at verified durable checkpoint/publication boundaries.
+```
+
 Watch mode uses portable bounded polling. A regular audio file becomes eligible
 only after its length, modification stamp, filesystem identity, and SHA-256
 remain unchanged for the complete settle interval. Every processing transition
@@ -307,6 +352,34 @@ rehashed. The report proves the signed recipe/input/model/output identities; it
 does not prove wall-clock time, duration, host, or user identity. Stage 11 JSON
 v1 files remain accepted; the additive bounded-stream v2 files reject unknown
 fields and unsupported future schema versions without modifying them.
+
+## Local authenticated IPC and durable jobs
+
+`denoize ipc` is a local OS-account control surface, not a remote service. V1
+binds only `127.0.0.1`, publishes an ephemeral endpoint and every finite limit
+in an owner-private discovery document, and authenticates each length-prefixed
+JSON request with an explicit bearer capability. The initial administrator
+grant manages grants and shutdown but cannot plan or submit audio. Worker grants
+name canonical input/output roots, permitted operations, a priority ceiling,
+and optional expiry. Their unencrypted tokens must remain in private files and
+must not be copied into logs, shell arguments, browser contexts, or history.
+
+Every submission first produces the same bounded read-only execution plan and
+resource admission report used by the CLI. Server-controlled plan, receipt,
+resource, isolation, model-path, configuration, and publication arguments
+cannot be overridden by a client. V1 runs one job at a time and durably orders
+the queue by bounded priority then submission sequence. Batch and durable stream
+jobs pause only at verified checkpoints/publication boundaries and are replanned
+before resume; a non-resumable file job is never retried after uncertain
+publication. Signed receipts reconcile a completed child across daemon restart.
+
+Terminal history is bounded and path-free. It keeps plan identity, conservative
+resource totals, destination actions, overwrite policy, error code, and an
+optional receipt fingerprint; receipt artifacts are pruned with expired history.
+Revoking a grant blocks new requests but does not erase admitted work, so cancel
+first when queued or running jobs must stop. The versioned discovery,
+capability, request/response, dry-run, status, and history schemas are documented
+in `docs/json.md` and shipped in both release assets and the crates.io package.
 
 ## Stable JSON automation
 

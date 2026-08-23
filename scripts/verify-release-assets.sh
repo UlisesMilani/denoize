@@ -59,6 +59,14 @@ expected_assets=(
   "denoize-execution-receipt-v1.schema.json"
   "denoize-execution-receipt-v2.schema.json"
   "denoize-hardware-v1.schema.json"
+  "denoize-ipc-capability-summary-v1.schema.json"
+  "denoize-ipc-capability-v1.schema.json"
+  "denoize-ipc-discovery-v1.schema.json"
+  "denoize-ipc-request-v1.schema.json"
+  "denoize-ipc-response-v1.schema.json"
+  "denoize-job-dry-run-v1.schema.json"
+  "denoize-job-history-v1.schema.json"
+  "denoize-job-status-v1.schema.json"
   "denoize-presentation-region-v1.schema.json"
   "denoize-receipt-public-key-v1.schema.json"
   "denoize-receipt-secret-key-v1.schema.json"
@@ -155,6 +163,14 @@ gh release download "$tag" \
   --pattern 'denoize-execution-receipt-v1.schema.json' \
   --pattern 'denoize-execution-receipt-v2.schema.json' \
   --pattern 'denoize-hardware-v1.schema.json' \
+  --pattern 'denoize-ipc-capability-summary-v1.schema.json' \
+  --pattern 'denoize-ipc-capability-v1.schema.json' \
+  --pattern 'denoize-ipc-discovery-v1.schema.json' \
+  --pattern 'denoize-ipc-request-v1.schema.json' \
+  --pattern 'denoize-ipc-response-v1.schema.json' \
+  --pattern 'denoize-job-dry-run-v1.schema.json' \
+  --pattern 'denoize-job-history-v1.schema.json' \
+  --pattern 'denoize-job-status-v1.schema.json' \
   --pattern 'denoize-presentation-region-v1.schema.json' \
   --pattern 'denoize-receipt-public-key-v1.schema.json' \
   --pattern 'denoize-receipt-secret-key-v1.schema.json' \
@@ -201,6 +217,14 @@ for schema in \
   denoize-execution-receipt-v1.schema.json \
   denoize-execution-receipt-v2.schema.json \
   denoize-hardware-v1.schema.json \
+  denoize-ipc-capability-summary-v1.schema.json \
+  denoize-ipc-capability-v1.schema.json \
+  denoize-ipc-discovery-v1.schema.json \
+  denoize-ipc-request-v1.schema.json \
+  denoize-ipc-response-v1.schema.json \
+  denoize-job-dry-run-v1.schema.json \
+  denoize-job-history-v1.schema.json \
+  denoize-job-status-v1.schema.json \
   denoize-presentation-region-v1.schema.json \
   denoize-receipt-public-key-v1.schema.json \
   denoize-receipt-secret-key-v1.schema.json \

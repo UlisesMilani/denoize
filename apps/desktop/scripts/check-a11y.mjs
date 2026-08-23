@@ -31,7 +31,7 @@ if (start < 0 || end < 0) {
   }
 
   const tabs = [...markup.matchAll(/<button\b[^>]*\brole="tab"[^>]*>/g)].map((match) => match[0]);
-  if (tabs.length !== 7) failures.push(`expected 7 navigation tabs, found ${tabs.length}`);
+  if (tabs.length !== 8) failures.push(`expected 8 navigation tabs, found ${tabs.length}`);
   for (const tab of tabs) {
     const id = /\sid="([^"]+)"/.exec(tab)?.[1];
     const controls = /\saria-controls="([^"]+)"/.exec(tab)?.[1];
@@ -52,6 +52,7 @@ requireSource(/id="toast" role="status" aria-live="polite" aria-atomic="true"/, 
 requireSource(/class="progress-track" role="progressbar"[^>]*aria-valuenow="0"/, "job progressbar semantics are incomplete");
 requireSource(/class="level-meter" role="meter"[^>]*aria-valuenow="0"/g, "live meters are missing meter semantics");
 requireSource(/id="waveform"[^>]*role="slider"[^>]*aria-disabled="true"/, "preview seek control lacks disabled slider semantics");
+requireSource(/id="ipc-result"[^>]*aria-live="polite"/, "IPC response preview is not an accessible live region");
 requireSource(/role="tab" aria-controls="preview-audition-panel"/, "dynamic preview candidates are not ARIA tabs");
 requireSource(/\["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"\]/, "navigation tabs lack keyboard traversal");
 requireSource(/\["ArrowLeft", "ArrowRight", "Home", "End"\]/, "preview controls lack keyboard traversal");

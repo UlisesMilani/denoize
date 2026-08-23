@@ -331,6 +331,14 @@ jobs:
           automation_schema="$asset_dir/denoize-automation-v1.schema.json"
           cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
+          ipc_capability_summary_schema="$asset_dir/denoize-ipc-capability-summary-v1.schema.json"
+          ipc_capability_schema="$asset_dir/denoize-ipc-capability-v1.schema.json"
+          ipc_discovery_schema="$asset_dir/denoize-ipc-discovery-v1.schema.json"
+          ipc_request_schema="$asset_dir/denoize-ipc-request-v1.schema.json"
+          ipc_response_schema="$asset_dir/denoize-ipc-response-v1.schema.json"
+          job_dry_run_schema="$asset_dir/denoize-job-dry-run-v1.schema.json"
+          job_history_schema="$asset_dir/denoize-job-history-v1.schema.json"
+          job_status_schema="$asset_dir/denoize-job-status-v1.schema.json"
           presentation_region_schema="$asset_dir/denoize-presentation-region-v1.schema.json"
           recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
           release_evidence_schema="$asset_dir/denoize-release-evidence-v1.schema.json"
@@ -354,6 +362,14 @@ jobs:
           cp schemas/denoize-automation-v1.schema.json "$automation_schema"
           cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
+          cp schemas/denoize-ipc-capability-summary-v1.schema.json "$ipc_capability_summary_schema"
+          cp schemas/denoize-ipc-capability-v1.schema.json "$ipc_capability_schema"
+          cp schemas/denoize-ipc-discovery-v1.schema.json "$ipc_discovery_schema"
+          cp schemas/denoize-ipc-request-v1.schema.json "$ipc_request_schema"
+          cp schemas/denoize-ipc-response-v1.schema.json "$ipc_response_schema"
+          cp schemas/denoize-job-dry-run-v1.schema.json "$job_dry_run_schema"
+          cp schemas/denoize-job-history-v1.schema.json "$job_history_schema"
+          cp schemas/denoize-job-status-v1.schema.json "$job_status_schema"
           cp schemas/denoize-presentation-region-v1.schema.json "$presentation_region_schema"
           cp schemas/denoize-recommendation-v1.schema.json "$recommendation_schema"
           cp schemas/denoize-release-evidence-v1.schema.json "$release_evidence_schema"
@@ -381,6 +397,9 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
             "$automation_schema" "$cli_schema" "$hardware_schema" \
+            "$ipc_capability_summary_schema" "$ipc_capability_schema" \
+            "$ipc_discovery_schema" "$ipc_request_schema" "$ipc_response_schema" \
+            "$job_dry_run_schema" "$job_history_schema" "$job_status_schema" \
             "$presentation_region_schema" \
             "$recommendation_schema" "$release_evidence_schema" \
             "$execution_plan_schema" "$stream_execution_plan_schema" \

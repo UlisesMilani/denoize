@@ -8,6 +8,7 @@ use denoize::batch_resume::{
 use denoize::benchmark::{BenchmarkReport, ComparisonReport};
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
 use denoize::encode::write_audio_to_file;
+use denoize::ipc::{IpcClient, IpcOperation, IpcResponseResult};
 use denoize::metadata::MetadataLimits;
 use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
@@ -61,6 +62,16 @@ struct DesktopError {
 
 type DesktopResult<T> = Result<T, DesktopError>;
 
+fn desktop_ipc_operation_allowed(operation: &IpcOperation) -> bool {
+    !matches!(
+        operation,
+        IpcOperation::CreateGrant { .. }
+            | IpcOperation::RevokeGrant { .. }
+            | IpcOperation::ListGrants { .. }
+            | IpcOperation::Shutdown { .. }
+    )
+}
+
 impl DesktopError {
     fn new(code: impl Into<String>, technical_detail: impl Into<String>) -> Self {
         Self {
@@ -97,6 +108,8 @@ impl DesktopError {
             "worker.failed"
         } else if lower.contains("receipt") || lower.contains("実行証明") {
             "receipt.failed"
+        } else if lower.contains("ipc") || lower.contains("capability") {
+            "ipc.failed"
         } else if lower.contains("model") || lower.contains("モデル") {
             "model.failed"
         } else if lower.contains("復旧") || lower.contains("recovery") {
@@ -143,6 +156,7 @@ impl DesktopError {
                 | "resource.accelerator"
                 | "worker.failed"
                 | "receipt.failed"
+                | "ipc.failed"
                 | "model.failed"
                 | "recovery.failed"
                 | "validation.invalid"
@@ -173,6 +187,27 @@ fn bounded_desktop_error_detail(mut detail: String) -> String {
     detail.truncate(end);
     detail.push('…');
     detail
+}
+
+#[tauri::command]
+async fn ipc_request(
+    discovery: String,
+    grant: String,
+    operation: IpcOperation,
+) -> DesktopResult<IpcResponseResult> {
+    if !desktop_ipc_operation_allowed(&operation) {
+        return Err(DesktopError::new(
+            "ipc.failed",
+            "privileged IPC capability-management and shutdown operations are not exposed to the WebView",
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = IpcClient::from_files(discovery, grant)?;
+        client.request(operation)
+    })
+    .await
+    .map_err(|error| format!("IPC request task failed: {error}"))?
+    .map_err(DesktopError::from)
 }
 
 impl From<String> for DesktopError {
@@ -7646,6 +7681,7 @@ pub fn run() {
             export_receipt_public_key,
             create_receipt_policy,
             verify_execution_receipt,
+            ipc_request,
             start_process,
             start_watch_folder,
             poll_watch_folder,
@@ -7756,6 +7792,23 @@ mod tests {
         invalid.code = "operation.failed".into();
         invalid.parameters.insert("bad key".into(), "value".into());
         assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn webview_ipc_bridge_rejects_privileged_capability_and_shutdown_operations() {
+        assert!(desktop_ipc_operation_allowed(&IpcOperation::Ping));
+        assert!(desktop_ipc_operation_allowed(&IpcOperation::History {
+            limit: 10
+        }));
+        assert!(!desktop_ipc_operation_allowed(&IpcOperation::Shutdown {
+            force: true
+        }));
+        assert!(!desktop_ipc_operation_allowed(&IpcOperation::ListGrants {
+            limit: 10
+        }));
+        assert!(!desktop_ipc_operation_allowed(&IpcOperation::RevokeGrant {
+            grant_id: "grant-1".into()
+        }));
     }
 
     #[test]

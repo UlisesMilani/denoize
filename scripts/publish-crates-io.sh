@@ -164,6 +164,14 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-execution-receipt-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-hardware-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-ipc-capability-summary-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-ipc-capability-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-ipc-discovery-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-ipc-request-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-ipc-response-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-job-dry-run-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-job-history-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-job-status-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-presentation-region-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-public-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-secret-key-v1.schema.json" \

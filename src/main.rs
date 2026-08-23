@@ -17,6 +17,10 @@ use denoize::decode::{
     AudioFormat, AudioProbe, AudioStreamReader, DecodeLimits,
 };
 use denoize::denoiser::{DenoiserConfig, Preset, ProcessingMode};
+use denoize::ipc::{
+    initialize_ipc_state, run_ipc_server, IpcClient, IpcGrantDocument, IpcGrantPolicy, IpcJobKind,
+    IpcJobSpec, IpcLimits, IpcOperation, IpcResponseResult, IpcServerConfig,
+};
 use denoize::metadata::MetadataLimits;
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
@@ -35,9 +39,11 @@ use denoize::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
+use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STREAM_BLOCK_FRAMES: usize = 8192;
@@ -401,6 +407,7 @@ USAGE:
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
+    denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -467,6 +474,7 @@ OPTIONS:
         --resume              resume a stream checkpoint or verify exact v3 batch outputs
         --receipt <PATH>      publish a signed execution receipt after finite output succeeds
         --receipt-key <PATH>  owner-only Ed25519 key used with --receipt
+        --plan <PATH>         require exact correspondence to a read-only execution plan
         --no-progress         suppress batch progress and ETA output
         --json                emit a machine-readable result
         --no-metadata         do not copy input tags/artwork/chapters to the output
@@ -565,6 +573,7 @@ struct Overrides {
     resume: bool,
     receipt: Option<String>,
     receipt_key: Option<String>,
+    execution_plan: Option<String>,
     no_progress: bool,
     json: bool,
     no_metadata: bool,
@@ -988,6 +997,7 @@ fn parse_args(args: &[String]) -> Result<(String, String, Overrides), String> {
             "--resume" => ov.resume = true,
             "--receipt" => ov.receipt = Some(parse_value(args, &mut i, a)?),
             "--receipt-key" => ov.receipt_key = Some(parse_value(args, &mut i, a)?),
+            "--plan" => ov.execution_plan = Some(parse_value(args, &mut i, a)?),
             "--no-progress" => ov.no_progress = true,
             "--json" => ov.json = true,
             "--no-metadata" => ov.no_metadata = true,
@@ -2528,11 +2538,517 @@ fn run_watch(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn ipc_usage() -> &'static str {
+    "\
+USAGE:
+    denoize ipc init --state-dir <DIR> --admin-grant <GRANT.json> [LIMITS]
+    denoize ipc serve --state-dir <DIR> [--discovery <DISCOVERY.json>]
+    denoize ipc ping --discovery <DISCOVERY.json> --grant <GRANT.json>
+    denoize ipc dry-run <file|batch|stream> <INPUT> <OUTPUT> [CLIENT OPTIONS] [-- PROCESSING OPTIONS]
+    denoize ipc submit <file|batch|stream> <INPUT> <OUTPUT> [CLIENT OPTIONS] [-- PROCESSING OPTIONS]
+    denoize ipc status <JOB_ID> [CLIENT OPTIONS]
+    denoize ipc list|history [--limit <N>] [CLIENT OPTIONS]
+    denoize ipc cancel|pause|resume <JOB_ID> [CLIENT OPTIONS]
+    denoize ipc grant create <POLICY.json> <GRANT.json> [CLIENT OPTIONS]
+    denoize ipc grant revoke <GRANT_ID> [CLIENT OPTIONS]
+    denoize ipc grant list [--limit <N>] [CLIENT OPTIONS]
+    denoize ipc shutdown [--force] [CLIENT OPTIONS]
+
+CLIENT OPTIONS:
+    --discovery <PATH>        owner-private server discovery document
+    --grant <PATH>            owner-private bearer capability document
+    --priority <-100..100>    durable queue priority for dry-run/submit (default: 0)
+    --pretty                  emit indented JSON instead of compact JSON
+
+INIT LIMITS:
+    --max-request-bytes <N>   framed request limit (default: 1048576)
+    --max-response-bytes <N>  framed response limit (default: 16777216)
+    --request-timeout-ms <N>  connection/request timeout (default: 900000)
+    --planning-timeout-ms <N> bounded plan child timeout (default: 900000)
+    --job-timeout-ms <N>      finite execution timeout (default: 86400000)
+    --max-connections <N>     concurrent loopback connections (default: 8)
+    --max-queue <N>           durable nonterminal jobs (default: 1024)
+    --max-history <N>         terminal history records (default: 1024)
+    --max-memory <MiB>        optional per-input denoize working-set limit
+    --max-temp-space <MiB>    optional aggregate temporary-space limit
+    --max-gpu-memory <MiB>    optional GPU-memory limit
+
+The v1 service binds only 127.0.0.1, executes one finite job at a time, and
+requires a capability for every request. Processing options begin after `--`;
+server-controlled publication, receipt, isolation, model-path, and resource
+options are rejected. File jobs are cancel-and-retry only; batch and stream
+pause at verified durable checkpoint/publication boundaries.
+"
+}
+
+fn run_ipc(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("ipc --help accepts no other arguments".into());
+        }
+        print!("{}", ipc_usage());
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("init") => run_ipc_init(&args[1..]),
+        Some("serve") => run_ipc_serve(&args[1..]),
+        Some("ping") => run_ipc_simple(&args[1..], IpcOperation::Ping),
+        Some("dry-run") => run_ipc_job(&args[1..], false),
+        Some("submit") => run_ipc_job(&args[1..], true),
+        Some("status") => run_ipc_job_id_command(&args[1..], "status"),
+        Some("cancel") => run_ipc_job_id_command(&args[1..], "cancel"),
+        Some("pause") => run_ipc_job_id_command(&args[1..], "pause"),
+        Some("resume") => run_ipc_job_id_command(&args[1..], "resume"),
+        Some("list") => run_ipc_list_command(&args[1..], false),
+        Some("history") => run_ipc_list_command(&args[1..], true),
+        Some("grant") => run_ipc_grant(&args[1..]),
+        Some("shutdown") => run_ipc_shutdown(&args[1..]),
+        Some(command) => Err(format!("unknown ipc command: {command}")),
+        None => Err("ipc requires a command (run `denoize ipc --help`)".into()),
+    }
+}
+
+fn run_ipc_init(args: &[String]) -> Result<(), String> {
+    let mut state = None;
+    let mut admin = None;
+    let mut limits = IpcLimits::default();
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--state-dir" => state = Some(ipc_parse_string(args, &mut index, option)?),
+            "--admin-grant" => admin = Some(ipc_parse_string(args, &mut index, option)?),
+            "--max-request-bytes" => {
+                limits.max_request_bytes = ipc_parse_number(args, &mut index, option)?
+            }
+            "--max-response-bytes" => {
+                limits.max_response_bytes = ipc_parse_number(args, &mut index, option)?
+            }
+            "--request-timeout-ms" => {
+                limits.request_timeout_millis = ipc_parse_number(args, &mut index, option)?
+            }
+            "--planning-timeout-ms" => {
+                limits.planning_timeout_millis = ipc_parse_number(args, &mut index, option)?
+            }
+            "--job-timeout-ms" => {
+                limits.job_timeout_millis = ipc_parse_number(args, &mut index, option)?
+            }
+            "--max-connections" => {
+                limits.max_connections = ipc_parse_number(args, &mut index, option)?
+            }
+            "--max-queue" => limits.max_queue_entries = ipc_parse_number(args, &mut index, option)?,
+            "--max-history" => {
+                limits.max_history_entries = ipc_parse_number(args, &mut index, option)?
+            }
+            "--max-memory" => {
+                limits.max_memory_bytes = Some(ipc_parse_mib(args, &mut index, option)?)
+            }
+            "--max-temp-space" => {
+                limits.max_temporary_bytes = Some(ipc_parse_mib(args, &mut index, option)?)
+            }
+            "--max-gpu-memory" => {
+                limits.max_gpu_memory_bytes = Some(ipc_parse_mib(args, &mut index, option)?)
+            }
+            value => return Err(format!("unknown ipc init option: {value}")),
+        }
+        index += 1;
+    }
+    let state = state.ok_or("ipc init requires --state-dir")?;
+    let admin = admin.ok_or("ipc init requires --admin-grant")?;
+    limits.validate()?;
+    let document = initialize_ipc_state(&state, &admin, limits)?;
+    println!("initialized IPC state for server {}", document.server_id);
+    println!("administrator grant: {admin}");
+    Ok(())
+}
+
+fn run_ipc_serve(args: &[String]) -> Result<(), String> {
+    let mut state = None;
+    let mut discovery = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--state-dir" => state = Some(ipc_parse_string(args, &mut index, "--state-dir")?),
+            "--discovery" => discovery = Some(ipc_parse_string(args, &mut index, "--discovery")?),
+            value => return Err(format!("unknown ipc serve option: {value}")),
+        }
+        index += 1;
+    }
+    let state = std::path::PathBuf::from(state.ok_or("ipc serve requires --state-dir")?);
+    let mut config = IpcServerConfig::new(state)?;
+    if let Some(discovery) = discovery {
+        config = config.with_discovery_file(discovery);
+    }
+    run_ipc_server(config)
+}
+
+fn run_ipc_job(args: &[String], submit: bool) -> Result<(), String> {
+    let separator = args.iter().position(|argument| argument == "--");
+    let (control, processing) = match separator {
+        Some(position) => (&args[..position], args[position + 1..].to_vec()),
+        None => (args, Vec::new()),
+    };
+    if control.len() < 3 {
+        return Err("ipc dry-run/submit requires KIND INPUT OUTPUT".into());
+    }
+    let kind = match control[0].as_str() {
+        "file" => IpcJobKind::File,
+        "batch" => IpcJobKind::Batch,
+        "stream" => IpcJobKind::Stream,
+        value => return Err(format!("unknown IPC job kind: {value}")),
+    };
+    let input = canonical_cli_path(&control[1], "IPC input")?;
+    let output = absolute_cli_path(&control[2], "IPC output")?;
+    let mut common = IpcClientOptions::default();
+    let mut priority = 0_i16;
+    parse_ipc_client_options(&control[3..], &mut common, Some(&mut priority), None)?;
+    let job = IpcJobSpec::new(kind, input, output)
+        .with_arguments(processing)
+        .with_priority(priority);
+    job.validate()?;
+    let operation = if submit {
+        IpcOperation::Submit { job }
+    } else {
+        IpcOperation::DryRun { job }
+    };
+    let result = ipc_client(&common)?.request(operation)?;
+    print_ipc_result(&result, common.pretty)
+}
+
+#[derive(Default)]
+struct IpcClientOptions {
+    discovery: Option<String>,
+    grant: Option<String>,
+    pretty: bool,
+}
+
+fn ipc_client(options: &IpcClientOptions) -> Result<IpcClient, String> {
+    IpcClient::from_files(
+        options
+            .discovery
+            .as_deref()
+            .ok_or("IPC client command requires --discovery")?,
+        options
+            .grant
+            .as_deref()
+            .ok_or("IPC client command requires --grant")?,
+    )
+}
+
+fn parse_ipc_client_options(
+    args: &[String],
+    options: &mut IpcClientOptions,
+    mut priority: Option<&mut i16>,
+    mut limit: Option<&mut u32>,
+) -> Result<(), String> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--discovery" => {
+                options.discovery = Some(ipc_parse_string(args, &mut index, "--discovery")?)
+            }
+            "--grant" => options.grant = Some(ipc_parse_string(args, &mut index, "--grant")?),
+            "--pretty" => {
+                if options.pretty {
+                    return Err("--pretty may be supplied only once".into());
+                }
+                options.pretty = true;
+            }
+            "--priority" => {
+                let target = priority
+                    .as_deref_mut()
+                    .ok_or("--priority is only valid for dry-run/submit")?;
+                *target = ipc_parse_number(args, &mut index, "--priority")?;
+            }
+            "--limit" => {
+                let target = limit
+                    .as_deref_mut()
+                    .ok_or("--limit is not valid for this IPC command")?;
+                *target = ipc_parse_number(args, &mut index, "--limit")?;
+            }
+            value => return Err(format!("unknown IPC client option: {value}")),
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn run_ipc_simple(args: &[String], operation: IpcOperation) -> Result<(), String> {
+    let mut options = IpcClientOptions::default();
+    parse_ipc_client_options(args, &mut options, None, None)?;
+    let result = ipc_client(&options)?.request(operation)?;
+    print_ipc_result(&result, options.pretty)
+}
+
+fn run_ipc_job_id_command(args: &[String], command: &str) -> Result<(), String> {
+    let job_id = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or_else(|| format!("ipc {command} requires JOB_ID"))?
+        .clone();
+    let mut options = IpcClientOptions::default();
+    parse_ipc_client_options(&args[1..], &mut options, None, None)?;
+    let operation = match command {
+        "status" => IpcOperation::Status { job_id },
+        "cancel" => IpcOperation::Cancel { job_id },
+        "pause" => IpcOperation::Pause { job_id },
+        "resume" => IpcOperation::Resume { job_id },
+        _ => return Err(format!("unsupported IPC job command: {command}")),
+    };
+    let result = ipc_client(&options)?.request(operation)?;
+    print_ipc_result(&result, options.pretty)
+}
+
+fn run_ipc_list_command(args: &[String], history: bool) -> Result<(), String> {
+    let mut options = IpcClientOptions::default();
+    let mut limit = 100_u32;
+    parse_ipc_client_options(args, &mut options, None, Some(&mut limit))?;
+    if !(1..=10_000).contains(&limit) {
+        return Err("IPC --limit must be in 1..=10000".into());
+    }
+    let operation = if history {
+        IpcOperation::History { limit }
+    } else {
+        IpcOperation::List { limit }
+    };
+    let result = ipc_client(&options)?.request(operation)?;
+    print_ipc_result(&result, options.pretty)
+}
+
+fn run_ipc_grant(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => {
+            let policy_path = args
+                .get(1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or("ipc grant create requires POLICY.json")?;
+            let output_path = args
+                .get(2)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or("ipc grant create requires output GRANT.json")?;
+            let policy = read_ipc_policy(policy_path)?;
+            let mut options = IpcClientOptions::default();
+            parse_ipc_client_options(&args[3..], &mut options, None, None)?;
+            let result = ipc_client(&options)?.request(IpcOperation::CreateGrant { policy })?;
+            let IpcResponseResult::Grant(document) = result else {
+                return Err("IPC server returned the wrong grant-create response".into());
+            };
+            write_ipc_grant(output_path, &document)?;
+            println!("created IPC grant {}: {output_path}", document.grant_id);
+            Ok(())
+        }
+        Some("revoke") => {
+            let grant_id = args
+                .get(1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or("ipc grant revoke requires GRANT_ID")?
+                .clone();
+            let mut options = IpcClientOptions::default();
+            parse_ipc_client_options(&args[2..], &mut options, None, None)?;
+            let result = ipc_client(&options)?.request(IpcOperation::RevokeGrant { grant_id })?;
+            print_ipc_result(&result, options.pretty)
+        }
+        Some("list") => {
+            let mut options = IpcClientOptions::default();
+            let mut limit = 100_u32;
+            parse_ipc_client_options(
+                args.get(1..).unwrap_or_default(),
+                &mut options,
+                None,
+                Some(&mut limit),
+            )?;
+            if !(1..=10_000).contains(&limit) {
+                return Err("IPC --limit must be in 1..=10000".into());
+            }
+            let result = ipc_client(&options)?.request(IpcOperation::ListGrants { limit })?;
+            print_ipc_result(&result, options.pretty)
+        }
+        Some(command) => Err(format!("unknown ipc grant command: {command}")),
+        None => Err("ipc grant requires create, revoke, or list".into()),
+    }
+}
+
+fn run_ipc_shutdown(args: &[String]) -> Result<(), String> {
+    let mut force = false;
+    let mut filtered = Vec::new();
+    for argument in args {
+        if argument == "--force" {
+            if force {
+                return Err("ipc shutdown accepts --force only once".into());
+            }
+            force = true;
+        } else {
+            filtered.push(argument.clone());
+        }
+    }
+    let mut options = IpcClientOptions::default();
+    parse_ipc_client_options(&filtered, &mut options, None, None)?;
+    let result = ipc_client(&options)?.request(IpcOperation::Shutdown { force })?;
+    print_ipc_result(&result, options.pretty)
+}
+
+fn read_ipc_policy(path: &str) -> Result<IpcGrantPolicy, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("open IPC grant policy {path}: {error}"))?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
+        if unsafe { GetFileType(file.as_raw_handle()) } != FILE_TYPE_DISK {
+            return Err("IPC grant policy must be a regular disk file".into());
+        }
+    }
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect IPC grant policy {path}: {error}"))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 1024 * 1024 {
+        return Err("IPC grant policy must be a nonempty regular file of at most 1 MiB".into());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(metadata.len() as usize)
+        .map_err(|error| format!("reserve IPC grant policy: {error}"))?;
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read IPC grant policy {path}: {error}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("IPC grant policy exceeds its 1 MiB limit".into());
+    }
+    let policy: IpcGrantPolicy = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse IPC grant policy {path}: {error}"))?;
+    policy.validate()?;
+    Ok(policy)
+}
+
+#[cfg(test)]
+mod ipc_policy_tests {
+    use super::*;
+
+    #[test]
+    fn regular_ipc_policy_is_read_from_one_bounded_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.json");
+        std::fs::write(
+            &path,
+            br#"{
+                "label":"worker",
+                "capabilities":["plan"],
+                "input_roots":["/input"],
+                "output_roots":["/output"],
+                "max_priority":0,
+                "expires_at_unix_millis":null
+            }"#,
+        )
+        .unwrap();
+        let policy = read_ipc_policy(path.to_str().unwrap()).unwrap();
+        assert_eq!(policy.label, "worker");
+        assert_eq!(policy.capabilities, vec![denoize::ipc::IpcCapability::Plan]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_ipc_policy_is_rejected_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("policy.fifo");
+        let encoded = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        let error = read_ipc_policy(path.to_str().unwrap()).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("regular file"), "{error}");
+    }
+}
+
+fn write_ipc_grant(path: &str, document: &IpcGrantDocument) -> Result<(), String> {
+    let mut bytes = Zeroizing::new(
+        serde_json::to_vec_pretty(document)
+            .map_err(|error| format!("serialize IPC capability grant: {error}"))?,
+    );
+    bytes.push(b'\n');
+    let mut output = AtomicOutput::new_private(path)?;
+    output
+        .file_mut()
+        .write_all(&bytes)
+        .map_err(|error| format!("write IPC capability grant {path}: {error}"))?;
+    output.commit(CommitMode::NoClobber)
+}
+
+fn print_ipc_result(result: &IpcResponseResult, pretty: bool) -> Result<(), String> {
+    let encoded = if pretty {
+        serde_json::to_string_pretty(result)
+    } else {
+        serde_json::to_string(result)
+    }
+    .map_err(|error| format!("serialize IPC result: {error}"))?;
+    println!("{encoded}");
+    Ok(())
+}
+
+fn ipc_parse_string(args: &[String], index: &mut usize, option: &str) -> Result<String, String> {
+    *index = index.checked_add(1).ok_or("IPC argument index overflow")?;
+    args.get(*index)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn ipc_parse_number<T>(args: &[String], index: &mut usize, option: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value = ipc_parse_string(args, index, option)?;
+    value
+        .parse::<T>()
+        .map_err(|error| format!("invalid value for {option}: {error}"))
+}
+
+fn ipc_parse_mib(args: &[String], index: &mut usize, option: &str) -> Result<u64, String> {
+    let mib: u64 = ipc_parse_number(args, index, option)?;
+    mib.checked_mul(BYTES_PER_MIB)
+        .ok_or_else(|| format!("{option} byte conversion overflows"))
+}
+
+fn canonical_cli_path(value: &str, label: &str) -> Result<String, String> {
+    let resolved = std::fs::canonicalize(value)
+        .map_err(|error| format!("resolve {label} {value}: {error}"))?;
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
+fn absolute_cli_path(value: &str, label: &str) -> Result<String, String> {
+    let path = std::path::PathBuf::from(value);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve current directory for {label}: {error}"))?
+            .join(path)
+    };
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     wait_for_isolation_gate()?;
     if args.first().map(String::as_str) == Some("hardware") {
         return run_hardware(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("ipc") {
+        return run_ipc(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("recommend") {
         return run_recommend(&args[1..]);
@@ -2563,6 +3079,7 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("--resume requires --batch or --stream".into());
     }
     validate_receipt_cli_options(&input, &output, &ov)?;
+    validate_requested_execution_plan(&input, &output, &ov)?;
     if ov.isolate && std::env::var_os(ISOLATED_CHILD_ENV).is_none() {
         return run_isolated(args, &ov);
     }
@@ -2576,6 +3093,46 @@ fn run(args: &[String]) -> Result<(), String> {
         return run_streaming_wav(&input, &output, ov);
     }
     run_one(&input, &output, ov)
+}
+
+fn validate_requested_execution_plan(
+    input: &str,
+    output: &str,
+    options: &Overrides,
+) -> Result<(), String> {
+    let Some(path) = options.execution_plan.as_deref() else {
+        return Ok(());
+    };
+    if input == "-" || output == "-" {
+        return Err("--plan execution requires durable regular-file input and output".into());
+    }
+    if options.isolate {
+        return Err("--plan cannot be combined with --isolate".into());
+    }
+    let supplied = ExecutionPlan::from_file(path)?;
+    let expected = if options.batch {
+        build_batch_execution_plan(
+            std::path::Path::new(input),
+            std::path::Path::new(output),
+            options,
+        )?
+    } else if options.stream {
+        build_stream_execution_plan(input, output, options)?
+    } else {
+        build_single_execution_plan(
+            std::path::Path::new(input),
+            std::path::Path::new(output),
+            options,
+        )?
+    };
+    if supplied != expected {
+        return Err(format!(
+            "execution no longer matches supplied plan: supplied={} current={}",
+            supplied.digest()?,
+            expected.digest()?
+        ));
+    }
+    Ok(())
 }
 
 fn validate_receipt_cli_options(
@@ -3140,6 +3697,9 @@ fn run_execution_plan(args: &[String]) -> Result<(), String> {
         return Err(
             "plan cannot publish a receipt; pass --receipt and --receipt-key to execution".into(),
         );
+    }
+    if options.execution_plan.is_some() {
+        return Err("plan cannot be combined with execution --plan".into());
     }
     if options.batch && options.stream {
         return Err("plan cannot combine --batch and --stream".into());
@@ -6132,6 +6692,7 @@ fn run_streaming_wav(input: &str, output: &str, ov: Overrides) -> Result<(), Str
                     if input_frames >= next_checkpoint {
                         checkpoint.checkpoint(input_frames)?;
                         denoize::fault_injection::hit("stream-checkpoint.after-periodic-sync")?;
+                        denoize::ipc::check_process_control_boundary()?;
                         if injected_stop_after_stream_checkpoint() {
                             return Err("injected stop after durable stream checkpoint".into());
                         }
@@ -7058,6 +7619,10 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
             );
             outcome
         };
+        if let Err(error) = denoize::ipc::check_process_control_boundary() {
+            CANCELLED.store(true, Ordering::SeqCst);
+            return finish(BatchFileOutcome::Failed(error), "paused");
+        }
         let commit_mode = match planned.decision {
             ResumeDecision::Skip { .. } => {
                 let Some(fingerprint) = planned.existing_output else {
@@ -7131,6 +7696,10 @@ fn run_batch(input: &str, output: &str, ov: &Overrides) -> Result<(), String> {
                 )),
                 "failed",
             );
+        }
+        if let Err(error) = denoize::ipc::check_process_control_boundary() {
+            CANCELLED.store(true, Ordering::SeqCst);
+            return finish(BatchFileOutcome::Failed(error), "paused");
         }
         match with_batch_publication_fence(&publication_fence, &CANCELLED, || {
             session.publish(
@@ -12029,6 +12598,13 @@ mod model_command_tests {
 }
 
 fn main() {
+    let _ipc_control = match denoize::ipc::install_process_control() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("denoize: error: {error}");
+            std::process::exit(1);
+        }
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&args) {
         eprintln!("denoize: error: {e}");
