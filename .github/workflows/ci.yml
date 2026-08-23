@@ -83,6 +83,7 @@ jobs:
           bash -n \
             scripts/build-offline-model-bundle.sh \
             scripts/generate-cli-docs.sh \
+            scripts/package-clap-plugin.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
@@ -103,6 +104,70 @@ jobs:
         run: |
           python3 scripts/test-release-updater-metadata.py
           bash scripts/test-release-evidence.sh
+
+  clap-plugin:
+    name: CLAP plug-in
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Test real-time and portable-state contracts
+        run: |
+          cargo test --locked -p denoize-clap
+          cargo test --locked --no-default-features --test daw_realtime_allocations
+          cargo test --locked --no-default-features --test cli_daw_plugin
+
+      - name: Build release plug-in
+        run: cargo build --locked --release -p denoize-clap
+
+      - name: Validate with the pinned official CLAP validator
+        shell: bash
+        run: |
+          validator_dir=$(mktemp -d /tmp/denoize-clap-validator.XXXXXX)
+          validator_zip="$validator_dir/clap-validator.zip"
+          curl --fail --location --silent --show-error \
+            https://github.com/free-audio/clap-validator/releases/download/0.4.1/clap-validator-0.4.1-127-g152b982-ubuntu-22.04.zip \
+            --output "$validator_zip"
+          echo "49edadcfb407ea0dd946ce418300e853fbd2660fa4b0d00e4f19ff8eef24ad90  $validator_zip" \
+            | sha256sum --check
+          unzip -q "$validator_zip" -d "$validator_dir"
+          tar -xzf "$validator_dir"/*.tar.gz -C "$validator_dir"
+          validator=$(find "$validator_dir" -type f -name clap-validator -perm -u+x | head -n 1)
+          test -n "$validator"
+          cp target/release/libdenoize_clap.so "$validator_dir/denoize.clap"
+          "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
+            > "$validator_dir/report.json"
+          jq -e '
+            (.results | length) == 44 and
+            ([.results[].status.code] | map(select(. == "success")) | length) == 36 and
+            ([.results[].status.code] | map(select(. == "skipped")) | length) == 8 and
+            ([.results[].status.code] | all(. == "success" or . == "skipped"))
+          ' "$validator_dir/report.json" >/dev/null
+
+      - name: Test release archive layouts
+        shell: bash
+        run: |
+          output_dir=$(mktemp -d /tmp/denoize-clap-package.XXXXXX)
+          bash scripts/package-clap-plugin.sh \
+            x86_64-unknown-linux-gnu v9.8.7 "$output_dir" \
+            target/release/libdenoize_clap.so
+          bash scripts/package-clap-plugin.sh \
+            aarch64-apple-darwin v9.8.7 "$output_dir" \
+            target/release/libdenoize_clap.so
+          bash scripts/package-clap-plugin.sh \
+            x86_64-pc-windows-msvc v9.8.7 "$output_dir" \
+            target/release/libdenoize_clap.so
+          tar -tzf "$output_dir/denoize-plugin-v9.8.7-x86_64-unknown-linux-gnu.tar.gz" \
+            | grep -Fx 'denoize-plugin-v9.8.7-x86_64-unknown-linux-gnu/denoize.clap'
+          tar -tzf "$output_dir/denoize-plugin-v9.8.7-aarch64-apple-darwin.tar.gz" \
+            | grep -Fx 'denoize-plugin-v9.8.7-aarch64-apple-darwin/denoize.clap/Contents/Info.plist'
+          unzip -t "$output_dir/denoize-plugin-v9.8.7-x86_64-pc-windows-msvc.zip"
 
   cli-docs:
     name: CLI documentation

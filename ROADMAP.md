@@ -253,7 +253,7 @@ unreviewable release.
 | 17 | Signed, self-describing custom-model runtime packages with frontend, license, resource, and tensor contracts | Released in v0.65.0 |
 | 18 | Local watch-folder automation with settle detection, retry, quarantine, and receipts | Released in v0.66.0 |
 | 19 | Local authenticated IPC and job-control API with bounded requests, capability-scoped authorization, durable status/cancel control, and stable automation contracts | Released in v0.67.0 |
-| 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Planned |
+| 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Released in v0.68.0 |
 | 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Planned |
 | 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Planned |
 | 23 | Portable projects and sample-accurate region/timeline workflows with bounded edit graphs, deterministic assembly, and signed provenance | Planned |
@@ -389,9 +389,8 @@ configuration-file, library, and desktop settings. DSP remains on the worker
 thread; capture uses a non-waiting bounded handoff, while playback consumes a
 bounded queue without waiting for the worker to release it. Overload discards
 stale complete chunks or the oldest complete playback frames, emits silence on
-playback contention, and cold-resets causal state at a sequence gap. Stage 20 remains
-responsible for the stronger allocation-free/lock-free plug-in callback
-contract.
+playback contention, and cold-resets causal state at a sequence gap. Stage 20
+adds the stronger allocation-free/lock-free plug-in callback contract.
 
 Device/configuration and stream callback failures enter a finite exponential
 backoff loop. Named devices are reacquired by an unambiguous exact name, while
@@ -417,12 +416,24 @@ bounded dry-run report of requested RAM, temporary space, destination changes,
 and overwrite policy. Bounded job history links that report to the resulting
 execution plan and signed receipt without retaining input paths indefinitely.
 
-Stage 20 brings the existing causal/live backends into DAW hosts without
+Stage 20 ships the fixed-memory causal DSP as a CLAP audio effect without
 allocating, blocking, performing filesystem or network I/O, or changing model
-state on the real-time audio thread. The first portable plug-in format must
-ship with deterministic preset/session round trips, latency reporting, channel
-layout negotiation, bypass/tail behavior, and host-level regression fixtures;
-additional platform formats follow only when they preserve the same contract.
+state on the real-time audio thread. Activation prepares every buffer and
+coefficient; processing supports mono/stereo, f32/f64, in-place/out-of-place
+buffers, sample-accurate parameter events, linked stereo detection, and bypass
+without changing the fixed delay. The host and the CLI report
+`fixed-10ms-v1`, while an independent bypassed impulse measurement must find
+the first output at the same frame for 44.1, 48, and 96 kHz.
+
+Portable preset and complete session JSON share the exact state serializer
+used by CLAP host snapshots. Both are bounded, reject unknown/future contracts,
+use regular non-symlink files, and publish atomically with no-clobber by
+default. CLI and Desktop surfaces create, inspect, import, validate, and export
+that one contract. CI uses a counting allocator for 1,000 callback blocks and
+the pinned official CLAP validator 0.4.1; all 36 applicable tests pass, 8
+capability tests skip, and no test fails or warns. Four platform archives join
+the release SBOM, provenance, checksum, and notice-verification set. Additional
+plug-in formats follow only when they preserve the same contract.
 
 Stage 21 turns model-quality, output-integrity, and speed claims into
 reproducible release evidence. Corpus manifests pin licenses, source revisions,

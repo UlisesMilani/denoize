@@ -44,6 +44,7 @@ pub mod benchmark;
 pub mod bessel;
 pub mod channel_layout;
 pub mod config;
+pub mod daw;
 pub mod decode;
 pub mod denoiser;
 pub mod encode;
@@ -99,6 +100,12 @@ pub use backend::{
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
 pub use config::{ConfigError, ResourcePlan};
+pub use daw::{
+    read_daw_preset, read_daw_session, write_daw_preset, write_daw_session, DawParameters,
+    DawPortConfiguration, DawPreset, DawRealtimeParameters, DawRealtimeProcessor, DawSessionState,
+    DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY, DAW_PLUGIN_ID, DAW_PRESET_SCHEMA,
+    DAW_PRESET_SCHEMA_VERSION, DAW_SESSION_SCHEMA, DAW_SESSION_SCHEMA_VERSION,
+};
 pub use decode::{
     decode_file, decode_file_from_session_with_limits, decode_file_with_limits,
     decode_file_with_metadata_limits, inspect_audio_stream_session, probe_file,

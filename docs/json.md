@@ -1,14 +1,21 @@
 # Stable JSON automation contracts
 
-denoize publishes twenty-seven versioned JSON contracts for local automation. Their
+denoize publishes twenty-nine versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
   describes a complete model, catalog, trust, cache-health, provenance, and
   recipe-ABI snapshot.
 - [`denoize-cli-output-v1.schema.json`](../schemas/denoize-cli-output-v1.schema.json)
-  describes single-file results, streaming results, batch NDJSON events, and
-  live-device status NDJSON.
+  describes single-file results, streaming results, batch NDJSON events,
+  live-device status NDJSON, and DAW plug-in inspection and measured-latency
+  reports.
+- [`denoize-daw-preset-v1.schema.json`](../schemas/denoize-daw-preset-v1.schema.json)
+  describes a compact host- and platform-independent CLAP preset with every
+  stable automatable parameter.
+- [`denoize-daw-session-v1.schema.json`](../schemas/denoize-daw-session-v1.schema.json)
+  describes the exact preset, channel layout, plug-in identity, and fixed
+  latency policy needed for deterministic session restoration.
 - [`denoize-execution-plan-v1.schema.json`](../schemas/denoize-execution-plan-v1.schema.json)
   describes a deterministic, read-only finite-file or batch plan.
 - [`denoize-execution-plan-v2.schema.json`](../schemas/denoize-execution-plan-v2.schema.json)
@@ -80,6 +87,28 @@ keys, policies, verification reports, presentation regions, runtime model
 package manifests, and IPC documents deliberately reject unknown fields: their
 exact typed representation participates in signing, authorization, admission,
 trust, or source-binding decisions.
+
+## DAW plug-in contracts
+
+`denoize-daw-preset-v1` is the portable, host-independent representation of
+the CLAP parameter set. It binds `org.penguin425.denoize`, a bounded display
+name, bypass, amount, threshold, release, dry/wet mix, output gain, and stereo
+link. `denoize-daw-session-v1` adds mono/stereo port configuration and the
+`fixed-10ms-v1` policy. The CLAP state extension serializes exactly that
+session document; there is no separate opaque host-only state format.
+
+Both contracts are at most 64 KiB, reject unknown properties and future
+versions, accept only finite bounded parameter values, and are read from
+regular non-symlink files. CLI and Desktop writes validate the complete object
+before an atomic no-clobber commit. `--replace` is the only CLI operation that
+permits replacement.
+
+`denoize plugin info --json` and `denoize plugin latency --json` use
+`denoize-cli-output-v1`. The latency record includes the host-reported frame
+count, the first non-zero frame measured with a bypassed f64 impulse, and a
+required `matches_reported: true` result. Preset/session inspect and create
+commands emit their native contracts; validate commands emit the corresponding
+CLI validation event.
 
 ## Local IPC contracts
 

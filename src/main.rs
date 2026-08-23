@@ -26,16 +26,19 @@ use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::AudioInputSession;
 use denoize::{
-    verify_stream_output_file, AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm,
+    read_daw_preset, read_daw_session, verify_stream_output_file, write_daw_preset,
+    write_daw_session, AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm,
     AtomicOutput, AudioStreamWriter, Backend, BackendOptions, BackendSession, ChannelMode,
-    CommitMode, DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
+    CommitMode, DawParameters, DawPortConfiguration, DawPreset, DawRealtimeProcessor,
+    DawSessionState, DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
     ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
     PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
     RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
     ResourceRequest, RuntimeModelPackage, SgmseProfile, SignedExecutionReceipt,
     SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
     StreamSpoolLimits, StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig,
-    WatchFolderJob, WatchProcessError, WindowType, WATCH_CYCLE_SCHEMA,
+    WatchFolderJob, WatchProcessError, WindowType, DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY,
+    DAW_PLUGIN_ID, WATCH_CYCLE_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -407,6 +410,7 @@ USAGE:
     denoize models <COMMAND> [MODEL|all] [OPTIONS]  (run `denoize models --help`)
     denoize metrics <REFERENCE> <TEST> [--json|--markdown]
     denoize compare <CLEAN> <NOISY> <ENHANCED> [--json|--html]
+    denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
 
 LIVE:
@@ -3041,6 +3045,424 @@ fn absolute_cli_path(value: &str, label: &str) -> Result<String, String> {
     Ok(absolute.to_string_lossy().into_owned())
 }
 
+fn plugin_usage() -> &'static str {
+    "\
+USAGE:
+    denoize plugin info [--json|--pretty]
+    denoize plugin latency [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin preset create <speech|gentle|music> <OUTPUT.json> [OPTIONS]
+    denoize plugin preset inspect|validate <PRESET.json> [--json|--pretty]
+    denoize plugin session create <PRESET.json> <OUTPUT.json> [--mono|--stereo] [OPTIONS]
+    denoize plugin session inspect|validate <SESSION.json> [--json|--pretty]
+
+PRESET CREATE OPTIONS:
+    --name <NAME>             portable preset display name
+    --amount <0..1>           suppression amount
+    --threshold-dbfs <-96..-18>
+    --release-ms <20..1000>
+    --mix <0..1>
+    --output-gain-db <-24..24>
+    --bypass|--no-bypass
+    --stereo-link|--no-stereo-link
+    --replace                 atomically replace an existing output
+    --json|--pretty           print the created contract as JSON
+
+SESSION CREATE OPTIONS:
+    --mono|--stereo           restored port layout (default: stereo)
+    --replace                 atomically replace an existing output
+    --json|--pretty           print the created contract as JSON
+
+CLAP state and these JSON contracts use the same stable parameter IDs, fixed
+10 ms latency policy, and deterministic compact serialization."
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PluginOutputMode {
+    Human,
+    Json,
+    Pretty,
+}
+
+fn parse_plugin_output_mode(args: &[String], command: &str) -> Result<PluginOutputMode, String> {
+    match args {
+        [] => Ok(PluginOutputMode::Human),
+        [flag] if flag == "--json" => Ok(PluginOutputMode::Json),
+        [flag] if flag == "--pretty" => Ok(PluginOutputMode::Pretty),
+        _ => Err(format!("{command} accepts only one of --json or --pretty")),
+    }
+}
+
+fn print_plugin_json<T: Serialize>(value: &T, mode: PluginOutputMode) -> Result<(), String> {
+    let encoded = match mode {
+        PluginOutputMode::Pretty => serde_json::to_string_pretty(value),
+        PluginOutputMode::Human | PluginOutputMode::Json => serde_json::to_string(value),
+    }
+    .map_err(|error| format!("serialize DAW plug-in output: {error}"))?;
+    println!("{encoded}");
+    Ok(())
+}
+
+fn run_plugin(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("plugin --help accepts no other arguments".into());
+        }
+        println!("{}", plugin_usage());
+        return Ok(());
+    }
+    match args.first().map(String::as_str) {
+        Some("info") => run_plugin_info(&args[1..]),
+        Some("latency") => run_plugin_latency(&args[1..]),
+        Some("preset") => run_plugin_preset(&args[1..]),
+        Some("session") => run_plugin_session(&args[1..]),
+        Some(command) => Err(format!("unknown plugin command: {command}")),
+        None => Err("plugin requires a command (run `denoize plugin --help`)".into()),
+    }
+}
+
+fn run_plugin_info(args: &[String]) -> Result<(), String> {
+    let mode = parse_plugin_output_mode(args, "plugin info")?;
+    let report = serde_json::json!({
+        "schema": CLI_JSON_SCHEMA,
+        "schema_version": CLI_JSON_SCHEMA_VERSION,
+        "event": "plugin-info",
+        "plugin_id": DAW_PLUGIN_ID,
+        "name": "denoize",
+        "version": VERSION,
+        "format": "CLAP",
+        "port_configurations": ["mono", "stereo"],
+        "sample_formats": ["f32", "f64"],
+        "factory_presets": ["speech", "gentle", "music"],
+        "latency_policy": DAW_LATENCY_POLICY,
+        "latency_millis": DAW_FIXED_LATENCY_MILLIS,
+        "realtime_contract": {
+            "allocations": 0,
+            "locks": 0,
+            "file_io": false,
+            "system_calls": false
+        }
+    });
+    if mode != PluginOutputMode::Human {
+        return print_plugin_json(&report, mode);
+    }
+    println!("denoize {VERSION} CLAP ({DAW_PLUGIN_ID})");
+    println!("ports: mono, stereo; samples: f32, f64");
+    println!("latency: fixed {DAW_FIXED_LATENCY_MILLIS:.1} ms ({DAW_LATENCY_POLICY})");
+    println!("factory presets: speech, gentle, music");
+    println!("audio callback: zero allocations, locks, file I/O, or system calls");
+    Ok(())
+}
+
+fn run_plugin_latency(args: &[String]) -> Result<(), String> {
+    let mut sample_rate = 48_000.0_f64;
+    let mut output = PluginOutputMode::Human;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sample-rate" => {
+                index += 1;
+                sample_rate = args
+                    .get(index)
+                    .ok_or("plugin latency requires a value for --sample-rate")?
+                    .parse::<f64>()
+                    .map_err(|error| format!("invalid --sample-rate: {error}"))?;
+            }
+            "--json" if output == PluginOutputMode::Human => output = PluginOutputMode::Json,
+            "--pretty" if output == PluginOutputMode::Human => output = PluginOutputMode::Pretty,
+            "--json" | "--pretty" => {
+                return Err("plugin latency accepts only one of --json or --pretty".into())
+            }
+            option => return Err(format!("unknown plugin latency option: {option}")),
+        }
+        index += 1;
+    }
+    let mut processor = DawRealtimeProcessor::new(sample_rate, 1)?;
+    let reported_frames = processor.latency_frames();
+    let runtime = processor.prepare_parameters(&DawParameters {
+        bypass: true,
+        ..DawParameters::default()
+    })?;
+    let mut measured_frames = None;
+    for frame in 0..=reported_frames.saturating_add(1) {
+        let input = if frame == 0 { 1.0 } else { 0.0 };
+        if processor.process_frame_f64([input, 0.0], &runtime)[0] != 0.0 {
+            measured_frames = Some(frame);
+            break;
+        }
+    }
+    let measured_frames =
+        measured_frames.ok_or("DAW impulse latency measurement produced no output")?;
+    let matches_reported = measured_frames == reported_frames;
+    if !matches_reported {
+        return Err(format!(
+            "DAW measured latency {measured_frames} frames differs from reported latency {reported_frames} frames"
+        ));
+    }
+    let report = serde_json::json!({
+        "schema": CLI_JSON_SCHEMA,
+        "schema_version": CLI_JSON_SCHEMA_VERSION,
+        "event": "plugin-latency",
+        "plugin_id": DAW_PLUGIN_ID,
+        "latency_policy": DAW_LATENCY_POLICY,
+        "sample_rate": sample_rate,
+        "latency_frames": reported_frames,
+        "latency_millis": processor.latency_millis(),
+        "measured_latency_frames": measured_frames,
+        "matches_reported": matches_reported,
+        "measurement": "f64-bypass-impulse-v1"
+    });
+    if output != PluginOutputMode::Human {
+        return print_plugin_json(&report, output);
+    }
+    println!(
+        "{:.6} Hz: {} frames ({:.6} ms; {})",
+        sample_rate,
+        reported_frames,
+        processor.latency_millis(),
+        DAW_LATENCY_POLICY
+    );
+    println!("measured impulse: {measured_frames} frames (matches reported)");
+    Ok(())
+}
+
+fn run_plugin_preset(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => run_plugin_preset_create(&args[1..]),
+        Some("inspect") => run_plugin_preset_read(&args[1..], false),
+        Some("validate") => run_plugin_preset_read(&args[1..], true),
+        Some(command) => Err(format!("unknown plugin preset command: {command}")),
+        None => Err("plugin preset requires create, inspect, or validate".into()),
+    }
+}
+
+fn run_plugin_preset_create(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("plugin preset create requires FACTORY and OUTPUT.json".into());
+    }
+    let factory = &args[0];
+    let path = &args[1];
+    let mut preset = DawPreset::factory(factory).ok_or_else(|| {
+        format!("unknown DAW factory preset {factory}; expected speech, gentle, or music")
+    })?;
+    let mut mode = CommitMode::NoClobber;
+    let mut output = PluginOutputMode::Human;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--name" => preset.name = plugin_option_value(args, &mut index, option)?,
+            "--amount" => preset.parameters.amount = plugin_number_value(args, &mut index, option)?,
+            "--threshold-dbfs" => {
+                preset.parameters.threshold_dbfs = plugin_number_value(args, &mut index, option)?
+            }
+            "--release-ms" => {
+                preset.parameters.release_ms = plugin_number_value(args, &mut index, option)?
+            }
+            "--mix" => preset.parameters.mix = plugin_number_value(args, &mut index, option)?,
+            "--output-gain-db" => {
+                preset.parameters.output_gain_db = plugin_number_value(args, &mut index, option)?
+            }
+            "--bypass" => preset.parameters.bypass = true,
+            "--no-bypass" => preset.parameters.bypass = false,
+            "--stereo-link" => preset.parameters.stereo_link = true,
+            "--no-stereo-link" => preset.parameters.stereo_link = false,
+            "--replace" if mode == CommitMode::NoClobber => mode = CommitMode::Replace,
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if output == PluginOutputMode::Human => output = PluginOutputMode::Json,
+            "--pretty" if output == PluginOutputMode::Human => output = PluginOutputMode::Pretty,
+            "--json" | "--pretty" => {
+                return Err("preset create accepts only one of --json or --pretty".into())
+            }
+            value => return Err(format!("unknown plugin preset create option: {value}")),
+        }
+        index += 1;
+    }
+    preset.validate()?;
+    write_daw_preset(path, &preset, mode)?;
+    if output != PluginOutputMode::Human {
+        print_plugin_json(&preset, output)
+    } else {
+        println!("created DAW preset {}: {path}", preset.name);
+        Ok(())
+    }
+}
+
+fn run_plugin_preset_read(args: &[String], validate: bool) -> Result<(), String> {
+    let path = args
+        .first()
+        .ok_or("plugin preset inspect/validate requires PRESET.json")?;
+    let mode = parse_plugin_output_mode(
+        &args[1..],
+        if validate {
+            "plugin preset validate"
+        } else {
+            "plugin preset inspect"
+        },
+    )?;
+    let preset = read_daw_preset(path)?;
+    if mode != PluginOutputMode::Human {
+        if validate {
+            return print_plugin_json(
+                &serde_json::json!({
+                    "schema": CLI_JSON_SCHEMA,
+                    "schema_version": CLI_JSON_SCHEMA_VERSION,
+                    "event": "plugin-preset-validation",
+                    "valid": true,
+                    "path": path,
+                    "plugin_id": preset.plugin_id,
+                    "name": preset.name
+                }),
+                mode,
+            );
+        }
+        return print_plugin_json(&preset, mode);
+    }
+    if validate {
+        println!("valid DAW preset: {path}");
+    } else {
+        print_preset_summary(&preset);
+    }
+    Ok(())
+}
+
+fn print_preset_summary(preset: &DawPreset) {
+    let parameters = preset.parameters;
+    println!("preset: {}", preset.name);
+    println!("plugin: {}", preset.plugin_id);
+    println!(
+        "amount={:.3} threshold={:.1} dBFS release={:.1} ms mix={:.3} output={:.1} dB",
+        parameters.amount,
+        parameters.threshold_dbfs,
+        parameters.release_ms,
+        parameters.mix,
+        parameters.output_gain_db
+    );
+    println!(
+        "bypass={} stereo-link={}",
+        parameters.bypass, parameters.stereo_link
+    );
+}
+
+fn run_plugin_session(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => run_plugin_session_create(&args[1..]),
+        Some("inspect") => run_plugin_session_read(&args[1..], false),
+        Some("validate") => run_plugin_session_read(&args[1..], true),
+        Some(command) => Err(format!("unknown plugin session command: {command}")),
+        None => Err("plugin session requires create, inspect, or validate".into()),
+    }
+}
+
+fn run_plugin_session_create(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("plugin session create requires PRESET.json and OUTPUT.json".into());
+    }
+    let preset_path = &args[0];
+    let output_path = &args[1];
+    let mut configuration = DawPortConfiguration::Stereo;
+    let mut configuration_selected = false;
+    let mut mode = CommitMode::NoClobber;
+    let mut output = PluginOutputMode::Human;
+    for option in &args[2..] {
+        match option.as_str() {
+            "--mono" if !configuration_selected => {
+                configuration = DawPortConfiguration::Mono;
+                configuration_selected = true;
+            }
+            "--stereo" if !configuration_selected => {
+                configuration = DawPortConfiguration::Stereo;
+                configuration_selected = true;
+            }
+            "--mono" | "--stereo" => {
+                return Err("session create accepts only one of --mono or --stereo".into())
+            }
+            "--replace" if mode == CommitMode::NoClobber => mode = CommitMode::Replace,
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if output == PluginOutputMode::Human => output = PluginOutputMode::Json,
+            "--pretty" if output == PluginOutputMode::Human => output = PluginOutputMode::Pretty,
+            "--json" | "--pretty" => {
+                return Err("session create accepts only one of --json or --pretty".into())
+            }
+            value => return Err(format!("unknown plugin session create option: {value}")),
+        }
+    }
+    let state = DawSessionState::new(read_daw_preset(preset_path)?, configuration)?;
+    write_daw_session(output_path, &state, mode)?;
+    if output != PluginOutputMode::Human {
+        print_plugin_json(&state, output)
+    } else {
+        println!(
+            "created deterministic {:?} DAW session: {output_path}",
+            configuration
+        );
+        Ok(())
+    }
+}
+
+fn run_plugin_session_read(args: &[String], validate: bool) -> Result<(), String> {
+    let path = args
+        .first()
+        .ok_or("plugin session inspect/validate requires SESSION.json")?;
+    let mode = parse_plugin_output_mode(
+        &args[1..],
+        if validate {
+            "plugin session validate"
+        } else {
+            "plugin session inspect"
+        },
+    )?;
+    let state = read_daw_session(path)?;
+    if mode != PluginOutputMode::Human {
+        if validate {
+            return print_plugin_json(
+                &serde_json::json!({
+                    "schema": CLI_JSON_SCHEMA,
+                    "schema_version": CLI_JSON_SCHEMA_VERSION,
+                    "event": "plugin-session-validation",
+                    "valid": true,
+                    "path": path,
+                    "plugin_id": state.plugin_id,
+                    "port_configuration": state.port_configuration,
+                    "latency_policy": state.latency_policy
+                }),
+                mode,
+            );
+        }
+        return print_plugin_json(&state, mode);
+    }
+    if validate {
+        println!("valid deterministic DAW session: {path}");
+    } else {
+        println!("session: {:?}", state.port_configuration);
+        println!("latency: {}", state.latency_policy);
+        print_preset_summary(&state.preset);
+    }
+    Ok(())
+}
+
+fn plugin_option_value(args: &[String], index: &mut usize, option: &str) -> Result<String, String> {
+    *index = index
+        .checked_add(1)
+        .ok_or("plugin argument index overflow")?;
+    args.get(*index)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn plugin_number_value<T>(args: &[String], index: &mut usize, option: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    plugin_option_value(args, index, option)?
+        .parse()
+        .map_err(|error| format!("invalid value for {option}: {error}"))
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     wait_for_isolation_gate()?;
@@ -3073,6 +3495,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("compare") {
         return run_compare(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("plugin") {
+        return run_plugin(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
     if ov.resume && !ov.batch && !ov.stream {
@@ -8171,7 +8596,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "29f848b60e2bdd3969b6d6135ab5c096b5a8f96a6d41bc7db2d86a6791f6233b";
+        "15a5484ef746e7721b3006f603b0a0867b516912c5ea5cc0e67d80f2551865e2";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

@@ -1,5 +1,24 @@
 # Third-party notices
 
+## Clack 0.1.1 and clap-sys 0.5.0
+
+The denoize CLAP plug-in uses the unmodified `clack-common`,
+`clack-extensions`, and `clack-plugin` 0.1.1 crates by Adrien Prokopowicz and
+the unmodified `clap-sys` 0.5.0 bindings. These crates are dual-licensed under
+MIT or Apache-2.0; denoize distributes them under the MIT option. The exact
+corresponding sources are [`prokopyl/clack` revision
+`82498dbfde2f8a16c7bb0e34389826089dbee5cf`](https://github.com/prokopyl/clack/tree/82498dbfde2f8a16c7bb0e34389826089dbee5cf)
+and [`micahrj/clap-sys` revision
+`25d7f53fdb6363ad63fbd80049cb7a42a97ac156`](https://github.com/micahrj/clap-sys/tree/25d7f53fdb6363ad63fbd80049cb7a42a97ac156).
+The crates.io
+checksums are `2f6a27523c0b3563da8286628d3f3a54fde73de3190d28586c2c314c3bdad1e6`,
+`6d97d8b4cab1975314c053b9ec35575c5cccd8c7b3db37b21cbe435be6174416`,
+`2fa04a5185c367bfd5566e616c9c20cec2abaee9bf8a6060a3f6e44b505d5f32`,
+and `a76abbdb2907f6fd97fb6bc0b7be96b77d328f2dd9669d1075cc03369ed22154`.
+The complete selected license texts are included at
+[`LICENSES/clack-0.1.1-MIT.txt`](LICENSES/clack-0.1.1-MIT.txt) and
+[`LICENSES/clap-sys-0.5.0-MIT.txt`](LICENSES/clap-sys-0.5.0-MIT.txt).
+
 ## GTCRN DNS3 model
 
 The signed offline model release bundle contains the official causal GTCRN

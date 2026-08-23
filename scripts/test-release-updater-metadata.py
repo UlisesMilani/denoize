@@ -183,7 +183,7 @@ class ReleaseUpdaterMetadataTests(unittest.TestCase):
 
         evidence = job_block("release-evidence")
         self.assertIn(
-            "needs: [build, desktop-build, model-catalog, updater-metadata]",
+            "needs: [build, plugin-build, desktop-build, model-catalog, updater-metadata]",
             evidence,
         )
 

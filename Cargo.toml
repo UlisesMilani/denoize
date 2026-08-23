@@ -1,6 +1,6 @@
 [package]
 name = "denoize"
-version = "0.67.1"
+version = "0.68.0"
 edition = "2021"
 authors = ["denoize"]
 description = "Pure-Rust audio denoiser for the world's highest sound quality. Classical DSP + optional RNNoise / DeepFilterNet backends."
@@ -12,6 +12,12 @@ documentation = "https://docs.rs/denoize"
 rust-version = "1.96"
 keywords = ["audio", "denoise", "dsp", "stft", "noise-reduction"]
 categories = ["multimedia::audio", "science"]
+
+[workspace]
+resolver = "2"
+members = [".", "plugins/denoize-clap"]
+default-members = ["."]
+exclude = ["apps/desktop/src-tauri"]
 
 [lib]
 name = "denoize"

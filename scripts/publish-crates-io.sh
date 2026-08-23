@@ -149,16 +149,21 @@ if [[ "$is_dry_run" == true ]]; then
   fi
   for required in \
     "denoize-${package_version}/src/automation.rs" \
+    "denoize-${package_version}/src/daw.rs" \
     "denoize-${package_version}/src/model_package/testdata/manifest.json" \
     "denoize-${package_version}/src/model_package/testdata/manifest.json.sig" \
     "denoize-${package_version}/src/model_package/testdata/minisign.pub" \
     "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
     "denoize-${package_version}/src/region.rs" \
+    "denoize-${package_version}/LICENSES/clack-0.1.1-MIT.txt" \
+    "denoize-${package_version}/LICENSES/clap-sys-0.5.0-MIT.txt" \
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-daw-preset-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-daw-session-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v1.schema.json" \

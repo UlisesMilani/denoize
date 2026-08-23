@@ -66,6 +66,12 @@ trap 'rm -f "$temporary_output"' EXIT
   echo '```text'
   "$binary" ipc --help
   echo '```'
+  echo
+  echo '## DAW plug-in contracts'
+  echo
+  echo '```text'
+  "$binary" plugin --help
+  echo '```'
   cat <<'EOF'
 
 Watch mode uses portable bounded polling. A regular audio file becomes eligible
@@ -153,6 +159,22 @@ Revoking a grant blocks new requests but does not erase admitted work, so cancel
 first when queued or running jobs must stop. The versioned discovery,
 capability, request/response, dry-run, status, and history schemas are documented
 in `docs/json.md` and shipped in both release assets and the crates.io package.
+
+## DAW plug-in contracts
+
+`denoize plugin info` reports the CLAP identity, mono/stereo and f32/f64
+capabilities, factory presets, fixed latency policy, and zero-allocation audio
+callback contract. `plugin latency` sends an f64 bypass impulse through the
+same processor, reports both the host frame count and measured first-output
+frame, and fails if they differ. It accepts every finite sample rate supported
+by CLAP validation up to 768 kHz.
+
+Preset and session creation is no-clobber by default; `--replace` is explicit.
+Both readers accept only bounded regular non-symlink JSON files. Preset v1
+contains every stable parameter. Session v1 adds the plug-in identity,
+`fixed-10ms-v1` policy, mono/stereo port configuration, and the preset. CLAP
+host snapshots use the same canonical session bytes, so file and host state
+round trips restore one deterministic contract.
 
 ## Stable JSON automation
 

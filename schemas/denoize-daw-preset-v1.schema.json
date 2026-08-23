@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-daw-preset-v1.schema.json",
+  "title": "denoize portable DAW preset v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "plugin_id", "name", "parameters"],
+  "properties": {
+    "schema": { "const": "denoize-daw-preset-v1" },
+    "schema_version": { "const": 1 },
+    "plugin_id": { "const": "org.penguin425.denoize" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]*$" },
+    "parameters": { "$ref": "#/$defs/parameters" }
+  },
+  "$defs": {
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bypass",
+        "amount",
+        "threshold_dbfs",
+        "release_ms",
+        "mix",
+        "output_gain_db",
+        "stereo_link"
+      ],
+      "properties": {
+        "bypass": { "type": "boolean" },
+        "amount": { "type": "number", "minimum": 0, "maximum": 1 },
+        "threshold_dbfs": { "type": "number", "minimum": -96, "maximum": -18 },
+        "release_ms": { "type": "number", "minimum": 20, "maximum": 1000 },
+        "mix": { "type": "number", "minimum": 0, "maximum": 1 },
+        "output_gain_db": { "type": "number", "minimum": -24, "maximum": 24 },
+        "stereo_link": { "type": "boolean" }
+      }
+    }
+  }
+}

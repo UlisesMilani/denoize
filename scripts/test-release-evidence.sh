@@ -23,7 +23,7 @@ rust_version=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"$/\1/p' \
   "$repo_dir/Cargo.toml" | head -n 1)
 release_toolchain="${rust_version}.0"
 if [[ $(grep -Fc "rustup toolchain install $release_toolchain " \
-  "$repo_dir/.github/workflows/release.yml") != 5 ]]; then
+  "$repo_dir/.github/workflows/release.yml") != 6 ]]; then
   echo "release-producing jobs do not all pin Rust $release_toolchain" >&2
   exit 1
 fi
@@ -37,7 +37,7 @@ mkdir -p "$artifact_dir" "$tmp_dir/package/$version" "$tmp_dir/bin"
 
 asset_spec="$tmp_dir/asset-spec.tsv"
 bash "$repo_dir/scripts/release-evidence-assets.sh" primary "$tag" > "$asset_spec"
-if [[ $(wc -l < "$asset_spec") != 14 ]] \
+if [[ $(wc -l < "$asset_spec") != 18 ]] \
   || [[ $(bash "$repo_dir/scripts/release-evidence-assets.sh" evidence "$tag" | wc -l) != 7 ]]; then
   echo "release evidence asset contract has the wrong cardinality" >&2
   exit 1
@@ -162,8 +162,8 @@ export DENOIZE_FAKE_GH_LOG="$tmp_dir/gh.log"
 PATH="$tmp_dir/bin:$PATH" bash "$repo_dir/scripts/verify-release-evidence.sh" \
   "$tag" "$artifact_dir" "$artifact_dir/denoize-sigstore-trusted-root.jsonl"
 
-if [[ $(wc -l < "$DENOIZE_FAKE_GH_LOG") != 15 ]]; then
-  echo "offline verifier did not check the archive and all 14 artifacts" >&2
+if [[ $(wc -l < "$DENOIZE_FAKE_GH_LOG") != 19 ]]; then
+  echo "offline verifier did not check the archive and all 18 artifacts" >&2
   exit 1
 fi
 while IFS= read -r invocation; do

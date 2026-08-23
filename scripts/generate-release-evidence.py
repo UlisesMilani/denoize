@@ -25,7 +25,7 @@ TAG_RE = re.compile(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PORTABLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$")
-KINDS = {"cli", "desktop", "crate", "model-bundle"}
+KINDS = {"cli", "plugin", "desktop", "crate", "model-bundle"}
 
 
 class EvidenceError(RuntimeError):
@@ -82,8 +82,8 @@ def read_asset_specs(path: Path) -> list[dict[str, str]]:
             raise EvidenceError(f"unsafe artifact target on line {line_number}: {target}")
         seen.add(name)
         specs.append({"kind": kind, "target": target, "name": name})
-    if len(specs) != 14:
-        raise EvidenceError(f"expected 14 installable release artifacts, found {len(specs)}")
+    if len(specs) != 18:
+        raise EvidenceError(f"expected 18 installable release artifacts, found {len(specs)}")
     return specs
 
 
@@ -274,6 +274,7 @@ def artifact_sbom(
     artifact_ref = f"urn:denoize:release-asset:{quote(tag, safe='')}:{quote(name, safe='')}"
     component_type = {
         "cli": "application",
+        "plugin": "application",
         "desktop": "application",
         "crate": "library",
         "model-bundle": "machine-learning-model",
@@ -434,7 +435,7 @@ def generate(args: argparse.Namespace) -> None:
             if size <= 0:
                 raise EvidenceError(f"release artifact is empty: {spec['name']}")
             digest = sha256_file(artifact)
-            if spec["kind"] == "cli":
+            if spec["kind"] in {"cli", "plugin"}:
                 inventory = root_lock
                 dependency_basis = "tagged-root-cargo-lock"
             elif spec["kind"] == "desktop":

@@ -81,6 +81,7 @@ jobs:
       - name: Verify release evidence tooling
         run: |
           bash -n \
+            scripts/package-clap-plugin.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
@@ -238,6 +239,96 @@ jobs:
             denoize-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256 \
             --clobber
 
+  plugin-build:
+    name: CLAP ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out tagged source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build release CLAP plug-in
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}" -p denoize-clap
+
+      - name: Validate tagged plug-in with official CLAP validator
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          validator_dir=$(mktemp -d /tmp/denoize-clap-validator.XXXXXX)
+          validator_zip="$validator_dir/clap-validator.zip"
+          curl --fail --location --silent --show-error \
+            https://github.com/free-audio/clap-validator/releases/download/0.4.1/clap-validator-0.4.1-127-g152b982-ubuntu-22.04.zip \
+            --output "$validator_zip"
+          echo "49edadcfb407ea0dd946ce418300e853fbd2660fa4b0d00e4f19ff8eef24ad90  $validator_zip" \
+            | sha256sum --check
+          unzip -q "$validator_zip" -d "$validator_dir"
+          tar -xzf "$validator_dir"/*.tar.gz -C "$validator_dir"
+          validator=$(find "$validator_dir" -type f -name clap-validator -perm -u+x | head -n 1)
+          test -n "$validator"
+          cp target/${{ matrix.target }}/release/libdenoize_clap.so \
+            "$validator_dir/denoize.clap"
+          "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
+            > "$validator_dir/report.json"
+          jq -e '
+            (.results | length) == 44 and
+            ([.results[].status.code] | map(select(. == "success")) | length) == 36 and
+            ([.results[].status.code] | map(select(. == "skipped")) | length) == 8 and
+            ([.results[].status.code] | all(. == "success" or . == "skipped"))
+          ' "$validator_dir/report.json" >/dev/null
+          for rate in 44100 48000 96000; do
+            cargo run --locked --release --no-default-features --bin denoize -- \
+              plugin latency --sample-rate "$rate" --json \
+              | jq -e '.matches_reported == true and .latency_frames == .measured_latency_frames' \
+                >/dev/null
+          done
+
+      - name: Package CLAP plug-in
+        shell: bash
+        run: |
+          bash scripts/package-clap-plugin.sh \
+            "${{ matrix.target }}" "$GITHUB_REF_NAME" .
+          archive="denoize-plugin-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$archive" > "$archive.sha256"
+          else
+            shasum -a 256 "$archive" > "$archive.sha256"
+          fi
+
+      - name: Upload CLAP release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            denoize-plugin-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }} \
+            denoize-plugin-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256 \
+            --clobber
+
   desktop-build:
     name: Desktop ${{ matrix.target }}
     needs: prepare
@@ -370,6 +461,8 @@ jobs:
           trust_asset="$asset_dir/denoize-model-trust-root-v1.json"
           automation_schema="$asset_dir/denoize-automation-v1.schema.json"
           cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
+          daw_preset_schema="$asset_dir/denoize-daw-preset-v1.schema.json"
+          daw_session_schema="$asset_dir/denoize-daw-session-v1.schema.json"
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
           ipc_capability_summary_schema="$asset_dir/denoize-ipc-capability-summary-v1.schema.json"
           ipc_capability_schema="$asset_dir/denoize-ipc-capability-v1.schema.json"
@@ -401,6 +494,8 @@ jobs:
           cp models/trust-root-v1.json "$trust_asset"
           cp schemas/denoize-automation-v1.schema.json "$automation_schema"
           cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
+          cp schemas/denoize-daw-preset-v1.schema.json "$daw_preset_schema"
+          cp schemas/denoize-daw-session-v1.schema.json "$daw_session_schema"
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
           cp schemas/denoize-ipc-capability-summary-v1.schema.json "$ipc_capability_summary_schema"
           cp schemas/denoize-ipc-capability-v1.schema.json "$ipc_capability_schema"
@@ -436,7 +531,8 @@ jobs:
             "$bundle" "$bundle_checksum" "$asset" "$asset.sig" "$trust_asset"
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
-            "$automation_schema" "$cli_schema" "$hardware_schema" \
+            "$automation_schema" "$cli_schema" \
+            "$daw_preset_schema" "$daw_session_schema" "$hardware_schema" \
             "$ipc_capability_summary_schema" "$ipc_capability_schema" \
             "$ipc_discovery_schema" "$ipc_request_schema" "$ipc_response_schema" \
             "$job_dry_run_schema" "$job_history_schema" "$job_status_schema" \
@@ -454,7 +550,7 @@ jobs:
 
   release-evidence:
     name: Generate release SBOMs and provenance
-    needs: [build, desktop-build, model-catalog, updater-metadata]
+    needs: [build, plugin-build, desktop-build, model-catalog, updater-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write

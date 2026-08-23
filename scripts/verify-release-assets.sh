@@ -35,6 +35,14 @@ expected_assets=(
   "denoize-${tag}-x86_64-pc-windows-msvc.zip.sha256"
   "denoize-${tag}-x86_64-unknown-linux-gnu.tar.gz"
   "denoize-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-plugin-${tag}-aarch64-apple-darwin.tar.gz"
+  "denoize-plugin-${tag}-aarch64-apple-darwin.tar.gz.sha256"
+  "denoize-plugin-${tag}-x86_64-apple-darwin.tar.gz"
+  "denoize-plugin-${tag}-x86_64-apple-darwin.tar.gz.sha256"
+  "denoize-plugin-${tag}-x86_64-pc-windows-msvc.zip"
+  "denoize-plugin-${tag}-x86_64-pc-windows-msvc.zip.sha256"
+  "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+  "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
   "denoize_${version}_aarch64.app.tar.gz"
   "denoize_${version}_aarch64.app.tar.gz.sig"
   "denoize_${version}_aarch64.dmg"
@@ -54,6 +62,8 @@ expected_assets=(
   "denoize-model-trust-root-v1.json"
   "denoize-automation-v1.schema.json"
   "denoize-cli-output-v1.schema.json"
+  "denoize-daw-preset-v1.schema.json"
+  "denoize-daw-session-v1.schema.json"
   "denoize-execution-plan-v1.schema.json"
   "denoize-execution-plan-v2.schema.json"
   "denoize-execution-receipt-v1.schema.json"
@@ -158,6 +168,8 @@ gh release download "$tag" \
   --pattern 'denoize-model-trust-root-v1.json' \
   --pattern 'denoize-automation-v1.schema.json' \
   --pattern 'denoize-cli-output-v1.schema.json' \
+  --pattern 'denoize-daw-preset-v1.schema.json' \
+  --pattern 'denoize-daw-session-v1.schema.json' \
   --pattern 'denoize-execution-plan-v1.schema.json' \
   --pattern 'denoize-execution-plan-v2.schema.json' \
   --pattern 'denoize-execution-receipt-v1.schema.json' \
@@ -212,6 +224,8 @@ fi
 for schema in \
   denoize-automation-v1.schema.json \
   denoize-cli-output-v1.schema.json \
+  denoize-daw-preset-v1.schema.json \
+  denoize-daw-session-v1.schema.json \
   denoize-execution-plan-v1.schema.json \
   denoize-execution-plan-v2.schema.json \
   denoize-execution-receipt-v1.schema.json \
@@ -295,6 +309,8 @@ archive_contains() {
 required_notice_files=(
   "LICENSE"
   "THIRD_PARTY.md"
+  "LICENSES/clack-0.1.1-MIT.txt"
+  "LICENSES/clap-sys-0.5.0-MIT.txt"
   "LICENSES/nanomp3-0.1.1-MIT.txt"
   "LICENSES/minisign-verify-0.2.5-MIT.txt"
   "LICENSES/symphonia-0.6.0-MPL-2.0.txt"
@@ -318,6 +334,35 @@ for target in "${cli_targets[@]}"; do
   for notice in "${required_notice_files[@]}"; do
     if ! archive_contains "$archive" "$package/$notice"; then
       echo "release archive $(basename "$archive") is missing $notice" >&2
+      exit 1
+    fi
+  done
+done
+
+for target in "${cli_targets[@]}"; do
+  package="denoize-plugin-${tag}-${target}"
+  if [[ "$target" == "x86_64-pc-windows-msvc" ]]; then
+    archive="$tmp_dir/$package.zip"
+  else
+    archive="$tmp_dir/$package.tar.gz"
+  fi
+  for notice in "${required_notice_files[@]}"; do
+    if ! archive_contains "$archive" "$package/$notice"; then
+      echo "CLAP archive $(basename "$archive") is missing $notice" >&2
+      exit 1
+    fi
+  done
+  if [[ "$target" == *-apple-darwin ]]; then
+    plugin_paths=(
+      "$package/denoize.clap/Contents/Info.plist"
+      "$package/denoize.clap/Contents/MacOS/denoize"
+    )
+  else
+    plugin_paths=("$package/denoize.clap")
+  fi
+  for plugin_path in "${plugin_paths[@]}"; do
+    if ! archive_contains "$archive" "$plugin_path"; then
+      echo "CLAP archive $(basename "$archive") is missing $plugin_path" >&2
       exit 1
     fi
   done
