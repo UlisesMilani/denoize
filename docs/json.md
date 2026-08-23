@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes thirty-five versioned JSON contracts for local automation. Their
+denoize publishes forty-four versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -88,6 +88,28 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-runtime-model-package-v1.schema.json`](../schemas/denoize-runtime-model-package-v1.schema.json)
   describes the signed identity, license, frontend, tensor, accelerator, and
   resource manifest embedded in a custom-model `.dmp` package.
+- [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
+  describes the signed channel, source commit, compatibility gate, rollback
+  policy, and exact platform artifact/SBOM/provenance graph.
+- [`denoize-update-manifest-verification-v1.schema.json`](../schemas/denoize-update-manifest-verification-v1.schema.json)
+  describes successful Minisign authentication of that manifest.
+- [`denoize-update-bundle-v1.schema.json`](../schemas/denoize-update-bundle-v1.schema.json)
+  describes complete verification of one candidate plus its offline
+  last-known-good payload.
+- [`denoize-update-download-v1.schema.json`](../schemas/denoize-update-download-v1.schema.json)
+  describes a bounded HTTPS download that was authenticated before atomic
+  no-clobber publication.
+- [`denoize-update-check-v1.schema.json`](../schemas/denoize-update-check-v1.schema.json)
+  describes a read-only compatibility, availability, and anti-rollback decision.
+- [`denoize-update-dry-run-v1.schema.json`](../schemas/denoize-update-dry-run-v1.schema.json)
+  describes read-only staging size and destination actions.
+- [`denoize-update-apply-v1.schema.json`](../schemas/denoize-update-apply-v1.schema.json)
+  describes the atomically selected candidate, retained last-known-good slot,
+  health deadline, and platform activation handoff.
+- [`denoize-update-status-v1.schema.json`](../schemas/denoize-update-status-v1.schema.json)
+  describes bounded managed-slot state and redacted durable diagnostics.
+- [`denoize-update-health-v1.schema.json`](../schemas/denoize-update-health-v1.schema.json)
+  describes startup confirmation or offline last-known-good recovery.
 - [`denoize-watch-state-v1.schema.json`](../schemas/denoize-watch-state-v1.schema.json)
   describes durable settle observations, retry scheduling, processing state,
   and completed/quarantined watch-folder jobs.

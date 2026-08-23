@@ -1,6 +1,6 @@
 [package]
 name = "denoize-desktop"
-version = "0.69.0"
+version = "0.70.0"
 description = "Desktop interface for denoize"
 authors = ["denoize"]
 edition = "2021"
@@ -40,7 +40,6 @@ fdk-aac-encoder = ["denoize/fdk-aac-encoder"]
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-process = "2.3.1"
-tauri-plugin-updater = "2.9.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading"] }

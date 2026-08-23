@@ -162,6 +162,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/docs/evaluation.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
+    "denoize-${package_version}/docs/updates.md" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-daw-preset-v1.schema.json" \
@@ -194,6 +195,15 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-recommendation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-release-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-runtime-model-package-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-apply-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-bundle-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-check-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-download-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-dry-run-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-health-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-manifest-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-manifest-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-update-status-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-cycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-quarantine-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-state-v1.schema.json" \

@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-update-health-v1.schema.json",
+  "title": "denoize update startup-health and recovery report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "action",
+    "running_version",
+    "active_version",
+    "last_known_good_version",
+    "health_token",
+    "start_attempts",
+    "maximum_start_attempts",
+    "deadline_unix_seconds",
+    "relaunch_required"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-update-health-v1" },
+    "schema_version": { "const": 1 },
+    "action": {
+      "enum": [
+        "unmanaged",
+        "healthy",
+        "confirm-required",
+        "confirmed",
+        "recovered-last-known-good",
+        "reactivate-managed-version"
+      ]
+    },
+    "running_version": { "$ref": "#/$defs/version" },
+    "active_version": { "$ref": "#/$defs/nullableVersion" },
+    "last_known_good_version": { "$ref": "#/$defs/nullableVersion" },
+    "health_token": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/sha256" }]
+    },
+    "start_attempts": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 0, "maximum": 16 }]
+    },
+    "maximum_start_attempts": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1, "maximum": 16 }]
+    },
+    "deadline_unix_seconds": {
+      "oneOf": [{ "type": "null" }, { "type": "integer", "minimum": 1 }]
+    },
+    "relaunch_required": { "type": "boolean" }
+  },
+  "$defs": {
+    "version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "nullableVersion": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/version" }]
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

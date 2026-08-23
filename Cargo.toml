@@ -1,6 +1,6 @@
 [package]
 name = "denoize"
-version = "0.69.0"
+version = "0.70.0"
 edition = "2021"
 authors = ["denoize"]
 description = "Pure-Rust audio denoiser for the world's highest sound quality. Classical DSP + optional RNNoise / DeepFilterNet backends."
@@ -112,6 +112,7 @@ fdk-aac-encoder = ["m4a-encode", "dep:fdk-aac-rust"]
 full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "m4a-encode", "visqol", "live"]
 
 [dev-dependencies]
+minisign = "0.9.1"
 prost = "0.14"
 
 [profile.release]
