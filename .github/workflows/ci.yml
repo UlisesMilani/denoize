@@ -92,13 +92,17 @@ jobs:
             scripts/verify-release-evidence.sh \
             scripts/verify-release-version.sh
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
+          python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
               "$schema" >/dev/null
           done
 
       - name: Test release evidence generation and offline verification
-        run: bash scripts/test-release-evidence.sh
+        run: |
+          python3 scripts/test-release-updater-metadata.py
+          bash scripts/test-release-evidence.sh
 
   cli-docs:
     name: CLI documentation

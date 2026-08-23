@@ -89,10 +89,13 @@ jobs:
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
+          python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
               "$schema" >/dev/null
           done
+          python3 scripts/test-release-updater-metadata.py
           bash scripts/test-release-evidence.sh
 
       - name: Verify crates.io package
@@ -293,9 +296,46 @@ jobs:
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true
+          # Matrix jobs upload target-local updater JSON under one shared name.
+          # updater-metadata replaces the last writer only after all four finish.
           updaterJsonPreferNsis: true
           retryAttempts: 3
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+  updater-metadata:
+    name: Assemble updater metadata
+    needs: desktop-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Assemble and upload updater metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_dir=$(mktemp -d /tmp/denoize-updater.XXXXXX)
+          assets_json="$asset_dir/release-assets.json"
+          metadata="$asset_dir/latest.json"
+          gh release view "$GITHUB_REF_NAME" --json assets > "$assets_json"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "denoize_${GITHUB_REF_NAME#v}_aarch64.app.tar.gz.sig" \
+            --pattern "denoize_${GITHUB_REF_NAME#v}_x64.app.tar.gz.sig" \
+            --pattern "denoize_${GITHUB_REF_NAME#v}_amd64.AppImage.sig" \
+            --pattern "denoize_${GITHUB_REF_NAME#v}_amd64.deb.sig" \
+            --pattern "denoize_${GITHUB_REF_NAME#v}_x64-setup.exe.sig" \
+            --pattern "denoize_${GITHUB_REF_NAME#v}_x64_en-US.msi.sig" \
+            --dir "$asset_dir"
+          python3 scripts/assemble-release-updater-metadata.py \
+            --tag "$GITHUB_REF_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --assets-json "$assets_json" \
+            --signature-dir "$asset_dir" \
+            --pub-date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --output "$metadata"
+          gh release upload "$GITHUB_REF_NAME" "$metadata" --clobber
 
   model-catalog:
     name: Sign catalog and build offline model bundle
@@ -414,7 +454,7 @@ jobs:
 
   release-evidence:
     name: Generate release SBOMs and provenance
-    needs: [build, desktop-build, model-catalog]
+    needs: [build, desktop-build, model-catalog, updater-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write

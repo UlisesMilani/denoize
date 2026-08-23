@@ -63,7 +63,11 @@ snapshot remain separate release assets. The verification checks that
 every CLI archive, desktop installer, signature, evidence file, and
 `latest.json` is present and non-empty, validates the SHA-256 manifests and
 offline provenance policy, and confirms that updater metadata points at
-uploaded assets. Only then can the exact pre-attested crate be published; its
+uploaded assets. Each desktop matrix job emits target-local updater metadata;
+a downstream job waits for all four targets, validates their uploaded payloads
+and signature digests, and atomically replaces `latest.json` with the complete
+ten-platform manifest before evidence generation or release verification.
+Only then can the exact pre-attested crate be published; its
 crates.io checksum must match before the GitHub draft becomes public. If any
 step fails, the GitHub release remains a draft.
 
