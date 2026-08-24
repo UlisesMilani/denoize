@@ -66,6 +66,7 @@ pub mod models;
 pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
+pub mod project;
 pub mod quality;
 pub mod recommendation;
 pub mod region;
@@ -164,6 +165,21 @@ pub use model_package::{
     RuntimeModelPackageInfo, RuntimeModelPackageManifest, RuntimeModelPackageReader,
     RuntimeModelResourceContract, RuntimeModelRuntimeContract, RuntimeModelTensorContract,
     RUNTIME_MODEL_PACKAGE_SCHEMA, RUNTIME_MODEL_PACKAGE_VERSION,
+};
+pub use project::{
+    assemble_project_timeline, build_project_bundle, import_project_bundle, inspect_project_bundle,
+    inspect_project_source, project_artifact_reference, relocate_project_source, run_project_batch,
+    validate_project_files, write_project_execution_plan, write_project_manifest,
+    write_signed_project_execution_receipt, ProjectArtifactReference, ProjectBatchItemReport,
+    ProjectBatchReport, ProjectBatchRequest, ProjectBundleBinding, ProjectBundleBindingKind,
+    ProjectBundleBuildOptions, ProjectBundleFileInfo, ProjectBundleImportReport, ProjectBundleInfo,
+    ProjectExecutionPlan, ProjectExecutionReceiptPayload, ProjectManifest, ProjectModelReference,
+    ProjectReceiptVerificationReport, ProjectRenderReport, ProjectSelection, ProjectSource,
+    ProjectSourceInspection, ProjectTimeline, ProjectValidationReport,
+    SignedProjectExecutionReceipt, PROJECT_BATCH_SCHEMA, PROJECT_BUNDLE_IMPORT_SCHEMA,
+    PROJECT_BUNDLE_SCHEMA, PROJECT_EXECUTION_PLAN_SCHEMA, PROJECT_EXECUTION_RECEIPT_SCHEMA,
+    PROJECT_MANIFEST_SCHEMA, PROJECT_MANIFEST_SCHEMA_VERSION, PROJECT_RECEIPT_VERIFICATION_SCHEMA,
+    PROJECT_RENDER_SCHEMA, PROJECT_VALIDATION_SCHEMA, PROJECT_WATCH_CYCLE_SCHEMA,
 };
 pub use quality::QualityMetrics;
 pub use recommendation::{

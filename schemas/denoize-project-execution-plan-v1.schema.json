@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-execution-plan-v1.schema.json",
+  "title": "denoize deterministic project timeline execution plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "project_id",
+    "manifest",
+    "manifest_digest",
+    "timeline_id",
+    "timeline_digest",
+    "output",
+    "timescale",
+    "channels",
+    "presentation_frames",
+    "resources"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-project-execution-plan-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "project_id": { "$ref": "#/$defs/id" },
+    "manifest": { "$ref": "#/$defs/artifact" },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "timeline_id": { "$ref": "#/$defs/id" },
+    "timeline_digest": { "$ref": "#/$defs/digest" },
+    "output": { "$ref": "#/$defs/plannedOutput" },
+    "timescale": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "presentation_frames": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "resources": { "$ref": "#/$defs/resources" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$"
+    },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "locator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!\\.\\.?(?:/|$))(?!.*[/]\\.\\.?(?:/|$))(?!.*\\\\)(?!.*:)[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255}(?:/[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255})*$"
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "locator", "fingerprint"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "locator": { "$ref": "#/$defs/locator" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "plannedOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "format", "publication", "action", "reason", "existing_fingerprint"],
+      "properties": {
+        "path": { "$ref": "#/$defs/locator" },
+        "format": { "const": "wav-f32" },
+        "publication": { "enum": ["no-clobber", "replace"] },
+        "action": { "const": "process" },
+        "reason": { "const": "deterministic-project-timeline-assembly" },
+        "existing_fingerprint": { "type": "null" }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["memory_bytes", "temporary_bytes", "cpu_jobs", "gpu_jobs", "gpu_memory_bytes"],
+      "properties": {
+        "memory_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "temporary_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "cpu_jobs": { "const": 1 },
+        "gpu_jobs": { "const": 0 },
+        "gpu_memory_bytes": { "const": 0 }
+      }
+    }
+  }
+}

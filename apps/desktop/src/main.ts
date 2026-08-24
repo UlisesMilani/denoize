@@ -256,6 +256,31 @@ type ExecutionPlan = {
   schema: string; schema_version: number; denoize_version: string; kind: "file" | "batch" | "stream";
   deterministic: boolean; metadata_policy: string; items: Array<Record<string, unknown>>;
 };
+type TimelineProjectManifest = {
+  schema: "denoize-project-v1"; schema_version: 1; project_id: string; denoize_version: string;
+  sources: Array<{ id: string; locator: string; timescale: number; channels: number; presentation_frames: number }>;
+  timelines: Array<{ id: string; timescale: number; channels: number; selections: Array<Record<string, unknown>> }>;
+  settings: Array<Record<string, unknown>>; presets: Array<Record<string, unknown>>;
+  models: Array<Record<string, unknown>>; plans: Array<Record<string, unknown>>; receipts: Array<Record<string, unknown>>;
+};
+type TimelineProjectPlan = {
+  schema: "denoize-project-execution-plan-v1"; schema_version: 1; denoize_version: string;
+  project_id: string; manifest: Record<string, unknown>; manifest_digest: string;
+  timeline_id: string; timeline_digest: string; output: Record<string, unknown>;
+  timescale: number; channels: number; presentation_frames: number; resources: Record<string, unknown>;
+};
+type TimelineProjectRender = {
+  schema: "denoize-project-render-v1"; schema_version: 1; project_id: string;
+  manifest_digest: string; timeline_id: string; timeline_digest: string; output: FileFingerprint;
+  timescale: number; channels: number; presentation_frames: number; retained_pcm_upper_bound_bytes: number;
+};
+type TimelineProjectBundleInfo = {
+  schema: "denoize-project-bundle-v1"; schema_version: 1; project_id: string;
+  manifest_digest: string; bundle: FileFingerprint; manifest: FileFingerprint; verification: FileFingerprint;
+  source_payloads_included: boolean; source_payload_bytes: number;
+  model_payloads_included: boolean; model_payload_bytes: number; document_bytes: number;
+  files: Array<Record<string, unknown>>;
+};
 type ReceiptVerificationReport = {
   schema: string; schema_version: number; receipt_schema: string; key_id: string;
   plan_digest: string; kind: "file" | "batch" | "stream"; verified_items: Array<Record<string, unknown>>;
@@ -312,6 +337,9 @@ let recommendationRunning = false;
 let evaluationRunning = false;
 let processPlan: ExecutionPlan | null = null;
 let batchPlan: ExecutionPlan | null = null;
+let timelineProjectManifest: TimelineProjectManifest | null = null;
+let timelineProjectPlan: TimelineProjectPlan | null = null;
+let timelineProjectBusy = false;
 let watchRunning = false;
 let watchStopping = false;
 let watchActiveJob: number | null = null;
@@ -343,6 +371,7 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <button id="nav-process" class="nav-item active" role="tab" data-page="process" aria-controls="page-process" aria-current="page" aria-selected="true" tabindex="0"><span aria-hidden="true">◈</span>ノイズ除去</button>
         <button id="nav-batch" class="nav-item" role="tab" data-page="batch" aria-controls="page-batch" aria-selected="false" tabindex="-1"><span aria-hidden="true">▦</span>バッチ</button>
         <button id="nav-watch" class="nav-item" role="tab" data-page="watch" aria-controls="page-watch" aria-selected="false" tabindex="-1"><span aria-hidden="true">◌</span>監視フォルダ</button>
+        <button id="nav-project" class="nav-item" role="tab" data-page="project" aria-controls="page-project" aria-selected="false" tabindex="-1"><span aria-hidden="true">⌗</span>プロジェクト</button>
         <button id="nav-live" class="nav-item" role="tab" data-page="live" aria-controls="page-live" aria-selected="false" tabindex="-1"><span aria-hidden="true">◉</span>リアルタイム</button>
         <button id="nav-plugin" class="nav-item" role="tab" data-page="plugin" aria-controls="page-plugin" aria-selected="false" tabindex="-1"><span aria-hidden="true">◫</span>DAW プラグイン</button>
         <button id="nav-compare" class="nav-item" role="tab" data-page="compare" aria-controls="page-compare" aria-selected="false" tabindex="-1"><span aria-hidden="true">◒</span>品質比較</button>
@@ -506,6 +535,51 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <button class="primary wide" id="start-watch">監視を開始 <span>→</span></button>
             <button class="danger wide hidden" id="stop-watch">停止</button>
           </article>
+        </div>
+      </section>
+
+      <section class="page" id="page-project" role="tabpanel" aria-labelledby="nav-project" aria-hidden="true">
+        <div class="grid two-col">
+          <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">PROJECT</span><h2>タイムラインプロジェクト</h2></div><span class="hint">PORTABLE · EXACT</span></div>
+              <p class="section-copy">source fingerprint と presentation timebase に固定された manifest を検証し、同じ決定論的 assembler で部分区間を連結します。</p>
+              <div class="file-row"><div><label>プロジェクトルート</label><div id="project-root-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-project-root">選択</button></div>
+              <div class="file-row"><div><label>プロジェクト manifest</label><div id="project-manifest-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-project-manifest">選択</button></div>
+              <input type="hidden" id="project-root-path"><input type="hidden" id="project-manifest-path">
+              <label>タイムライン<select id="project-timeline" disabled><option value="">manifest を選択</option></select></label>
+              <div class="button-row"><button class="secondary" id="validate-project" disabled>参照を検証</button><button class="secondary" id="plan-project" disabled>実行計画を確認</button><button class="secondary" id="save-project-plan" disabled>計画JSONを保存</button></div>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">ASSEMBLE</span><h2>タイムラインを書き出す</h2></div><span class="hint">FLOAT WAV · NO-CLOBBER</span></div>
+              <div class="file-row"><div><label>WAV 出力</label><div id="project-output-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-project-output">選択</button></div>
+              <div class="file-row"><div><label>署名付き実行証明（任意）</label><div id="project-receipt-display" class="path empty">使用しない</div></div><div class="button-row"><button class="secondary" id="clear-project-receipt">解除</button><button class="secondary" id="choose-project-receipt">保存先</button></div></div>
+              <div class="file-row"><div><label>署名鍵</label><div id="project-receipt-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-project-receipt-key">選択</button></div>
+              <input type="hidden" id="project-output-path"><input type="hidden" id="project-receipt-path"><input type="hidden" id="project-receipt-key-path">
+              <p class="field-hint">出力前に exact plan を再計算します。manifest、source、既存出力は置換しません。</p>
+              <button class="primary wide" id="assemble-project" disabled>タイムラインを組み立てる <span>→</span></button>
+            </article>
+          </div>
+          <div class="stack">
+            <article class="card result-card">
+              <div class="card-heading"><div><span class="step">EVIDENCE</span><h2>プロジェクト結果</h2></div></div>
+              <div id="project-result-empty" class="empty-panel">manifest とプロジェクトルートを選んでください</div>
+              <pre id="project-result" class="json-preview hidden"></pre>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">OFFLINE</span><h2>オフライン bundle</h2></div><span class="hint">DPB v1</span></div>
+              <p class="section-copy">既定では manifest、設定、preset、参照、検証証跡だけを運びます。source 音声と model payload は上限付きで明示した場合だけ含めます。</p>
+              <div class="file-row"><div><label>Bundle 保存先</label><div id="project-bundle-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-project-bundle-output">選択</button></div>
+              <input type="hidden" id="project-bundle-path">
+              <div class="toggle-grid"><label class="toggle"><input id="project-bundle-sources" type="checkbox"><span></span><div><b>source 音声を含める</b><small>明示した総量上限まで</small></div></label><label class="toggle"><input id="project-bundle-models" type="checkbox"><span></span><div><b>model payload を含める</b><small>署名と license を再検証</small></div></label></div>
+              <div class="form-grid two"><label>source 上限 MiB<input id="project-bundle-source-limit" type="number" value="1024" min="1" max="65536" disabled></label><label>model 上限 MiB<input id="project-bundle-model-limit" type="number" value="4096" min="1" max="65536" disabled></label></div>
+              <button class="primary wide" id="create-project-bundle" disabled>Bundle を作成</button>
+              <div class="file-row"><div><label>既存 bundle</label><div id="project-bundle-input-display" class="path empty">選択されていません</div></div><div class="button-row"><button class="secondary" id="inspect-project-bundle" disabled>検査</button><button class="secondary" id="choose-project-bundle-input">選択</button></div></div>
+              <div class="file-row"><div><label>新規の取込先フォルダ</label><div id="project-import-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-project-import">指定</button></div>
+              <input type="hidden" id="project-bundle-input-path"><input type="hidden" id="project-import-path">
+              <button class="primary wide" id="import-project-bundle" disabled>Bundle を検証して取込</button>
+            </article>
+          </div>
         </div>
       </section>
 
@@ -2427,6 +2501,282 @@ $("#choose-watch-state").addEventListener("click", async () => {
 });
 $("#start-watch").addEventListener("click", () => void startWatchAutomation().catch((error) => showToast(errorText(error), true)));
 $("#stop-watch").addEventListener("click", () => void stopWatchAutomation());
+
+function projectParentPath(path: string) {
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return index > 0 ? path.slice(0, index) : index === 0 ? path.slice(0, 1) : "";
+}
+
+function projectJoinPath(root: string, name: string) {
+  const separator = root.includes("\\") ? "\\" : "/";
+  return `${root.replace(/[\\/]$/, "")}${separator}${name}`;
+}
+
+function renderTimelineProjectResult(value: unknown) {
+  $("#project-result").textContent = JSON.stringify(value, null, 2);
+  $("#project-result").classList.remove("hidden");
+  $("#project-result-empty").classList.add("hidden");
+}
+
+function updateTimelineProjectControls() {
+  document.querySelectorAll<HTMLButtonElement>("#page-project button").forEach((button) => {
+    button.disabled = timelineProjectBusy;
+  });
+  const root = $<HTMLInputElement>("#project-root-path").value;
+  const manifest = $<HTMLInputElement>("#project-manifest-path").value;
+  const timeline = $<HTMLSelectElement>("#project-timeline").value;
+  const output = $<HTMLInputElement>("#project-output-path").value;
+  const bundleOutput = $<HTMLInputElement>("#project-bundle-path").value;
+  const bundleInput = $<HTMLInputElement>("#project-bundle-input-path").value;
+  const importPath = $<HTMLInputElement>("#project-import-path").value;
+  $<HTMLSelectElement>("#project-timeline").disabled = timelineProjectBusy || !timelineProjectManifest;
+  $<HTMLButtonElement>("#validate-project").disabled = timelineProjectBusy || !root || !manifest;
+  $<HTMLButtonElement>("#plan-project").disabled = timelineProjectBusy || !root || !manifest || !timeline || !output;
+  $<HTMLButtonElement>("#save-project-plan").disabled = timelineProjectBusy || !timelineProjectPlan;
+  $<HTMLButtonElement>("#assemble-project").disabled = timelineProjectBusy || !root || !manifest || !timeline || !output;
+  $<HTMLButtonElement>("#create-project-bundle").disabled = timelineProjectBusy || !root || !manifest || !bundleOutput;
+  $<HTMLButtonElement>("#inspect-project-bundle").disabled = timelineProjectBusy || !bundleInput;
+  $<HTMLButtonElement>("#import-project-bundle").disabled = timelineProjectBusy || !bundleInput || !importPath;
+}
+
+function setTimelineProjectBusy(busy: boolean) {
+  timelineProjectBusy = busy;
+  $("#page-project").setAttribute("aria-busy", String(busy));
+  document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((button) => { button.disabled = busy; });
+  $<HTMLButtonElement>("#check-update").disabled = busy;
+  updateTimelineProjectControls();
+}
+
+function ensureTimelineProjectIdle() {
+  if (timelineProjectBusy || watchRunning || activeJob !== null || pendingJobKind !== null
+    || previewJob !== null || pendingPreview || recommendationRunning || evaluationRunning
+    || activeModelJob !== null || pendingModelName !== null || updateUiBusy
+    || !$("#stop-live").classList.contains("hidden")) {
+    throw new Error(tr("別の処理が実行中です", "Another operation is running"));
+  }
+}
+
+async function runTimelineProjectOperation<T>(operation: () => Promise<T>): Promise<T> {
+  ensureTimelineProjectIdle();
+  setTimelineProjectBusy(true);
+  try { return await operation(); }
+  finally { setTimelineProjectBusy(false); }
+}
+
+function timelineProjectDocumentRequest() {
+  const manifest = $<HTMLInputElement>("#project-manifest-path").value;
+  const root = $<HTMLInputElement>("#project-root-path").value;
+  if (!manifest || !root) throw new Error(tr("manifest とプロジェクトルートを選んでください", "Select a manifest and project root"));
+  return { manifest, root };
+}
+
+function timelineProjectRequest() {
+  const document = timelineProjectDocumentRequest();
+  const timeline = $<HTMLSelectElement>("#project-timeline").value;
+  const output = $<HTMLInputElement>("#project-output-path").value;
+  if (!timeline || !output) throw new Error(tr("タイムラインと WAV 出力を選んでください", "Select a timeline and WAV output"));
+  return { ...document, timeline, output };
+}
+
+async function loadTimelineProject(path: string) {
+  const manifest = await runTimelineProjectOperation(() => invoke<TimelineProjectManifest>("inspect_project_manifest", { path }));
+  timelineProjectManifest = manifest;
+  timelineProjectPlan = null;
+  const timeline = $<HTMLSelectElement>("#project-timeline");
+  timeline.innerHTML = manifest.timelines.map((item) => `<option data-i18n-skip value="${escapeHtml(item.id)}">${escapeHtml(item.id)} · ${item.timescale} Hz · ${item.channels} ch</option>`).join("");
+  renderTimelineProjectResult(manifest);
+  updateTimelineProjectControls();
+}
+
+$("#choose-project-root").addEventListener("click", async () => {
+  const path = await open({ directory: true, multiple: false });
+  if (typeof path === "string") {
+    setPath("#project-root-path", "#project-root-display", path);
+    timelineProjectPlan = null;
+    updateTimelineProjectControls();
+  }
+});
+
+$("#choose-project-manifest").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize project", extensions: ["json"] }] });
+  if (typeof path !== "string") return;
+  setPath("#project-manifest-path", "#project-manifest-display", path);
+  if (!$<HTMLInputElement>("#project-root-path").value) {
+    setPath("#project-root-path", "#project-root-display", projectParentPath(path));
+  }
+  try { await loadTimelineProject(path); }
+  catch (error) {
+    timelineProjectManifest = null;
+    timelineProjectPlan = null;
+    $<HTMLSelectElement>("#project-timeline").innerHTML = `<option value="">${tr("manifest を選択", "Select a manifest")}</option>`;
+    updateTimelineProjectControls();
+    showToast(errorText(error), true);
+  }
+});
+
+$("#project-timeline").addEventListener("change", () => {
+  timelineProjectPlan = null;
+  updateTimelineProjectControls();
+});
+
+$("#choose-project-output").addEventListener("click", async () => {
+  const root = $<HTMLInputElement>("#project-root-path").value;
+  const timeline = $<HTMLSelectElement>("#project-timeline").value || "timeline";
+  const project = timelineProjectManifest?.project_id ?? "project";
+  const path = await save({
+    defaultPath: root ? projectJoinPath(root, `${project}.${timeline}.wav`) : `${project}.${timeline}.wav`,
+    filters: [{ name: "Float WAV", extensions: ["wav"] }],
+  });
+  if (path) {
+    setPath("#project-output-path", "#project-output-display", path);
+    timelineProjectPlan = null;
+    updateTimelineProjectControls();
+  }
+});
+
+$("#choose-project-receipt").addEventListener("click", async () => {
+  const root = $<HTMLInputElement>("#project-root-path").value;
+  const project = timelineProjectManifest?.project_id ?? "project";
+  const path = await save({
+    defaultPath: root ? projectJoinPath(root, `${project}.receipt.json`) : `${project}.receipt.json`,
+    filters: [{ name: "Project execution receipt", extensions: ["json"] }],
+  });
+  if (path) setPath("#project-receipt-path", "#project-receipt-display", path);
+});
+
+$("#choose-project-receipt-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Receipt secret key", extensions: ["json"] }] });
+  if (typeof path === "string") setPath("#project-receipt-key-path", "#project-receipt-key-display", path);
+});
+
+$("#clear-project-receipt").addEventListener("click", () => {
+  setPath("#project-receipt-path", "#project-receipt-display", null);
+  setPath("#project-receipt-key-path", "#project-receipt-key-display", null);
+  $("#project-receipt-display").textContent = tr("使用しない", "Disabled");
+});
+
+$("#validate-project").addEventListener("click", async () => {
+  try {
+    const report = await runTimelineProjectOperation(() => invoke("validate_project_manifest", { request: timelineProjectDocumentRequest() }));
+    renderTimelineProjectResult(report);
+    showToast(tr("プロジェクト参照を検証しました", "Project references verified"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+$("#plan-project").addEventListener("click", async () => {
+  try {
+    timelineProjectPlan = await runTimelineProjectOperation(() => invoke<TimelineProjectPlan>("plan_project_timeline", { request: timelineProjectRequest() }));
+    renderTimelineProjectResult(timelineProjectPlan);
+    updateTimelineProjectControls();
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+$("#save-project-plan").addEventListener("click", async () => {
+  if (!timelineProjectPlan) return;
+  const path = await save({ defaultPath: "denoize-project-plan.json", filters: [{ name: "Project execution plan", extensions: ["json"] }] });
+  if (!path) return;
+  try {
+    await invoke("save_project_execution_plan", { path, plan: timelineProjectPlan });
+    showToast(tr("プロジェクト実行計画を保存しました", "Project execution plan saved"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+$("#assemble-project").addEventListener("click", async () => {
+  try {
+    const report = await runTimelineProjectOperation(async () => {
+      const base = timelineProjectRequest();
+      const plan = await invoke<TimelineProjectPlan>("plan_project_timeline", { request: base });
+      timelineProjectPlan = plan;
+      renderTimelineProjectResult(plan);
+      return invoke<TimelineProjectRender>("assemble_project_timeline", { request: {
+        ...base,
+        plan,
+        receipt: $<HTMLInputElement>("#project-receipt-path").value || null,
+        receiptKey: $<HTMLInputElement>("#project-receipt-key-path").value || null,
+      } });
+    });
+    renderTimelineProjectResult(report);
+    showToast(tr("タイムラインを組み立てました", "Timeline assembled"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+for (const [checkboxSelector, limitSelector] of [
+  ["#project-bundle-sources", "#project-bundle-source-limit"],
+  ["#project-bundle-models", "#project-bundle-model-limit"],
+] as const) {
+  $(checkboxSelector).addEventListener("change", () => {
+    $<HTMLInputElement>(limitSelector).disabled = !$<HTMLInputElement>(checkboxSelector).checked;
+  });
+}
+
+$("#choose-project-bundle-output").addEventListener("click", async () => {
+  const root = $<HTMLInputElement>("#project-root-path").value;
+  const project = timelineProjectManifest?.project_id ?? "project";
+  const path = await save({
+    defaultPath: root ? projectJoinPath(root, `${project}.dpb`) : `${project}.dpb`,
+    filters: [{ name: "denoize project bundle", extensions: ["dpb"] }],
+  });
+  if (path) {
+    setPath("#project-bundle-path", "#project-bundle-display", path);
+    updateTimelineProjectControls();
+  }
+});
+
+$("#create-project-bundle").addEventListener("click", async () => {
+  try {
+    const document = timelineProjectDocumentRequest();
+    const includeSources = $<HTMLInputElement>("#project-bundle-sources").checked;
+    const includeModels = $<HTMLInputElement>("#project-bundle-models").checked;
+    const output = $<HTMLInputElement>("#project-bundle-path").value;
+    const info = await runTimelineProjectOperation(() => invoke<TimelineProjectBundleInfo>("create_project_bundle", { request: {
+      ...document,
+      output,
+      includeSources,
+      sourcePayloadLimitMb: includeSources ? Number($<HTMLInputElement>("#project-bundle-source-limit").value) : null,
+      includeModels,
+      modelPayloadLimitMb: includeModels ? Number($<HTMLInputElement>("#project-bundle-model-limit").value) : null,
+    } }));
+    renderTimelineProjectResult(info);
+    setPath("#project-bundle-input-path", "#project-bundle-input-display", output);
+    updateTimelineProjectControls();
+    showToast(tr("オフライン bundle を作成しました", "Offline bundle created"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+$("#choose-project-bundle-input").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize project bundle", extensions: ["dpb"] }] });
+  if (typeof path === "string") {
+    setPath("#project-bundle-input-path", "#project-bundle-input-display", path);
+    updateTimelineProjectControls();
+  }
+});
+
+$("#inspect-project-bundle").addEventListener("click", async () => {
+  try {
+    const path = $<HTMLInputElement>("#project-bundle-input-path").value;
+    const info = await runTimelineProjectOperation(() => invoke<TimelineProjectBundleInfo>("inspect_project_bundle", { path }));
+    renderTimelineProjectResult(info);
+    showToast(tr("オフライン bundle を検証しました", "Offline bundle verified"));
+  } catch (error) { showToast(errorText(error), true); }
+});
+
+$("#choose-project-import").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "denoize-imported-project" });
+  if (path) {
+    setPath("#project-import-path", "#project-import-display", path);
+    updateTimelineProjectControls();
+  }
+});
+
+$("#import-project-bundle").addEventListener("click", async () => {
+  try {
+    const path = $<HTMLInputElement>("#project-bundle-input-path").value;
+    const destination = $<HTMLInputElement>("#project-import-path").value;
+    const report = await runTimelineProjectOperation(() => invoke<Record<string, unknown>>("import_project_bundle", { path, destination }));
+    renderTimelineProjectResult(report);
+    showToast(tr("オフライン bundle を取り込みました", "Offline bundle imported"));
+  } catch (error) { showToast(errorText(error), true); }
+});
 
 const evaluationJsonSelectors: Array<[string, string, string]> = [
   ["#choose-evaluation-manifest", "#evaluation-manifest-path", "#evaluation-manifest-display"],

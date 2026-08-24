@@ -24,7 +24,7 @@ denoize update check-online \
   --state-dir "$STATE_DIR" \
   --channel stable \
   --platform linux-x86_64-appimage \
-  --current-version 0.69.0 \
+  --current-version 0.70.0 \
   --pretty
 ```
 
@@ -36,7 +36,7 @@ embedded byte against the signed manifest, and then publishes with no-clobber:
 ```sh
 denoize update bundle download denoize-update.dub \
   --platform linux-x86_64-appimage \
-  --from-version 0.69.0 \
+  --from-version 0.70.0 \
   --pretty
 ```
 
@@ -47,7 +47,7 @@ dry run are read-only; neither creates the state root:
 denoize update bundle inspect denoize-update.dub --pretty
 denoize update dry-run denoize-update.dub \
   --state-dir "$STATE_DIR" \
-  --current-version 0.69.0 \
+  --current-version 0.70.0 \
   --pretty
 ```
 
@@ -58,7 +58,7 @@ active with a pending-health record:
 ```sh
 denoize update apply denoize-update.dub \
   --state-dir "$STATE_DIR" \
-  --current-version 0.69.0 \
+  --current-version 0.70.0 \
   --pretty
 denoize update status --state-dir "$STATE_DIR" --pretty
 ```
@@ -124,10 +124,10 @@ but not URLs, credentials, user paths, or health tokens. The raw token exists
 only in the immediate apply/startup-health report and the owner-private state
 needed to confirm a restart; it is never copied into durable diagnostics.
 
-## v0.70.0 compatibility gate
+## v0.71.0 compatibility gate
 
-The first recoverable-update release accepts exact transitions from v0.68.0
-and v0.69.0. Every one of the six platform packages has two `.dub` assets, so
+This release accepts exact transitions from v0.69.0 and v0.70.0. Every one of
+the six platform packages has two `.dub` assets, so
 both migrations carry their own authenticated offline rollback payload. A
 future update must continue to cover at least the two preceding releases or
 reject the transition without modifying existing state.

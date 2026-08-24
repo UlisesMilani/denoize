@@ -48,6 +48,7 @@ pub use preview::{preview_worker_request_from_args, run_preview_worker};
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 static ACCESSIBILITY_E2E_ACTIVE: AtomicBool = AtomicBool::new(false);
 static EVALUATION_RUNNING: AtomicBool = AtomicBool::new(false);
+static PROJECT_OPERATION_RUNNING: AtomicBool = AtomicBool::new(false);
 const ACCESSIBILITY_E2E_ARGUMENT: &str = "--denoize-desktop-a11y-e2e";
 const MAX_DESKTOP_ERROR_DETAIL_BYTES: usize = 4 * 1024;
 const MAX_DESKTOP_ERROR_PARAMETERS: usize = 16;
@@ -1111,6 +1112,46 @@ struct EvaluationComparisonRequest {
     candidate_key: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectDocumentRequest {
+    manifest: String,
+    root: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectTimelineRequest {
+    manifest: String,
+    root: String,
+    timeline: String,
+    output: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectAssemblyRequest {
+    manifest: String,
+    root: String,
+    timeline: String,
+    output: String,
+    plan: denoize::ProjectExecutionPlan,
+    receipt: Option<String>,
+    receipt_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProjectBundleBuildRequest {
+    manifest: String,
+    root: String,
+    output: String,
+    include_sources: bool,
+    source_payload_limit_mb: Option<usize>,
+    include_models: bool,
+    model_payload_limit_mb: Option<usize>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchRequest {
@@ -1909,6 +1950,395 @@ async fn plan_batch(request: BatchRequest) -> DesktopResult<ExecutionPlan> {
             .await
             .map_err(|error| format!("バッチ実行計画タスクに失敗しました: {error}"))??,
     )
+}
+
+struct ProjectOperationGuard;
+
+impl ProjectOperationGuard {
+    fn acquire() -> Result<Self, String> {
+        PROJECT_OPERATION_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "another project operation is already running".to_string())?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ProjectOperationGuard {
+    fn drop(&mut self) {
+        PROJECT_OPERATION_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn canonical_desktop_project_root(raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err("project root must not be empty".into());
+    }
+    let root = std::fs::canonicalize(raw)
+        .map_err(|error| format!("resolve project root {raw}: {error}"))?;
+    if !root.is_dir() {
+        return Err(format!(
+            "project root is not a directory: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+fn desktop_project_path(root: &Path, raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err("project path must not be empty".into());
+    }
+    let path = PathBuf::from(raw);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    })
+}
+
+fn contained_desktop_project_input(
+    root: &Path,
+    raw: &str,
+    context: &str,
+) -> Result<PathBuf, String> {
+    let requested = desktop_project_path(root, raw)?;
+    let resolved = std::fs::canonicalize(&requested)
+        .map_err(|error| format!("resolve {context} {}: {error}", requested.display()))?;
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "{context} is outside project root {}",
+            root.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn contained_desktop_project_output(
+    root: &Path,
+    raw: &str,
+    context: &str,
+) -> Result<PathBuf, String> {
+    let requested = desktop_project_path(root, raw)?;
+    let name = requested
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("{context} must name a file"))?;
+    let parent = requested
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(root);
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("resolve {context} parent {}: {error}", parent.display()))?;
+    if !parent.starts_with(root) {
+        return Err(format!(
+            "{context} is outside project root {}",
+            root.display()
+        ));
+    }
+    Ok(parent.join(name))
+}
+
+fn prepare_desktop_project_plan(
+    request: &ProjectTimelineRequest,
+) -> Result<
+    (
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        denoize::ProjectManifest,
+        denoize::ProjectExecutionPlan,
+    ),
+    String,
+> {
+    let root = canonical_desktop_project_root(&request.root)?;
+    let manifest_path =
+        contained_desktop_project_input(&root, &request.manifest, "project manifest")?;
+    let output = contained_desktop_project_output(&root, &request.output, "project output")?;
+    if output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_none_or(|extension| !extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("project timeline output must use the .wav extension".into());
+    }
+    let manifest = denoize::ProjectManifest::from_file(&manifest_path)?;
+    denoize::validate_project_files(&manifest, &root, DecodeLimits::default())?;
+    let timeline = if request.timeline.trim().is_empty() {
+        manifest
+            .timelines
+            .first()
+            .map(|timeline| timeline.id.as_str())
+            .ok_or("project has no timeline")?
+    } else {
+        request.timeline.as_str()
+    };
+    manifest.timeline(timeline)?;
+    let manifest_reference =
+        denoize::project_artifact_reference("manifest", &manifest_path, &root)?;
+    let output_locator = denoize::portable_locator(&output, &root)?;
+    let plan = denoize::ProjectExecutionPlan::new(
+        &manifest,
+        timeline,
+        manifest_reference,
+        output_locator,
+        CommitMode::NoClobber,
+    )?;
+    Ok((root, manifest_path, output, manifest, plan))
+}
+
+struct PreparedDesktopProjectReceipt {
+    path: PathBuf,
+    key: ReceiptSecretKey,
+    stage: AtomicOutput,
+}
+
+fn prepare_desktop_project_receipt(
+    request: &ProjectAssemblyRequest,
+    root: &Path,
+    manifest: &Path,
+    output: &Path,
+) -> Result<Option<PreparedDesktopProjectReceipt>, String> {
+    validate_receipt_pair(request.receipt.as_deref(), request.receipt_key.as_deref())?;
+    let (Some(receipt), Some(key)) = (&request.receipt, &request.receipt_key) else {
+        return Ok(None);
+    };
+    let receipt = contained_desktop_project_output(root, receipt, "project receipt")?;
+    let key = PathBuf::from(key);
+    require_missing_receipt(&receipt)?;
+    require_distinct_execution_paths(&[
+        ("project manifest", manifest),
+        ("project output", output),
+        ("project receipt", &receipt),
+        ("project receipt key", &key),
+    ])?;
+    let secret = ReceiptSecretKey::from_file(&key)?;
+    let stage = AtomicOutput::new(&receipt)?;
+    Ok(Some(PreparedDesktopProjectReceipt {
+        path: receipt,
+        key: secret,
+        stage,
+    }))
+}
+
+fn write_desktop_project_receipt_stage(
+    receipt: &denoize::SignedProjectExecutionReceipt,
+    prepared: &mut PreparedDesktopProjectReceipt,
+) -> Result<(), String> {
+    let mut bytes = receipt.to_pretty_json()?.into_bytes();
+    bytes.push(b'\n');
+    prepared
+        .stage
+        .file_mut()
+        .write_all(&bytes)
+        .map_err(|error| {
+            format!(
+                "write staged project receipt {}: {error}",
+                prepared.path.display()
+            )
+        })?;
+    prepared.stage.file_mut().sync_data().map_err(|error| {
+        format!(
+            "sync staged project receipt {}: {error}",
+            prepared.path.display()
+        )
+    })
+}
+
+fn project_bundle_payload_limit(
+    included: bool,
+    limit_mb: Option<usize>,
+    label: &str,
+) -> Result<u64, String> {
+    match (included, limit_mb) {
+        (false, None) => Ok(0),
+        (false, Some(_)) => Err(format!(
+            "project {label} payload limit requires its include option"
+        )),
+        (true, None) => Err(format!(
+            "included project {label} payloads require a positive MiB limit"
+        )),
+        (true, Some(limit_mb)) => checked_desktop_mib(Some(limit_mb), label)?
+            .ok_or_else(|| format!("included project {label} payload limit is missing")),
+    }
+}
+
+#[tauri::command]
+async fn inspect_project_manifest(path: String) -> DesktopResult<denoize::ProjectManifest> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        if path.trim().is_empty() {
+            return Err("project manifest path must not be empty".into());
+        }
+        denoize::ProjectManifest::from_file(path)
+    })
+    .await
+    .map_err(|error| format!("project manifest inspection task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn validate_project_manifest(
+    request: ProjectDocumentRequest,
+) -> DesktopResult<denoize::ProjectValidationReport> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ProjectOperationGuard::acquire()?;
+        let root = canonical_desktop_project_root(&request.root)?;
+        let path = contained_desktop_project_input(&root, &request.manifest, "project manifest")?;
+        let manifest = denoize::ProjectManifest::from_file(path)?;
+        denoize::validate_project_files(&manifest, root, DecodeLimits::default())
+    })
+    .await
+    .map_err(|error| format!("project validation task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn plan_project_timeline(
+    request: ProjectTimelineRequest,
+) -> DesktopResult<denoize::ProjectExecutionPlan> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ProjectOperationGuard::acquire()?;
+        prepare_desktop_project_plan(&request).map(|(_, _, _, _, plan)| plan)
+    })
+    .await
+    .map_err(|error| format!("project planning task failed: {error}"))??)
+}
+
+#[tauri::command]
+fn save_project_execution_plan(
+    path: String,
+    plan: denoize::ProjectExecutionPlan,
+) -> DesktopResult<()> {
+    if path.trim().is_empty() {
+        return Err("project plan destination must not be empty".into());
+    }
+    denoize::write_project_execution_plan(path, &plan, CommitMode::NoClobber, true)
+        .map_err(DesktopError::from)
+}
+
+#[tauri::command]
+async fn assemble_project_timeline(
+    request: ProjectAssemblyRequest,
+) -> DesktopResult<denoize::ProjectRenderReport> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ProjectOperationGuard::acquire()?;
+        let timeline_request = ProjectTimelineRequest {
+            manifest: request.manifest.clone(),
+            root: request.root.clone(),
+            timeline: request.timeline.clone(),
+            output: request.output.clone(),
+        };
+        let (root, manifest_path, output, manifest, expected_plan) =
+            prepare_desktop_project_plan(&timeline_request)?;
+        if request.plan != expected_plan {
+            return Err(format!(
+                "project assembly no longer matches its reviewed plan: reviewed={} current={}",
+                request.plan.digest()?,
+                expected_plan.digest()?
+            ));
+        }
+        let prepared_receipt = prepare_desktop_project_receipt(
+            &request,
+            &root,
+            &manifest_path,
+            &output,
+        )?;
+        let report = denoize::assemble_project_timeline(
+            &manifest,
+            &expected_plan.timeline_id,
+            &root,
+            &output,
+            CommitMode::NoClobber,
+            DecodeLimits::default(),
+        )?;
+        if let Some(mut prepared) = prepared_receipt {
+            let receipt = denoize::SignedProjectExecutionReceipt::sign(
+                &expected_plan,
+                report.output,
+                &prepared.key,
+            )?;
+            write_desktop_project_receipt_stage(&receipt, &mut prepared)?;
+            let receipt_path = prepared.path.clone();
+            prepared
+                .stage
+                .commit(CommitMode::NoClobber)
+                .map_err(|error| {
+                    format!(
+                        "project audio was published to {}, but its signed receipt could not be published to {}: {error}",
+                        output.display(),
+                        receipt_path.display()
+                    )
+                })?;
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|error| format!("project assembly task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn create_project_bundle(
+    request: ProjectBundleBuildRequest,
+) -> DesktopResult<denoize::ProjectBundleInfo> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ProjectOperationGuard::acquire()?;
+        if request.output.trim().is_empty() {
+            return Err("project bundle destination must not be empty".into());
+        }
+        let root = canonical_desktop_project_root(&request.root)?;
+        let manifest =
+            contained_desktop_project_input(&root, &request.manifest, "project manifest")?;
+        let options = denoize::ProjectBundleBuildOptions {
+            include_sources: request.include_sources,
+            source_payload_limit_bytes: project_bundle_payload_limit(
+                request.include_sources,
+                request.source_payload_limit_mb,
+                "source",
+            )?,
+            include_models: request.include_models,
+            model_payload_limit_bytes: project_bundle_payload_limit(
+                request.include_models,
+                request.model_payload_limit_mb,
+                "model",
+            )?,
+            commit_mode: CommitMode::NoClobber,
+        };
+        denoize::build_project_bundle(
+            manifest,
+            root,
+            request.output,
+            &options,
+            DecodeLimits::default(),
+        )
+    })
+    .await
+    .map_err(|error| format!("project bundle creation task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn inspect_project_bundle(path: String) -> DesktopResult<denoize::ProjectBundleInfo> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ProjectOperationGuard::acquire()?;
+        if path.trim().is_empty() {
+            return Err("project bundle path must not be empty".into());
+        }
+        denoize::inspect_project_bundle(path)
+    })
+    .await
+    .map_err(|error| format!("project bundle inspection task failed: {error}"))??)
+}
+
+#[tauri::command]
+async fn import_project_bundle(
+    path: String,
+    destination: String,
+) -> DesktopResult<denoize::ProjectBundleImportReport> {
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let _guard = ProjectOperationGuard::acquire()?;
+        if path.trim().is_empty() || destination.trim().is_empty() {
+            return Err("project bundle and new destination must not be empty".into());
+        }
+        denoize::import_project_bundle(path, destination)
+    })
+    .await
+    .map_err(|error| format!("project bundle import task failed: {error}"))??)
 }
 
 #[tauri::command]
@@ -8461,6 +8891,14 @@ pub fn run() {
             recommend_settings,
             plan_process,
             plan_batch,
+            inspect_project_manifest,
+            validate_project_manifest,
+            plan_project_timeline,
+            save_project_execution_plan,
+            assemble_project_timeline,
+            create_project_bundle,
+            inspect_project_bundle,
+            import_project_bundle,
             save_execution_plan,
             validate_evaluation_corpus,
             run_release_evaluation,
@@ -8572,6 +9010,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static PROJECT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn application_update_platform_tracks_the_packaged_bundle_type() {
@@ -8685,7 +9125,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "fbcc5581afebfe2dc826006e8420c2c7c16ea87ebbd3bbf5ceb88edc15a994fb";
+        "615725b48303953aa4733a7f8cfe03492332b778b9909874d7cd93c38693e08c";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {
@@ -8894,6 +9334,157 @@ mod tests {
         wav.extend((samples.len() as u32).to_le_bytes());
         wav.extend(samples);
         std::fs::write(path, wav).unwrap();
+    }
+
+    fn desktop_timeline_project_fixture(
+        directory: &TestDirectory,
+    ) -> (PathBuf, denoize::ProjectManifest) {
+        let source_path = directory.join("source.wav");
+        let manifest_path = directory.join("project.json");
+        write_test_wav(&source_path);
+        let inspection =
+            denoize::inspect_project_source(&source_path, DecodeLimits::default()).unwrap();
+        let source =
+            denoize::ProjectSource::new("source", "source.wav", inspection.clone(), None).unwrap();
+        let selection = denoize::ProjectSelection::new(
+            "selection",
+            "source",
+            denoize::PresentationRegion::new(
+                inspection.fingerprint,
+                inspection.timescale,
+                0,
+                inspection.presentation_frames,
+            )
+            .unwrap(),
+            vec![0],
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        let timeline = denoize::ProjectTimeline::new(
+            "main",
+            inspection.timescale,
+            inspection.channels,
+            vec![selection],
+        )
+        .unwrap();
+        let manifest = denoize::ProjectManifest::new(
+            "desktop-project",
+            vec![source],
+            vec![timeline],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        denoize::write_project_manifest(&manifest_path, &manifest, CommitMode::NoClobber, true)
+            .unwrap();
+        (manifest_path, manifest)
+    }
+
+    #[test]
+    fn desktop_project_assembly_requires_the_reviewed_plan_and_signs_the_exact_output() {
+        let _project_lock = PROJECT_TEST_LOCK.lock().unwrap();
+        let directory = TestDirectory::create("timeline-project");
+        let (manifest_path, _) = desktop_timeline_project_fixture(&directory);
+        let output = directory.join("assembled.wav");
+        let receipt = directory.join("assembled.receipt.json");
+        let secret = directory.join("receipt-secret.json");
+        let public = directory.join("receipt-public.json");
+        denoize::write_new_receipt_keypair(&secret, &public).unwrap();
+        let timeline_request = ProjectTimelineRequest {
+            manifest: manifest_path.to_string_lossy().into_owned(),
+            root: directory.path.to_string_lossy().into_owned(),
+            timeline: "main".into(),
+            output: output.to_string_lossy().into_owned(),
+        };
+        let (_, _, _, _, plan) = prepare_desktop_project_plan(&timeline_request).unwrap();
+
+        let report =
+            tauri::async_runtime::block_on(assemble_project_timeline(ProjectAssemblyRequest {
+                manifest: timeline_request.manifest.clone(),
+                root: timeline_request.root.clone(),
+                timeline: timeline_request.timeline.clone(),
+                output: timeline_request.output.clone(),
+                plan: plan.clone(),
+                receipt: Some(receipt.to_string_lossy().into_owned()),
+                receipt_key: Some(secret.to_string_lossy().into_owned()),
+            }))
+            .unwrap();
+        assert_eq!(report.schema, denoize::PROJECT_RENDER_SCHEMA);
+        let signed = denoize::SignedProjectExecutionReceipt::from_file(&receipt).unwrap();
+        let key = ReceiptPublicKey::from_file(public).unwrap();
+        signed
+            .verify_with_key(&key, Some(&plan), &directory.path)
+            .unwrap();
+
+        let rejected_output = directory.join("rejected.wav");
+        let rejected_request = ProjectTimelineRequest {
+            output: rejected_output.to_string_lossy().into_owned(),
+            ..timeline_request
+        };
+        let (_, _, _, _, expected) = prepare_desktop_project_plan(&rejected_request).unwrap();
+        let mut stale = expected.clone();
+        stale.output.path = "different.wav".into();
+        let error =
+            tauri::async_runtime::block_on(assemble_project_timeline(ProjectAssemblyRequest {
+                manifest: rejected_request.manifest,
+                root: rejected_request.root,
+                timeline: rejected_request.timeline,
+                output: rejected_request.output,
+                plan: stale,
+                receipt: None,
+                receipt_key: None,
+            }))
+            .unwrap_err();
+        assert!(error.technical_detail.contains("reviewed plan"));
+        assert!(!rejected_output.exists());
+    }
+
+    #[test]
+    fn desktop_project_bundle_defaults_to_references_and_imports_no_clobber() {
+        let _project_lock = PROJECT_TEST_LOCK.lock().unwrap();
+        let directory = TestDirectory::create("timeline-project-bundle");
+        let (manifest, _) = desktop_timeline_project_fixture(&directory);
+        let bundle = directory.join("project.dpb");
+        let destination = directory.join("imported-project");
+        let info =
+            tauri::async_runtime::block_on(create_project_bundle(ProjectBundleBuildRequest {
+                manifest: manifest.to_string_lossy().into_owned(),
+                root: directory.path.to_string_lossy().into_owned(),
+                output: bundle.to_string_lossy().into_owned(),
+                include_sources: false,
+                source_payload_limit_mb: None,
+                include_models: false,
+                model_payload_limit_mb: None,
+            }))
+            .unwrap();
+        assert!(!info.source_payloads_included);
+        assert_eq!(info.source_payload_bytes, 0);
+        assert!(bundle.exists());
+
+        let inspected =
+            tauri::async_runtime::block_on(inspect_project_bundle(bundle.to_string_lossy().into()))
+                .unwrap();
+        assert_eq!(inspected, info);
+        let imported = tauri::async_runtime::block_on(import_project_bundle(
+            bundle.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        assert_eq!(imported.omitted_sources, vec!["source"]);
+        assert!(destination.join("project.denoize.json").exists());
+        assert!(!destination.join("source.wav").exists());
+
+        let error = tauri::async_runtime::block_on(import_project_bundle(
+            bundle.to_string_lossy().into_owned(),
+            destination.to_string_lossy().into_owned(),
+        ))
+        .unwrap_err();
+        assert!(error.technical_detail.contains("already exists"));
     }
 
     fn write_test_stereo_wav(path: &Path) {

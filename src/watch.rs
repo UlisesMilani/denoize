@@ -42,6 +42,10 @@ const MAX_PORTABLE_FILENAME_UNITS: usize = 240;
 const MAX_DIGESTED_STEM_UNITS: usize = 120;
 const RECEIPT_SUFFIX: &str = ".receipt.json";
 const QUARANTINE_REASON_SUFFIX: &str = ".denoize-watch.json";
+const DEFAULT_AUDIO_INPUT_EXTENSIONS: &[&str] = &[
+    "wav", "rf64", "bwf", "aif", "aiff", "aifc", "caf", "mp3", "m4a", "m4b", "mp4", "aac", "flac",
+    "opus", "ogg", "oga", "vorbis",
+];
 
 /// Configuration for one durable watch-folder instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +56,7 @@ pub struct WatchFolderConfig {
     receipt_root: PathBuf,
     state_path: PathBuf,
     processor_identity: Digest,
+    input_extensions: Vec<String>,
     output_extension: String,
     recursive: bool,
     settle_millis: u64,
@@ -86,6 +91,10 @@ impl WatchFolderConfig {
             state_path: output_root.join(".denoize-watch-state.json"),
             processor_identity,
             output_root,
+            input_extensions: DEFAULT_AUDIO_INPUT_EXTENSIONS
+                .iter()
+                .map(|extension| (*extension).into())
+                .collect(),
             output_extension: "wav".into(),
             recursive: false,
             settle_millis: DEFAULT_SETTLE_MILLIS,
@@ -114,6 +123,24 @@ impl WatchFolderConfig {
 
     pub fn with_output_extension(mut self, extension: impl Into<String>) -> Self {
         self.output_extension = extension.into();
+        self
+    }
+
+    /// Restrict candidate discovery to an explicit portable extension set.
+    /// This lets other deterministic processors reuse the same durable watch
+    /// state machine without treating arbitrary files as audio.
+    pub fn with_input_extensions<I, S>(mut self, extensions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.input_extensions = extensions
+            .into_iter()
+            .map(Into::into)
+            .map(|extension: String| extension.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+        self.input_extensions.sort();
+        self.input_extensions.dedup();
         self
     }
 
@@ -172,6 +199,10 @@ impl WatchFolderConfig {
         &self.output_extension
     }
 
+    pub fn input_extensions(&self) -> &[String] {
+        &self.input_extensions
+    }
+
     pub fn recursive(&self) -> bool {
         self.recursive
     }
@@ -207,6 +238,18 @@ impl WatchFolderConfig {
                 "unsupported watch output extension: {}",
                 self.output_extension
             ));
+        }
+        if self.input_extensions.is_empty()
+            || self.input_extensions.len() > 32
+            || self.input_extensions.iter().any(|extension| {
+                extension.is_empty()
+                    || extension.len() > 16
+                    || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            })
+        {
+            return Err(
+                "watch input extensions must contain 1..=32 portable alphanumeric values".into(),
+            );
         }
         if self.poll_millis == 0 || self.poll_millis > MAX_MILLIS {
             return Err(format!(
@@ -610,6 +653,7 @@ impl WatchFolder {
             &self.input_root,
             self.config.recursive,
             self.config.max_files,
+            &self.config.input_extensions,
         )?;
         report.observed = collected.files.len();
         report.scan_errors = collected.scan_errors;
@@ -1355,32 +1399,11 @@ fn file_identity(
     Ok(None)
 }
 
-fn is_supported_audio_path(path: &Path) -> bool {
+fn has_supported_extension(path: &Path, supported: &[String]) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "wav"
-                    | "rf64"
-                    | "bwf"
-                    | "aif"
-                    | "aiff"
-                    | "aifc"
-                    | "caf"
-                    | "mp3"
-                    | "m4a"
-                    | "m4b"
-                    | "mp4"
-                    | "aac"
-                    | "flac"
-                    | "opus"
-                    | "ogg"
-                    | "oga"
-                    | "vorbis"
-            )
-        })
-        .unwrap_or(false)
+        .map(|extension| extension.to_ascii_lowercase())
+        .is_some_and(|extension| supported.iter().any(|value| value == &extension))
 }
 
 struct CollectedInputs {
@@ -1388,7 +1411,12 @@ struct CollectedInputs {
     scan_errors: usize,
 }
 
-fn collect_inputs(root: &Path, recursive: bool, maximum: usize) -> Result<CollectedInputs, String> {
+fn collect_inputs(
+    root: &Path,
+    recursive: bool,
+    maximum: usize,
+    supported_extensions: &[String],
+) -> Result<CollectedInputs, String> {
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
     let mut files = Vec::new();
     let mut entries = 0_usize;
@@ -1447,7 +1475,7 @@ fn collect_inputs(root: &Path, recursive: bool, maximum: usize) -> Result<Collec
             let path = entry.path();
             if file_type.is_dir() && recursive {
                 pending.push((path, depth + 1));
-            } else if file_type.is_file() && is_supported_audio_path(&path) {
+            } else if file_type.is_file() && has_supported_extension(&path, supported_extensions) {
                 files.push(path);
             }
         }

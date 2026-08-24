@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-watch-cycle-v1.schema.json",
+  "title": "denoize durable project watch cycle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "root",
+    "input",
+    "output",
+    "timeline",
+    "cancelled",
+    "observed",
+    "pending",
+    "attempted",
+    "succeeded",
+    "retrying",
+    "quarantined",
+    "superseded",
+    "scan_errors"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-project-watch-cycle-v1" },
+    "schema_version": { "const": 1 },
+    "root": { "type": "string", "minLength": 1 },
+    "input": { "type": "string", "minLength": 1 },
+    "output": { "type": "string", "minLength": 1 },
+    "timeline": {
+      "oneOf": [
+        { "$ref": "#/$defs/id" },
+        { "type": "null" }
+      ]
+    },
+    "cancelled": { "type": "boolean" },
+    "observed": { "$ref": "#/$defs/count" },
+    "pending": { "$ref": "#/$defs/count" },
+    "attempted": { "$ref": "#/$defs/count" },
+    "succeeded": { "$ref": "#/$defs/count" },
+    "retrying": { "$ref": "#/$defs/count" },
+    "quarantined": { "$ref": "#/$defs/count" },
+    "superseded": { "$ref": "#/$defs/count" },
+    "scan_errors": { "$ref": "#/$defs/count" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    }
+  }
+}

@@ -8,7 +8,7 @@
 
 [package]
 name = "denoize"
-version = "0.70.0"
+version = "0.71.0"
 edition = "2021"
 rust-version = "1.96"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
@@ -45,6 +45,7 @@ include = [
     "/scripts/export-sgmse.py",
     "/scripts/validate-sgmse.py",
     "/scripts/generate-cli-docs.sh",
+    "/scripts/test-project-schemas.py",
     "/scripts/test-evaluation-evidence.sh",
     "/scripts/build-offline-model-bundle.sh",
     "/scripts/generate-release-evidence.py",
@@ -55,6 +56,7 @@ include = [
     "/docs/evaluation.md",
     "/docs/json.md",
     "/docs/models.md",
+    "/docs/projects.md",
     "/docs/resilience.md",
     "/docs/release-evidence.md",
     "/docs/updates.md",

@@ -3,7 +3,8 @@ use std::path::Path;
 use denoize::batch_resume::{Digest, FileFingerprint};
 use denoize::{
     ExecutionKind, ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, PlannedArtifact,
-    PlannedOutput, PlannedResources, ReceiptItem, ReceiptTrustPolicy, SignedExecutionReceipt,
+    PlannedOutput, PlannedResources, ProjectExecutionPlan, ProjectManifest, ReceiptItem,
+    ReceiptTrustPolicy, SignedExecutionReceipt, SignedProjectExecutionReceipt,
 };
 
 #[allow(dead_code)]
@@ -194,6 +195,83 @@ fn automation_seeds(directory: &Path) -> Vec<(&'static str, Vec<u8>)> {
     let policy = ReceiptTrustPolicy::new(vec![public.clone()], Vec::new())
         .expect("construct valid resilience trust policy");
 
+    let project_source_path = directory.join("project-source.wav");
+    denoize::write_audio(
+        &project_source_path,
+        &audio(),
+        denoize::EncodeOptions::default(),
+    )
+    .expect("write project resilience source");
+    let inspection =
+        denoize::inspect_project_source(&project_source_path, denoize::DecodeLimits::default())
+            .expect("inspect project resilience source");
+    let project_source =
+        denoize::ProjectSource::new("source", "project-source.wav", inspection.clone(), None)
+            .expect("construct project resilience source");
+    let project_selection = denoize::ProjectSelection::new(
+        "selection",
+        "source",
+        denoize::PresentationRegion::new(
+            inspection.fingerprint,
+            inspection.timescale,
+            0,
+            inspection.presentation_frames,
+        )
+        .expect("construct project resilience region"),
+        vec![0],
+        0,
+        0,
+        0,
+    )
+    .expect("construct project resilience selection");
+    let project_timeline = denoize::ProjectTimeline::new(
+        "main",
+        inspection.timescale,
+        inspection.channels,
+        vec![project_selection],
+    )
+    .expect("construct project resilience timeline");
+    let project = ProjectManifest::new(
+        "parser-resilience",
+        vec![project_source],
+        vec![project_timeline],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("construct project resilience manifest");
+    let project_path = directory.join("project.json");
+    denoize::write_project_manifest(
+        &project_path,
+        &project,
+        denoize::CommitMode::NoClobber,
+        false,
+    )
+    .expect("write project resilience manifest");
+    let project_plan = ProjectExecutionPlan::new(
+        &project,
+        "main",
+        denoize::project_artifact_reference("manifest", &project_path, directory)
+            .expect("reference project resilience manifest"),
+        "project-output.wav",
+        denoize::CommitMode::NoClobber,
+    )
+    .expect("construct project resilience plan");
+    let project_receipt =
+        SignedProjectExecutionReceipt::sign(&project_plan, fingerprint(5), &secret)
+            .expect("sign project resilience receipt");
+    let project_bundle_path = directory.join("project.dpb");
+    denoize::build_project_bundle(
+        &project_path,
+        directory,
+        &project_bundle_path,
+        &denoize::ProjectBundleBuildOptions::default(),
+        denoize::DecodeLimits::default(),
+    )
+    .expect("build project resilience bundle");
+
     vec![
         (
             "execution-plan",
@@ -227,6 +305,31 @@ fn automation_seeds(directory: &Path) -> Vec<(&'static str, Vec<u8>)> {
                 .into_bytes(),
         ),
         ("offline-bundle", b"DENOIZE-MODEL-BUNDLE\0v1\0".to_vec()),
+        (
+            "project-manifest",
+            project
+                .to_json()
+                .expect("serialize project resilience manifest")
+                .into_bytes(),
+        ),
+        (
+            "project-plan",
+            project_plan
+                .to_json()
+                .expect("serialize project resilience plan")
+                .into_bytes(),
+        ),
+        (
+            "project-receipt",
+            project_receipt
+                .to_json()
+                .expect("serialize project resilience receipt")
+                .into_bytes(),
+        ),
+        (
+            "project-bundle",
+            std::fs::read(project_bundle_path).expect("read project resilience bundle"),
+        ),
     ]
 }
 
@@ -236,7 +339,11 @@ fn exercise_automation(path: &Path) {
     let _ = denoize::ReceiptPublicKey::from_file(path);
     let _ = denoize::ReceiptSecretKey::from_file(path);
     let _ = ReceiptTrustPolicy::from_file(path);
+    let _ = ProjectManifest::from_file(path);
+    let _ = ProjectExecutionPlan::from_file(path);
+    let _ = SignedProjectExecutionReceipt::from_file(path);
     let _ = denoize::models::inspect_offline_bundle(path);
+    let _ = denoize::inspect_project_bundle(path);
 }
 
 #[test]

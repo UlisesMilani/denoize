@@ -65,6 +65,9 @@ jobs:
       - name: Run release tests
         run: cargo test --locked --all-targets --features full
 
+      - name: Validate project JSON contracts
+        run: python3 scripts/test-project-schemas.py --denoize target/debug/denoize
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -94,6 +97,7 @@ jobs:
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
+          python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
@@ -518,6 +522,9 @@ jobs:
           cp schemas/denoize-job-status-v1.schema.json "$job_status_schema"
           cp schemas/denoize-listening-result-v1.schema.json "$listening_result_schema"
           cp schemas/denoize-presentation-region-v1.schema.json "$presentation_region_schema"
+          for project_schema in schemas/denoize-project-*.schema.json; do
+            cp "$project_schema" "$asset_dir/"
+          done
           cp schemas/denoize-recommendation-v1.schema.json "$recommendation_schema"
           cp schemas/denoize-release-evidence-v1.schema.json "$release_evidence_schema"
           cp schemas/denoize-execution-plan-v1.schema.json "$execution_plan_schema"
@@ -558,6 +565,7 @@ jobs:
             "$job_dry_run_schema" "$job_history_schema" "$job_status_schema" \
             "$listening_result_schema" \
             "$presentation_region_schema" \
+            "$asset_dir"/denoize-project-*.schema.json \
             "$recommendation_schema" "$release_evidence_schema" \
             "$execution_plan_schema" "$stream_execution_plan_schema" \
             "$execution_receipt_schema" "$stream_execution_receipt_schema" \
@@ -745,7 +753,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.68.0 0.69.0)
+          rollback_versions=(0.69.0 0.70.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-execution-receipt-v1.schema.json",
+  "title": "denoize signed deterministic project timeline receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "payload", "signature"],
+  "properties": {
+    "schema": { "const": "denoize-project-execution-receipt-v1" },
+    "schema_version": { "const": 1 },
+    "payload": { "$ref": "#/$defs/payload" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$"
+    },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "locator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!\\.\\.?(?:/|$))(?!.*[/]\\.\\.?(?:/|$))(?!.*\\\\)(?!.*:)[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255}(?:/[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255})*$"
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "format", "fingerprint"],
+      "properties": {
+        "path": { "$ref": "#/$defs/locator" },
+        "format": { "const": "wav-f32" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" }
+      }
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "denoize_version",
+        "plan_digest",
+        "project_id",
+        "manifest_digest",
+        "timeline_id",
+        "timeline_digest",
+        "output",
+        "timescale",
+        "channels",
+        "presentation_frames",
+        "outcome"
+      ],
+      "properties": {
+        "denoize_version": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "plan_digest": { "$ref": "#/$defs/digest" },
+        "project_id": { "$ref": "#/$defs/id" },
+        "manifest_digest": { "$ref": "#/$defs/digest" },
+        "timeline_id": { "$ref": "#/$defs/id" },
+        "timeline_digest": { "$ref": "#/$defs/digest" },
+        "output": { "$ref": "#/$defs/output" },
+        "timescale": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "presentation_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "outcome": { "const": "succeeded" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "key_id": { "$ref": "#/$defs/digest" },
+        "value_base64": { "type": "string", "pattern": "^[A-Za-z0-9+/]{86}==$" }
+      }
+    }
+  }
+}

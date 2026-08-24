@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-render-v1.schema.json",
+  "title": "denoize project render v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "project_id", "manifest_digest", "timeline_id", "timeline_digest", "output", "timescale", "channels", "presentation_frames", "retained_pcm_upper_bound_bytes"],
+  "properties": {
+    "schema": { "const": "denoize-project-render-v1" },
+    "schema_version": { "const": 1 },
+    "project_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$" },
+    "manifest_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "timeline_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$" },
+    "timeline_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "output": { "$ref": "#/$defs/fingerprint" },
+    "timescale": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "presentation_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "retained_pcm_upper_bound_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+  },
+  "$defs": {
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

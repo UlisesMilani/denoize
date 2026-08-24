@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-verification-v1.schema.json",
+  "title": "denoize project verification v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "project_id", "manifest_digest", "sources_verified", "settings_verified", "presets_verified", "models_verified", "plans_verified", "receipts_verified", "timelines_verified"],
+  "properties": {
+    "schema": { "const": "denoize-project-verification-v1" },
+    "schema_version": { "const": 1 },
+    "project_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$" },
+    "manifest_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sources_verified": { "$ref": "#/$defs/count" },
+    "settings_verified": { "$ref": "#/$defs/count" },
+    "presets_verified": { "$ref": "#/$defs/count" },
+    "models_verified": { "$ref": "#/$defs/count" },
+    "plans_verified": { "$ref": "#/$defs/count" },
+    "receipts_verified": { "$ref": "#/$defs/count" },
+    "timelines_verified": { "$ref": "#/$defs/count" }
+  },
+  "$defs": {
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+  }
+}

@@ -157,10 +157,15 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
     "denoize-${package_version}/src/region.rs" \
+    "denoize-${package_version}/src/project.rs" \
+    "denoize-${package_version}/src/project_automation.rs" \
+    "denoize-${package_version}/src/project_bundle.rs" \
+    "denoize-${package_version}/src/project_execution.rs" \
     "denoize-${package_version}/LICENSES/clack-0.1.1-MIT.txt" \
     "denoize-${package_version}/LICENSES/clap-sys-0.5.0-MIT.txt" \
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/docs/evaluation.md" \
+    "denoize-${package_version}/docs/projects.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/docs/updates.md" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
@@ -187,6 +192,16 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-job-status-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-listening-result-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-presentation-region-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-batch-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-bundle-import-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-bundle-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-execution-plan-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-execution-receipt-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-receipt-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-render-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-watch-cycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-public-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-secret-key-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-trust-policy-v1.schema.json" \
@@ -208,6 +223,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-watch-quarantine-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-state-v1.schema.json" \
     "denoize-${package_version}/scripts/test-evaluation-evidence.sh" \
+    "denoize-${package_version}/scripts/test-project-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
     if ! tar -tf "$package_archive" | grep -Fx "$required" >/dev/null; then

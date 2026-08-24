@@ -72,7 +72,7 @@ After primary evidence is uploaded, the application-update job downloads the
 two declared rollback releases, extracts their verified SBOMs, signs the v1
 recoverable manifest, builds all 12 platform/source `.dub` bundles, and attests
 those transport assets. Release verification authenticates every bundle and
-requires exact v0.68.0/v0.69.0 compatibility before publication.
+requires exact v0.69.0/v0.70.0 compatibility before publication.
 Only then can the exact pre-attested crate be published; its
 crates.io checksum must match before the GitHub draft becomes public. If any
 step fails, the GitHub release remains a draft.
