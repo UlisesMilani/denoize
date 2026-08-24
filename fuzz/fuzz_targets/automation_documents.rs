@@ -3,7 +3,10 @@
 use std::io::Write as _;
 
 use denoize::{
-    ExecutionPlan, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy, SignedExecutionReceipt,
+    ExecutionPlan, ProjectBatchReport, ProjectBundleImportReport, ProjectBundleInfo,
+    ProjectExecutionPlan, ProjectManifest, ProjectReceiptVerificationReport, ProjectRenderReport,
+    ProjectValidationReport, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
+    SignedExecutionReceipt, SignedProjectExecutionReceipt,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -19,6 +22,15 @@ fuzz_target!(|data: &[u8]| {
     let _ = serde_json::from_slice::<ReceiptPublicKey>(data);
     let _ = serde_json::from_slice::<ReceiptSecretKey>(data);
     let _ = serde_json::from_slice::<ReceiptTrustPolicy>(data);
+    let _ = serde_json::from_slice::<ProjectManifest>(data);
+    let _ = serde_json::from_slice::<ProjectExecutionPlan>(data);
+    let _ = serde_json::from_slice::<SignedProjectExecutionReceipt>(data);
+    let _ = serde_json::from_slice::<ProjectValidationReport>(data);
+    let _ = serde_json::from_slice::<ProjectRenderReport>(data);
+    let _ = serde_json::from_slice::<ProjectReceiptVerificationReport>(data);
+    let _ = serde_json::from_slice::<ProjectBundleInfo>(data);
+    let _ = serde_json::from_slice::<ProjectBundleImportReport>(data);
+    let _ = serde_json::from_slice::<ProjectBatchReport>(data);
 
     let mut document = tempfile::Builder::new()
         .prefix("denoize-fuzz-")
@@ -34,6 +46,9 @@ fuzz_target!(|data: &[u8]| {
     let _ = ReceiptPublicKey::from_file(document.path());
     let _ = ReceiptSecretKey::from_file(document.path());
     let _ = ReceiptTrustPolicy::from_file(document.path());
+    let _ = ProjectManifest::from_file(document.path());
+    let _ = ProjectExecutionPlan::from_file(document.path());
+    let _ = SignedProjectExecutionReceipt::from_file(document.path());
 
     let mut bundle = tempfile::Builder::new()
         .prefix("denoize-fuzz-")
@@ -43,4 +58,5 @@ fuzz_target!(|data: &[u8]| {
     bundle.write_all(data).expect("write bounded fuzz bundle");
     bundle.flush().expect("flush fuzz bundle");
     let _ = denoize::models::inspect_offline_bundle(bundle.path());
+    let _ = denoize::inspect_project_bundle(bundle.path());
 });

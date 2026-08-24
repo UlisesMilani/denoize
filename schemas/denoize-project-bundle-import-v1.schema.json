@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-bundle-import-v1.schema.json",
+  "title": "denoize portable project bundle import report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "project_id",
+    "manifest_digest",
+    "bundle",
+    "destination",
+    "manifest_locator",
+    "verification_locator",
+    "files_imported",
+    "omitted_sources",
+    "omitted_models"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-project-bundle-import-v1" },
+    "schema_version": { "const": 1 },
+    "project_id": { "$ref": "#/$defs/id" },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "bundle": { "$ref": "#/$defs/fingerprint" },
+    "destination": { "type": "string", "minLength": 1 },
+    "manifest_locator": { "const": "project.denoize.json" },
+    "verification_locator": {
+      "const": ".denoize/project-verification-v1.json"
+    },
+    "files_imported": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 32770
+    },
+    "omitted_sources": {
+      "type": "array",
+      "maxItems": 4096,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "omitted_models": {
+      "type": "array",
+      "maxItems": 16384,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 137438953472
+        },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

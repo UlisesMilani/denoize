@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-receipt-verification-v1.schema.json",
+  "title": "denoize project receipt verification report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "receipt_schema",
+    "key_id",
+    "plan_digest",
+    "project_id",
+    "manifest_digest",
+    "timeline_id",
+    "timeline_digest",
+    "output_path",
+    "output",
+    "outcome"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-project-receipt-verification-v1" },
+    "schema_version": { "const": 1 },
+    "receipt_schema": { "const": "denoize-project-execution-receipt-v1" },
+    "key_id": { "$ref": "#/$defs/digest" },
+    "plan_digest": { "$ref": "#/$defs/digest" },
+    "project_id": { "$ref": "#/$defs/id" },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "timeline_id": { "$ref": "#/$defs/id" },
+    "timeline_digest": { "$ref": "#/$defs/digest" },
+    "output_path": { "$ref": "#/$defs/locator" },
+    "output": { "$ref": "#/$defs/fingerprint" },
+    "outcome": { "const": "succeeded" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^(?!\\.$)(?!\\.\\.$)[A-Za-z0-9._-]+$"
+    },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "locator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!\\.\\.?(?:/|$))(?!.*[/]\\.\\.?(?:/|$))(?!.*\\\\)(?!.*:)[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255}(?:/[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255})*$"
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["len", "digest"],
+      "properties": {
+        "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    }
+  }
+}

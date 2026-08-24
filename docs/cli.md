@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.70.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.71.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -23,6 +23,7 @@ USAGE:
     denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
     denoize update <COMMAND> [OPTIONS]  (run `denoize update --help`)
+    denoize project <COMMAND> [OPTIONS]  (run `denoize project --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -127,7 +128,7 @@ CONFIGURATION:
 ## Watch-folder automation
 
 ```text
-denoize 0.70.0 watch-folder automation
+denoize 0.71.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -382,6 +383,49 @@ All successful commands emit one versioned JSON document. `check` and `dry-run`
 are read-only. `apply` stages the authenticated candidate and an offline
 last-known-good installation, then waits for explicit startup health confirmation.
 Recovery never lowers the accepted-version floor and never requires a network.
+```
+
+## Portable projects and sample-accurate timelines
+
+```text
+Portable project and deterministic partial-file timeline commands:
+
+    denoize project create <PROJECT.json> --root DIR --project-id ID \
+        --source ID=PATH [--source ID=PATH ...] \
+        --selection ID=SOURCE,START_SECONDS,DURATION_SECONDS[,CHANNEL_MAP[,PAD_BEFORE[,PAD_AFTER[,CROSSFADE]]]] \
+        [--source-license SOURCE=ID=PATH] [--setting ID=PATH] [--preset ID=PATH] \
+        [--model ID=PACKAGE.dmp,PUBLIC_KEY] [--plan ID=PATH] [--receipt ID=PATH] \
+        [--timeline ID] [--pretty] [--force]
+    denoize project inspect <PROJECT.json> [--pretty]
+    denoize project validate <PROJECT.json> --root DIR [--pretty]
+    denoize project assemble <PROJECT.json> <OUTPUT.wav> --root DIR \
+        [--timeline ID] [--plan PLAN.json] \
+        [--receipt RECEIPT.json --receipt-key SECRET.json] [--pretty] [--force]
+    denoize project relocate <PROJECT.json> <SOURCE_ID> <CANDIDATE> \
+        --root DIR --output PROJECT.json [--pretty] [--force]
+    denoize project bundle create <PROJECT.json> <OUTPUT.dpb> --root DIR \
+        [--include-sources --max-source-bytes N] \
+        [--include-models --max-model-bytes N] [--pretty] [--force]
+    denoize project bundle inspect <BUNDLE.dpb> [--pretty]
+    denoize project bundle import <BUNDLE.dpb> <NEW_PROJECT_DIR> [--pretty]
+    denoize project plan create <PROJECT.json> <OUTPUT.wav> --root DIR \
+        --output PLAN.json [--timeline ID] [--pretty] [--force]
+    denoize project receipt verify <RECEIPT.json> --root DIR \
+        (--public-key KEY.json | --trust-policy POLICY.json) [--plan PLAN.json] [--pretty]
+    denoize project batch <PROJECT.json>... --root DIR --output-dir DIR \
+        [--timeline ID] [--pretty] [--force]
+    denoize project watch <INPUT_DIR> <OUTPUT_DIR> --root DIR \
+        --receipt-key SECRET.json [--timeline ID] [--once] [--settle-ms N] \
+        [--poll-ms N] [--recursive] [--pretty]
+
+CHANNEL_MAP is a '+'-separated list of zero-based source channels, for example
+`0+1` or `0+0`. Times are quantized exactly once onto the source presentation
+timebase. Crossfades are supported only between adjacent unpadded selections.
+All commands reject unknown/future records and changed fingerprints before any
+project or audio output is published. Bundles always carry settings, presets,
+plans, receipts, source licenses, model public keys, and verification evidence.
+Source audio and model packages require explicit aggregate byte limits. Import
+publishes only to a new directory and never replaces an existing project.
 ```
 
 Watch mode uses portable bounded polling. A regular audio file becomes eligible

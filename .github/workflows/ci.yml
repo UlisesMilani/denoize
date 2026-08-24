@@ -64,6 +64,9 @@ jobs:
       - name: Test all features
         run: cargo test --locked --all-targets --features full
 
+      - name: Validate project JSON contracts
+        run: python3 scripts/test-project-schemas.py --denoize target/debug/denoize
+
       - name: Run bounded deterministic resilience matrix
         env:
           DENOIZE_RESILIENCE_FEATURES: full
@@ -102,6 +105,7 @@ jobs:
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
+          python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \

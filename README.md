@@ -724,9 +724,9 @@ applicable passes, no failures or warnings, and 8 capability-based skips.
 
 ## Desktop app
 
-The Tauri desktop app exposes single-file denoising, batch conversion, DAW
-plug-in state management, quality comparison, and model management without
-sending audio off the computer. Its
+The Tauri desktop app exposes single-file denoising, batch conversion, portable
+project timelines, DAW plug-in state management, quality comparison, and model
+management without sending audio off the computer. Its
 default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.
 ONNX-based backends expose model-file, model-rate, and SGMSE quality controls
@@ -792,6 +792,14 @@ selected sample rate, loads the three factory presets, edits every stable
 parameter, and imports or atomically exports portable preset and deterministic
 session JSON. All validation and file publication remain in Rust; the WebView
 does not implement a second parser or state contract.
+
+The Project page loads and validates source-bound manifests, selects a linear
+sample-accurate timeline, previews or saves its exact execution plan, assembles
+a verified float WAV, and optionally publishes a signed project receipt. It can
+also create, inspect, and import offline project bundles. Source audio and model
+package payloads are excluded by default and require explicit positive MiB
+limits; project operations are serialized and existing destinations are never
+replaced.
 
 File and batch jobs keep owner-private recovery records while their exact
 denoize staging files are live. After a crash, the desktop can retry the saved
@@ -916,6 +924,42 @@ as a draft and cannot publish the crate before every target and its evidence
 have been verified.
 
 ## CLI highlights
+
+### Portable projects and sample-accurate timelines
+
+Create a source-bound project, review its exact presentation-timeline plan, and
+assemble it without retaining whole-file PCM:
+
+```sh
+denoize project create project.json --root . --project-id interview \
+  --source main=recording.wav \
+  --selection intro=main,12.5,8.0,0+1 \
+  --selection answer=main,45,20,0+1,0,0,0.25 --pretty
+denoize project validate project.json --root . --pretty
+denoize project plan create project.json assembled.wav \
+  --root . --output assembly-plan.json --pretty
+denoize project assemble project.json assembled.wav \
+  --root . --plan assembly-plan.json --pretty
+```
+
+Selections use exact decoded-presentation ticks, explicit channel maps, silence
+padding, and only adjacent unpadded crossfades. Manifests bind every source,
+setting, preset, signed model package, plan, receipt, and license reference by
+portable locator, byte length, and SHA-256. Changed sources, unsupported graph
+shapes, unknown fields, path escapes, and output collisions fail before
+publication. Missing sources can be relocated only to a complete fingerprint
+and presentation-geometry match.
+
+Offline `.dpb` bundles carry the manifest, settings, presets, verification
+evidence, source licenses, model public keys, plans, and receipts. Source audio
+and model package payloads remain references unless their include flag and a
+positive aggregate byte ceiling are both supplied. Import authenticates the
+complete bundle and publishes only to a new directory. Project batch and watch
+automation invoke the same deterministic assembler; watch additionally signs
+each successful output.
+
+See [portable projects](docs/projects.md) for the CLI, Desktop, bundle, plan,
+receipt, relocation, and safety contracts.
 
 ### Read-only plans and signed receipts
 

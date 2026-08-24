@@ -256,7 +256,7 @@ unreviewable release.
 | 20 | Real-time-safe DAW plug-in integration with portable presets, deterministic session restoration, and measured latency | Released in v0.68.0 |
 | 21 | Reproducible licensed-corpus objective, perceptual, performance, output-quality, and regression evaluation with publishable evidence manifests | Released in v0.69.0 |
 | 22 | Signed updates with staged activation, health-checked rollback, and offline recovery | Released in v0.70.0 |
-| 23 | Portable projects and sample-accurate region/timeline workflows with bounded edit graphs, deterministic assembly, and signed provenance | Planned |
+| 23 | Portable projects and sample-accurate region/timeline workflows with bounded edit graphs, deterministic assembly, and signed provenance | Released in v0.71.0 |
 
 Stage 8 accepts regular-file WAV, FLAC, and Ogg Vorbis input, writes an atomic
 WAV, and supports the stateful Classical, RNNoise, and GTCRN backends. Its

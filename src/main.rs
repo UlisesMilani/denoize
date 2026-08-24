@@ -42,6 +42,7 @@ use denoize::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -414,6 +415,7 @@ USAGE:
     denoize plugin <COMMAND> [OPTIONS]  (run `denoize plugin --help`)
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
     denoize update <COMMAND> [OPTIONS]  (run `denoize update --help`)
+    denoize project <COMMAND> [OPTIONS]  (run `denoize project --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -4090,6 +4092,1605 @@ fn run_update_recover(args: &[String]) -> Result<(), String> {
     print_update_document(&report, pretty)
 }
 
+fn project_usage() -> &'static str {
+    "\
+Portable project and deterministic partial-file timeline commands:
+
+    denoize project create <PROJECT.json> --root DIR --project-id ID \\
+        --source ID=PATH [--source ID=PATH ...] \\
+        --selection ID=SOURCE,START_SECONDS,DURATION_SECONDS[,CHANNEL_MAP[,PAD_BEFORE[,PAD_AFTER[,CROSSFADE]]]] \\
+        [--source-license SOURCE=ID=PATH] [--setting ID=PATH] [--preset ID=PATH] \\
+        [--model ID=PACKAGE.dmp,PUBLIC_KEY] [--plan ID=PATH] [--receipt ID=PATH] \\
+        [--timeline ID] [--pretty] [--force]
+    denoize project inspect <PROJECT.json> [--pretty]
+    denoize project validate <PROJECT.json> --root DIR [--pretty]
+    denoize project assemble <PROJECT.json> <OUTPUT.wav> --root DIR \\
+        [--timeline ID] [--plan PLAN.json] \\
+        [--receipt RECEIPT.json --receipt-key SECRET.json] [--pretty] [--force]
+    denoize project relocate <PROJECT.json> <SOURCE_ID> <CANDIDATE> \\
+        --root DIR --output PROJECT.json [--pretty] [--force]
+    denoize project bundle create <PROJECT.json> <OUTPUT.dpb> --root DIR \\
+        [--include-sources --max-source-bytes N] \\
+        [--include-models --max-model-bytes N] [--pretty] [--force]
+    denoize project bundle inspect <BUNDLE.dpb> [--pretty]
+    denoize project bundle import <BUNDLE.dpb> <NEW_PROJECT_DIR> [--pretty]
+    denoize project plan create <PROJECT.json> <OUTPUT.wav> --root DIR \\
+        --output PLAN.json [--timeline ID] [--pretty] [--force]
+    denoize project receipt verify <RECEIPT.json> --root DIR \\
+        (--public-key KEY.json | --trust-policy POLICY.json) [--plan PLAN.json] [--pretty]
+    denoize project batch <PROJECT.json>... --root DIR --output-dir DIR \\
+        [--timeline ID] [--pretty] [--force]
+    denoize project watch <INPUT_DIR> <OUTPUT_DIR> --root DIR \\
+        --receipt-key SECRET.json [--timeline ID] [--once] [--settle-ms N] \\
+        [--poll-ms N] [--recursive] [--pretty]
+
+CHANNEL_MAP is a '+'-separated list of zero-based source channels, for example
+`0+1` or `0+0`. Times are quantized exactly once onto the source presentation
+timebase. Crossfades are supported only between adjacent unpadded selections.
+All commands reject unknown/future records and changed fingerprints before any
+project or audio output is published. Bundles always carry settings, presets,
+plans, receipts, source licenses, model public keys, and verification evidence.
+Source audio and model packages require explicit aggregate byte limits. Import
+publishes only to a new directory and never replaces an existing project.
+"
+}
+
+fn run_project(args: &[String]) -> Result<(), String> {
+    if args.is_empty()
+        || args.first().map(String::as_str) == Some("help")
+        || args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        print!("{}", project_usage());
+        return Ok(());
+    }
+    match args[0].as_str() {
+        "create" => run_project_create(&args[1..]),
+        "inspect" => run_project_inspect(&args[1..]),
+        "validate" => run_project_validate(&args[1..]),
+        "assemble" => run_project_assemble(&args[1..]),
+        "relocate" => run_project_relocate(&args[1..]),
+        "bundle" => run_project_bundle(&args[1..]),
+        "plan" => run_project_plan(&args[1..]),
+        "receipt" => run_project_receipt(&args[1..]),
+        "batch" => run_project_batch_command(&args[1..]),
+        "watch" => run_project_watch(&args[1..]),
+        command => Err(format!("unknown project command: {command}")),
+    }
+}
+
+fn run_project_bundle(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => run_project_bundle_create(&args[1..]),
+        Some("inspect") => run_project_bundle_inspect(&args[1..]),
+        Some("import") => run_project_bundle_import(&args[1..]),
+        _ => Err("project bundle requires `create`, `inspect`, or `import`".into()),
+    }
+}
+
+fn run_project_bundle_create(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project bundle create requires PROJECT.json OUTPUT.dpb".into());
+    }
+    let project = &args[0];
+    let output = &args[1];
+    let mut root = None;
+    let mut include_sources = false;
+    let mut source_limit = None;
+    let mut include_models = false;
+    let mut model_limit = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--include-sources" if !include_sources => include_sources = true,
+            "--include-models" if !include_models => include_models = true,
+            "--max-source-bytes" => {
+                let raw = project_option_value(args, &mut index, option)?;
+                let value = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid value for {option}: {raw}"))?;
+                set_project_option(&mut source_limit, value, option)?;
+            }
+            "--max-model-bytes" => {
+                let raw = project_option_value(args, &mut index, option)?;
+                let value = raw
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid value for {option}: {raw}"))?;
+                set_project_option(&mut model_limit, value, option)?;
+            }
+            "--pretty" if !pretty => pretty = true,
+            "--force" if !force => force = true,
+            "--include-sources" | "--include-models" | "--pretty" | "--force" => {
+                return Err(format!("{option} specified more than once"));
+            }
+            value => return Err(format!("unknown project bundle create option: {value}")),
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project bundle create requires --root DIR")?,
+    )?;
+    let options = denoize::ProjectBundleBuildOptions {
+        include_sources,
+        source_payload_limit_bytes: source_limit.unwrap_or(0),
+        include_models,
+        model_payload_limit_bytes: model_limit.unwrap_or(0),
+        commit_mode: project_commit_mode(force),
+    };
+    let report =
+        denoize::build_project_bundle(project, root, output, &options, DecodeLimits::default())?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_bundle_inspect(args: &[String]) -> Result<(), String> {
+    let bundle = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project bundle inspect requires BUNDLE.dpb")?;
+    let mut pretty = false;
+    for option in &args[1..] {
+        match option.as_str() {
+            "--pretty" if !pretty => pretty = true,
+            "--pretty" => return Err("--pretty specified more than once".into()),
+            value => return Err(format!("unknown project bundle inspect option: {value}")),
+        }
+    }
+    let report = denoize::inspect_project_bundle(bundle)?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_bundle_import(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project bundle import requires BUNDLE.dpb NEW_PROJECT_DIR".into());
+    }
+    let mut pretty = false;
+    for option in &args[2..] {
+        match option.as_str() {
+            "--pretty" if !pretty => pretty = true,
+            "--pretty" => return Err("--pretty specified more than once".into()),
+            value => return Err(format!("unknown project bundle import option: {value}")),
+        }
+    }
+    let report = denoize::import_project_bundle(&args[0], &args[1])?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_plan(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => run_project_plan_create(&args[1..]),
+        _ => Err("project plan requires `create`".into()),
+    }
+}
+
+fn run_project_plan_create(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project plan create requires PROJECT.json OUTPUT.wav".into());
+    }
+    let project_raw = &args[0];
+    let audio_output_raw = &args[1];
+    let mut root = None;
+    let mut plan_output = None;
+    let mut timeline = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--output" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut plan_output, value, option)?;
+            }
+            "--timeline" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut timeline, value, option)?;
+            }
+            "--pretty" if !pretty => pretty = true,
+            "--force" if !force => force = true,
+            "--pretty" | "--force" => return Err(format!("{option} specified more than once")),
+            value => return Err(format!("unknown project plan create option: {value}")),
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project plan create requires --root DIR")?,
+    )?;
+    let project_path = contained_project_input(&root, project_raw, "project manifest")?;
+    let audio_output = contained_project_output(&root, audio_output_raw, "project output")?;
+    let manifest = denoize::ProjectManifest::from_file(&project_path)?;
+    denoize::validate_project_files(&manifest, &root, DecodeLimits::default())?;
+    let timeline = timeline
+        .or_else(|| {
+            manifest
+                .timelines
+                .first()
+                .map(|timeline| timeline.id.clone())
+        })
+        .ok_or("project has no timeline")?;
+    let manifest_reference = denoize::project_artifact_reference("manifest", &project_path, &root)?;
+    let output_locator = denoize::portable_locator(&audio_output, &root)?;
+    let plan = denoize::ProjectExecutionPlan::new(
+        &manifest,
+        &timeline,
+        manifest_reference,
+        output_locator,
+        project_commit_mode(force),
+    )?;
+    let plan_output = plan_output.ok_or("project plan create requires --output PLAN.json")?;
+    reject_cli_project_publication_collision(
+        &manifest,
+        &root,
+        Some(&project_path),
+        std::path::Path::new(&plan_output),
+        "project plan output",
+    )?;
+    let plan_destination =
+        normalized_project_destination(std::path::Path::new(&plan_output), "project plan output")?;
+    let audio_destination = normalized_project_destination(&audio_output, "project audio output")?;
+    let plan_target = std::fs::canonicalize(&plan_destination).ok();
+    let audio_target = std::fs::canonicalize(&audio_destination).ok();
+    if plan_destination == audio_destination || plan_target.is_some() && plan_target == audio_target
+    {
+        return Err("project plan and audio output paths must differ".into());
+    }
+    denoize::write_project_execution_plan(plan_output, &plan, project_commit_mode(force), pretty)?;
+    print_project_document(&plan, pretty)
+}
+
+fn run_project_receipt(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("verify") => run_project_receipt_verify(&args[1..]),
+        _ => Err("project receipt requires `verify`".into()),
+    }
+}
+
+fn run_project_receipt_verify(args: &[String]) -> Result<(), String> {
+    let receipt_path = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project receipt verify requires RECEIPT.json")?;
+    let mut root = None;
+    let mut public_key = None;
+    let mut trust_policy = None;
+    let mut plan = None;
+    let mut pretty = false;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--public-key" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut public_key, value, option)?;
+            }
+            "--trust-policy" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut trust_policy, value, option)?;
+            }
+            "--plan" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut plan, value, option)?;
+            }
+            "--pretty" if !pretty => pretty = true,
+            "--pretty" => return Err("--pretty specified more than once".into()),
+            value => return Err(format!("unknown project receipt verify option: {value}")),
+        }
+        index += 1;
+    }
+    if public_key.is_some() == trust_policy.is_some() {
+        return Err(
+            "project receipt verify requires exactly one of --public-key or --trust-policy".into(),
+        );
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project receipt verify requires --root DIR")?,
+    )?;
+    let receipt = denoize::SignedProjectExecutionReceipt::from_file(receipt_path)?;
+    let plan = plan
+        .as_deref()
+        .map(denoize::ProjectExecutionPlan::from_file)
+        .transpose()?;
+    let report = if let Some(path) = public_key {
+        let key = denoize::ReceiptPublicKey::from_file(path)?;
+        receipt.verify_with_key(&key, plan.as_ref(), &root)?
+    } else {
+        let policy_path =
+            trust_policy.ok_or("project receipt trust source disappeared after validation")?;
+        let policy = denoize::ReceiptTrustPolicy::from_file(policy_path)?;
+        receipt.verify_with_policy(&policy, plan.as_ref(), &root)?
+    };
+    print_project_document(&report, pretty)
+}
+
+fn run_project_batch_command(args: &[String]) -> Result<(), String> {
+    let mut manifests = Vec::new();
+    let mut root = None;
+    let mut output_dir = None;
+    let mut timeline = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 0;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--output-dir" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut output_dir, value, option)?;
+            }
+            "--timeline" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut timeline, value, option)?;
+            }
+            "--pretty" if !pretty => pretty = true,
+            "--force" if !force => force = true,
+            "--pretty" | "--force" => return Err(format!("{option} specified more than once")),
+            value if value.starts_with('-') => {
+                return Err(format!("unknown project batch option: {value}"));
+            }
+            value => manifests.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if manifests.is_empty() {
+        return Err("project batch requires at least one PROJECT.json".into());
+    }
+    let root =
+        canonical_cli_project_root(root.as_deref().ok_or("project batch requires --root DIR")?)?;
+    let output_dir = contained_project_directory(
+        &root,
+        output_dir
+            .as_deref()
+            .ok_or("project batch requires --output-dir DIR")?,
+        "project batch output directory",
+        true,
+    )?;
+    let mut requests = Vec::new();
+    for raw in manifests {
+        let manifest_path = contained_project_input(&root, &raw, "project batch manifest")?;
+        let manifest = denoize::ProjectManifest::from_file(&manifest_path)?;
+        let selected_timeline = timeline
+            .clone()
+            .or_else(|| manifest.timelines.first().map(|value| value.id.clone()))
+            .ok_or("project batch manifest has no timeline")?;
+        manifest.timeline(&selected_timeline)?;
+        let output = output_dir.join(format!("{}.{}.wav", manifest.project_id, selected_timeline));
+        requests.push(denoize::ProjectBatchRequest {
+            manifest_path,
+            timeline_id: Some(selected_timeline),
+            output_path: output,
+        });
+    }
+    let report = denoize::run_project_batch(
+        &requests,
+        &root,
+        project_commit_mode(force),
+        DecodeLimits::default(),
+    )?;
+    print_project_document(&report, pretty)
+}
+
+#[derive(Serialize)]
+struct ProjectWatchCycleJson<'a> {
+    schema: &'static str,
+    schema_version: u32,
+    root: &'a str,
+    input: &'a str,
+    output: &'a str,
+    timeline: Option<&'a str>,
+    cancelled: bool,
+    #[serde(flatten)]
+    report: &'a WatchCycleReport,
+}
+
+fn print_project_watch_cycle(
+    root: &str,
+    input: &str,
+    output: &str,
+    timeline: Option<&str>,
+    report: &WatchCycleReport,
+    cancelled: bool,
+    pretty: bool,
+) -> Result<(), String> {
+    print_project_document(
+        &ProjectWatchCycleJson {
+            schema: denoize::PROJECT_WATCH_CYCLE_SCHEMA,
+            schema_version: 1,
+            root,
+            input,
+            output,
+            timeline,
+            cancelled,
+            report,
+        },
+        pretty,
+    )
+}
+
+fn run_project_watch(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project watch requires INPUT_DIR OUTPUT_DIR".into());
+    }
+    let input_raw = &args[0];
+    let output_raw = &args[1];
+    let mut root = None;
+    let mut receipt_key = None;
+    let mut timeline = None;
+    let mut once = false;
+    let mut recursive = false;
+    let mut settle_millis = 2_000_u64;
+    let mut poll_millis = 500_u64;
+    let mut retry_initial_millis = 1_000_u64;
+    let mut retry_max_millis = 60_000_u64;
+    let mut max_attempts = 5_u32;
+    let mut max_files = 10_000_usize;
+    let mut pretty = false;
+    let mut seen_settle = false;
+    let mut seen_poll = false;
+    let mut seen_retry_initial = false;
+    let mut seen_retry_max = false;
+    let mut seen_max_attempts = false;
+    let mut seen_max_files = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--receipt-key" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut receipt_key, value, option)?;
+            }
+            "--timeline" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut timeline, value, option)?;
+            }
+            "--settle-ms" if !seen_settle => {
+                settle_millis = parse_project_watch_number(args, &mut index, option)?;
+                seen_settle = true;
+            }
+            "--poll-ms" if !seen_poll => {
+                poll_millis = parse_project_watch_number(args, &mut index, option)?;
+                seen_poll = true;
+            }
+            "--retry-initial-ms" if !seen_retry_initial => {
+                retry_initial_millis = parse_project_watch_number(args, &mut index, option)?;
+                seen_retry_initial = true;
+            }
+            "--retry-max-ms" if !seen_retry_max => {
+                retry_max_millis = parse_project_watch_number(args, &mut index, option)?;
+                seen_retry_max = true;
+            }
+            "--max-attempts" if !seen_max_attempts => {
+                max_attempts = parse_project_watch_number(args, &mut index, option)?;
+                seen_max_attempts = true;
+            }
+            "--max-watch-files" if !seen_max_files => {
+                max_files = parse_project_watch_number(args, &mut index, option)?;
+                seen_max_files = true;
+            }
+            "--once" if !once => once = true,
+            "--recursive" if !recursive => recursive = true,
+            "--pretty" if !pretty => pretty = true,
+            "--once" | "--recursive" | "--pretty" | "--settle-ms" | "--poll-ms"
+            | "--retry-initial-ms" | "--retry-max-ms" | "--max-attempts" | "--max-watch-files" => {
+                return Err(format!("{option} specified more than once"))
+            }
+            value => return Err(format!("unknown project watch option: {value}")),
+        }
+        index += 1;
+    }
+    let root =
+        canonical_cli_project_root(root.as_deref().ok_or("project watch requires --root DIR")?)?;
+    let input =
+        contained_project_directory(&root, input_raw, "project watch input directory", true)?;
+    let output =
+        contained_project_directory(&root, output_raw, "project watch output directory", false)?;
+    let key_raw = receipt_key.ok_or("project watch requires --receipt-key SECRET.json")?;
+    let key_path = std::fs::canonicalize(&key_raw)
+        .map_err(|error| format!("resolve project watch receipt key {key_raw}: {error}"))?;
+    if key_path.starts_with(&input) || key_path.starts_with(&output) {
+        return Err("project watch receipt key must be outside input and output trees".into());
+    }
+    let secret = denoize::ReceiptSecretKey::from_file(&key_path)?;
+    let public = secret.public_key()?;
+    let key_fingerprint = batch_resume::fingerprint_file(&key_path)?;
+    let identity = format!(
+        "denoize-project-watch-v1\nroot={}\ntimeline={}\nkey-id={}\nkey-fingerprint={:?}",
+        root.display(),
+        timeline.as_deref().unwrap_or("<first>"),
+        public.key_id,
+        key_fingerprint
+    );
+    let config = WatchFolderConfig::new(&input, &output, identity.as_bytes())
+        .with_input_extensions(["json"])
+        .with_output_extension("wav")
+        .with_recursive(recursive)
+        .with_settle_duration(Duration::from_millis(settle_millis))
+        .with_poll_interval(Duration::from_millis(poll_millis))
+        .with_retry_delays(
+            Duration::from_millis(retry_initial_millis),
+            Duration::from_millis(retry_max_millis),
+        )
+        .with_max_attempts(max_attempts)
+        .with_max_files(max_files);
+    let settle_duration = config.settle_duration();
+    let poll_interval = config.poll_interval();
+    let mut watch = WatchFolder::open(config)?;
+    CANCELLED.store(false, Ordering::SeqCst);
+    install_cancel_handler()?;
+    let run_cycle = |watch: &mut WatchFolder| {
+        watch.cycle(|job| {
+            process_project_watch_job(
+                job,
+                &root,
+                timeline.as_deref(),
+                &key_path,
+                key_fingerprint,
+                &secret,
+                &public,
+            )
+        })
+    };
+    let root_text = root.to_string_lossy();
+    let input_text = input.to_string_lossy();
+    let output_text = output.to_string_lossy();
+    if once {
+        let first = run_cycle(&mut watch)?;
+        print_project_watch_cycle(
+            &root_text,
+            &input_text,
+            &output_text,
+            timeline.as_deref(),
+            &first,
+            false,
+            pretty,
+        )?;
+        if first.observed != 0 && settle_duration != Duration::ZERO {
+            wait_watch_interval(settle_duration);
+            if !CANCELLED.load(Ordering::SeqCst) {
+                let second = run_cycle(&mut watch)?;
+                print_project_watch_cycle(
+                    &root_text,
+                    &input_text,
+                    &output_text,
+                    timeline.as_deref(),
+                    &second,
+                    false,
+                    pretty,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    while !CANCELLED.load(Ordering::SeqCst) {
+        match run_cycle(&mut watch) {
+            Ok(report) => print_project_watch_cycle(
+                &root_text,
+                &input_text,
+                &output_text,
+                timeline.as_deref(),
+                &report,
+                false,
+                pretty,
+            )?,
+            Err(error) => eprintln!("denoize: project watch scan failed; retrying: {error}"),
+        }
+        wait_watch_interval(poll_interval);
+    }
+    print_project_watch_cycle(
+        &root_text,
+        &input_text,
+        &output_text,
+        timeline.as_deref(),
+        &WatchCycleReport::default(),
+        true,
+        pretty,
+    )
+}
+
+fn parse_project_watch_number<T>(
+    args: &[String],
+    index: &mut usize,
+    option: &str,
+) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let raw = project_option_value(args, index, option)?;
+    raw.parse()
+        .map_err(|error| format!("invalid value for {option}: {error}"))
+}
+
+fn prepare_project_watch_plan(
+    job: &WatchFolderJob,
+    root: &std::path::Path,
+    requested_timeline: Option<&str>,
+) -> Result<
+    (
+        denoize::ProjectManifest,
+        denoize::ProjectExecutionPlan,
+        String,
+    ),
+    String,
+> {
+    if batch_resume::fingerprint_file(&job.input_path)? != job.input_fingerprint {
+        return Err("project watch manifest changed after settling".into());
+    }
+    let manifest = denoize::ProjectManifest::from_file(&job.input_path)?;
+    if batch_resume::fingerprint_file(&job.input_path)? != job.input_fingerprint {
+        return Err("project watch manifest changed while it was parsed".into());
+    }
+    let timeline = requested_timeline
+        .map(str::to_string)
+        .or_else(|| manifest.timelines.first().map(|value| value.id.clone()))
+        .ok_or("project watch manifest has no timeline")?;
+    manifest.timeline(&timeline)?;
+    let manifest_locator = denoize::portable_locator(&job.input_path, root)?;
+    let reference = denoize::ProjectArtifactReference::new(
+        "manifest",
+        manifest_locator,
+        job.input_fingerprint,
+    )?;
+    let output_locator = denoize::portable_locator(&job.output_path, root)?;
+    let plan = denoize::ProjectExecutionPlan::new(
+        &manifest,
+        &timeline,
+        reference,
+        output_locator,
+        CommitMode::NoClobber,
+    )?;
+    Ok((manifest, plan, timeline))
+}
+
+fn recover_project_watch_job(
+    job: &WatchFolderJob,
+    root: &std::path::Path,
+    plan: &denoize::ProjectExecutionPlan,
+    public: &ReceiptPublicKey,
+) -> Result<bool, String> {
+    let output_exists = path_exists_for_watch(&job.output_path)?;
+    let receipt_exists = path_exists_for_watch(&job.receipt_path)?;
+    match (output_exists, receipt_exists) {
+        (false, false) => return Ok(false),
+        (true, false) => {
+            return Err(format!(
+                "project watch output exists without its receipt: {}",
+                job.output_path.display()
+            ));
+        }
+        (false, true) => {
+            return Err(format!(
+                "project watch receipt exists without its output: {}",
+                job.receipt_path.display()
+            ));
+        }
+        (true, true) => {}
+    }
+    let receipt = denoize::SignedProjectExecutionReceipt::from_file(&job.receipt_path)?;
+    receipt.verify_with_key(public, Some(plan), root)?;
+    Ok(true)
+}
+
+fn classify_project_watch_error(error: String) -> WatchProcessError {
+    let lowercase = error.to_ascii_lowercase();
+    if lowercase.contains("changed after settling") || lowercase.contains("changed while") {
+        return WatchProcessError::deferred(error);
+    }
+    if [
+        "unsupported",
+        "unknown field",
+        "invalid",
+        "differs from",
+        "collides",
+        "must",
+        "cannot",
+    ]
+    .iter()
+    .any(|needle| lowercase.contains(needle))
+    {
+        WatchProcessError::permanent(error)
+    } else {
+        WatchProcessError::retryable(error)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_project_watch_job(
+    job: &WatchFolderJob,
+    root: &std::path::Path,
+    requested_timeline: Option<&str>,
+    key_path: &std::path::Path,
+    expected_key_fingerprint: FileFingerprint,
+    secret: &ReceiptSecretKey,
+    public: &ReceiptPublicKey,
+) -> Result<(), WatchProcessError> {
+    let current_key = batch_resume::fingerprint_file(key_path).map_err(|error| {
+        WatchProcessError::deferred(format!(
+            "project watch receipt key is temporarily unavailable: {error}"
+        ))
+    })?;
+    if current_key != expected_key_fingerprint {
+        return Err(WatchProcessError::deferred(
+            "project watch receipt key changed; restart with a fresh state path",
+        ));
+    }
+    let (manifest, plan, timeline) = prepare_project_watch_plan(job, root, requested_timeline)
+        .map_err(classify_project_watch_error)?;
+    match recover_project_watch_job(job, root, &plan, public) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => return Err(WatchProcessError::permanent(error)),
+    }
+    let render = denoize::assemble_project_timeline(
+        &manifest,
+        &timeline,
+        root,
+        &job.output_path,
+        CommitMode::NoClobber,
+        DecodeLimits::default(),
+    )
+    .map_err(classify_project_watch_error)?;
+    let receipt = denoize::SignedProjectExecutionReceipt::sign(&plan, render.output, secret)
+        .map_err(WatchProcessError::permanent)?;
+    denoize::write_signed_project_execution_receipt(
+        &job.receipt_path,
+        &receipt,
+        CommitMode::NoClobber,
+        false,
+    )
+    .map_err(WatchProcessError::permanent)?;
+    match recover_project_watch_job(job, root, &plan, public) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WatchProcessError::permanent(
+            "project watch returned without publishing an output/receipt pair",
+        )),
+        Err(error) => Err(WatchProcessError::permanent(error)),
+    }
+}
+
+fn project_option_value(
+    args: &[String],
+    index: &mut usize,
+    option: &str,
+) -> Result<String, String> {
+    *index = index
+        .checked_add(1)
+        .ok_or("project argument index overflow")?;
+    args.get(*index)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| format!("missing value for {option}"))
+}
+
+fn set_project_option<T>(slot: &mut Option<T>, value: T, option: &str) -> Result<(), String> {
+    if slot.is_some() {
+        return Err(format!("{option} specified more than once"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+fn print_project_document<T: Serialize>(value: &T, pretty: bool) -> Result<(), String> {
+    let mut document = if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
+    }
+    .map_err(|error| format!("serialize project result: {error}"))?;
+    document.push('\n');
+    std::io::stdout()
+        .lock()
+        .write_all(document.as_bytes())
+        .map_err(|error| format!("write project result: {error}"))
+}
+
+fn project_commit_mode(force: bool) -> CommitMode {
+    if force {
+        CommitMode::Replace
+    } else {
+        CommitMode::NoClobber
+    }
+}
+
+fn canonical_cli_project_root(raw: &str) -> Result<std::path::PathBuf, String> {
+    let root = std::fs::canonicalize(raw)
+        .map_err(|error| format!("resolve project root {raw}: {error}"))?;
+    if !root.is_dir() {
+        return Err(format!(
+            "project root is not a directory: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+fn project_input_path(root: &std::path::Path, raw: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(raw);
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn contained_project_input(
+    root: &std::path::Path,
+    raw: &str,
+    context: &str,
+) -> Result<std::path::PathBuf, String> {
+    let path = project_input_path(root, raw);
+    let path = std::fs::canonicalize(&path)
+        .map_err(|error| format!("resolve {context} {}: {error}", path.display()))?;
+    if !path.starts_with(root) {
+        return Err(format!(
+            "{context} is outside project root {}",
+            root.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn contained_project_output(
+    root: &std::path::Path,
+    raw: &str,
+    context: &str,
+) -> Result<std::path::PathBuf, String> {
+    let requested = project_input_path(root, raw);
+    let name = requested
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("{context} must name a file"))?;
+    let parent = requested
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(root);
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("resolve {context} parent {}: {error}", parent.display()))?;
+    if !parent.starts_with(root) {
+        return Err(format!(
+            "{context} is outside project root {}",
+            root.display()
+        ));
+    }
+    let output = parent.join(name);
+    if output == root {
+        return Err(format!("{context} must name a file"));
+    }
+    Ok(output)
+}
+
+fn normalized_project_destination(
+    path: &std::path::Path,
+    context: &str,
+) -> Result<std::path::PathBuf, String> {
+    let requested = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("resolve current directory for {context}: {error}"))?
+            .join(path)
+    };
+    let name = requested
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("{context} must name a file"))?;
+    let parent = requested
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("resolve {context} parent {}: {error}", parent.display()))?;
+    Ok(parent.join(name))
+}
+
+fn reject_cli_project_publication_collision(
+    manifest: &denoize::ProjectManifest,
+    root: &std::path::Path,
+    manifest_path: Option<&std::path::Path>,
+    output: &std::path::Path,
+    context: &str,
+) -> Result<(), String> {
+    let destination = normalized_project_destination(output, context)?;
+    let existing_target = std::fs::canonicalize(&destination).ok();
+    if let Some(manifest_path) = manifest_path {
+        let manifest_path = std::fs::canonicalize(manifest_path).map_err(|error| {
+            format!(
+                "re-resolve project manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+        if destination == manifest_path || existing_target.as_ref() == Some(&manifest_path) {
+            return Err(format!("{context} must not replace its project manifest"));
+        }
+    }
+
+    let mut locators = Vec::new();
+    for source in &manifest.sources {
+        locators.push(source.locator.as_str());
+        if let Some(license) = &source.license {
+            locators.push(license.locator.as_str());
+        }
+    }
+    for reference in manifest
+        .settings
+        .iter()
+        .chain(&manifest.presets)
+        .chain(&manifest.plans)
+        .chain(&manifest.receipts)
+    {
+        locators.push(reference.locator.as_str());
+    }
+    for model in &manifest.models {
+        locators.push(model.package.locator.as_str());
+        locators.push(model.public_key.locator.as_str());
+    }
+    for locator in locators {
+        let artifact = contained_project_input(root, locator, "project artifact")?;
+        if destination == artifact || existing_target.as_ref() == Some(&artifact) {
+            return Err(format!(
+                "{context} collides with referenced project artifact {locator}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contained_project_directory(
+    root: &std::path::Path,
+    raw: &str,
+    context: &str,
+    must_exist: bool,
+) -> Result<std::path::PathBuf, String> {
+    let requested = project_input_path(root, raw);
+    if must_exist || requested.exists() {
+        let directory = std::fs::canonicalize(&requested)
+            .map_err(|error| format!("resolve {context} {}: {error}", requested.display()))?;
+        if !directory.is_dir() || !directory.starts_with(root) {
+            return Err(format!(
+                "{context} must be a directory below {}",
+                root.display()
+            ));
+        }
+        return Ok(directory);
+    }
+    let name = requested
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("{context} must name a directory"))?;
+    let parent = requested
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(root);
+    let parent = std::fs::canonicalize(parent)
+        .map_err(|error| format!("resolve {context} parent {}: {error}", parent.display()))?;
+    if !parent.is_dir() || !parent.starts_with(root) {
+        return Err(format!(
+            "{context} is outside project root {}",
+            root.display()
+        ));
+    }
+    Ok(parent.join(name))
+}
+
+fn parse_project_binding(value: &str, option: &str) -> Result<(String, String), String> {
+    let (id, path) = value
+        .split_once('=')
+        .ok_or_else(|| format!("{option} must use ID=PATH"))?;
+    if id.is_empty() || path.is_empty() {
+        return Err(format!("{option} must use non-empty ID=PATH"));
+    }
+    Ok((id.to_string(), path.to_string()))
+}
+
+fn parse_project_seconds(value: &str, field: &str) -> Result<f64, String> {
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("invalid {field}: {value}"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("{field} must be a finite non-negative value"));
+    }
+    Ok(value)
+}
+
+fn project_seconds_to_ticks(value: f64, timescale: u32, field: &str) -> Result<u64, String> {
+    let ticks = value * f64::from(timescale);
+    if !ticks.is_finite() || ticks > 9_007_199_254_740_991_f64 {
+        return Err(format!("{field} does not fit the project timebase"));
+    }
+    Ok(ticks.round() as u64)
+}
+
+fn parse_project_channel_map(raw: &str, source_channels: u16) -> Result<Vec<u16>, String> {
+    if raw.is_empty() {
+        return Ok((0..source_channels).collect());
+    }
+    let channels = raw
+        .split('+')
+        .map(|value| {
+            value
+                .parse::<u16>()
+                .map_err(|_| format!("invalid project channel index: {value}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if channels.is_empty() || channels.iter().any(|channel| *channel >= source_channels) {
+        return Err(format!(
+            "project channel map must reference channels below {source_channels}"
+        ));
+    }
+    Ok(channels)
+}
+
+fn build_project_references(
+    values: &[String],
+    option: &str,
+    root: &std::path::Path,
+) -> Result<Vec<denoize::ProjectArtifactReference>, String> {
+    values
+        .iter()
+        .map(|value| {
+            let (id, raw) = parse_project_binding(value, option)?;
+            let path = contained_project_input(root, &raw, option)?;
+            denoize::project_artifact_reference(id, path, root)
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct ProjectCreateOptions {
+    root: Option<String>,
+    project_id: Option<String>,
+    timeline_id: Option<String>,
+    sources: Vec<String>,
+    source_licenses: Vec<String>,
+    selections: Vec<String>,
+    settings: Vec<String>,
+    presets: Vec<String>,
+    models: Vec<String>,
+    plans: Vec<String>,
+    receipts: Vec<String>,
+    pretty: bool,
+    force: bool,
+}
+
+fn run_project_create(args: &[String]) -> Result<(), String> {
+    let output = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project create requires PROJECT.json")?;
+    let mut options = ProjectCreateOptions::default();
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut options.root, value, option)?;
+            }
+            "--project-id" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut options.project_id, value, option)?;
+            }
+            "--timeline" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut options.timeline_id, value, option)?;
+            }
+            "--source" => options
+                .sources
+                .push(project_option_value(args, &mut index, option)?),
+            "--source-license" => options
+                .source_licenses
+                .push(project_option_value(args, &mut index, option)?),
+            "--selection" => options
+                .selections
+                .push(project_option_value(args, &mut index, option)?),
+            "--setting" => options
+                .settings
+                .push(project_option_value(args, &mut index, option)?),
+            "--preset" => options
+                .presets
+                .push(project_option_value(args, &mut index, option)?),
+            "--model" => options
+                .models
+                .push(project_option_value(args, &mut index, option)?),
+            "--plan" => options
+                .plans
+                .push(project_option_value(args, &mut index, option)?),
+            "--receipt" => options
+                .receipts
+                .push(project_option_value(args, &mut index, option)?),
+            "--pretty" if !options.pretty => options.pretty = true,
+            "--force" if !options.force => options.force = true,
+            "--pretty" | "--force" => return Err(format!("{option} specified more than once")),
+            value => return Err(format!("unknown project create option: {value}")),
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        options
+            .root
+            .as_deref()
+            .ok_or("project create requires --root DIR")?,
+    )?;
+    let project_id = options
+        .project_id
+        .ok_or("project create requires --project-id ID")?;
+    if options.sources.is_empty() || options.selections.is_empty() {
+        return Err("project create requires at least one --source and --selection".into());
+    }
+
+    let mut license_specs = BTreeMap::new();
+    for value in &options.source_licenses {
+        let (source_id, nested) = parse_project_binding(value, "--source-license")?;
+        let (license_id, raw) = parse_project_binding(&nested, "--source-license")?;
+        if license_specs
+            .insert(source_id.clone(), (license_id, raw))
+            .is_some()
+        {
+            return Err(format!("duplicate --source-license for {source_id}"));
+        }
+    }
+    let mut seen_sources = BTreeSet::new();
+    let mut sources = Vec::new();
+    for value in &options.sources {
+        let (id, raw) = parse_project_binding(value, "--source")?;
+        if !seen_sources.insert(id.clone()) {
+            return Err(format!("duplicate project source ID: {id}"));
+        }
+        let path = contained_project_input(&root, &raw, "project source")?;
+        let inspection = denoize::inspect_project_source(&path, DecodeLimits::default())?;
+        let locator = denoize::portable_locator(&path, &root)?;
+        let license = license_specs
+            .remove(&id)
+            .map(|(license_id, raw)| {
+                let path = contained_project_input(&root, &raw, "project source license")?;
+                denoize::project_artifact_reference(license_id, path, &root)
+            })
+            .transpose()?;
+        sources.push(denoize::ProjectSource::new(
+            id, locator, inspection, license,
+        )?);
+    }
+    if let Some((unknown, _)) = license_specs.into_iter().next() {
+        return Err(format!(
+            "--source-license references unknown project source {unknown}"
+        ));
+    }
+    sources.sort_by(|left, right| left.id.cmp(&right.id));
+    let source_map = sources
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect::<BTreeMap<_, _>>();
+    let mut selections = Vec::new();
+    for value in &options.selections {
+        let (selection_id, specification) = value
+            .split_once('=')
+            .ok_or("--selection must use ID=SOURCE,START,DURATION[,CHANNEL_MAP[,PAD_BEFORE[,PAD_AFTER[,CROSSFADE]]]]")?;
+        let fields = specification.split(',').collect::<Vec<_>>();
+        if !(3..=7).contains(&fields.len()) {
+            return Err("--selection must contain 3..=7 comma-separated fields".into());
+        }
+        let source = source_map.get(fields[0]).ok_or_else(|| {
+            format!(
+                "selection {selection_id} references unknown source {}",
+                fields[0]
+            )
+        })?;
+        let start = parse_project_seconds(fields[1], "selection start")?;
+        let duration = parse_project_seconds(fields[2], "selection duration")?;
+        if duration <= 0.0 {
+            return Err("selection duration must be positive".into());
+        }
+        let channel_map =
+            parse_project_channel_map(fields.get(3).copied().unwrap_or(""), source.channels)?;
+        let padding_before = parse_project_seconds(
+            fields.get(4).copied().unwrap_or("0"),
+            "selection padding before",
+        )?;
+        let padding_after = parse_project_seconds(
+            fields.get(5).copied().unwrap_or("0"),
+            "selection padding after",
+        )?;
+        let crossfade =
+            parse_project_seconds(fields.get(6).copied().unwrap_or("0"), "selection crossfade")?;
+        selections.push(denoize::ProjectSelection::new(
+            selection_id,
+            source.id.clone(),
+            denoize::PresentationRegion::from_seconds(
+                source.fingerprint,
+                source.timescale,
+                start,
+                duration,
+            )?,
+            channel_map,
+            project_seconds_to_ticks(padding_before, source.timescale, "selection padding before")?,
+            project_seconds_to_ticks(padding_after, source.timescale, "selection padding after")?,
+            project_seconds_to_ticks(crossfade, source.timescale, "selection crossfade")?,
+        )?);
+    }
+    let first = selections
+        .first()
+        .ok_or("project create requires at least one selection")?;
+    let first_source = source_map
+        .get(first.source_id.as_str())
+        .ok_or("first project selection source disappeared")?;
+    let channels = u16::try_from(first.channel_map.len())
+        .map_err(|_| "project output channel count does not fit u16".to_string())?;
+    let timeline = denoize::ProjectTimeline::new(
+        options.timeline_id.unwrap_or_else(|| "main".into()),
+        first_source.timescale,
+        channels,
+        selections,
+    )?;
+
+    let settings = build_project_references(&options.settings, "--setting", &root)?;
+    let presets = build_project_references(&options.presets, "--preset", &root)?;
+    let plans = build_project_references(&options.plans, "--plan", &root)?;
+    let receipts = build_project_references(&options.receipts, "--receipt", &root)?;
+    let mut models = Vec::new();
+    for value in &options.models {
+        let (id, paths) = value
+            .split_once('=')
+            .ok_or("--model must use ID=PACKAGE.dmp,PUBLIC_KEY")?;
+        let (package_raw, key_raw) = paths
+            .split_once(',')
+            .ok_or("--model must use ID=PACKAGE.dmp,PUBLIC_KEY")?;
+        let package_path = contained_project_input(&root, package_raw, "project model package")?;
+        let key_path = contained_project_input(&root, key_raw, "project model public key")?;
+        let package =
+            denoize::project_artifact_reference(format!("{id}.package"), package_path, &root)?;
+        let public_key =
+            denoize::project_artifact_reference(format!("{id}.public-key"), key_path, &root)?;
+        models.push(denoize::ProjectModelReference::open(
+            id, package, public_key, &root,
+        )?);
+    }
+    let manifest = denoize::ProjectManifest::new(
+        project_id,
+        sources,
+        vec![timeline],
+        settings,
+        presets,
+        models,
+        plans,
+        receipts,
+    )?;
+    reject_cli_project_publication_collision(
+        &manifest,
+        &root,
+        None,
+        std::path::Path::new(output),
+        "project manifest output",
+    )?;
+    denoize::write_project_manifest(
+        output,
+        &manifest,
+        project_commit_mode(options.force),
+        options.pretty,
+    )?;
+    print_project_document(&manifest, options.pretty)
+}
+
+fn run_project_inspect(args: &[String]) -> Result<(), String> {
+    let project = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project inspect requires PROJECT.json")?;
+    let mut pretty = false;
+    for option in &args[1..] {
+        match option.as_str() {
+            "--pretty" if !pretty => pretty = true,
+            "--pretty" => return Err("--pretty specified more than once".into()),
+            value => return Err(format!("unknown project inspect option: {value}")),
+        }
+    }
+    let manifest = denoize::ProjectManifest::from_file(project)?;
+    print_project_document(&manifest, pretty)
+}
+
+struct ProjectPathOptions {
+    root: std::path::PathBuf,
+    output: Option<String>,
+    timeline: Option<String>,
+    pretty: bool,
+    force: bool,
+}
+
+fn parse_project_root_and_output_options(
+    args: &[String],
+    start: usize,
+    allow_output: bool,
+) -> Result<ProjectPathOptions, String> {
+    let mut root = None;
+    let mut output = None;
+    let mut timeline = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = start;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--output" if allow_output => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut output, value, option)?;
+            }
+            "--timeline" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut timeline, value, option)?;
+            }
+            "--pretty" if !pretty => pretty = true,
+            "--force" if !force => force = true,
+            "--pretty" | "--force" => return Err(format!("{option} specified more than once")),
+            value => return Err(format!("unknown project option: {value}")),
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project command requires --root DIR")?,
+    )?;
+    Ok(ProjectPathOptions {
+        root,
+        output,
+        timeline,
+        pretty,
+        force,
+    })
+}
+
+fn run_project_validate(args: &[String]) -> Result<(), String> {
+    let project = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project validate requires PROJECT.json")?;
+    let ProjectPathOptions {
+        root,
+        output,
+        timeline,
+        pretty,
+        force,
+    } = parse_project_root_and_output_options(args, 1, false)?;
+    if output.is_some() || timeline.is_some() || force {
+        return Err("project validate accepts only --root and --pretty".into());
+    }
+    let manifest = denoize::ProjectManifest::from_file(project)?;
+    let report = denoize::validate_project_files(&manifest, root, DecodeLimits::default())?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_assemble(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project assemble requires PROJECT.json OUTPUT.wav".into());
+    }
+    let project_raw = &args[0];
+    let output_raw = &args[1];
+    let mut root = None;
+    let mut timeline = None;
+    let mut supplied_plan = None;
+    let mut receipt = None;
+    let mut receipt_key = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--timeline" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut timeline, value, option)?;
+            }
+            "--plan" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut supplied_plan, value, option)?;
+            }
+            "--receipt" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut receipt, value, option)?;
+            }
+            "--receipt-key" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut receipt_key, value, option)?;
+            }
+            "--pretty" if !pretty => pretty = true,
+            "--force" if !force => force = true,
+            "--pretty" | "--force" => return Err(format!("{option} specified more than once")),
+            value => return Err(format!("unknown project assemble option: {value}")),
+        }
+        index += 1;
+    }
+    if receipt.is_some() != receipt_key.is_some() {
+        return Err("project assemble requires --receipt and --receipt-key together".into());
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project assemble requires --root DIR")?,
+    )?;
+    let project_path = if supplied_plan.is_some() || receipt.is_some() {
+        contained_project_input(&root, project_raw, "project manifest")?
+    } else {
+        std::path::PathBuf::from(project_raw)
+    };
+    let manifest = denoize::ProjectManifest::from_file(&project_path)?;
+    let timeline = timeline
+        .or_else(|| {
+            manifest
+                .timelines
+                .first()
+                .map(|timeline| timeline.id.clone())
+        })
+        .ok_or("project has no timeline")?;
+    let mode = project_commit_mode(force);
+    let mut planned = None;
+    let output_path = if supplied_plan.is_some() || receipt.is_some() {
+        let output = contained_project_output(&root, output_raw, "project output")?;
+        let manifest_reference =
+            denoize::project_artifact_reference("manifest", &project_path, &root)?;
+        let output_locator = denoize::portable_locator(&output, &root)?;
+        let expected = denoize::ProjectExecutionPlan::new(
+            &manifest,
+            &timeline,
+            manifest_reference,
+            output_locator,
+            mode,
+        )?;
+        if let Some(path) = supplied_plan.as_deref() {
+            let supplied = denoize::ProjectExecutionPlan::from_file(path)?;
+            if supplied != expected {
+                return Err(format!(
+                    "project assembly no longer matches supplied plan: supplied={} current={}",
+                    supplied.digest()?,
+                    expected.digest()?
+                ));
+            }
+        }
+        planned = Some(expected);
+        output
+    } else {
+        std::path::PathBuf::from(output_raw)
+    };
+
+    let receipt_state = if let (Some(path), Some(key)) = (receipt, receipt_key) {
+        let path = contained_project_output(&root, &path, "project receipt")?;
+        if path == output_path {
+            return Err("project receipt and audio output paths must differ".into());
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(format!(
+                    "project receipt destination already exists: {}",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect project receipt destination {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        Some((path, denoize::ReceiptSecretKey::from_file(key)?))
+    } else {
+        None
+    };
+    reject_cli_project_publication_collision(
+        &manifest,
+        &root,
+        Some(&project_path),
+        &output_path,
+        "project output",
+    )?;
+    let report = denoize::assemble_project_timeline(
+        &manifest,
+        &timeline,
+        &root,
+        &output_path,
+        mode,
+        DecodeLimits::default(),
+    )?;
+    if let Some((receipt_path, key)) = receipt_state {
+        let plan = planned
+            .as_ref()
+            .ok_or("project receipt plan state disappeared after assembly")?;
+        let signed = denoize::SignedProjectExecutionReceipt::sign(plan, report.output, &key)?;
+        denoize::write_signed_project_execution_receipt(
+            &receipt_path,
+            &signed,
+            CommitMode::NoClobber,
+            pretty,
+        )
+        .map_err(|error| {
+            format!(
+                "project audio was published to {}, but its signed receipt could not be published to {}: {error}",
+                output_path.display(),
+                receipt_path.display()
+            )
+        })?;
+    }
+    print_project_document(&report, pretty)
+}
+
+fn run_project_relocate(args: &[String]) -> Result<(), String> {
+    if args.len() < 3
+        || args[0].starts_with('-')
+        || args[1].starts_with('-')
+        || args[2].starts_with('-')
+    {
+        return Err("project relocate requires PROJECT.json SOURCE_ID CANDIDATE".into());
+    }
+    let project = &args[0];
+    let source_id = &args[1];
+    let candidate_raw = &args[2];
+    let ProjectPathOptions {
+        root,
+        output,
+        timeline,
+        pretty,
+        force,
+    } = parse_project_root_and_output_options(args, 3, true)?;
+    if timeline.is_some() {
+        return Err("project relocate does not accept --timeline".into());
+    }
+    let output = output.ok_or("project relocate requires --output PROJECT.json")?;
+    let candidate = project_input_path(&root, candidate_raw);
+    let manifest = denoize::ProjectManifest::from_file(project)?;
+    let relocated = denoize::relocate_project_source(
+        &manifest,
+        source_id,
+        candidate,
+        &root,
+        DecodeLimits::default(),
+    )?;
+    reject_cli_project_publication_collision(
+        &manifest,
+        &root,
+        Some(std::path::Path::new(project)),
+        std::path::Path::new(&output),
+        "relocated project manifest output",
+    )?;
+    reject_cli_project_publication_collision(
+        &relocated,
+        &root,
+        Some(std::path::Path::new(project)),
+        std::path::Path::new(&output),
+        "relocated project manifest output",
+    )?;
+    denoize::write_project_manifest(output, &relocated, project_commit_mode(force), pretty)?;
+    print_project_document(&relocated, pretty)
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     wait_for_isolation_gate()?;
@@ -4131,6 +5732,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("update") {
         return run_update(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("project") {
+        return run_project(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
     if ov.resume && !ov.batch && !ov.stream {
@@ -9229,7 +10833,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "fbcc5581afebfe2dc826006e8420c2c7c16ea87ebbd3bbf5ceb88edc15a994fb";
+        "615725b48303953aa4733a7f8cfe03492332b778b9909874d7cd93c38693e08c";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

@@ -1191,7 +1191,7 @@ impl ReceiptTrustPolicy {
             .map_err(|error| format!("serialize receipt trust policy: {error}"))
     }
 
-    fn resolve(&self, key_id: &str) -> Result<&ReceiptPublicKey, String> {
+    pub(crate) fn resolve(&self, key_id: &str) -> Result<&ReceiptPublicKey, String> {
         if self
             .revoked_key_ids
             .binary_search_by(|value| value.as_str().cmp(key_id))

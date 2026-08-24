@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes forty-four versioned JSON contracts for local automation. Their
+denoize publishes fifty-four versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -68,6 +68,35 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-presentation-region-v1.schema.json`](../schemas/denoize-presentation-region-v1.schema.json)
   describes one exact, source-bound interval on the decoded presentation
   timeline.
+- [`denoize-project-batch-v1.schema.json`](../schemas/denoize-project-batch-v1.schema.json)
+  describes a sorted, bounded set of deterministic project assembly results.
+- [`denoize-project-bundle-import-v1.schema.json`](../schemas/denoize-project-bundle-import-v1.schema.json)
+  describes one authenticated no-clobber project-tree import and any omitted
+  source or model payloads.
+- [`denoize-project-bundle-v1.schema.json`](../schemas/denoize-project-bundle-v1.schema.json)
+  describes the authenticated contents, bindings, fingerprints, and explicit
+  source/model payload budgets of an offline project bundle.
+- [`denoize-project-execution-plan-v1.schema.json`](../schemas/denoize-project-execution-plan-v1.schema.json)
+  describes the exact manifest, timeline, float-WAV destination, publication
+  decision, geometry, and conservative assembly resources.
+- [`denoize-project-execution-receipt-v1.schema.json`](../schemas/denoize-project-execution-receipt-v1.schema.json)
+  describes the project-domain Ed25519-signed identity of a successfully
+  published timeline output.
+- [`denoize-project-receipt-verification-v1.schema.json`](../schemas/denoize-project-receipt-verification-v1.schema.json)
+  describes successful independent signature, optional plan, and rooted output
+  verification for a project receipt.
+- [`denoize-project-render-v1.schema.json`](../schemas/denoize-project-render-v1.schema.json)
+  describes completed deterministic assembly, exact output geometry, and the
+  retained-PCM upper bound.
+- [`denoize-project-v1.schema.json`](../schemas/denoize-project-v1.schema.json)
+  describes a portable source-bound project, its linear sample-accurate
+  timelines, and fingerprinted settings, presets, models, plans, and receipts.
+- [`denoize-project-verification-v1.schema.json`](../schemas/denoize-project-verification-v1.schema.json)
+  describes read-only verification of every project source and referenced
+  artifact.
+- [`denoize-project-watch-cycle-v1.schema.json`](../schemas/denoize-project-watch-cycle-v1.schema.json)
+  describes one bounded settled-manifest scan, assembly, retry, quarantine, and
+  cancellation report from project watch automation.
 - [`denoize-receipt-public-key-v1.schema.json`](../schemas/denoize-receipt-public-key-v1.schema.json)
   describes a distributable receipt-verification key.
 - [`denoize-receipt-secret-key-v1.schema.json`](../schemas/denoize-receipt-secret-key-v1.schema.json)
@@ -124,10 +153,38 @@ documented enum/string values are stable. A future release may add fields, so
 consumers must ignore unknown fields unless the contract explicitly says they
 are rejected. Removing a field, changing its type, or changing a documented
 value requires a new schema identifier and version. Execution plans, receipts,
-keys, policies, verification reports, presentation regions, runtime model
-package manifests, and IPC documents deliberately reject unknown fields: their
-exact typed representation participates in signing, authorization, admission,
-trust, or source-binding decisions.
+keys, policies, verification reports, presentation regions, project documents,
+runtime model package manifests, and IPC documents deliberately reject unknown
+fields: their exact typed representation participates in signing,
+authorization, admission, trust, or source-binding decisions.
+
+## Portable project contracts
+
+`denoize-project-v1` contains only portable locators and authenticated
+references; it never embeds source audio or model-package bytes in JSON.
+Sources bind exact file fingerprints and decoded presentation geometry.
+Selections reuse `denoize-presentation-region-v1`, name an explicit channel map,
+and add bounded silence or one crossfade from the immediately preceding
+unpadded selection. Timelines are ordered linear paths. Unknown graph records,
+branches, arbitrary overlaps, resampling, changed fingerprints, mismatched
+timebases, and out-of-bounds regions are rejected.
+
+The manifest, plan, receipt, validation, render, batch, watch, and bundle report
+types all reject unknown properties and future versions. Manifest, plan, and
+receipt JSON inputs are bounded regular non-symlink files. Digests use separate
+domains for the manifest, timeline, plan, and signed receipt payload. A reviewed
+project plan must equal the independently reconstructed current plan before
+assembly; a receipt binds that plan digest, manifest/timeline identity, and the
+verified published output.
+
+The binary `.dpb` transport is length-delimited and reports its authenticated
+contents through `denoize-project-bundle-v1`. Settings, presets, source
+licenses, model public keys, plans, receipts, the manifest, and read-only
+verification evidence are carried by default. Source and model-package payloads
+are included only when separately requested with a positive aggregate byte
+limit. Import authenticates and parses every entry before a no-clobber staged
+directory rename. See [portable projects](projects.md) for command examples and
+the complete containment and publication boundary.
 
 ## DAW plug-in contracts
 
