@@ -78,6 +78,7 @@ pub mod service;
 pub mod stft;
 mod stoi_resample;
 pub mod stream;
+pub mod universal_restoration;
 pub mod update;
 pub mod vad;
 pub mod watch;
@@ -224,6 +225,21 @@ pub use restoration::{
     RestorationReport, RestorationResult, RestorationStatus, WindPlosiveConfig, WpeChannelMode,
     WpeConfig, MAX_RESTORATION_CHANNELS, MAX_RESTORATION_MASK_RUNS, MAX_RESTORATION_OPERATIONS,
     RESTORATION_MASK_SCHEMA, RESTORATION_REPORT_SCHEMA, RESTORATION_SCHEMA_VERSION,
+};
+#[cfg(feature = "bsrnn")]
+pub use universal_restoration::restore_universal_audio;
+pub use universal_restoration::{
+    estimate_universal_restoration_memory_bytes, sign_universal_promotion_evidence,
+    SignedUniversalPromotionEvidence, UniversalDegradation, UniversalDegradationEvidence,
+    UniversalMaskRun, UniversalMaskState, UniversalMetricOperator, UniversalMetricOutcome,
+    UniversalModelFamily, UniversalModelIdentity, UniversalPromotionEvidencePayload,
+    UniversalRenderRole, UniversalRestorationConfig, UniversalRestorationDecision,
+    UniversalRestorationMask, UniversalRestorationReport, UniversalRestorationResult,
+    UniversalSafetyGate, UniversalSafetyGateKind, UniversalSafetyMeasurements,
+    UniversalStratumEvidence, MAX_UNIVERSAL_EVIDENCE_METRICS, MAX_UNIVERSAL_EVIDENCE_STRATA,
+    MAX_UNIVERSAL_MASK_RUNS, UNIVERSAL_PROMOTION_EVIDENCE_SCHEMA,
+    UNIVERSAL_RESTORATION_MASK_SCHEMA, UNIVERSAL_RESTORATION_REPORT_SCHEMA,
+    UNIVERSAL_RESTORATION_SCHEMA_VERSION,
 };
 pub use watch::{
     WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError,

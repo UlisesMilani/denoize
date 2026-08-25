@@ -1118,6 +1118,36 @@ struct DesktopRestorationResult {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UniversalRestorationRequest {
+    input: String,
+    output: String,
+    model_package: String,
+    model_package_key: String,
+    model_family: String,
+    render_role: String,
+    allow_experimental: bool,
+    analysis_seconds: u32,
+    minimum_degradation_score: f64,
+    maximum_energy_gain_db: f64,
+    maximum_peak_gain_db: f64,
+    maximum_new_clipping_ratio: f64,
+    maximum_quality_regression: f64,
+    accelerator: String,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    replace: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopUniversalRestorationResult {
+    output: String,
+    report: denoize::UniversalRestorationReport,
+    mask: denoize::UniversalRestorationMask,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EvaluationValidationRequest {
     manifest: String,
     corpus_root: String,
@@ -2142,6 +2172,158 @@ async fn restore_audio_input(
         tauri::async_runtime::spawn_blocking(move || run_desktop_restoration(request))
             .await
             .map_err(|error| format!("決定的復元タスクに失敗しました: {error}"))??,
+    )
+}
+
+fn desktop_universal_restoration_config(
+    request: &UniversalRestorationRequest,
+) -> Result<denoize::UniversalRestorationConfig, String> {
+    let config = denoize::UniversalRestorationConfig {
+        model_family: denoize::UniversalModelFamily::parse(&request.model_family)
+            .ok_or_else(|| format!("不明な汎用復元モデル種別です: {}", request.model_family))?,
+        render_role: denoize::UniversalRenderRole::parse(&request.render_role)
+            .ok_or_else(|| format!("不明な汎用復元レンダー種別です: {}", request.render_role))?,
+        allow_experimental: request.allow_experimental,
+        analysis_seconds: request.analysis_seconds,
+        minimum_degradation_score: request.minimum_degradation_score,
+        maximum_energy_gain_db: request.maximum_energy_gain_db,
+        maximum_peak_gain_db: request.maximum_peak_gain_db,
+        maximum_new_clipping_ratio: request.maximum_new_clipping_ratio,
+        maximum_quality_score_regression: request.maximum_quality_regression,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+#[cfg(feature = "full")]
+fn run_desktop_universal_restoration(
+    request: UniversalRestorationRequest,
+) -> Result<DesktopUniversalRestorationResult, String> {
+    const MAX_DESKTOP_UNIVERSAL_MASK_RUNS: usize = 200_000;
+    for (value, label) in [
+        (&request.input, "汎用復元入力"),
+        (&request.output, "汎用復元出力"),
+        (&request.model_package, "署名付きモデルパッケージ"),
+        (&request.model_package_key, "モデルパッケージ公開鍵"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("{label}を選択してください"));
+        }
+    }
+    let config = desktop_universal_restoration_config(&request)?;
+    let accelerator = AcceleratorPreference::parse(&request.accelerator)
+        .ok_or_else(|| format!("不明なアクセラレータです: {}", request.accelerator))?;
+    checked_desktop_mib(request.max_memory_mb, "プロセスメモリ上限")?;
+
+    let input = Path::new(&request.input);
+    let output = Path::new(&request.output);
+    let package_path = Path::new(&request.model_package);
+    let package_key_path = Path::new(&request.model_package_key);
+    require_distinct_execution_paths(&[
+        ("入力", input),
+        ("出力", output),
+        ("モデルパッケージ", package_path),
+        ("モデル公開鍵", package_key_path),
+    ])?;
+    ensure_output_available(output, request.replace)?;
+
+    let package = denoize::RuntimeModelPackage::open(package_path, package_key_path)?;
+    if package.manifest_v2().is_none() {
+        return Err("汎用復元には署名済みruntime model package v2が必要です".into());
+    }
+    let mut backend_options = BackendOptions::default().with_runtime_model_package(package);
+    backend_options.deterministic = true;
+    backend_options.accelerator = accelerator;
+    let accelerator = denoize::select_accelerator_for_options(Backend::Bsrnn, &backend_options)?;
+    let profile = backend_options
+        .runtime_package
+        .as_ref()
+        .expect("universal restoration retains its authenticated package")
+        .precision_profile_for(accelerator.effective())?
+        .expect("runtime model package v2 selects a precision profile");
+    let model_working_set = profile
+        .resources
+        .max_session_memory_bytes
+        .saturating_add(profile.resources.max_worker_memory_bytes);
+    denoize::ensure_memory_limit(
+        model_working_set,
+        request.max_memory_mb,
+        "desktop universal restoration model working set",
+    )?;
+    // Fail closed on model bytes, graph semantics, and numerical vectors
+    // before the user's audio file is opened.
+    let session =
+        BackendSession::prepare_with_accelerator(Backend::Bsrnn, backend_options, accelerator)?;
+
+    let maximum = checked_desktop_mib(request.max_memory_mb, "プロセスメモリ上限")?;
+    let decode_maximum = maximum.map(|limit| limit.saturating_sub(model_working_set));
+    let limits = DecodeLimits::new(
+        denoize::metadata_limits_for_available_memory(decode_maximum),
+        decode_maximum,
+    );
+    let mut input_session = denoize::AudioInputSession::open(input)?;
+    denoize::ensure_memory_limit(
+        model_working_set.saturating_add(denoize::estimate_session_memory_bytes(&input_session)),
+        request.max_memory_mb,
+        "desktop universal restoration input/model preflight",
+    )?;
+    let audio = read_audio_from_session_with_limits(&mut input_session, limits)?;
+    let working_set = denoize::estimate_universal_restoration_memory_bytes(&audio)
+        .saturating_add(model_working_set);
+    denoize::ensure_memory_limit(
+        working_set,
+        request.max_memory_mb,
+        "desktop universal restoration working set",
+    )?;
+    let metadata = if request.preserve_metadata {
+        input_session
+            .read_metadata_with_limits(desktop_retained_metadata_limits(maximum, working_set))?
+    } else {
+        None
+    };
+    let result = denoize::restore_universal_audio(&audio, &session, &config)?;
+    if result.mask.runs.len() > MAX_DESKTOP_UNIVERSAL_MASK_RUNS {
+        return Err(format!(
+            "汎用復元マスクがDesktop表示上限の{MAX_DESKTOP_UNIVERSAL_MASK_RUNS} runsを超えました。CLIの--maskを使用してください"
+        ));
+    }
+    let format = OutputFormat::from_path(output)?;
+    let encode = EncodeOptions::default();
+    encode.validate_options(format)?;
+    format.validate_config(&result.audio, &encode)?;
+    denoize::write_audio_transactional(
+        output,
+        &result.audio,
+        encode,
+        metadata,
+        if request.replace {
+            CommitMode::Replace
+        } else {
+            CommitMode::NoClobber
+        },
+    )?;
+    Ok(DesktopUniversalRestorationResult {
+        output: request.output,
+        report: result.report,
+        mask: result.mask,
+    })
+}
+
+#[cfg(not(feature = "full"))]
+fn run_desktop_universal_restoration(
+    _request: UniversalRestorationRequest,
+) -> Result<DesktopUniversalRestorationResult, String> {
+    Err("このDesktopビルドでは汎用BSRNN復元を利用できません".into())
+}
+
+#[tauri::command]
+async fn restore_universal_audio_input(
+    request: UniversalRestorationRequest,
+) -> DesktopResult<DesktopUniversalRestorationResult> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || run_desktop_universal_restoration(request))
+            .await
+            .map_err(|error| format!("汎用音声復元タスクに失敗しました: {error}"))??,
     )
 }
 
@@ -9103,6 +9285,7 @@ pub fn run() {
             diagnose_audio_input,
             assess_audio_inputs,
             restore_audio_input,
+            restore_universal_audio_input,
             plan_process,
             plan_batch,
             inspect_project_manifest,
@@ -9327,6 +9510,101 @@ mod tests {
             .contains("不明な復元処理"));
     }
 
+    fn universal_desktop_request() -> UniversalRestorationRequest {
+        UniversalRestorationRequest {
+            input: "missing.wav".into(),
+            output: "restored.wav".into(),
+            model_package: "model.dmp".into(),
+            model_package_key: "model.pub".into(),
+            model_family: "discriminative".into(),
+            render_role: "primary".into(),
+            allow_experimental: false,
+            analysis_seconds: 12,
+            minimum_degradation_score: 0.08,
+            maximum_energy_gain_db: 6.0,
+            maximum_peak_gain_db: 6.0,
+            maximum_new_clipping_ratio: 0.0001,
+            maximum_quality_regression: 5.0,
+            accelerator: "cpu".into(),
+            max_memory_mb: Some(256),
+            preserve_metadata: true,
+            replace: false,
+        }
+    }
+
+    #[test]
+    fn desktop_universal_restoration_contract_is_closed_and_safe_by_default() {
+        let request: UniversalRestorationRequest = serde_json::from_value(serde_json::json!({
+            "input": "recording.wav",
+            "output": "restored.wav",
+            "modelPackage": "model.dmp",
+            "modelPackageKey": "model.pub",
+            "modelFamily": "discriminative",
+            "renderRole": "primary",
+            "allowExperimental": false,
+            "analysisSeconds": 12,
+            "minimumDegradationScore": 0.08,
+            "maximumEnergyGainDb": 6.0,
+            "maximumPeakGainDb": 6.0,
+            "maximumNewClippingRatio": 0.0001,
+            "maximumQualityRegression": 5.0,
+            "accelerator": "cpu",
+            "maxMemoryMb": 256,
+            "preserveMetadata": true,
+            "replace": false
+        }))
+        .unwrap();
+        let config = desktop_universal_restoration_config(&request).unwrap();
+        assert_eq!(
+            config.model_family,
+            denoize::UniversalModelFamily::Discriminative
+        );
+        assert_eq!(config.render_role, denoize::UniversalRenderRole::Primary);
+        assert!(!config.allow_experimental);
+
+        assert!(
+            serde_json::from_value::<UniversalRestorationRequest>(serde_json::json!({
+                "input": "recording.wav",
+                "output": "restored.wav",
+                "modelPackage": "model.dmp",
+                "modelPackageKey": "model.pub",
+                "modelFamily": "discriminative",
+                "renderRole": "primary",
+                "allowExperimental": false,
+                "analysisSeconds": 12,
+                "minimumDegradationScore": 0.08,
+                "maximumEnergyGainDb": 6.0,
+                "maximumPeakGainDb": 6.0,
+                "maximumNewClippingRatio": 0.0001,
+                "maximumQualityRegression": 5.0,
+                "accelerator": "cpu",
+                "maxMemoryMb": null,
+                "preserveMetadata": true,
+                "replace": false,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_universal_restoration_rejects_unsafe_modes_before_file_io() {
+        let mut request = universal_desktop_request();
+        request.model_family = "generative".into();
+        assert!(desktop_universal_restoration_config(&request)
+            .unwrap_err()
+            .contains("allow_experimental=true"));
+
+        request.allow_experimental = true;
+        request.render_role = "alternate".into();
+        assert!(desktop_universal_restoration_config(&request).is_ok());
+
+        request.analysis_seconds = 0;
+        assert!(desktop_universal_restoration_config(&request)
+            .unwrap_err()
+            .contains("analysis_seconds"));
+    }
+
     #[test]
     fn application_update_platform_tracks_the_packaged_bundle_type() {
         assert_eq!(
@@ -9439,7 +9717,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "2fc37ed344bbd6bb242b76fffa0a64039651e6e6f4851324e1a21097d51f7786";
+        "976b34c1ee4fa13ae4d9e428362b7cf41799efd1cf98be633d1f7fc4acf6f875";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

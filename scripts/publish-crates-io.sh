@@ -158,6 +158,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
     "denoize-${package_version}/src/region.rs" \
+    "denoize-${package_version}/src/universal_restoration.rs" \
     "denoize-${package_version}/src/project.rs" \
     "denoize-${package_version}/src/project_automation.rs" \
     "denoize-${package_version}/src/project_bundle.rs" \
@@ -171,6 +172,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/docs/restoration-research.md" \
     "denoize-${package_version}/docs/restoration.md" \
+    "denoize-${package_version}/docs/universal-restoration.md" \
     "denoize-${package_version}/docs/updates.md" \
     "denoize-${package_version}/schemas/denoize-assessment-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
@@ -220,6 +222,9 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-runtime-model-package-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-restoration-mask-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-restoration-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-universal-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-universal-restoration-mask-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-universal-restoration-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-apply-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-bundle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-check-v1.schema.json" \
@@ -236,6 +241,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-evaluation-evidence.sh" \
     "denoize-${package_version}/scripts/test-project-schemas.py" \
     "denoize-${package_version}/scripts/test-restoration-schemas.py" \
+    "denoize-${package_version}/scripts/test-universal-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-runtime-model-package-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do

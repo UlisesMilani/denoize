@@ -185,6 +185,41 @@ See [Deterministic restoration](docs/restoration.md), the closed
 [mask](schemas/denoize-restoration-mask-v1.schema.json) contracts, and the
 [research and acceptance review](docs/restoration-research.md#stage-26--deterministic-restoration).
 
+### Fail-closed universal speech restoration
+
+**denoize universal** runs a signed runtime package v2 through the dedicated
+48 kHz BSRNN spectral adapter. The discriminative `primary` path is the safe
+default; hybrid and generative packages require both an `alternate` role and an
+explicit experimental opt-in:
+
+~~~sh
+denoize universal degraded.wav restored.wav \
+  --model-package urgent-bsrnn.dmp \
+  --model-package-key publisher.pub \
+  --report universal-report.json \
+  --mask universal-mask.json \
+  --max-memory 4096 --pretty
+~~~
+
+The package signature, provenance, exact graph interface, selected-runtime
+resource profile, and numerical vectors pass before source inference. Clean
+input bypasses the model. A private candidate is published only when geometry,
+finite-sample, energy, peak, new-clipping, silence-injection, and native-quality
+gates all pass; otherwise the decoded input is written unchanged. Reports bind
+package/key/source/checkpoint and PCM/mask SHA-256 values without paths.
+
+Signal gates do not prove preservation of words, phonemes, prosody, or speaker
+identity. Model promotion therefore uses separately signed evidence covering 20
+required demographic/material/degradation strata, nine metrics per stratum,
+and human-listening thresholds. Upstream URGENT and UniPASE weights are not
+bundled because their complete artifact-level training-data redistribution
+chain has not been established. See [Universal restoration](docs/universal-restoration.md),
+its [research audit](docs/restoration-research.md#stage-27--universal-speech-restoration),
+and the closed [report](schemas/denoize-universal-restoration-report-v1.schema.json),
+[mask](schemas/denoize-universal-restoration-mask-v1.schema.json), and
+[promotion evidence](schemas/denoize-universal-promotion-evidence-v1.schema.json)
+contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |

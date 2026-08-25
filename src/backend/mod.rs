@@ -179,7 +179,8 @@ impl SgmseProfile {
 pub struct BackendOptions {
     /// Model configuration used by the `onnx` backend when that feature is enabled.
     pub onnx: Option<OnnxModelConfig>,
-    /// Authenticated custom-model package used by the generic `onnx` backend.
+    /// Authenticated custom-model package used by the generic `onnx` backend
+    /// or the dedicated BSRNN spectral adapter.
     ///
     /// Prefer [`BackendOptions::with_runtime_model_package`] so the compatible
     /// path/rate identity is populated atomically. Raw ONNX configuration and
@@ -226,7 +227,7 @@ impl BackendOptions {
             if !backend_accepts_runtime_package(backend) {
                 return Err(ConfigError::invalid(
                     "backend_options.runtime_package",
-                    "a package used only by the generic onnx backend",
+                    "a package used by the generic onnx or dedicated bsrnn backend",
                 ));
             }
             if self.onnx.as_ref() != Some(&package.model_config()) {
@@ -290,7 +291,14 @@ impl BackendOptions {
 fn backend_accepts_runtime_package(backend: Backend) -> bool {
     #[cfg(feature = "onnx")]
     {
-        backend == Backend::Onnx
+        if backend == Backend::Onnx {
+            return true;
+        }
+        #[cfg(feature = "bsrnn")]
+        if backend == Backend::Bsrnn {
+            return true;
+        }
+        false
     }
     #[cfg(not(feature = "onnx"))]
     {

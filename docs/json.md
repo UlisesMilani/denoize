@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes fifty-eight versioned JSON contracts for local automation. Their
+denoize publishes sixty-three versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -140,6 +140,18 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   context-padded, detected, and replaced frames and name every contributing
   operation. Library and schema-parity tests additionally require exact,
   gap-free coverage of every frame in every channel.
+- [`denoize-universal-restoration-report-v1.schema.json`](../schemas/denoize-universal-restoration-report-v1.schema.json)
+  describes one fail-closed universal render decision, authenticated model and
+  provenance identity, degradation evidence, signal-safety gates, and exact
+  input/candidate/output PCM and mask digests without filesystem paths.
+- [`denoize-universal-restoration-mask-v1.schema.json`](../schemas/denoize-universal-restoration-mask-v1.schema.json)
+  describes exact, gap-free `untouched`/`replaced` float-PCM coverage for every
+  channel and frame selected by universal restoration.
+- [`denoize-universal-promotion-evidence-v1.schema.json`](../schemas/denoize-universal-promotion-evidence-v1.schema.json)
+  describes Ed25519-signed package/corpus/result identity, all required
+  demographic, material, and degradation strata, nine fidelity/quality/output/
+  performance metrics per stratum, and a mechanically consistent listening
+  and promotion decision.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -180,8 +192,9 @@ keys, policies, verification reports, presentation regions, project documents,
 runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
-assessment, and restoration reports and restoration masks also reject unknown
-fields so a consumer cannot silently ignore a new safety dimension.
+assessment, deterministic and universal restoration reports and masks, and
+universal promotion evidence also reject unknown fields so a consumer cannot
+silently ignore a new safety dimension.
 
 ## Portable project contracts
 

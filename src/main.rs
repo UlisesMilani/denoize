@@ -409,6 +409,7 @@ USAGE:
     denoize assess <INPUT> [--analysis-seconds N] [--json|--pretty]
     denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
+    denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -463,7 +464,7 @@ OPTIONS:
         --true-peak <DBTP>    finite ceiling in -20..0 dBTP with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
-        --model-package <PATH> signed custom-model runtime package (.dmp; -b onnx)
+        --model-package <PATH> signed runtime package (.dmp; -b onnx or bsrnn)
         --model-package-key <PATH> trusted Minisign public key for --model-package
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
@@ -1691,10 +1692,20 @@ fn processing_backend_choice(ov: &Overrides) -> BackendChoice {
     }
 }
 
-fn generic_onnx_backend_selected(ov: &Overrides) -> bool {
+fn runtime_package_backend_selected(ov: &Overrides) -> bool {
     #[cfg(feature = "onnx")]
     {
-        !ov.auto_backend && ov.backend == Some(Backend::Onnx)
+        if ov.auto_backend {
+            return false;
+        }
+        if ov.backend == Some(Backend::Onnx) {
+            return true;
+        }
+        #[cfg(feature = "bsrnn")]
+        if ov.backend == Some(Backend::Bsrnn) {
+            return true;
+        }
+        false
     }
     #[cfg(not(feature = "onnx"))]
     {
@@ -1778,8 +1789,8 @@ fn validate_effective_options(ov: &Overrides, sample_rate: u32) -> Result<(), St
                     "--model-package cannot be combined with --onnx-model or --onnx-rate".into(),
                 );
             }
-            if !generic_onnx_backend_selected(ov) {
-                return Err("--model-package requires --backend onnx".into());
+            if !runtime_package_backend_selected(ov) {
+                return Err("--model-package requires --backend onnx or bsrnn".into());
             }
         }
         (None, None) => {
@@ -5716,6 +5727,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("restore") {
         return run_restore(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("universal") {
+        return run_universal(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("receipts") {
         return run_receipts(&args[1..]);
     }
@@ -8016,6 +8030,610 @@ fn run_restore(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn universal_usage() -> &'static str {
+    "\
+USAGE:
+    denoize universal <INPUT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> [OPTIONS]
+    denoize universal evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Run fail-closed universal speech restoration through an authenticated BSRNN
+spectral package v2. The safe default is discriminative and primary. Clean
+input bypasses inference. A candidate is published only after geometry,
+finite-sample, energy, peak, clipping, silence-injection, and native-quality
+gates pass; otherwise OUTPUT contains the bit-exact decoded input.
+
+OPTIONS:
+        --model-package <PATH>            required signed runtime package v2
+        --model-package-key <PATH>        trusted Minisign public key
+        --family <FAMILY>                 discriminative|hybrid|generative
+        --render-role <ROLE>              primary|alternate
+        --experimental                    required for hybrid/generative alternate renders
+        --analysis-seconds <N>            bounded diagnosis prefix, 1..60 (default: 12)
+        --minimum-degradation-score <F>   inference threshold, 0..1 (default: 0.08)
+        --maximum-energy-gain-db <DB>     fail-closed candidate ceiling, 0..24 (default: 6)
+        --maximum-peak-gain-db <DB>       fail-closed peak-rise ceiling, 0..24 (default: 6)
+        --maximum-new-clipping-ratio <F>  added clipping ceiling, 0..0.1 (default: 0.0001)
+        --maximum-quality-regression <F>  native proxy regression ceiling, 0..25 (default: 5)
+        --accelerator <NAME>              cpu|auto|gpu|metal|cuda (default: cpu)
+        --report <PATH.json>              atomically write the closed report
+        --mask <PATH.json>                atomically write the complete RLE change mask
+        --max-memory <MB>                 bound decode, model, candidate, and mask memory
+        --no-metadata                     do not copy input metadata
+        --replace                         atomically replace output/report/mask destinations
+        --json                            emit compact report JSON
+        --pretty                          emit indented report JSON
+    -h, --help                            show this help
+"
+}
+
+#[cfg_attr(not(feature = "bsrnn"), allow(dead_code))]
+#[derive(Debug)]
+struct UniversalCliOptions {
+    input: String,
+    output: String,
+    package: String,
+    package_key: String,
+    report: Option<String>,
+    mask: Option<String>,
+    config: denoize::UniversalRestorationConfig,
+    accelerator: AcceleratorPreference,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_universal_args(args: &[String]) -> Result<UniversalCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut package = None;
+    let mut package_key = None;
+    let mut report = None;
+    let mut mask = None;
+    let mut config = denoize::UniversalRestorationConfig::default();
+    let mut accelerator = AcceleratorPreference::Cpu;
+    let mut accelerator_seen = false;
+    let mut max_memory_mb = None;
+    let mut preserve_metadata = true;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut experimental_seen = false;
+    let mut scalar_options = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--family"
+                | "--render-role"
+                | "--analysis-seconds"
+                | "--minimum-degradation-score"
+                | "--maximum-energy-gain-db"
+                | "--maximum-peak-gain-db"
+                | "--maximum-new-clipping-ratio"
+                | "--maximum-quality-regression"
+        ) && !scalar_options.insert(argument)
+        {
+            return Err(format!("{argument} may be supplied only once"));
+        }
+        match argument {
+            "--model-package" if package.is_none() => {
+                package = Some(parse_value(args, &mut index, "--model-package")?);
+            }
+            "--model-package" => return Err("--model-package may be supplied only once".into()),
+            "--model-package-key" if package_key.is_none() => {
+                package_key = Some(parse_value(args, &mut index, "--model-package-key")?);
+            }
+            "--model-package-key" => {
+                return Err("--model-package-key may be supplied only once".into())
+            }
+            "--family" => {
+                let value: String = parse_value(args, &mut index, "--family")?;
+                config.model_family = denoize::UniversalModelFamily::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown universal model family: {value} (expected discriminative, hybrid, or generative)"
+                    )
+                })?;
+            }
+            "--render-role" => {
+                let value: String = parse_value(args, &mut index, "--render-role")?;
+                config.render_role =
+                    denoize::UniversalRenderRole::parse(&value).ok_or_else(|| {
+                        format!(
+                        "unknown universal render role: {value} (expected primary or alternate)"
+                    )
+                    })?;
+            }
+            "--experimental" if !experimental_seen => {
+                experimental_seen = true;
+                config.allow_experimental = true;
+            }
+            "--experimental" => return Err("--experimental may be supplied only once".into()),
+            "--analysis-seconds" => {
+                config.analysis_seconds = parse_value(args, &mut index, "--analysis-seconds")?;
+            }
+            "--minimum-degradation-score" => {
+                config.minimum_degradation_score =
+                    parse_value(args, &mut index, "--minimum-degradation-score")?;
+            }
+            "--maximum-energy-gain-db" => {
+                config.maximum_energy_gain_db =
+                    parse_value(args, &mut index, "--maximum-energy-gain-db")?;
+            }
+            "--maximum-peak-gain-db" => {
+                config.maximum_peak_gain_db =
+                    parse_value(args, &mut index, "--maximum-peak-gain-db")?;
+            }
+            "--maximum-new-clipping-ratio" => {
+                config.maximum_new_clipping_ratio =
+                    parse_value(args, &mut index, "--maximum-new-clipping-ratio")?;
+            }
+            "--maximum-quality-regression" => {
+                config.maximum_quality_score_regression =
+                    parse_value(args, &mut index, "--maximum-quality-regression")?;
+            }
+            "--accelerator" if !accelerator_seen => {
+                accelerator_seen = true;
+                let value: String = parse_value(args, &mut index, "--accelerator")?;
+                accelerator = AcceleratorPreference::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown universal accelerator: {value} (expected cpu, auto, gpu, metal, or cuda)"
+                    )
+                })?;
+            }
+            "--accelerator" => return Err("--accelerator may be supplied only once".into()),
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--mask" if mask.is_none() => {
+                mask = Some(parse_value(args, &mut index, "--mask")?);
+            }
+            "--mask" => return Err("--mask may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--no-metadata" if preserve_metadata => preserve_metadata = false,
+            "--no-metadata" => return Err("--no-metadata may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" => {
+                if print_mode != DiagnosticPrintMode::Human {
+                    return Err("universal accepts only one of --json or --pretty".into());
+                }
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" => {
+                if print_mode != DiagnosticPrintMode::Human {
+                    return Err("universal accepts only one of --json or --pretty".into());
+                }
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "-h" | "--help" => return Err("universal help requested".into()),
+            "-" => return Err(
+                "universal restoration requires regular-file paths; stdin/stdout are unsupported"
+                    .into(),
+            ),
+            value if value.starts_with('-') => {
+                return Err(format!("unknown universal option: {value}"));
+            }
+            value => {
+                if positional.len() == 2 {
+                    return Err(format!("unexpected extra universal argument: {value}"));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let input = positional
+        .first()
+        .cloned()
+        .ok_or("universal requires INPUT")?;
+    let output = positional
+        .get(1)
+        .cloned()
+        .ok_or("universal requires OUTPUT")?;
+    let package = package.ok_or("universal requires --model-package")?;
+    let package_key = package_key.ok_or("universal requires --model-package-key")?;
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    config.validate()?;
+    Ok(UniversalCliOptions {
+        input,
+        output,
+        package,
+        package_key,
+        report,
+        mask,
+        config,
+        accelerator,
+        max_memory_mb,
+        preserve_metadata,
+        commit_mode,
+        print_mode,
+    })
+}
+
+#[cfg(feature = "bsrnn")]
+fn validate_universal_publication_paths(options: &UniversalCliOptions) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (&options.input, "universal input"),
+        (&options.package, "universal model package"),
+        (&options.package_key, "universal model package key"),
+    ] {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (Some(options.output.as_str()), "universal audio output"),
+        (options.report.as_deref(), "universal report"),
+        (options.mask.as_deref(), "universal mask"),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace an input, model package, or key"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+fn run_universal(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("evidence") {
+        return run_universal_evidence(&args[1..]);
+    }
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("universal --help accepts no other arguments".into());
+        }
+        print!("{}", universal_usage());
+        return Ok(());
+    }
+    let options = parse_universal_args(args)?;
+    #[cfg(feature = "bsrnn")]
+    {
+        validate_universal_publication_paths(&options)?;
+        run_universal_audio(options)
+    }
+    #[cfg(not(feature = "bsrnn"))]
+    {
+        run_universal_audio(options)
+    }
+}
+
+fn run_universal_evidence(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", universal_usage());
+        return Ok(());
+    }
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err("universal evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]".into());
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson
+            }
+            "--json" | "--pretty" => {
+                return Err("universal evidence verify accepts only one output mode".into())
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown universal evidence option: {value}"))
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err("universal evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into());
+    }
+    let evidence = denoize::SignedUniversalPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence)
+                .map_err(|error| format!("serialize universal promotion evidence: {error}"))?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified universal promotion evidence: family={:?}, package={}, strata={}, listeners={}, accepted={}",
+            evidence.payload.model_family,
+            evidence.payload.model_package_sha256,
+            evidence.payload.strata.len(),
+            evidence.payload.listener_count,
+            evidence.payload.accepted
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err(
+            "universal promotion evidence is authentic but does not pass promotion gates".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "bsrnn")]
+fn run_universal_audio(options: UniversalCliOptions) -> Result<(), String> {
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let package = RuntimeModelPackage::open(&options.package, &options.package_key)?;
+    if package.manifest_v2().is_none() {
+        return Err("universal restoration requires runtime model package v2".into());
+    }
+    let mut backend_options = BackendOptions::default().with_runtime_model_package(package);
+    backend_options.deterministic = true;
+    backend_options.accelerator = options.accelerator;
+    let accelerator = denoize::select_accelerator_for_options(Backend::Bsrnn, &backend_options)?;
+    let package = backend_options
+        .runtime_package
+        .as_ref()
+        .expect("universal backend options retain their package");
+    let profile = package
+        .precision_profile_for(accelerator.effective())?
+        .expect("universal package v2 selects a precision profile");
+    let model_working_set = profile
+        .resources
+        .max_session_memory_bytes
+        .saturating_add(profile.resources.max_worker_memory_bytes);
+    ensure_memory_limit(
+        model_working_set,
+        options.max_memory_mb,
+        "universal model working set",
+    )?;
+    // Preparing the session authenticates the selected model component,
+    // validates its graph contract, and executes every signed numerical vector
+    // before user-controlled audio is opened or decoded.
+    let session =
+        BackendSession::prepare_with_accelerator(Backend::Bsrnn, backend_options, accelerator)?;
+    let decode_maximum = maximum.map(|limit| limit.saturating_sub(model_working_set));
+    let decode_limits = DecodeLimits::new(
+        metadata_limits_for_available_bytes(decode_maximum),
+        decode_maximum,
+    );
+    let mut input_session = AudioInputSession::open(&options.input)?;
+    ensure_memory_limit(
+        model_working_set.saturating_add(estimate_session_memory_bytes(&input_session)),
+        options.max_memory_mb,
+        "universal input/model preflight",
+    )?;
+    let audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)?;
+    let working_set = denoize::estimate_universal_restoration_memory_bytes(&audio)
+        .saturating_add(model_working_set);
+    ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "universal decoded/model working set",
+    )?;
+    let metadata = if options.preserve_metadata {
+        input_session.read_metadata_with_limits(retained_metadata_limits(
+            options.max_memory_mb,
+            working_set,
+        )?)?
+    } else {
+        None
+    };
+    let result = denoize::restore_universal_audio(&audio, &session, &options.config)?;
+    let mut staged_report = options
+        .report
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.report))
+        .transpose()?;
+    let mut staged_mask = options
+        .mask
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.mask))
+        .transpose()?;
+    let format = OutputFormat::from_path(std::path::Path::new(&options.output))?;
+    let encode_options = EncodeOptions::default();
+    encode_options.validate_options(format)?;
+    format.validate_config(&result.audio, &encode_options)?;
+    denoize::write_audio_transactional(
+        &options.output,
+        &result.audio,
+        encode_options,
+        metadata,
+        options.commit_mode,
+    )?;
+    if let Some(report) = staged_report.take() {
+        report.commit(options.commit_mode)?;
+    }
+    if let Some(mask) = staged_mask.take() {
+        mask.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => {
+            println!(
+                "universal restoration: decision={:?} family={:?} role={:?} channels={} frames={} changed={} package={}",
+                result.report.decision,
+                result.report.model_family,
+                result.report.render_role,
+                result.report.channels,
+                result.report.frames,
+                result.report.changed_samples,
+                result.report.model.package_sha256
+            );
+            for warning in &result.report.warnings {
+                println!("warning: {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "bsrnn"))]
+fn run_universal_audio(_options: UniversalCliOptions) -> Result<(), String> {
+    Err("universal audio restoration requires a build with the bsrnn feature".into())
+}
+
+#[cfg(test)]
+mod universal_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn universal_cli_defaults_to_discriminative_primary_and_no_clobber() {
+        let parsed = parse_universal_args(&arguments(&[
+            "input.wav",
+            "output.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.config.model_family,
+            denoize::UniversalModelFamily::Discriminative
+        );
+        assert_eq!(
+            parsed.config.render_role,
+            denoize::UniversalRenderRole::Primary
+        );
+        assert!(!parsed.config.allow_experimental);
+        assert_eq!(parsed.accelerator, AcceleratorPreference::Cpu);
+        assert_eq!(parsed.commit_mode, CommitMode::NoClobber);
+        assert!(parsed.preserve_metadata);
+    }
+
+    #[test]
+    fn universal_cli_requires_explicit_alternate_for_experimental_models() {
+        let base = [
+            "input.wav",
+            "output.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--family",
+            "generative",
+        ];
+        assert!(parse_universal_args(&arguments(&base))
+            .unwrap_err()
+            .contains("allow_experimental=true"));
+
+        let mut allowed = base.to_vec();
+        allowed.extend(["--render-role", "alternate", "--experimental"]);
+        let parsed = parse_universal_args(&arguments(&allowed)).unwrap();
+        assert_eq!(
+            parsed.config.model_family,
+            denoize::UniversalModelFamily::Generative
+        );
+        assert_eq!(
+            parsed.config.render_role,
+            denoize::UniversalRenderRole::Alternate
+        );
+        assert!(parsed.config.allow_experimental);
+    }
+
+    #[test]
+    fn universal_cli_rejects_ambiguous_and_unbounded_values_before_io() {
+        let required = [
+            "input.wav",
+            "output.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+        ];
+        for extra in [
+            vec!["--json", "--pretty"],
+            vec!["--max-memory", "0"],
+            vec!["--analysis-seconds", "61"],
+            vec!["--maximum-new-clipping-ratio", "NaN"],
+            vec!["--family", "safe", "--family", "generative"],
+            vec![
+                "--minimum-degradation-score",
+                "0.1",
+                "--minimum-degradation-score",
+                "0.2",
+            ],
+        ] {
+            let mut values = required.to_vec();
+            values.extend(extra);
+            assert!(parse_universal_args(&arguments(&values)).is_err());
+        }
+
+        let error = run_universal(&arguments(&[
+            "missing.wav",
+            "output.wav",
+            "--model-package",
+            "missing.dmp",
+            "--model-package-key",
+            "missing.pub",
+            "--family",
+            "hybrid",
+        ]))
+        .unwrap_err();
+        assert!(error.contains("allow_experimental=true"));
+        assert!(!error.contains("resolve universal input"));
+    }
+
+    #[test]
+    fn universal_evidence_parser_is_closed_before_file_io() {
+        assert!(
+            run_universal_evidence(&arguments(&["verify", "evidence.json"]))
+                .unwrap_err()
+                .contains("requires EVIDENCE.json and PUBLIC-KEY.json")
+        );
+        assert!(run_universal_evidence(&arguments(&[
+            "verify",
+            "evidence.json",
+            "public.json",
+            "--json",
+            "--pretty",
+        ]))
+        .unwrap_err()
+        .contains("only one output mode"));
+        assert!(run_universal_evidence(&arguments(&["unknown"]))
+            .unwrap_err()
+            .contains("requires: verify"));
+    }
 }
 
 fn print_diagnostic_report(report: &denoize::DiagnosticReport) {
@@ -11449,7 +12067,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "2fc37ed344bbd6bb242b76fffa0a64039651e6e6f4851324e1a21097d51f7786";
+        "976b34c1ee4fa13ae4d9e428362b7cf41799efd1cf98be633d1f7fc4acf6f875";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {
@@ -16484,7 +17102,7 @@ mod tests {
                     "--model-package-key".into(),
                     "missing.pub".into(),
                 ],
-                "requires --backend onnx",
+                "requires --backend onnx or bsrnn",
             ),
         ] {
             let error = parse_args(&args).unwrap_err();

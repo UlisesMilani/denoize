@@ -312,7 +312,7 @@ impl OnnxWaveformModel {
     }
 }
 
-fn validate_v2_graph_contract(
+pub(crate) fn validate_v2_graph_contract(
     model: &InferenceModel,
     manifest: &crate::RuntimeModelPackageManifestV2,
 ) -> Result<(), String> {
@@ -443,7 +443,7 @@ fn validate_v2_generic_waveform_compatibility(
     Ok(())
 }
 
-fn validate_v2_numerical_vectors(
+pub(crate) fn validate_v2_numerical_vectors(
     template: &InferenceModel,
     manifest: &crate::RuntimeModelPackageManifestV2,
     profile: &crate::RuntimeModelPrecisionProfileContractV2,

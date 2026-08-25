@@ -8,7 +8,7 @@
 
 [package]
 name = "denoize"
-version = "0.74.0"
+version = "0.75.0"
 edition = "2021"
 rust-version = "1.96"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
@@ -48,6 +48,7 @@ include = [
     "/scripts/test-diagnostic-schemas.py",
     "/scripts/test-project-schemas.py",
     "/scripts/test-restoration-schemas.py",
+    "/scripts/test-universal-restoration-schemas.py",
     "/scripts/test-runtime-model-package-schemas.py",
     "/scripts/test-evaluation-evidence.sh",
     "/scripts/build-offline-model-bundle.sh",
@@ -65,6 +66,7 @@ include = [
     "/docs/release-evidence.md",
     "/docs/restoration-research.md",
     "/docs/restoration.md",
+    "/docs/universal-restoration.md",
     "/docs/updates.md",
     "/schemas/*.json",
     "/models/*.json",

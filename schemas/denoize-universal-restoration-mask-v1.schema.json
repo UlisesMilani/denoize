@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-universal-restoration-mask-v1.schema.json",
+  "title": "denoize universal restoration change mask v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "channels", "frames", "runs"],
+  "properties": {
+    "schema": { "const": "denoize-universal-restoration-mask-v1" },
+    "schema_version": { "const": 1 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "frames": { "type": "integer", "minimum": 0 },
+    "runs": {
+      "type": "array",
+      "maxItems": 4000000,
+      "items": { "$ref": "#/$defs/run" }
+    }
+  },
+  "$defs": {
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["channel", "start_frame", "frame_count", "state"],
+      "properties": {
+        "channel": { "type": "integer", "minimum": 0, "maximum": 63 },
+        "start_frame": { "type": "integer", "minimum": 0 },
+        "frame_count": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["untouched", "replaced"] }
+      }
+    }
+  }
+}
