@@ -158,6 +158,33 @@ and the closed
 [denoize-diagnostic-v1](schemas/denoize-diagnostic-v1.schema.json) and
 [denoize-assessment-v1](schemas/denoize-assessment-v1.schema.json) contracts.
 
+### Deterministic audio restoration
+
+**denoize restore** provides conservative, model-free de-clipping,
+prediction-residual de-clicking, harmonic de-hum, finite WPE de-reverberation,
+and short wind/plosive repair:
+
+~~~sh
+denoize restore damaged.wav restored.wav \
+  --report restoration-report.json --mask restoration-mask.json
+denoize restore damaged.wav --detect-only \
+  --operations declip,declick,dehum --pretty
+~~~
+
+The pipeline never changes decoded sample rate, channels, or frame count.
+Detect-only mode is bit-exact and can export a complete channel/frame RLE mask
+without writing audio. Apply mode uses conservative confidence gates, explicit
+iteration and attenuation ceilings, bounded memory admission, atomic
+no-clobber outputs, and a canonical operation order. Reports contain PCM and
+mask digests, detected/changed counts, confidence, energy delta, warnings, and
+closed per-operation evidence, but no filesystem path. Context padding is
+separate from accepted damage and from samples actually replaced.
+
+See [Deterministic restoration](docs/restoration.md), the closed
+[report](schemas/denoize-restoration-report-v1.schema.json) and
+[mask](schemas/denoize-restoration-mask-v1.schema.json) contracts, and the
+[research and acceptance review](docs/restoration-research.md#stage-26--deterministic-restoration).
+
 ## Supported input formats
 
 | Format | Decoder | Notes |

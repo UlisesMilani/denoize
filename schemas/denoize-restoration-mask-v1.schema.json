@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-restoration-mask-v1.schema.json",
+  "title": "denoize deterministic restoration mask v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "channels", "frames", "runs"],
+  "properties": {
+    "schema": { "const": "denoize-restoration-mask-v1" },
+    "schema_version": { "const": 1 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "frames": { "type": "integer", "minimum": 0 },
+    "runs": {
+      "type": "array",
+      "maxItems": 4000000,
+      "items": { "$ref": "#/$defs/run" }
+    }
+  },
+  "$defs": {
+    "operation": {
+      "enum": ["declip", "declick", "dehum", "dereverb", "wind-plosive"]
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel",
+        "start_frame",
+        "frame_count",
+        "state",
+        "operations",
+        "confidence"
+      ],
+      "properties": {
+        "channel": { "type": "integer", "minimum": 0, "maximum": 63 },
+        "start_frame": { "type": "integer", "minimum": 0 },
+        "frame_count": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["untouched", "detected", "padded", "replaced"] },
+        "operations": {
+          "type": "array",
+          "maxItems": 5,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/operation" }
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "untouched" } } },
+          "then": {
+            "properties": {
+              "operations": { "maxItems": 0 },
+              "confidence": { "const": 0 }
+            }
+          },
+          "else": {
+            "properties": { "operations": { "minItems": 1 } }
+          }
+        }
+      ]
+    }
+  }
+}

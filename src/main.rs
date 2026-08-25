@@ -408,6 +408,7 @@ USAGE:
     denoize diagnose <INPUT> [--analysis-seconds N] [--json|--pretty]
     denoize assess <INPUT> [--analysis-seconds N] [--json|--pretty]
     denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
+    denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -5712,6 +5713,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("assess") {
         return run_assess(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("restore") {
+        return run_restore(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("receipts") {
         return run_receipts(&args[1..]);
     }
@@ -7625,6 +7629,391 @@ fn run_assess(args: &[String]) -> Result<(), String> {
         DiagnosticPrintMode::Json => println!("{}", report.to_json()?),
         DiagnosticPrintMode::PrettyJson => println!("{}", report.to_pretty_json()?),
         DiagnosticPrintMode::Human => print_assessment_report(&report),
+    }
+    Ok(())
+}
+
+fn restore_usage() -> &'static str {
+    "\
+USAGE:
+    denoize restore <INPUT> <OUTPUT> [OPTIONS]
+    denoize restore <INPUT> --detect-only [OPTIONS]
+
+Run deterministic de-clipping, de-clicking, harmonic de-hum, finite WPE
+de-reverberation, and conservative wind/plosive repair. Audio geometry is
+preserved. Every run can export a closed report and a complete same-length RLE
+mask; uncertain damage is reported or bypassed instead of being invented.
+
+OPTIONS:
+        --operations <LIST>             comma-separated declip,declick,dehum,dereverb,wind-plosive
+        --detect-only                   detect and export evidence without modifying PCM
+        --report <PATH.json>            atomically write denoize-restoration-report-v1
+        --mask <PATH.json>              atomically write denoize-restoration-mask-v1
+        --max-memory <MB>               bound decode and restoration working memory
+        --no-metadata                   do not copy input metadata to an audio output
+        --replace                       atomically replace output/report/mask destinations
+        --dehum-attenuation-db <DB>     maximum harmonic subtraction, 0..80 (default: 30)
+        --declick-threshold-mad <N>     robust residual threshold, 4..40 (default: 10)
+        --declip-iterations <N>         sparse projection iterations, 1..128 (default: 24)
+        --wpe-channel-mode <MODE>       independent|multichannel (default: independent)
+        --wpe-delay <FRAMES>            late-prediction delay, 1..20 (default: 3)
+        --wpe-taps <N>                  prediction taps, 1..24 (default: 8)
+        --wpe-iterations <N>            WPE iterations, 1..10 (default: 3)
+        --wpe-regularization <F>        finite solver regularization, 1e-12..1
+        --wpe-max-attenuation-db <DB>   WPE attenuation ceiling, 0..40 (default: 12)
+        --wind-max-attenuation-db <DB>  burst attenuation ceiling, 0..40 (default: 18)
+        --json                          emit compact report JSON to stdout
+        --pretty                        emit indented report JSON to stdout
+    -h, --help                          show this help
+"
+}
+
+struct RestorationCliOptions {
+    input: String,
+    output: Option<String>,
+    report: Option<String>,
+    mask: Option<String>,
+    config: denoize::RestorationConfig,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_restoration_operations(value: &str) -> Result<Vec<denoize::RestorationOperation>, String> {
+    if value.is_empty() {
+        return Err("--operations requires at least one operation".into());
+    }
+    value
+        .split(',')
+        .map(|operation| match operation {
+            "declip" => Ok(denoize::RestorationOperation::Declip),
+            "declick" => Ok(denoize::RestorationOperation::Declick),
+            "dehum" => Ok(denoize::RestorationOperation::Dehum),
+            "dereverb" => Ok(denoize::RestorationOperation::Dereverb),
+            "wind-plosive" => Ok(denoize::RestorationOperation::WindPlosive),
+            _ => Err(format!(
+                "unknown restoration operation: {operation} (expected declip, declick, dehum, dereverb, or wind-plosive)"
+            )),
+        })
+        .collect()
+}
+
+fn parse_restore_args(args: &[String]) -> Result<RestorationCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut report = None;
+    let mut mask = None;
+    let mut config = denoize::RestorationConfig::default();
+    let mut max_memory_mb = None;
+    let mut preserve_metadata = true;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut detect_only = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--operations" => {
+                let value: String = parse_value(args, &mut index, "--operations")?;
+                config.operations = parse_restoration_operations(&value)?;
+            }
+            "--detect-only" if !detect_only => {
+                detect_only = true;
+                config.mode = denoize::RestorationMode::DetectOnly;
+            }
+            "--detect-only" => return Err("--detect-only may be supplied only once".into()),
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--mask" if mask.is_none() => {
+                mask = Some(parse_value(args, &mut index, "--mask")?);
+            }
+            "--mask" => return Err("--mask may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--no-metadata" if preserve_metadata => preserve_metadata = false,
+            "--no-metadata" => return Err("--no-metadata may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--dehum-attenuation-db" => {
+                config.dehum.attenuation_db =
+                    parse_value(args, &mut index, "--dehum-attenuation-db")?;
+            }
+            "--declick-threshold-mad" => {
+                config.declick.residual_threshold_mad =
+                    parse_value(args, &mut index, "--declick-threshold-mad")?;
+            }
+            "--declip-iterations" => {
+                config.declip.iterations = parse_value(args, &mut index, "--declip-iterations")?;
+            }
+            "--wpe-channel-mode" => {
+                let value: String = parse_value(args, &mut index, "--wpe-channel-mode")?;
+                config.dereverb.channel_mode = match value.as_str() {
+                    "independent" => denoize::WpeChannelMode::Independent,
+                    "multichannel" => denoize::WpeChannelMode::Multichannel,
+                    _ => {
+                        return Err(format!(
+                            "unknown --wpe-channel-mode value: {value} (expected independent or multichannel)"
+                        ))
+                    }
+                };
+            }
+            "--wpe-delay" => {
+                config.dereverb.prediction_delay_frames =
+                    parse_value(args, &mut index, "--wpe-delay")?;
+            }
+            "--wpe-taps" => {
+                config.dereverb.prediction_taps = parse_value(args, &mut index, "--wpe-taps")?;
+            }
+            "--wpe-iterations" => {
+                config.dereverb.iterations = parse_value(args, &mut index, "--wpe-iterations")?;
+            }
+            "--wpe-regularization" => {
+                config.dereverb.regularization =
+                    parse_value(args, &mut index, "--wpe-regularization")?;
+            }
+            "--wpe-max-attenuation-db" => {
+                config.dereverb.maximum_attenuation_db =
+                    parse_value(args, &mut index, "--wpe-max-attenuation-db")?;
+            }
+            "--wind-max-attenuation-db" => {
+                config.wind_plosive.maximum_attenuation_db =
+                    parse_value(args, &mut index, "--wind-max-attenuation-db")?;
+            }
+            "--json" => {
+                if print_mode != DiagnosticPrintMode::Human {
+                    return Err("restore accepts only one of --json or --pretty".into());
+                }
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" => {
+                if print_mode != DiagnosticPrintMode::Human {
+                    return Err("restore accepts only one of --json or --pretty".into());
+                }
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "-h" | "--help" => return Err("restore help requested".into()),
+            "-" => {
+                return Err(
+                    "restore requires regular-file paths; stdin/stdout are unsupported".into(),
+                )
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown restore option: {value}"));
+            }
+            value => {
+                if positional.len() == 2 {
+                    return Err(format!("unexpected extra restore argument: {value}"));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let input = positional
+        .first()
+        .cloned()
+        .ok_or("restore requires INPUT")?;
+    let output = positional.get(1).cloned();
+    if config.mode == denoize::RestorationMode::Apply && output.is_none() {
+        return Err(
+            "restore apply mode requires OUTPUT; use --detect-only for report-only analysis".into(),
+        );
+    }
+    if output.is_none()
+        && report.is_none()
+        && mask.is_none()
+        && print_mode == DiagnosticPrintMode::Human
+    {
+        return Err("detect-only restore requires --report, --mask, --json, or --pretty".into());
+    }
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    config.validate()?;
+    Ok(RestorationCliOptions {
+        input,
+        output,
+        report,
+        mask,
+        config,
+        max_memory_mb,
+        preserve_metadata,
+        commit_mode,
+        print_mode,
+    })
+}
+
+fn validate_restoration_publication_paths(options: &RestorationCliOptions) -> Result<(), String> {
+    let input = std::fs::canonicalize(&options.input)
+        .map_err(|error| format!("resolve restoration input {}: {error}", options.input))?;
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (options.output.as_deref(), "restoration audio output"),
+        (options.report.as_deref(), "restoration report"),
+        (options.mask.as_deref(), "restoration mask"),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if normalized == input || existing.as_ref() == Some(&input) {
+            return Err(format!("{context} must not replace the restoration input"));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_restoration_destination_available(
+    path: &std::path::Path,
+    mode: CommitMode,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if mode == CommitMode::Replace
+                && (metadata.is_file() || metadata.file_type().is_symlink()) =>
+        {
+            Ok(())
+        }
+        Ok(_) if mode == CommitMode::Replace => Err(format!(
+            "restoration destination exists but is not a replaceable file or symlink: {}",
+            path.display()
+        )),
+        Ok(_) => Err(format!(
+            "restoration destination already exists: {} (use --replace to replace it)",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "inspect restoration destination {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn stage_restoration_json<T: Serialize>(path: &str, document: &T) -> Result<AtomicOutput, String> {
+    let mut bytes = serde_json::to_vec_pretty(document)
+        .map_err(|error| format!("serialize restoration document: {error}"))?;
+    bytes.push(b'\n');
+    let mut output = AtomicOutput::new(path)?;
+    output
+        .file_mut()
+        .write_all(&bytes)
+        .map_err(|error| format!("write staged restoration document {path}: {error}"))?;
+    output
+        .file_mut()
+        .sync_data()
+        .map_err(|error| format!("sync staged restoration document {path}: {error}"))?;
+    Ok(output)
+}
+
+fn run_restore(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("restore --help accepts no other arguments".into());
+        }
+        print!("{}", restore_usage());
+        return Ok(());
+    }
+    let options = parse_restore_args(args)?;
+    validate_restoration_publication_paths(&options)?;
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let decode_limits = DecodeLimits::new(metadata_limits_for_available_bytes(maximum), maximum);
+    let mut input_session = AudioInputSession::open(&options.input)?;
+    ensure_memory_limit(
+        estimate_session_memory_bytes(&input_session),
+        options.max_memory_mb,
+        "restoration input preflight",
+    )?;
+    let audio = read_audio_from_session_with_limits(&mut input_session, decode_limits)?;
+    let restoration_memory = denoize::estimate_restoration_memory_bytes(&audio, &options.config);
+    ensure_memory_limit(
+        restoration_memory,
+        options.max_memory_mb,
+        "restoration decoded working set",
+    )?;
+    let metadata = if options.output.is_some() && options.preserve_metadata {
+        input_session.read_metadata_with_limits(retained_metadata_limits(
+            options.max_memory_mb,
+            restoration_memory,
+        )?)?
+    } else {
+        None
+    };
+    let result = denoize::restore_audio(&audio, &options.config)?;
+    let mut staged_report = options
+        .report
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.report))
+        .transpose()?;
+    let mut staged_mask = options
+        .mask
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.mask))
+        .transpose()?;
+    if let Some(output) = &options.output {
+        let format = OutputFormat::from_path(std::path::Path::new(output))?;
+        let encode_options = EncodeOptions::default();
+        encode_options.validate_options(format)?;
+        format.validate_config(&result.audio, &encode_options)?;
+        denoize::write_audio_transactional(
+            output,
+            &result.audio,
+            encode_options,
+            metadata,
+            options.commit_mode,
+        )?;
+    }
+    if let Some(report) = staged_report.take() {
+        report.commit(options.commit_mode)?;
+    }
+    if let Some(mask) = staged_mask.take() {
+        mask.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => {
+            println!(
+                "restoration: mode={:?} channels={} frames={} detected={} changed={} confidence={:.3} energy={:+.3} dB",
+                result.report.mode,
+                result.report.channels,
+                result.report.frames,
+                result.report.detected_samples,
+                result.report.changed_samples,
+                result.report.confidence,
+                result.report.energy_delta_db
+            );
+            for operation in &result.report.operations {
+                println!(
+                    "  {}: {:?}, detected={}, changed={}, confidence={:.3}, energy={:+.3} dB",
+                    operation.operation.name(),
+                    operation.status,
+                    operation.detected_samples,
+                    operation.changed_samples,
+                    operation.confidence,
+                    operation.energy_delta_db
+                );
+            }
+            for warning in &result.report.warnings {
+                println!("warning: {warning}");
+            }
+        }
     }
     Ok(())
 }
@@ -11060,7 +11449,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "b4ce9b772bbc3d2902864d9278f000f5d761f57d0dec93bf933ced7abbb435e2";
+        "2fc37ed344bbd6bb242b76fffa0a64039651e6e6f4851324e1a21097d51f7786";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-restoration-report-v1.schema.json",
+  "title": "denoize deterministic restoration report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "mode",
+    "sample_rate",
+    "channels",
+    "frames",
+    "input_pcm_sha256",
+    "mask_sha256",
+    "deterministic",
+    "bypassed",
+    "detected_samples",
+    "changed_samples",
+    "confidence",
+    "energy_delta_db",
+    "operations",
+    "warnings"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-restoration-report-v1" },
+    "schema_version": { "const": 1 },
+    "mode": { "enum": ["apply", "detect-only"] },
+    "sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "frames": { "type": "integer", "minimum": 0 },
+    "input_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "mask_sha256": { "$ref": "#/$defs/sha256" },
+    "deterministic": { "const": true },
+    "bypassed": { "type": "boolean" },
+    "detected_samples": { "type": "integer", "minimum": 0 },
+    "changed_samples": { "type": "integer", "minimum": 0 },
+    "confidence": { "$ref": "#/$defs/confidence" },
+    "energy_delta_db": { "$ref": "#/$defs/energy_delta" },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/operation_report" }
+    },
+    "warnings": { "$ref": "#/$defs/warnings" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "mode": { "const": "detect-only" } },
+        "required": ["mode"]
+      },
+      "then": {
+        "properties": {
+          "bypassed": { "const": true },
+          "changed_samples": { "const": 0 },
+          "energy_delta_db": { "const": 0 },
+          "operations": {
+            "items": {
+              "properties": {
+                "status": { "enum": ["detected", "skipped"] },
+                "changed_samples": { "const": 0 },
+                "energy_delta_db": { "const": 0 }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "energy_delta": {
+      "type": "number",
+      "minimum": -240,
+      "maximum": 240
+    },
+    "operation": {
+      "enum": ["declip", "declick", "dehum", "dereverb", "wind-plosive"]
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    },
+    "operation_report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "status",
+        "detected_samples",
+        "changed_samples",
+        "confidence",
+        "energy_delta_db",
+        "warnings",
+        "details"
+      ],
+      "properties": {
+        "operation": { "$ref": "#/$defs/operation" },
+        "status": { "enum": ["applied", "detected", "skipped"] },
+        "detected_samples": { "type": "integer", "minimum": 0 },
+        "changed_samples": { "type": "integer", "minimum": 0 },
+        "confidence": { "$ref": "#/$defs/confidence" },
+        "energy_delta_db": { "$ref": "#/$defs/energy_delta" },
+        "warnings": { "$ref": "#/$defs/warnings" },
+        "details": { "$ref": "#/$defs/details" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "operation": { "const": "declip" } } },
+          "then": { "properties": { "details": { "$ref": "#/$defs/declip_details" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "declick" } } },
+          "then": { "properties": { "details": { "$ref": "#/$defs/declick_details" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "dehum" } } },
+          "then": { "properties": { "details": { "$ref": "#/$defs/dehum_details" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "dereverb" } } },
+          "then": { "properties": { "details": { "$ref": "#/$defs/dereverb_details" } } }
+        },
+        {
+          "if": { "properties": { "operation": { "const": "wind-plosive" } } },
+          "then": { "properties": { "details": { "$ref": "#/$defs/wind_details" } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "skipped" } } },
+          "then": {
+            "properties": {
+              "detected_samples": { "const": 0 },
+              "changed_samples": { "const": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "detected" } } },
+          "then": {
+            "properties": {
+              "detected_samples": { "minimum": 1 },
+              "changed_samples": { "const": 0 }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "applied" } } },
+          "then": {
+            "properties": {
+              "detected_samples": { "minimum": 1 },
+              "changed_samples": { "minimum": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "details": {
+      "oneOf": [
+        { "$ref": "#/$defs/dehum_details" },
+        { "$ref": "#/$defs/declick_details" },
+        { "$ref": "#/$defs/declip_details" },
+        { "$ref": "#/$defs/dereverb_details" },
+        { "$ref": "#/$defs/wind_details" }
+      ]
+    },
+    "dehum_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "fundamental_hz", "tracked_blocks", "harmonic_count", "attenuation_db"],
+      "properties": {
+        "kind": { "const": "dehum" },
+        "fundamental_hz": {
+          "oneOf": [
+            { "type": "number", "minimum": 49, "maximum": 61 },
+            { "type": "null" }
+          ]
+        },
+        "tracked_blocks": { "type": "integer", "minimum": 0 },
+        "harmonic_count": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "attenuation_db": { "type": "number", "minimum": 0, "maximum": 80 }
+      }
+    },
+    "declick_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "regions", "rejected_regions", "prediction_order", "maximum_gap_samples"],
+      "properties": {
+        "kind": { "const": "declick" },
+        "regions": { "type": "integer", "minimum": 0 },
+        "rejected_regions": { "type": "integer", "minimum": 0 },
+        "prediction_order": { "type": "integer", "minimum": 2, "maximum": 64 },
+        "maximum_gap_samples": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "declip_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "regions",
+        "rejected_regions",
+        "positive_threshold",
+        "negative_threshold",
+        "iterations",
+        "converged_regions"
+      ],
+      "properties": {
+        "kind": { "const": "declip" },
+        "regions": { "type": "integer", "minimum": 0 },
+        "rejected_regions": { "type": "integer", "minimum": 0 },
+        "positive_threshold": {
+          "oneOf": [
+            { "type": "number", "minimum": 0, "maximum": 1 },
+            { "type": "null" }
+          ]
+        },
+        "negative_threshold": {
+          "oneOf": [
+            { "type": "number", "minimum": -1, "maximum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "iterations": { "type": "integer", "minimum": 1, "maximum": 128 },
+        "converged_regions": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "dereverb_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "channel_mode",
+        "frame_size",
+        "hop_size",
+        "prediction_delay_frames",
+        "prediction_taps",
+        "effective_context_frames",
+        "iterations",
+        "solved_bins",
+        "ill_conditioned_bins",
+        "convergence"
+      ],
+      "properties": {
+        "kind": { "const": "dereverb" },
+        "channel_mode": { "enum": ["independent", "multichannel"] },
+        "frame_size": { "type": "integer", "minimum": 128, "maximum": 4096 },
+        "hop_size": { "type": "integer", "minimum": 1, "maximum": 2048 },
+        "prediction_delay_frames": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "prediction_taps": { "type": "integer", "minimum": 1, "maximum": 24 },
+        "effective_context_frames": { "type": "integer", "minimum": 1 },
+        "iterations": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "solved_bins": { "type": "integer", "minimum": 0 },
+        "ill_conditioned_bins": { "type": "integer", "minimum": 0 },
+        "convergence": { "$ref": "#/$defs/confidence" }
+      }
+    },
+    "wind_details": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "regions",
+        "rejected_regions",
+        "low_band_hz",
+        "maximum_attenuation_db",
+        "stereo_coherence"
+      ],
+      "properties": {
+        "kind": { "const": "wind-plosive" },
+        "regions": { "type": "integer", "minimum": 0 },
+        "rejected_regions": { "type": "integer", "minimum": 0 },
+        "low_band_hz": { "type": "number", "minimum": 40, "maximum": 500 },
+        "maximum_attenuation_db": { "type": "number", "minimum": 0, "maximum": 40 },
+        "stereo_coherence": {
+          "oneOf": [
+            { "$ref": "#/$defs/confidence" },
+            { "type": "null" }
+          ]
+        }
+      }
+    }
+  }
+}

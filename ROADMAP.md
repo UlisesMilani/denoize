@@ -64,7 +64,7 @@ stop/rollback conditions behind this order are maintained in
 |---:|---:|---|---|
 | 1 | 24 | Bounded degradation diagnosis, native no-reference quality dimensions, uncertainty, recommended repair pipeline, and presentation-safe before/after assessment | Released in v0.72.0 |
 | 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
-| 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Planned |
+| 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Planned |
 | 5 | 28 | Neural CLAP processing, VST3, custom editor, sidechain foundation, off-callback inference, host latency, automation, overload fallback, then AUv3 and LV2 | Planned |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Planned |
@@ -99,7 +99,16 @@ only through their dedicated later-stage adapter.
 Stage 26 establishes deterministic, inspectable baselines before a universal
 generative repair model can ship. An undamaged-input bypass corpus, repair-mask
 accuracy, transient/timbre preservation, stereo-image preservation, bounded
-streaming where applicable, and exact-duration output are acceptance gates.
+streaming where applicable, and exact-duration output are acceptance gates. The
+v0.74.0 implementation provides a separate Rust configuration/API and
+`denoize restore` command, conservative confidence gates, robust harmonic
+regression, prediction-residual click interpolation, analysis-sparse constrained
+declipping, finite independent or four-channel WPE, and local wind/plosive
+attenuation. Detect-only mode is bit-exact. Every run can publish a path-free
+closed report and an exact-coverage RLE mask distinguishing detected damage,
+context padding, and replaced samples; CLI/Desktop admission uses an explicit memory
+ceiling and all outputs retain no-clobber defaults. See
+[Deterministic restoration](docs/restoration.md).
 
 Stage 27 starts with the official URGENT BSRNN baseline because denoize already
 has a BSRNN frontend. Flow/diffusion models remain experimental and opt-in

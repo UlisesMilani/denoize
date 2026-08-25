@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes fifty-six versioned JSON contracts for local automation. Their
+denoize publishes fifty-eight versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -131,6 +131,15 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-runtime-model-numerical-vectors-v1.schema.json`](../schemas/denoize-runtime-model-numerical-vectors-v1.schema.json)
   describes bounded named inputs and expected outputs executed on the selected
   runtime before a v2 model is accepted for audio processing.
+- [`denoize-restoration-report-v1.schema.json`](../schemas/denoize-restoration-report-v1.schema.json)
+  describes deterministic restoration geometry, PCM and mask digests,
+  detected/changed counts, confidence, energy delta, warnings, and closed
+  operation-specific evidence without filesystem paths.
+- [`denoize-restoration-mask-v1.schema.json`](../schemas/denoize-restoration-mask-v1.schema.json)
+  describes a channel-ordered RLE mask whose runs distinguish untouched,
+  context-padded, detected, and replaced frames and name every contributing
+  operation. Library and schema-parity tests additionally require exact,
+  gap-free coverage of every frame in every channel.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -170,9 +179,9 @@ value requires a new schema identifier and version. Execution plans, receipts,
 keys, policies, verification reports, presentation regions, project documents,
 runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
-authorization, admission, trust, or source-binding decisions. Diagnostic and
-assessment reports also reject unknown fields so a consumer cannot silently
-ignore a new safety dimension.
+authorization, admission, trust, or source-binding decisions. Diagnostic,
+assessment, and restoration reports and restoration masks also reject unknown
+fields so a consumer cannot silently ignore a new safety dimension.
 
 ## Portable project contracts
 

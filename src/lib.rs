@@ -73,6 +73,7 @@ pub mod recommendation;
 pub mod region;
 pub mod resample;
 pub mod resource;
+pub mod restoration;
 pub mod service;
 pub mod stft;
 mod stoi_resample;
@@ -215,6 +216,14 @@ pub use resource::{
     estimate_model_session_bytes, estimate_temporary_bytes, metadata_limits_after_retained_memory,
     metadata_limits_for_available_memory, ResourceGovernor, ResourceLimits, ResourcePermit,
     ResourceRequest, ResourceUsage,
+};
+pub use restoration::{
+    estimate_restoration_memory_bytes, restore_audio, DeclickConfig, DeclipConfig, DehumConfig,
+    RestorationConfig, RestorationMask, RestorationMaskRun, RestorationMaskState, RestorationMode,
+    RestorationOperation, RestorationOperationDetails, RestorationOperationReport,
+    RestorationReport, RestorationResult, RestorationStatus, WindPlosiveConfig, WpeChannelMode,
+    WpeConfig, MAX_RESTORATION_CHANNELS, MAX_RESTORATION_MASK_RUNS, MAX_RESTORATION_OPERATIONS,
+    RESTORATION_MASK_SCHEMA, RESTORATION_REPORT_SCHEMA, RESTORATION_SCHEMA_VERSION,
 };
 pub use watch::{
     WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError,

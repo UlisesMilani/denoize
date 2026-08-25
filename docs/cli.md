@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.73.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.74.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -16,6 +16,7 @@ USAGE:
     denoize diagnose <INPUT> [--analysis-seconds N] [--json|--pretty]
     denoize assess <INPUT> [--analysis-seconds N] [--json|--pretty]
     denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
+    denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -167,10 +168,45 @@ OPTIONS:
     -h, --help                 show this help
 ```
 
+## Deterministic audio restoration
+
+```text
+USAGE:
+    denoize restore <INPUT> <OUTPUT> [OPTIONS]
+    denoize restore <INPUT> --detect-only [OPTIONS]
+
+Run deterministic de-clipping, de-clicking, harmonic de-hum, finite WPE
+de-reverberation, and conservative wind/plosive repair. Audio geometry is
+preserved. Every run can export a closed report and a complete same-length RLE
+mask; uncertain damage is reported or bypassed instead of being invented.
+
+OPTIONS:
+        --operations <LIST>             comma-separated declip,declick,dehum,dereverb,wind-plosive
+        --detect-only                   detect and export evidence without modifying PCM
+        --report <PATH.json>            atomically write denoize-restoration-report-v1
+        --mask <PATH.json>              atomically write denoize-restoration-mask-v1
+        --max-memory <MB>               bound decode and restoration working memory
+        --no-metadata                   do not copy input metadata to an audio output
+        --replace                       atomically replace output/report/mask destinations
+        --dehum-attenuation-db <DB>     maximum harmonic subtraction, 0..80 (default: 30)
+        --declick-threshold-mad <N>     robust residual threshold, 4..40 (default: 10)
+        --declip-iterations <N>         sparse projection iterations, 1..128 (default: 24)
+        --wpe-channel-mode <MODE>       independent|multichannel (default: independent)
+        --wpe-delay <FRAMES>            late-prediction delay, 1..20 (default: 3)
+        --wpe-taps <N>                  prediction taps, 1..24 (default: 8)
+        --wpe-iterations <N>            WPE iterations, 1..10 (default: 3)
+        --wpe-regularization <F>        finite solver regularization, 1e-12..1
+        --wpe-max-attenuation-db <DB>   WPE attenuation ceiling, 0..40 (default: 12)
+        --wind-max-attenuation-db <DB>  burst attenuation ceiling, 0..40 (default: 18)
+        --json                          emit compact report JSON to stdout
+        --pretty                        emit indented report JSON to stdout
+    -h, --help                          show this help
+```
+
 ## Watch-folder automation
 
 ```text
-denoize 0.73.0 watch-folder automation
+denoize 0.74.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
