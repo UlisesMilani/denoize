@@ -137,7 +137,7 @@ impl OnnxWaveformModel {
         config
             .validate_config()
             .map_err(|error| error.to_string())?;
-        let mut reader = package.open_model_reader()?;
+        let mut reader = package.open_model_reader_for(runtime)?;
         let template = tract_onnx::onnx()
             .model_for_read(&mut reader)
             .map_err(|error| {
@@ -152,6 +152,22 @@ impl OnnxWaveformModel {
                 package.package_path().display()
             )
         })?;
+        if let Some(manifest) = package.manifest_v2() {
+            let profile = package
+                .precision_profile_for(runtime)?
+                .expect("v2 packages always select a precision profile");
+            let mut inspected = template.clone();
+            if inspected.analyse(false).is_ok() {
+                validate_v2_graph_contract(&inspected, manifest)?;
+            } else {
+                validate_v2_graph_contract(&template, manifest)?;
+            }
+            validate_v2_generic_waveform_compatibility(manifest)?;
+            let vectors = package
+                .numerical_vectors_for(runtime)?
+                .expect("v2 precision profiles always carry numerical vectors");
+            validate_v2_numerical_vectors(&template, manifest, profile, &vectors, runtime)?;
+        }
         Self::from_template(config, runtime, template, Some(&package.manifest().tensor))
     }
 
@@ -294,6 +310,336 @@ impl OnnxWaveformModel {
         });
         Ok(runnable)
     }
+}
+
+fn validate_v2_graph_contract(
+    model: &InferenceModel,
+    manifest: &crate::RuntimeModelPackageManifestV2,
+) -> Result<(), String> {
+    let inputs = model.input_outlets().map_err(tract_error)?;
+    let outputs = model.output_outlets().map_err(tract_error)?;
+    if inputs.len() != manifest.tensors.inputs.len()
+        || outputs.len() != manifest.tensors.outputs.len()
+    {
+        return Err(format!(
+            "authenticated runtime model v2 tensor count does not match the ONNX graph: manifest inputs={} outputs={}, graph inputs={} outputs={}",
+            manifest.tensors.inputs.len(),
+            manifest.tensors.outputs.len(),
+            inputs.len(),
+            outputs.len()
+        ));
+    }
+    for (index, (outlet, expected)) in inputs.iter().zip(&manifest.tensors.inputs).enumerate() {
+        validate_v2_graph_tensor(
+            model,
+            *outlet,
+            model.input_fact(index).map_err(tract_error)?,
+            expected,
+            "input",
+        )?;
+    }
+    for (index, (outlet, expected)) in outputs.iter().zip(&manifest.tensors.outputs).enumerate() {
+        validate_v2_graph_tensor(
+            model,
+            *outlet,
+            model.output_fact(index).map_err(tract_error)?,
+            expected,
+            "output",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_v2_graph_tensor(
+    model: &InferenceModel,
+    outlet: OutletId,
+    fact: &InferenceFact,
+    expected: &crate::RuntimeModelTensorContractV2,
+    kind: &str,
+) -> Result<(), String> {
+    let actual_name = model
+        .outlet_label(outlet)
+        .unwrap_or_else(|| model.node(outlet.node).name.as_str());
+    if actual_name != expected.name {
+        return Err(format!(
+            "authenticated runtime model v2 {kind} name does not match the ONNX graph: manifest={} graph={actual_name}",
+            expected.name
+        ));
+    }
+    let actual_type = match fact.datum_type.concretize() {
+        Some(DatumType::F32) => "float32",
+        Some(DatumType::I64) => "int64",
+        Some(other) => {
+            return Err(format!(
+                "authenticated runtime model v2 {kind} {} has unsupported ONNX type {other:?}",
+                expected.name
+            ));
+        }
+        None => {
+            return Err(format!(
+                "authenticated runtime model v2 {kind} {} datum type is unknown",
+                expected.name
+            ));
+        }
+    };
+    if actual_type != expected.element_type {
+        return Err(format!(
+            "authenticated runtime model v2 {kind} {} type mismatch: manifest={} graph={actual_type}",
+            expected.name, expected.element_type
+        ));
+    }
+    let rank = known_rank(kind, fact)?;
+    if rank != expected.axes.len() {
+        return Err(format!(
+            "authenticated runtime model v2 {kind} {} rank mismatch: manifest={} graph={rank}",
+            expected.name,
+            expected.axes.len()
+        ));
+    }
+    for (axis_index, axis) in expected.axes.iter().enumerate() {
+        if let Some(expected_dimension) = axis.fixed {
+            let actual = known_dimension(fact, axis_index)?;
+            if actual.map(|value| value as u64) != Some(expected_dimension) {
+                return Err(format!(
+                    "authenticated runtime model v2 {kind} {} axis {} mismatch: manifest={expected_dimension} graph={actual:?}",
+                    expected.name, axis.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_v2_generic_waveform_compatibility(
+    manifest: &crate::RuntimeModelPackageManifestV2,
+) -> Result<(), String> {
+    let generic = manifest.tensors.inputs.len() == 1
+        && manifest.tensors.outputs.len() == 1
+        && matches!(
+            manifest.runtime.mode.as_str(),
+            "finite" | "finite-and-streaming"
+        )
+        && manifest.frontend.channels.policy == "independent-mono"
+        && manifest.tensors.inputs[0].role == "audio"
+        && manifest.tensors.outputs[0].role == "audio"
+        && !manifest.tensors.inputs[0].optional
+        && manifest.state_pairs.is_empty()
+        && matches!(
+            manifest.tensors.inputs[0]
+                .axes
+                .iter()
+                .map(|axis| axis.kind.as_str())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            ["batch", "sample"] | ["batch", "channel", "sample"]
+        )
+        && manifest.tensors.inputs[0].axes == manifest.tensors.outputs[0].axes;
+    if !generic {
+        return Err(
+            "authenticated runtime model v2 graph requires a dedicated adapter for streaming-only, multichannel, optional, auxiliary/state, or non-waveform semantics"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_v2_numerical_vectors(
+    template: &InferenceModel,
+    manifest: &crate::RuntimeModelPackageManifestV2,
+    profile: &crate::RuntimeModelPrecisionProfileContractV2,
+    vectors: &crate::RuntimeModelNumericalVectorsV1,
+    runtime: AcceleratorRuntime,
+) -> Result<(), String> {
+    if vectors.profile_id != profile.id {
+        return Err(
+            "runtime model numerical vector profile selection changed after verification".into(),
+        );
+    }
+    for case in &vectors.cases {
+        let mut model = template.clone();
+        let input_by_name: std::collections::HashMap<_, _> = case
+            .inputs
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor))
+            .collect();
+        let output_by_name: std::collections::HashMap<_, _> = case
+            .outputs
+            .iter()
+            .map(|tensor| (tensor.name.as_str(), tensor))
+            .collect();
+        for (index, contract) in manifest.tensors.inputs.iter().enumerate() {
+            let tensor = input_by_name.get(contract.name.as_str()).ok_or_else(|| {
+                format!(
+                    "runtime model numerical case {} omits graph input {}",
+                    case.id, contract.name
+                )
+            })?;
+            model
+                .set_input_fact(index, numerical_fact(tensor)?)
+                .map_err(tract_error)?;
+        }
+        for (index, contract) in manifest.tensors.outputs.iter().enumerate() {
+            let tensor = output_by_name.get(contract.name.as_str()).ok_or_else(|| {
+                format!(
+                    "runtime model numerical case {} omits graph output {}",
+                    case.id, contract.name
+                )
+            })?;
+            model
+                .set_output_fact(index, numerical_fact(tensor)?)
+                .map_err(tract_error)?;
+        }
+        let model = model.into_typed().map_err(tract_error)?;
+        let runnable = super::tract_runtime::prepare(
+            model,
+            runtime,
+            &format!("runtime model v2 numerical case {}", case.id),
+        )?;
+        let mut inputs = TVec::new();
+        for contract in &manifest.tensors.inputs {
+            let tensor = input_by_name
+                .get(contract.name.as_str())
+                .expect("all numerical inputs were checked");
+            inputs.push(numerical_tensor(tensor)?.into_tvalue());
+        }
+        let actual = runnable.run(inputs).map_err(tract_error)?;
+        if actual.len() != manifest.tensors.outputs.len() {
+            return Err(format!(
+                "runtime model numerical case {} returned {} outputs, expected {}",
+                case.id,
+                actual.len(),
+                manifest.tensors.outputs.len()
+            ));
+        }
+        for (index, contract) in manifest.tensors.outputs.iter().enumerate() {
+            let expected = output_by_name
+                .get(contract.name.as_str())
+                .expect("all numerical outputs were checked");
+            compare_numerical_output(&actual[index], expected, case.tolerance, &case.id)?;
+        }
+    }
+    Ok(())
+}
+
+fn numerical_fact(tensor: &crate::RuntimeModelNumericalTensorV1) -> Result<InferenceFact, String> {
+    let shape: TVec<usize> = tensor
+        .shape
+        .iter()
+        .map(|value| {
+            usize::try_from(*value)
+                .map_err(|_| "runtime model numerical vector shape is too large".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    match tensor.element_type.as_str() {
+        "float32" => Ok(f32::fact(shape).into()),
+        "int64" => Ok(i64::fact(shape).into()),
+        other => Err(format!(
+            "runtime model numerical vector element type {other} is unsupported"
+        )),
+    }
+}
+
+fn numerical_tensor(tensor: &crate::RuntimeModelNumericalTensorV1) -> Result<Tensor, String> {
+    let shape: Vec<usize> = tensor
+        .shape
+        .iter()
+        .map(|value| {
+            usize::try_from(*value)
+                .map_err(|_| "runtime model numerical vector shape is too large".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    match tensor.element_type.as_str() {
+        "float32" => {
+            let values: Vec<f32> = tensor.values.iter().map(|value| *value as f32).collect();
+            Tensor::from_shape(&shape, &values).map_err(tract_error)
+        }
+        "int64" => {
+            let values: Vec<i64> = tensor.values.iter().map(|value| *value as i64).collect();
+            Tensor::from_shape(&shape, &values).map_err(tract_error)
+        }
+        other => Err(format!(
+            "runtime model numerical vector element type {other} is unsupported"
+        )),
+    }
+}
+
+fn compare_numerical_output(
+    actual: &TValue,
+    expected: &crate::RuntimeModelNumericalTensorV1,
+    tolerance: crate::RuntimeModelNumericalToleranceV1,
+    case_id: &str,
+) -> Result<(), String> {
+    match expected.element_type.as_str() {
+        "float32" => {
+            let values = actual.to_plain_array_view::<f32>().map_err(tract_error)?;
+            let expected_shape = numerical_shape(expected)?;
+            if values.shape() != expected_shape.as_slice() {
+                return Err(format!(
+                    "runtime model numerical case {case_id} output {} shape mismatch: expected {:?}, observed {:?}",
+                    expected.name,
+                    expected_shape,
+                    values.shape()
+                ));
+            }
+            if values.len() != expected.values.len() {
+                return Err(format!(
+                    "runtime model numerical case {case_id} output {} length mismatch",
+                    expected.name
+                ));
+            }
+            for (index, (observed, reference)) in values.iter().zip(&expected.values).enumerate() {
+                let observed = f64::from(*observed);
+                let allowed =
+                    f64::from(tolerance.absolute) + f64::from(tolerance.relative) * reference.abs();
+                if !observed.is_finite() || (observed - reference).abs() > allowed {
+                    return Err(format!(
+                        "runtime model numerical case {case_id} output {} differs at element {index}: expected {reference}, observed {observed}, tolerance {allowed}",
+                        expected.name
+                    ));
+                }
+            }
+        }
+        "int64" => {
+            let values = actual.to_plain_array_view::<i64>().map_err(tract_error)?;
+            let expected_shape = numerical_shape(expected)?;
+            if values.shape() != expected_shape.as_slice() {
+                return Err(format!(
+                    "runtime model numerical case {case_id} output {} shape mismatch: expected {:?}, observed {:?}",
+                    expected.name,
+                    expected_shape,
+                    values.shape()
+                ));
+            }
+            if values.len() != expected.values.len()
+                || values
+                    .iter()
+                    .zip(&expected.values)
+                    .any(|(observed, reference)| *observed != *reference as i64)
+            {
+                return Err(format!(
+                    "runtime model numerical case {case_id} integer output {} differs",
+                    expected.name
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "runtime model numerical output type {other} is unsupported"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn numerical_shape(tensor: &crate::RuntimeModelNumericalTensorV1) -> Result<Vec<usize>, String> {
+    tensor
+        .shape
+        .iter()
+        .map(|value| {
+            usize::try_from(*value)
+                .map_err(|_| "runtime model numerical vector shape is too large".to_string())
+        })
+        .collect()
 }
 
 pub fn process(
@@ -493,6 +839,7 @@ fn tract_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use prost::Message;
+    use sha2::Digest as _;
     use tract_onnx::pb::{
         attribute_proto, tensor_proto, tensor_shape_proto, type_proto, AttributeProto, GraphProto,
         ModelProto, NodeProto, OperatorSetIdProto, StringStringEntryProto, TensorProto,
@@ -915,6 +1262,191 @@ mod tests {
         .unwrap();
 
         let package = crate::RuntimeModelPackage::open(&package_path, &public_key_path).unwrap();
+        let model = OnnxWaveformModel::load_runtime_package_with_accelerator(
+            &package,
+            AcceleratorRuntime::Cpu,
+        )
+        .unwrap();
+        let input = vec![vec![-0.5, 0.0, 0.25, 0.75]];
+        assert_eq!(model.process(&input, 16_000, false).unwrap(), input);
+    }
+
+    #[test]
+    fn v2_package_checks_named_graph_and_numerical_vector_before_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let package_path = directory.path().join("identity-v2.dmp");
+        let mut model_bytes = Vec::new();
+        identity_model().encode(&mut model_bytes).unwrap();
+        let license = b"fixture license".to_vec();
+        let provenance = br#"{"schema":"fixture-provenance-v1"}"#.to_vec();
+        let vectors = serde_json::to_vec(&serde_json::json!({
+            "schema": "denoize-runtime-model-numerical-vectors-v1",
+            "profile_id": "fp32",
+            "cases": [{
+                "id": "identity",
+                "inputs": [{
+                    "name": "input",
+                    "element_type": "float32",
+                    "shape": [1, 4],
+                    "values": [-0.5, 0.0, 0.25, 0.75]
+                }],
+                "outputs": [{
+                    "name": "output",
+                    "element_type": "float32",
+                    "shape": [1, 4],
+                    "values": [-0.5, 0.0, 0.25, 0.75]
+                }],
+                "tolerance": { "absolute": 0.000001, "relative": 0.000001 }
+            }]
+        }))
+        .unwrap();
+        let file = |filename: &str, bytes: &[u8]| crate::RuntimeModelFileContract {
+            filename: filename.into(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+        };
+        let axes = || {
+            vec![
+                crate::RuntimeModelAxisContractV2 {
+                    name: "batch".into(),
+                    kind: "batch".into(),
+                    fixed: Some(1),
+                },
+                crate::RuntimeModelAxisContractV2 {
+                    name: "samples".into(),
+                    kind: "sample".into(),
+                    fixed: None,
+                },
+            ]
+        };
+        let resources = crate::RuntimeModelResourceContract {
+            max_session_memory_bytes: crate::estimate_model_session_bytes(model_bytes.len() as u64)
+                .unwrap(),
+            max_worker_memory_bytes: 4096,
+            max_gpu_session_memory_bytes: 0,
+            max_gpu_worker_memory_bytes: 0,
+            accelerators: vec!["cpu".into()],
+        };
+        let manifest = crate::RuntimeModelPackageManifestV2 {
+            schema: crate::RUNTIME_MODEL_PACKAGE_SCHEMA_V2.into(),
+            format_version: crate::RUNTIME_MODEL_PACKAGE_VERSION_V2,
+            package_id: "denoize.test.identity-v2".into(),
+            package_revision: "1".into(),
+            signing_key_id: "0000000000000001".into(),
+            runtime: crate::RuntimeModelRuntimeContractV2 {
+                kind: "onnx-audio-graph-v2".into(),
+                sample_rate_hz: 16_000,
+                mode: "finite-and-streaming".into(),
+            },
+            frontend: crate::RuntimeModelFrontendContractV2 {
+                normalization: "pcm-f32-minus-one-to-one-v1".into(),
+                resampling: "bandlimited-waveform-v1".into(),
+                duration: "preserve-input-frames-v1".into(),
+                channels: crate::RuntimeModelChannelContractV2 {
+                    policy: "independent-mono".into(),
+                    roles: vec![],
+                    geometry: None,
+                },
+            },
+            tensors: crate::RuntimeModelTensorSetContractV2 {
+                inputs: vec![crate::RuntimeModelTensorContractV2 {
+                    name: "input".into(),
+                    role: "audio".into(),
+                    element_type: "float32".into(),
+                    axes: axes(),
+                    optional: false,
+                    state_id: None,
+                }],
+                outputs: vec![crate::RuntimeModelTensorContractV2 {
+                    name: "output".into(),
+                    role: "audio".into(),
+                    element_type: "float32".into(),
+                    axes: axes(),
+                    optional: false,
+                    state_id: None,
+                }],
+            },
+            state_pairs: vec![],
+            latency: crate::RuntimeModelLatencyContractV2 {
+                frame_samples: 4,
+                hop_samples: 4,
+                left_context_samples: 0,
+                right_context_samples: 0,
+                lookahead_samples: 0,
+                algorithmic_latency_samples: 0,
+                flush_samples: 0,
+            },
+            components: vec![
+                crate::RuntimeModelComponentContractV2 {
+                    id: "model-fp32".into(),
+                    kind: "onnx-model".into(),
+                    file: file("model.onnx", &model_bytes),
+                },
+                crate::RuntimeModelComponentContractV2 {
+                    id: "license".into(),
+                    kind: "license-notice".into(),
+                    file: file("LICENSE.txt", &license),
+                },
+                crate::RuntimeModelComponentContractV2 {
+                    id: "provenance".into(),
+                    kind: "provenance-json".into(),
+                    file: file("provenance.json", &provenance),
+                },
+                crate::RuntimeModelComponentContractV2 {
+                    id: "vectors-fp32".into(),
+                    kind: "numerical-vectors-json".into(),
+                    file: file("vectors-fp32.json", &vectors),
+                },
+            ],
+            precision_profiles: vec![crate::RuntimeModelPrecisionProfileContractV2 {
+                id: "fp32".into(),
+                element_type: "float32".into(),
+                model_component: "model-fp32".into(),
+                numerical_vectors_component: "vectors-fp32".into(),
+                resources,
+            }],
+            default_precision_profile: "fp32".into(),
+            license: crate::RuntimeModelLicenseContractV2 {
+                spdx: "MIT".into(),
+                notice_component: "license".into(),
+            },
+            provenance: crate::RuntimeModelProvenanceContractV2 {
+                component: "provenance".into(),
+                source_repository: "https://example.invalid/source".into(),
+                source_revision: "0123456789abcdef".into(),
+                source_sha256: "0".repeat(64),
+                source_license_spdx: "MIT".into(),
+                checkpoint_source: "https://example.invalid/checkpoint".into(),
+                checkpoint_sha256: "1".repeat(64),
+                checkpoint_license_spdx: "MIT".into(),
+                conversion_tool: "fixture-converter".into(),
+                conversion_revision: "1".into(),
+                training_datasets: vec![crate::RuntimeModelTrainingDatasetContractV2 {
+                    id: "synthetic".into(),
+                    source: "urn:denoize:test:synthetic".into(),
+                    revision: "1".into(),
+                    sha256: Some("2".repeat(64)),
+                    license_spdx: "CC0-1.0".into(),
+                }],
+            },
+        };
+        let mut streaming_only = manifest.clone();
+        streaming_only.runtime.mode = "streaming".into();
+        assert!(validate_v2_generic_waveform_compatibility(&streaming_only)
+            .unwrap_err()
+            .contains("dedicated adapter"));
+        let mut program_audio = manifest.clone();
+        program_audio.frontend.channels.policy = "program-multichannel".into();
+        assert!(validate_v2_generic_waveform_compatibility(&program_audio)
+            .unwrap_err()
+            .contains("dedicated adapter"));
+        let package = crate::RuntimeModelPackage::for_onnx_v2_contract_test(
+            package_path,
+            manifest,
+            vec![model_bytes, license, provenance, vectors],
+        );
+        assert_eq!(package.info().format_version, 2);
+        assert_eq!(package.info().v2.unwrap().numerical_vector_cases, 1);
         let model = OnnxWaveformModel::load_runtime_package_with_accelerator(
             &package,
             AcceleratorRuntime::Cpu,

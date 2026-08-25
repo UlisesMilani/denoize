@@ -11060,7 +11060,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "2eb2fcd7675995336ca3752b2e246223326fb7ea133fbb46b53953898268434a";
+        "b4ce9b772bbc3d2902864d9278f000f5d761f57d0dec93bf933ced7abbb435e2";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {
@@ -14161,6 +14161,7 @@ USAGE:
     denoize models package inspect <PACKAGE.dmp> <MINISIGN.pub>
     denoize models package license <PACKAGE.dmp> <MINISIGN.pub>
     denoize models package create <OUTPUT.dmp> <MANIFEST.json> <MANIFEST.json.sig> <MINISIGN.pub> <MODEL.onnx> <LICENSE>
+    denoize models package create-v2 <OUTPUT.dmp> <MANIFEST.json> <MANIFEST.json.sig> <MINISIGN.pub> <COMPONENTS-DIR>
     denoize models snapshot [--json] [--pretty]
     denoize models cache-dir
 
@@ -14894,6 +14895,92 @@ fn print_runtime_model_package_info(info: &denoize::RuntimeModelPackageInfo) {
         "max-gpu-worker-memory-bytes: {}",
         info.max_gpu_worker_memory_bytes
     );
+    if let Some(v2) = &info.v2 {
+        println!("runtime-kind: {}", v2.runtime_kind);
+        println!("runtime-mode: {}", v2.runtime_mode);
+        println!("channel-policy: {}", v2.channel_policy);
+        println!("component-count: {}", v2.component_count);
+        println!("numerical-vector-cases: {}", v2.numerical_vector_cases);
+        println!(
+            "latency: frame={} hop={} left={} right={} lookahead={} algorithmic={} flush={}",
+            v2.latency.frame_samples,
+            v2.latency.hop_samples,
+            v2.latency.left_context_samples,
+            v2.latency.right_context_samples,
+            v2.latency.lookahead_samples,
+            v2.latency.algorithmic_latency_samples,
+            v2.latency.flush_samples
+        );
+        for tensor in &v2.inputs {
+            println!(
+                "input-tensor: {}\t{}\t{}\t{}",
+                tensor.name,
+                tensor.role,
+                tensor.element_type,
+                tensor
+                    .axes
+                    .iter()
+                    .map(|axis| format!(
+                        "{}:{}:{}",
+                        axis.name,
+                        axis.kind,
+                        axis.fixed
+                            .map_or_else(|| "dynamic".into(), |value| value.to_string())
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        for tensor in &v2.outputs {
+            println!(
+                "output-tensor: {}\t{}\t{}\t{}",
+                tensor.name,
+                tensor.role,
+                tensor.element_type,
+                tensor
+                    .axes
+                    .iter()
+                    .map(|axis| format!(
+                        "{}:{}:{}",
+                        axis.name,
+                        axis.kind,
+                        axis.fixed
+                            .map_or_else(|| "dynamic".into(), |value| value.to_string())
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+        for state in &v2.state_pairs {
+            println!(
+                "state-pair: {}\t{}\t{}\t{}",
+                state.id, state.input, state.output, state.initialization
+            );
+        }
+        for profile in &v2.precision_profiles {
+            println!(
+                "precision-profile: {}\t{}\t{}\t{}\t{}",
+                profile.id,
+                profile.element_type,
+                profile.model_component,
+                profile.numerical_vectors_component,
+                profile.resources.accelerators.join(",")
+            );
+        }
+        println!(
+            "default-precision-profile: {}",
+            v2.default_precision_profile
+        );
+        println!(
+            "provenance: source={}@{} checkpoint={} conversion={}@{} datasets={}",
+            v2.provenance.source_repository,
+            v2.provenance.source_revision,
+            v2.provenance.checkpoint_sha256,
+            v2.provenance.conversion_tool,
+            v2.provenance.conversion_revision,
+            v2.provenance.training_datasets.len()
+        );
+    }
 }
 
 fn run_runtime_model_package(args: &[String]) -> Result<(), String> {
@@ -14937,6 +15024,19 @@ fn run_runtime_model_package(args: &[String]) -> Result<(), String> {
             print_runtime_model_package_info(&info);
             eprintln!(
                 "created authenticated runtime model package {} ({})",
+                args[2], info.package_sha256
+            );
+        }
+        "create-v2" => {
+            if args.len() != 7 {
+                return Err("models package create-v2 requires OUTPUT.dmp MANIFEST.json MANIFEST.json.sig MINISIGN.pub COMPONENTS-DIR".into());
+            }
+            let info = denoize::build_runtime_model_package_v2(
+                &args[2], &args[3], &args[4], &args[5], &args[6],
+            )?;
+            print_runtime_model_package_info(&info);
+            eprintln!(
+                "created authenticated runtime model package v2 {} ({})",
                 args[2], info.package_sha256
             );
         }
@@ -15726,6 +15826,7 @@ mod model_command_tests {
             "package inspect",
             "package license",
             "package create",
+            "package create-v2",
             "models snapshot",
         ] {
             assert!(models_usage().contains(flag));
@@ -15802,6 +15903,10 @@ mod model_command_tests {
             (
                 vec!["package".into(), "create".into(), "output.dmp".into()],
                 "models package create requires OUTPUT.dmp",
+            ),
+            (
+                vec!["package".into(), "create-v2".into(), "output.dmp".into()],
+                "models package create-v2 requires OUTPUT.dmp",
             ),
             (
                 vec!["package".into(), "license".into()],

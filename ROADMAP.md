@@ -56,17 +56,21 @@ and training-data terms; exact source revision and digest; CPU fallback;
 numerical parity vectors; stratified quality evidence; and explicit
 hallucination or target-leakage gates.
 
+The research review, candidate comparison, acceptance metrics, and explicit
+stop/rollback conditions behind this order are maintained in
+[docs/restoration-research.md](docs/restoration-research.md).
+
 | Order | Stage | Scope | Status |
 |---:|---:|---|---|
 | 1 | 24 | Bounded degradation diagnosis, native no-reference quality dimensions, uncertainty, recommended repair pipeline, and presentation-safe before/after assessment | Released in v0.72.0 |
-| 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Planned |
+| 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Planned |
-| 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and opt-in generative mode | Planned |
+| 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Planned |
 | 5 | 28 | Neural CLAP processing, VST3, custom editor, sidechain foundation, off-callback inference, host latency, automation, overload fallback, then AUv3 and LV2 | Planned |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Planned |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
-| 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, and multiple export formats | Planned |
+| 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Planned |
 | 10 | 33 | Stable C ABI, WASM, and mobile SDKs after runtime and processing ABI stabilization | Planned |
 
 Stage 24 publishes
@@ -82,7 +86,15 @@ authority.
 Stage 25 keeps v1 packages backward compatible and fail-closed. It does not
 permit arbitrary scripts or archive extraction. Enrollment, far-end reference,
 microphone geometry, and recurrent state are typed tensor roles rather than
-untrusted command hooks.
+untrusted command hooks. The v2 container authenticates an ordered component
+table, exact ONNX graph names/types/ranks/fixed dimensions, deterministic
+zero-initialized state pairs, a CPU-safe default plus accelerator-specific
+precision profiles, bounded resource reservations, consolidated SPDX and
+source/checkpoint/training-data provenance, and signed numerical vectors that
+must execute on the selected runtime before source audio. The current generic
+adapter deliberately runs only the existing one-audio-input/one-audio-output
+waveform layout; richer contracts are inspectable now and become executable
+only through their dedicated later-stage adapter.
 
 Stage 26 establishes deterministic, inspectable baselines before a universal
 generative repair model can ship. An undamaged-input bypass corpus, repair-mask
@@ -101,9 +113,18 @@ processing distinguishes microphone arrays from ordinary program stereo.
 Target-speaker enrollment audio is not retained by default.
 
 Stage 32 deliberately follows stable restoration chains so the project format
-does not encode provisional DSP semantics. Stage 33 follows runtime and
+does not encode provisional DSP semantics. Its C2PA export appends verifiable
+operation and model fingerprints without claiming that provenance assertions
+prove truth. Stage 33 follows runtime and
 timeline stabilization so exported ABI compatibility can be maintained rather
 than repeatedly broken.
+
+Music/general-audio restoration, unified audio foundation models, and
+audio-visual target extraction remain a documented research watchlist rather
+than committed stages. The current evidence, redistributable-weight status, or
+privacy/fidelity gates are not yet strong enough to place them ahead of Stages
+25–33; promotion conditions are recorded in
+[docs/restoration-research.md](docs/restoration-research.md).
 
 ## Investigation status
 

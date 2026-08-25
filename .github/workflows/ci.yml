@@ -67,6 +67,9 @@ jobs:
       - name: Validate project JSON contracts
         run: python3 scripts/test-project-schemas.py --denoize target/debug/denoize
 
+      - name: Validate runtime model package JSON contracts
+        run: python3 scripts/test-runtime-model-package-schemas.py
+
       - name: Validate native diagnostic JSON contracts
         run: python3 scripts/test-diagnostic-schemas.py --denoize target/debug/denoize
 
@@ -110,6 +113,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
           python3 -c 'compile(open("scripts/test-diagnostic-schemas.py", encoding="utf-8").read(), "scripts/test-diagnostic-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \

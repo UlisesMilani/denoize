@@ -167,11 +167,21 @@ pub use hardware::{
 pub use input::AudioInputSession;
 pub use input::StreamSpoolLimits;
 pub use model_package::{
-    build_runtime_model_package, inspect_runtime_model_package, RuntimeModelFileContract,
-    RuntimeModelFrontendContract, RuntimeModelLicenseContract, RuntimeModelPackage,
-    RuntimeModelPackageInfo, RuntimeModelPackageManifest, RuntimeModelPackageReader,
-    RuntimeModelResourceContract, RuntimeModelRuntimeContract, RuntimeModelTensorContract,
-    RUNTIME_MODEL_PACKAGE_SCHEMA, RUNTIME_MODEL_PACKAGE_VERSION,
+    build_runtime_model_package, build_runtime_model_package_v2, inspect_runtime_model_package,
+    RuntimeModelAxisContractV2, RuntimeModelChannelContractV2, RuntimeModelChannelRoleContractV2,
+    RuntimeModelComponentContractV2, RuntimeModelFileContract, RuntimeModelFrontendContract,
+    RuntimeModelFrontendContractV2, RuntimeModelGeometryContractV2, RuntimeModelLatencyContractV2,
+    RuntimeModelLicenseContract, RuntimeModelLicenseContractV2, RuntimeModelMicrophonePositionV2,
+    RuntimeModelNumericalCaseV1, RuntimeModelNumericalTensorV1, RuntimeModelNumericalToleranceV1,
+    RuntimeModelNumericalVectorsV1, RuntimeModelPackage, RuntimeModelPackageInfo,
+    RuntimeModelPackageManifest, RuntimeModelPackageManifestV2, RuntimeModelPackageReader,
+    RuntimeModelPackageV2Info, RuntimeModelPrecisionProfileContractV2,
+    RuntimeModelProvenanceContractV2, RuntimeModelResourceContract, RuntimeModelRuntimeContract,
+    RuntimeModelRuntimeContractV2, RuntimeModelStatePairContractV2, RuntimeModelTensorContract,
+    RuntimeModelTensorContractV2, RuntimeModelTensorSetContractV2,
+    RuntimeModelTrainingDatasetContractV2, RUNTIME_MODEL_PACKAGE_SCHEMA,
+    RUNTIME_MODEL_PACKAGE_SCHEMA_V2, RUNTIME_MODEL_PACKAGE_VERSION,
+    RUNTIME_MODEL_PACKAGE_VERSION_V2,
 };
 pub use project::{
     assemble_project_timeline, build_project_bundle, import_project_bundle, inspect_project_bundle,
