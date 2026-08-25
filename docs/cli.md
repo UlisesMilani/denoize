@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.71.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.72.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -13,6 +13,9 @@ USAGE:
     denoize live --list-devices
     denoize hardware [--json|--pretty]
     denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
+    denoize diagnose <INPUT> [--analysis-seconds N] [--json|--pretty]
+    denoize assess <INPUT> [--analysis-seconds N] [--json|--pretty]
+    denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -125,10 +128,49 @@ CONFIGURATION:
     before audio decoding, output staging, or batch worker creation.
 ```
 
+## Native degradation diagnosis
+
+```text
+USAGE:
+    denoize diagnose <INPUT> [OPTIONS]
+
+Analyze a bounded input prefix for noise, clipping, hum, clicks, reverberation,
+bandwidth limitation, dropouts, wind/plosives, and codec risk. The native
+estimator is network-free and reports confidence and uncertainty; it is not a
+human-MOS or semantic-fidelity release gate.
+
+OPTIONS:
+        --analysis-seconds <N> analyze 1..60 seconds (default: 12)
+        --max-memory <MB>      bound denoize-owned decode and analysis memory
+        --json                 emit compact denoize-diagnostic-v1 JSON
+        --pretty               emit indented denoize-diagnostic-v1 JSON
+    -h, --help                 show this help
+```
+
+## No-reference quality assessment
+
+```text
+USAGE:
+    denoize assess <INPUT> [OPTIONS]
+    denoize assess <BEFORE> <AFTER> [OPTIONS]
+
+Produce a single-input no-reference quality report or compare the same bounded
+metrics before and after processing. Before/after mode also verifies sample
+rate, channel count, and presentation duration. It never treats a proxy score
+as proof of semantic or speaker-identity fidelity.
+
+OPTIONS:
+        --analysis-seconds <N> analyze 1..60 seconds from each input (default: 12)
+        --max-memory <MB>      bound denoize-owned decode and analysis memory
+        --json                 emit compact denoize-assessment-v1 JSON
+        --pretty               emit indented denoize-assessment-v1 JSON
+    -h, --help                 show this help
+```
+
 ## Watch-folder automation
 
 ```text
-denoize 0.71.0 watch-folder automation
+denoize 0.72.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

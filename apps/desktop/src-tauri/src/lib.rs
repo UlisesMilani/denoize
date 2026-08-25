@@ -1080,6 +1080,23 @@ struct RecommendationRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiagnosticRequest {
+    input: String,
+    analysis_seconds: u32,
+    max_memory_mb: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AssessmentRequest {
+    baseline: Option<String>,
+    candidate: String,
+    analysis_seconds: u32,
+    max_memory_mb: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EvaluationValidationRequest {
     manifest: String,
     corpus_root: String,
@@ -1932,6 +1949,65 @@ async fn recommend_settings(
     })
     .await
     .map_err(|error| format!("推奨分析タスクに失敗しました: {error}"))??)
+}
+
+fn desktop_diagnostic_options(
+    analysis_seconds: u32,
+    max_memory_mb: Option<usize>,
+) -> Result<denoize::DiagnosticOptions, String> {
+    let maximum = checked_desktop_mib(max_memory_mb, "プロセスメモリ上限")?;
+    let limits = DecodeLimits::new(
+        denoize::metadata_limits_for_available_memory(maximum),
+        maximum,
+    );
+    let options = denoize::DiagnosticOptions::new()
+        .with_analysis_seconds(analysis_seconds)
+        .with_decode_limits(limits);
+    options.validate()?;
+    Ok(options)
+}
+
+#[tauri::command]
+async fn diagnose_audio_input(
+    request: DiagnosticRequest,
+) -> DesktopResult<denoize::DiagnosticReport> {
+    let options = desktop_diagnostic_options(request.analysis_seconds, request.max_memory_mb)?;
+    if request.input.trim().is_empty() {
+        return Err("劣化診断する入力ファイルを選択してください".into());
+    }
+    let input = request.input;
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        denoize::diagnose_file_with_options(input, options)
+    })
+    .await
+    .map_err(|error| format!("劣化診断タスクに失敗しました: {error}"))??)
+}
+
+#[tauri::command]
+async fn assess_audio_inputs(
+    request: AssessmentRequest,
+) -> DesktopResult<denoize::AssessmentReport> {
+    let options = desktop_diagnostic_options(request.analysis_seconds, request.max_memory_mb)?;
+    if request.candidate.trim().is_empty() {
+        return Err("品質評価する入力ファイルを選択してください".into());
+    }
+    if request
+        .baseline
+        .as_deref()
+        .is_some_and(|baseline| baseline.trim().is_empty())
+    {
+        return Err("比較元ファイルは空でないパスにしてください".into());
+    }
+    let baseline = request.baseline;
+    let candidate = request.candidate;
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || match baseline {
+            Some(baseline) => denoize::compare_files_with_options(baseline, candidate, options),
+            None => denoize::assess_file_with_options(candidate, options),
+        })
+        .await
+        .map_err(|error| format!("品質評価タスクに失敗しました: {error}"))??,
+    )
 }
 
 #[tauri::command]
@@ -8889,6 +8965,8 @@ pub fn run() {
             finish_accessibility_e2e,
             app_info,
             recommend_settings,
+            diagnose_audio_input,
+            assess_audio_inputs,
             plan_process,
             plan_batch,
             inspect_project_manifest,
@@ -9014,6 +9092,36 @@ mod tests {
     static PROJECT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn desktop_diagnostic_contract_is_bounded_and_closed() {
+        let options = desktop_diagnostic_options(12, Some(64)).unwrap();
+        assert_eq!(options.analysis_seconds(), 12);
+        assert_eq!(
+            options.decode_limits().max_working_set_bytes,
+            Some(64 * 1024 * 1024)
+        );
+        assert!(desktop_diagnostic_options(0, None).is_err());
+        assert!(desktop_diagnostic_options(61, None).is_err());
+
+        let request: DiagnosticRequest = serde_json::from_value(serde_json::json!({
+            "input": "recording.wav",
+            "analysisSeconds": 7,
+            "maxMemoryMb": 32
+        }))
+        .unwrap();
+        assert_eq!(request.input, "recording.wav");
+        assert_eq!(request.analysis_seconds, 7);
+        assert!(
+            serde_json::from_value::<DiagnosticRequest>(serde_json::json!({
+                "input": "recording.wav",
+                "analysisSeconds": 7,
+                "maxMemoryMb": null,
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn application_update_platform_tracks_the_packaged_bundle_type() {
         assert_eq!(
             application_update_platform_for("linux", "x86_64", Some(BundleType::AppImage), false,)
@@ -9125,7 +9233,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "615725b48303953aa4733a7f8cfe03492332b778b9909874d7cd93c38693e08c";
+        "2eb2fcd7675995336ca3752b2e246223326fb7ea133fbb46b53953898268434a";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

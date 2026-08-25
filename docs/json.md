@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes fifty-four versioned JSON contracts for local automation. Their
+denoize publishes fifty-six versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -10,6 +10,13 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes single-file results, streaming results, batch NDJSON events,
   live-device status NDJSON, and DAW plug-in inspection and measured-latency
   reports.
+- [`denoize-diagnostic-v1.schema.json`](../schemas/denoize-diagnostic-v1.schema.json)
+  describes bounded degradation measurements, nine independent findings,
+  confidence, native quality dimensions, uncertainty, and a recommended repair
+  pipeline without a source pathname.
+- [`denoize-assessment-v1.schema.json`](../schemas/denoize-assessment-v1.schema.json)
+  describes a single-input no-reference assessment or a presentation-checked
+  before/after comparison that explicitly leaves semantic fidelity unassessed.
 - [`denoize-daw-preset-v1.schema.json`](../schemas/denoize-daw-preset-v1.schema.json)
   describes a compact host- and platform-independent CLAP preset with every
   stable automatable parameter.
@@ -155,8 +162,10 @@ are rejected. Removing a field, changing its type, or changing a documented
 value requires a new schema identifier and version. Execution plans, receipts,
 keys, policies, verification reports, presentation regions, project documents,
 runtime model package manifests, and IPC documents deliberately reject unknown
-fields: their exact typed representation participates in signing,
-authorization, admission, trust, or source-binding decisions.
+fields because their exact typed representation participates in signing,
+authorization, admission, trust, or source-binding decisions. Diagnostic and
+assessment reports also reject unknown fields so a consumer cannot silently
+ignore a new safety dimension.
 
 ## Portable project contracts
 

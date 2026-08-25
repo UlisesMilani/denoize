@@ -150,6 +150,7 @@ if [[ "$is_dry_run" == true ]]; then
   for required in \
     "denoize-${package_version}/src/automation.rs" \
     "denoize-${package_version}/src/daw.rs" \
+    "denoize-${package_version}/src/diagnostics.rs" \
     "denoize-${package_version}/src/evaluation.rs" \
     "denoize-${package_version}/src/model_package/testdata/manifest.json" \
     "denoize-${package_version}/src/model_package/testdata/manifest.json.sig" \
@@ -165,13 +166,16 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/LICENSES/clap-sys-0.5.0-MIT.txt" \
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/docs/evaluation.md" \
+    "denoize-${package_version}/docs/diagnostics.md" \
     "denoize-${package_version}/docs/projects.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/docs/updates.md" \
+    "denoize-${package_version}/schemas/denoize-assessment-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-daw-preset-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-daw-session-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-diagnostic-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-receipt-v1.schema.json" \
@@ -222,6 +226,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-watch-cycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-quarantine-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-watch-state-v1.schema.json" \
+    "denoize-${package_version}/scripts/test-diagnostic-schemas.py" \
     "denoize-${package_version}/scripts/test-evaluation-evidence.sh" \
     "denoize-${package_version}/scripts/test-project-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"

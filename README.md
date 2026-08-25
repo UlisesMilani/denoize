@@ -125,6 +125,32 @@ that can be reproduced without inventing a model argument are auto-selected.
 The analyzed-sample SHA-256 is a content fingerprint; remove it before sharing
 a report when correlating the source audio would be sensitive.
 
+### Native degradation diagnosis and no-reference assessment
+
+**denoize diagnose** performs bounded, deterministic, network-free triage when
+a clean reference is unavailable:
+
+~~~sh
+denoize diagnose damaged.wav
+denoize diagnose damaged.wav --analysis-seconds 20 --pretty
+denoize assess before.wav after.wav --json
+~~~
+
+The report separates additive noise, clipping, 50/60 Hz hum, clicks,
+reverberation, bandwidth limitation, short dropouts, wind/plosive energy, and
+codec risk. Each finding carries direct evidence, continuous severity,
+confidence, and a recommended restoration action. **assess** can evaluate one
+input or compare before/after quality while separately checking sample rate,
+channel count, and presentation duration.
+
+The native score and MOS proxy are triage estimates, not human MOS. Schema v1
+always reports semantic fidelity as unassessed; it cannot prove preservation of
+words, phonemes, speaker identity, language, or prosody and cannot authorize a
+generative result by score alone. See [Native diagnostics](docs/diagnostics.md)
+and the closed
+[denoize-diagnostic-v1](schemas/denoize-diagnostic-v1.schema.json) and
+[denoize-assessment-v1](schemas/denoize-assessment-v1.schema.json) contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -725,7 +751,8 @@ applicable passes, no failures or warnings, and 8 capability-based skips.
 ## Desktop app
 
 The Tauri desktop app exposes single-file denoising, batch conversion, portable
-project timelines, DAW plug-in state management, quality comparison, and model
+project timelines, DAW plug-in state management, native degradation diagnosis,
+no-reference before/after assessment, signed quality comparison, and model
 management without sending audio off the computer. Its
 default build includes every backend in the repository's `full` feature set;
 FDK-AAC remains an explicit opt-in because of its separate licensing terms.

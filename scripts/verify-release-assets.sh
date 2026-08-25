@@ -60,10 +60,12 @@ expected_assets=(
   "denoize-model-catalog-v1.json"
   "denoize-model-catalog-v1.json.sig"
   "denoize-model-trust-root-v1.json"
+  "denoize-assessment-v1.schema.json"
   "denoize-automation-v1.schema.json"
   "denoize-cli-output-v1.schema.json"
   "denoize-daw-preset-v1.schema.json"
   "denoize-daw-session-v1.schema.json"
+  "denoize-diagnostic-v1.schema.json"
   "denoize-execution-plan-v1.schema.json"
   "denoize-execution-plan-v2.schema.json"
   "denoize-execution-receipt-v1.schema.json"
@@ -118,7 +120,7 @@ expected_assets=(
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
-update_rollback_versions=(0.69.0 0.70.0)
+update_rollback_versions=(0.70.0 0.71.0)
 update_platforms=(
   "darwin-aarch64-app"
   "darwin-x86_64-app"
@@ -228,10 +230,12 @@ gh release download "$tag" \
   --pattern '*.jsonl' \
   --pattern 'denoize-model-catalog-v1.json' \
   --pattern 'denoize-model-trust-root-v1.json' \
+  --pattern 'denoize-assessment-v1.schema.json' \
   --pattern 'denoize-automation-v1.schema.json' \
   --pattern 'denoize-cli-output-v1.schema.json' \
   --pattern 'denoize-daw-preset-v1.schema.json' \
   --pattern 'denoize-daw-session-v1.schema.json' \
+  --pattern 'denoize-diagnostic-v1.schema.json' \
   --pattern 'denoize-execution-plan-v1.schema.json' \
   --pattern 'denoize-execution-plan-v2.schema.json' \
   --pattern 'denoize-execution-receipt-v1.schema.json' \
@@ -293,10 +297,12 @@ if ! cmp -s models/trust-root-v1.json "$tmp_dir/denoize-model-trust-root-v1.json
 fi
 
 for schema in \
+  denoize-assessment-v1.schema.json \
   denoize-automation-v1.schema.json \
   denoize-cli-output-v1.schema.json \
   denoize-daw-preset-v1.schema.json \
   denoize-daw-session-v1.schema.json \
+  denoize-diagnostic-v1.schema.json \
   denoize-execution-plan-v1.schema.json \
   denoize-execution-plan-v2.schema.json \
   denoize-execution-receipt-v1.schema.json \
@@ -385,7 +391,7 @@ jq -e \
   .channel == "stable" and
   .version == $version and
   .source_commit == $commit and
-  .compatibility.accepted_from_versions == ["0.69.0", "0.70.0"] and
+  .compatibility.accepted_from_versions == ["0.70.0", "0.71.0"] and
   .rollback_policy.retained_last_known_good == 1 and
   .rollback_policy.manual_recovery == true and
   .rollback_policy.network_required_for_recovery == false and
@@ -411,7 +417,7 @@ jq -e \
     ($platform_row.candidate.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
-    ([$platform_row.rollbacks[].from_version] == ["0.69.0", "0.70.0"]) and
+    ([$platform_row.rollbacks[].from_version] == ["0.70.0", "0.71.0"]) and
     all($platform_row.rollbacks[]; . as $rollback |
       $rollback.payload.activation == $platform_row.candidate.activation and
       (.bundle_url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and

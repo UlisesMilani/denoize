@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-assessment-v1.schema.json",
+  "title": "denoize native no-reference assessment v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "network_accessed",
+    "baseline",
+    "candidate",
+    "comparison",
+    "verdict",
+    "warnings"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-assessment-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1 },
+    "network_accessed": { "const": false },
+    "baseline": {
+      "oneOf": [
+        { "$ref": "denoize-diagnostic-v1.schema.json" },
+        { "type": "null" }
+      ]
+    },
+    "candidate": { "$ref": "denoize-diagnostic-v1.schema.json" },
+    "comparison": {
+      "oneOf": [
+        { "$ref": "#/$defs/comparison" },
+        { "type": "null" }
+      ]
+    },
+    "verdict": {
+      "enum": ["single-input", "improved", "degraded", "unchanged", "mixed", "incomparable"]
+    },
+    "warnings": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": { "verdict": { "const": "single-input" } },
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": {
+          "baseline": { "type": "null" },
+          "comparison": { "type": "null" }
+        }
+      },
+      "else": {
+        "properties": {
+          "baseline": { "$ref": "denoize-diagnostic-v1.schema.json" },
+          "comparison": { "$ref": "#/$defs/comparison" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "verdict": { "const": "incomparable" } },
+        "required": ["verdict"]
+      },
+      "then": {
+        "properties": {
+          "comparison": {
+            "properties": { "presentation_preserved": { "const": false } }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "comparison": {
+            "properties": { "presentation_preserved": { "const": true } }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "nullableInteger": {
+      "oneOf": [
+        { "type": "integer" },
+        { "type": "null" }
+      ]
+    },
+    "nullableNumber": {
+      "oneOf": [
+        { "type": "number" },
+        { "type": "null" }
+      ]
+    },
+    "comparison": {
+      "type": "object",
+      "required": [
+        "quality_score_delta",
+        "estimated_mos_proxy_delta",
+        "noise_cleanliness_delta",
+        "distortion_freedom_delta",
+        "spectral_completeness_delta",
+        "continuity_delta",
+        "sample_rate_equal",
+        "channel_count_equal",
+        "total_frame_delta",
+        "duration_delta_milliseconds",
+        "presentation_preserved",
+        "semantic_fidelity_assessed"
+      ],
+      "properties": {
+        "quality_score_delta": { "type": "number", "minimum": -100, "maximum": 100 },
+        "estimated_mos_proxy_delta": { "type": "number", "minimum": -4, "maximum": 4 },
+        "noise_cleanliness_delta": { "type": "number", "minimum": -100, "maximum": 100 },
+        "distortion_freedom_delta": { "type": "number", "minimum": -100, "maximum": 100 },
+        "spectral_completeness_delta": { "type": "number", "minimum": -100, "maximum": 100 },
+        "continuity_delta": { "type": "number", "minimum": -100, "maximum": 100 },
+        "sample_rate_equal": { "type": "boolean" },
+        "channel_count_equal": { "type": "boolean" },
+        "total_frame_delta": { "$ref": "#/$defs/nullableInteger" },
+        "duration_delta_milliseconds": { "$ref": "#/$defs/nullableNumber" },
+        "presentation_preserved": { "type": "boolean" },
+        "semantic_fidelity_assessed": { "const": false }
+      },
+      "additionalProperties": false
+    }
+  }
+}

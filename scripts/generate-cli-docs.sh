@@ -37,6 +37,18 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" --help
   echo '```'
   echo
+  echo '## Native degradation diagnosis'
+  echo
+  echo '```text'
+  "$binary" diagnose --help
+  echo '```'
+  echo
+  echo '## No-reference quality assessment'
+  echo
+  echo '```text'
+  "$binary" assess --help
+  echo '```'
+  echo
   echo '## Watch-folder automation'
   echo
   echo '```text'
