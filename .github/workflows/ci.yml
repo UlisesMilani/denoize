@@ -159,7 +159,7 @@ jobs:
             | sha256sum --check
           unzip -q "$validator_zip" -d "$validator_dir"
           tar -xzf "$validator_dir"/*.tar.gz -C "$validator_dir"
-          validator=$(find "$validator_dir" -type f -name clap-validator -perm -u+x | head -n 1)
+          validator=$(find "$validator_dir" -type f -name clap-validator -perm -u+x -print -quit)
           test -n "$validator"
           cp target/release/libdenoize_clap.so "$validator_dir/denoize.clap"
           validator_status=1
