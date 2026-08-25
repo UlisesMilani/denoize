@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.72.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.73.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -170,7 +170,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.72.0 watch-folder automation
+denoize 0.73.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -234,6 +234,7 @@ USAGE:
     denoize models package inspect <PACKAGE.dmp> <MINISIGN.pub>
     denoize models package license <PACKAGE.dmp> <MINISIGN.pub>
     denoize models package create <OUTPUT.dmp> <MANIFEST.json> <MANIFEST.json.sig> <MINISIGN.pub> <MODEL.onnx> <LICENSE>
+    denoize models package create-v2 <OUTPUT.dmp> <MANIFEST.json> <MANIFEST.json.sig> <MINISIGN.pub> <COMPONENTS-DIR>
     denoize models snapshot [--json] [--pretty]
     denoize models cache-dir
 

@@ -33,8 +33,15 @@ preserving timbre, transients, dynamics, stereo imaging, and natural "air".
 Build everything: `cargo build --release --features full`
 
 The generic ONNX backend is the deployment foundation for future neural
-models. It intentionally accepts only single-input/single-output waveform
-models; spectral models and diffusion samplers require dedicated adapters.
+models. Raw `.onnx` files and signed package v1 intentionally accept only
+single-input/single-output waveform models. Signed package v2 additionally
+authenticates named multi-input/output tensors, recurrent state, channel roles
+and microphone geometry, latency/context, per-accelerator precision profiles,
+resource budgets, provenance, and numerical conformance vectors. The generic
+adapter executes only a finite-capable, independent-mono graph with one required
+waveform input and one waveform output; expressive v2 graphs fail closed until
+their dedicated restoration, target-speaker, AEC, or spatial adapter is
+selected.
 Library embedders can load [`OnnxWaveformModel`](https://docs.rs/denoize/latest/denoize/struct.OnnxWaveformModel.html)
 once, inspect its validated `float32` waveform contract, and reuse the most
 recently compiled input length instead of parsing and optimizing the graph on
@@ -220,6 +227,10 @@ denoize noisy.wav clean.wav -b onnx \
 denoize noisy.wav clean.wav -b onnx \
   --model-package voice-cleaner.dmp \
   --model-package-key vendor-model.pub
+
+# Inspect either signed package version; v2 also reports named I/O, state,
+# latency, precision profiles, provenance, and numerical-vector coverage
+denoize models package inspect voice-cleaner.dmp vendor-model.pub
 
 # Official MP-SENet checkpoint converted with scripts/export-mpsenet.py
 denoize noisy.wav clean.wav -b mpsenet \

@@ -195,6 +195,17 @@ type RuntimeModelPackageInfo = {
   licenseSizeBytes: number; licenseSpdx: string; maxSessionMemoryBytes: number;
   maxWorkerMemoryBytes: number; maxGpuSessionMemoryBytes: number;
   maxGpuWorkerMemoryBytes: number; accelerators: string[];
+  v2: null | {
+    runtimeKind: string; runtimeMode: string; channelPolicy: string;
+    inputs: Array<{ name: string; role: string; element_type: string }>;
+    outputs: Array<{ name: string; role: string; element_type: string }>;
+    statePairs: Array<{ id: string; input: string; output: string }>;
+    latency: { algorithmic_latency_samples: number; lookahead_samples: number };
+    defaultPrecisionProfile: string;
+    precisionProfiles: Array<{ id: string; element_type: string }>;
+    provenance: { source_repository: string; source_revision: string; training_datasets: unknown[] };
+    componentCount: number; numericalVectorCases: number;
+  };
 };
 type FileFingerprint = { len: number; digest: string };
 type PresentationRegion = {
@@ -1345,9 +1356,15 @@ async function verifySelectedRuntimePackage() {
     const info = await invoke<RuntimeModelPackageInfo>("inspect_runtime_model_package", { path, publicKey });
     if (!selectionIsCurrent()) return;
     $<HTMLInputElement>("#onnx-rate").value = String(info.sampleRateHz);
+    const v2Details = info.v2
+      ? tr(
+        ` · v2 ${info.v2.runtimeMode} · I/O ${info.v2.inputs.length}/${info.v2.outputs.length} · 状態 ${info.v2.statePairs.length} · ${info.v2.precisionProfiles.length}精度 · 遅延 ${info.v2.latency.algorithmic_latency_samples} sample · 数値vector ${info.v2.numericalVectorCases}件`,
+        ` · v2 ${info.v2.runtimeMode} · I/O ${info.v2.inputs.length}/${info.v2.outputs.length} · states ${info.v2.statePairs.length} · ${info.v2.precisionProfiles.length} precision profiles · latency ${info.v2.latency.algorithmic_latency_samples} samples · ${info.v2.numericalVectorCases} numerical vectors`,
+      )
+      : "";
     $("#runtime-package-status").textContent = tr(
-      `認証済みパッケージ · ${info.packageId}@${info.packageRevision} · ${info.licenseSpdx} · ${info.tensorLayout} · ${info.accelerators.join(",")} · SHA-256 ${info.packageSha256.slice(0, 16)}… · graph契約は処理開始時に確認`,
-      `Authenticated package · ${info.packageId}@${info.packageRevision} · ${info.licenseSpdx} · ${info.tensorLayout} · ${info.accelerators.join(",")} · SHA-256 ${info.packageSha256.slice(0, 16)}… · graph contract checked when processing`,
+      `認証済みパッケージ · ${info.packageId}@${info.packageRevision}${v2Details} · ${info.licenseSpdx} · ${info.tensorLayout} · ${info.accelerators.join(",")} · SHA-256 ${info.packageSha256.slice(0, 16)}… · graph契約と数値vectorは処理開始時に確認`,
+      `Authenticated package · ${info.packageId}@${info.packageRevision}${v2Details} · ${info.licenseSpdx} · ${info.tensorLayout} · ${info.accelerators.join(",")} · SHA-256 ${info.packageSha256.slice(0, 16)}… · graph contract and numerical vectors checked when processing`,
     );
     showToast(tr("署名付きモデルパッケージを認証しました", "Signed model package authenticated"));
   } catch (error) {

@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-runtime-model-numerical-vectors-v1.schema.json",
+  "title": "denoize runtime model numerical vectors v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "profile_id", "cases"],
+  "properties": {
+    "schema": { "const": "denoize-runtime-model-numerical-vectors-v1" },
+    "profile_id": { "$ref": "#/$defs/identifier" },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "inputs", "outputs", "tolerance"],
+        "properties": {
+          "id": { "$ref": "#/$defs/identifier" },
+          "inputs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "$ref": "#/$defs/tensor" }
+          },
+          "outputs": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": { "$ref": "#/$defs/tensor" }
+          },
+          "tolerance": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["absolute", "relative"],
+            "properties": {
+              "absolute": { "type": "number", "minimum": 0, "maximum": 0.01 },
+              "relative": { "type": "number", "minimum": 0, "maximum": 0.01 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._+-]+$"
+    },
+    "tensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "element_type", "shape", "values"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/\\\\\\u0000-\\u001F\\u007F-\\u009F]+$"
+        },
+        "element_type": { "enum": ["float32", "int64"] },
+        "shape": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "type": "integer", "minimum": 1, "maximum": 1099511627776 }
+        },
+        "values": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1048576,
+          "items": { "type": "number" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "element_type": { "const": "float32" } } },
+          "then": {
+            "properties": {
+              "values": {
+                "items": {
+                  "minimum": -3.4028234663852886e38,
+                  "maximum": 3.4028234663852886e38
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "element_type": { "const": "int64" } } },
+          "then": {
+            "properties": {
+              "values": {
+                "items": {
+                  "type": "integer",
+                  "minimum": -9007199254740992,
+                  "maximum": 9007199254740992
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

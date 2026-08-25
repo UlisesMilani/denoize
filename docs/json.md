@@ -124,6 +124,13 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-runtime-model-package-v1.schema.json`](../schemas/denoize-runtime-model-package-v1.schema.json)
   describes the signed identity, license, frontend, tensor, accelerator, and
   resource manifest embedded in a custom-model `.dmp` package.
+- [`denoize-runtime-model-package-v2.schema.json`](../schemas/denoize-runtime-model-package-v2.schema.json)
+  describes the signed named graph I/O, recurrent state, channel roles and
+  geometry, latency/context, precision profiles, components, resource bounds,
+  license, and source/checkpoint/training-data provenance of a v2 `.dmp`.
+- [`denoize-runtime-model-numerical-vectors-v1.schema.json`](../schemas/denoize-runtime-model-numerical-vectors-v1.schema.json)
+  describes bounded named inputs and expected outputs executed on the selected
+  runtime before a v2 model is accepted for audio processing.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.

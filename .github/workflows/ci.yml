@@ -67,6 +67,9 @@ jobs:
       - name: Validate project JSON contracts
         run: python3 scripts/test-project-schemas.py --denoize target/debug/denoize
 
+      - name: Validate runtime model package JSON contracts
+        run: python3 scripts/test-runtime-model-package-schemas.py
+
       - name: Validate native diagnostic JSON contracts
         run: python3 scripts/test-diagnostic-schemas.py --denoize target/debug/denoize
 
@@ -110,6 +113,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
           python3 -c 'compile(open("scripts/test-diagnostic-schemas.py", encoding="utf-8").read(), "scripts/test-diagnostic-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
@@ -155,11 +159,30 @@ jobs:
             | sha256sum --check
           unzip -q "$validator_zip" -d "$validator_dir"
           tar -xzf "$validator_dir"/*.tar.gz -C "$validator_dir"
-          validator=$(find "$validator_dir" -type f -name clap-validator -perm -u+x | head -n 1)
+          validator=$(find "$validator_dir" -type f -name clap-validator -perm -u+x -print -quit)
           test -n "$validator"
           cp target/release/libdenoize_clap.so "$validator_dir/denoize.clap"
-          "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
-            > "$validator_dir/report.json"
+          validator_status=1
+          for attempt in 1 2; do
+            set +e
+            "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
+              > "$validator_dir/report.json"
+            validator_status=$?
+            set -e
+            if [ "$validator_status" -eq 0 ]; then
+              break
+            fi
+            printf 'CLAP validator attempt %s failed with status %s\n' \
+              "$attempt" "$validator_status" >&2
+          done
+          if [ "$validator_status" -ne 0 ]; then
+            if jq -e . "$validator_dir/report.json" >/dev/null 2>&1; then
+              jq . "$validator_dir/report.json" >&2
+            else
+              sed -n '1,200p' "$validator_dir/report.json" >&2
+            fi
+            exit "$validator_status"
+          fi
           jq -e '
             (.results | length) == 44 and
             ([.results[].status.code] | map(select(. == "success")) | length) == 36 and

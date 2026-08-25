@@ -1,0 +1,461 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-runtime-model-package-v2.schema.json",
+  "title": "denoize signed runtime model package manifest v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "format_version",
+    "package_id",
+    "package_revision",
+    "signing_key_id",
+    "runtime",
+    "frontend",
+    "tensors",
+    "state_pairs",
+    "latency",
+    "components",
+    "precision_profiles",
+    "default_precision_profile",
+    "license",
+    "provenance"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-runtime-model-package-v2" },
+    "format_version": { "const": 2 },
+    "package_id": { "$ref": "#/$defs/identifier" },
+    "package_revision": { "$ref": "#/$defs/identifier" },
+    "signing_key_id": { "type": "string", "pattern": "^[0-9A-F]{16}$" },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "sample_rate_hz", "mode"],
+      "properties": {
+        "kind": { "const": "onnx-audio-graph-v2" },
+        "sample_rate_hz": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "mode": { "enum": ["finite", "streaming", "finite-and-streaming"] }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["normalization", "resampling", "duration", "channels"],
+      "properties": {
+        "normalization": { "const": "pcm-f32-minus-one-to-one-v1" },
+        "resampling": { "const": "bandlimited-waveform-v1" },
+        "duration": { "const": "preserve-input-frames-v1" },
+        "channels": { "$ref": "#/$defs/channels" }
+      }
+    },
+    "tensors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputs", "outputs"],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/inputTensor" }
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/outputTensor" }
+        }
+      }
+    },
+    "state_pairs": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "input", "output", "initialization"],
+        "properties": {
+          "id": { "$ref": "#/$defs/identifier" },
+          "input": { "$ref": "#/$defs/tensorName" },
+          "output": { "$ref": "#/$defs/tensorName" },
+          "initialization": { "const": "zeros" }
+        }
+      }
+    },
+    "latency": { "$ref": "#/$defs/latency" },
+    "components": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/component" }
+    },
+    "precision_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/precisionProfile" }
+    },
+    "default_precision_profile": { "$ref": "#/$defs/identifier" },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["spdx", "notice_component"],
+      "properties": {
+        "spdx": { "$ref": "#/$defs/spdx" },
+        "notice_component": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "provenance": { "$ref": "#/$defs/provenance" }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._+-]+$"
+    },
+    "tensorName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[^/\\\\\\u0000-\\u001F\\u007F-\\u009F]+$"
+    },
+    "spdx": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._+(): -]+$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "boundedText256": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+    },
+    "boundedText512": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+    },
+    "publicUri": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(https://[^/?#@]+(?:/[^?#]*)?|urn:[^?#]+)$"
+    },
+    "axis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "fixed"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "kind": {
+          "enum": [
+            "batch",
+            "channel",
+            "sample",
+            "frame",
+            "frequency",
+            "feature",
+            "coordinate",
+            "state"
+          ]
+        },
+        "fixed": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "integer", "minimum": 1, "maximum": 1099511627776 }
+          ]
+        }
+      }
+    },
+    "tensorBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "role", "element_type", "axes", "optional", "state_id"],
+      "properties": {
+        "name": { "$ref": "#/$defs/tensorName" },
+        "role": { "type": "string" },
+        "element_type": { "enum": ["float32", "int64"] },
+        "axes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/axis" }
+        },
+        "optional": { "type": "boolean" },
+        "state_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/identifier" }
+          ]
+        }
+      }
+    },
+    "inputTensor": {
+      "allOf": [
+        { "$ref": "#/$defs/tensorBase" },
+        {
+          "properties": {
+            "role": {
+              "enum": [
+                "audio",
+                "far-end-reference",
+                "enrollment",
+                "microphone-geometry",
+                "state",
+                "control"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "outputTensor": {
+      "allOf": [
+        { "$ref": "#/$defs/tensorBase" },
+        {
+          "properties": {
+            "role": { "enum": ["audio", "state", "mask", "diagnostic"] },
+            "optional": { "const": false }
+          }
+        }
+      ]
+    },
+    "channels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy", "roles", "geometry"],
+      "properties": {
+        "policy": { "enum": ["independent-mono", "program-multichannel", "microphone-array"] },
+        "roles": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["channel_index", "role"],
+            "properties": {
+              "channel_index": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "role": {
+                "enum": [
+                  "program-left",
+                  "program-right",
+                  "program-center",
+                  "program-lfe",
+                  "program-surround",
+                  "microphone"
+                ]
+              }
+            }
+          }
+        },
+        "geometry": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/geometry" }
+          ]
+        }
+      }
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate_system", "units", "microphones"],
+      "properties": {
+        "coordinate_system": { "const": "right-handed-cartesian" },
+        "units": { "const": "millimeters" },
+        "microphones": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["channel_index", "x_mm", "y_mm", "z_mm"],
+            "properties": {
+              "channel_index": { "type": "integer", "minimum": 0, "maximum": 255 },
+              "x_mm": { "type": "integer", "minimum": -100000, "maximum": 100000 },
+              "y_mm": { "type": "integer", "minimum": -100000, "maximum": 100000 },
+              "z_mm": { "type": "integer", "minimum": -100000, "maximum": 100000 }
+            }
+          }
+        }
+      }
+    },
+    "latency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_samples",
+        "hop_samples",
+        "left_context_samples",
+        "right_context_samples",
+        "lookahead_samples",
+        "algorithmic_latency_samples",
+        "flush_samples"
+      ],
+      "properties": {
+        "frame_samples": { "$ref": "#/$defs/positiveSamples" },
+        "hop_samples": { "$ref": "#/$defs/positiveSamples" },
+        "left_context_samples": { "$ref": "#/$defs/samples" },
+        "right_context_samples": { "$ref": "#/$defs/samples" },
+        "lookahead_samples": { "$ref": "#/$defs/samples" },
+        "algorithmic_latency_samples": { "$ref": "#/$defs/samples" },
+        "flush_samples": { "$ref": "#/$defs/samples" }
+      }
+    },
+    "samples": { "type": "integer", "minimum": 0, "maximum": 1099511627776 },
+    "positiveSamples": { "type": "integer", "minimum": 1, "maximum": 1099511627776 },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "size_bytes", "sha256"],
+      "properties": {
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[^/\\\\\\u0000-\\u001F\\u007F-\\u009F]+$",
+          "not": { "enum": [".", ".."] }
+        },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 68719476736 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "file"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "kind": {
+          "enum": ["onnx-model", "license-notice", "provenance-json", "numerical-vectors-json"]
+        },
+        "file": { "$ref": "#/$defs/file" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "license-notice" } } },
+          "then": {
+            "properties": {
+              "file": { "properties": { "size_bytes": { "maximum": 16777216 } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "provenance-json" } } },
+          "then": {
+            "properties": {
+              "file": { "properties": { "size_bytes": { "maximum": 16777216 } } }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "numerical-vectors-json" } } },
+          "then": {
+            "properties": {
+              "file": { "properties": { "size_bytes": { "maximum": 67108864 } } }
+            }
+          }
+        }
+      ]
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_session_memory_bytes",
+        "max_worker_memory_bytes",
+        "max_gpu_session_memory_bytes",
+        "max_gpu_worker_memory_bytes",
+        "accelerators"
+      ],
+      "properties": {
+        "max_session_memory_bytes": { "$ref": "#/$defs/memoryBytes" },
+        "max_worker_memory_bytes": { "$ref": "#/$defs/memoryBytes" },
+        "max_gpu_session_memory_bytes": { "$ref": "#/$defs/memoryBytes" },
+        "max_gpu_worker_memory_bytes": { "$ref": "#/$defs/memoryBytes" },
+        "accelerators": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "enum": ["cpu", "metal", "cuda"] }
+        }
+      }
+    },
+    "memoryBytes": { "type": "integer", "minimum": 0, "maximum": 1099511627776 },
+    "precisionProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "element_type",
+        "model_component",
+        "numerical_vectors_component",
+        "resources"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "element_type": { "enum": ["float32", "float16", "int8"] },
+        "model_component": { "$ref": "#/$defs/identifier" },
+        "numerical_vectors_component": { "$ref": "#/$defs/identifier" },
+        "resources": { "$ref": "#/$defs/resources" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "source_repository",
+        "source_revision",
+        "source_sha256",
+        "source_license_spdx",
+        "checkpoint_source",
+        "checkpoint_sha256",
+        "checkpoint_license_spdx",
+        "conversion_tool",
+        "conversion_revision",
+        "training_datasets"
+      ],
+      "properties": {
+        "component": { "$ref": "#/$defs/identifier" },
+        "source_repository": { "$ref": "#/$defs/publicUri" },
+        "source_revision": { "$ref": "#/$defs/boundedText512" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_license_spdx": { "$ref": "#/$defs/spdx" },
+        "checkpoint_source": { "$ref": "#/$defs/publicUri" },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_license_spdx": { "$ref": "#/$defs/spdx" },
+        "conversion_tool": { "$ref": "#/$defs/boundedText512" },
+        "conversion_revision": { "$ref": "#/$defs/boundedText512" },
+        "training_datasets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "source", "revision", "sha256", "license_spdx"],
+            "properties": {
+              "id": { "$ref": "#/$defs/identifier" },
+              "source": { "$ref": "#/$defs/publicUri" },
+              "revision": { "$ref": "#/$defs/boundedText256" },
+              "sha256": {
+                "oneOf": [
+                  { "type": "null" },
+                  { "$ref": "#/$defs/sha256" }
+                ]
+              },
+              "license_spdx": { "$ref": "#/$defs/spdx" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -19,6 +19,21 @@ use std::path::{Path, PathBuf};
 
 use crate::{AcceleratorRuntime, AtomicOutput, CommitMode, OnnxModelConfig};
 
+mod v2;
+
+pub use v2::{
+    build_runtime_model_package_v2, RuntimeModelAxisContractV2, RuntimeModelChannelContractV2,
+    RuntimeModelChannelRoleContractV2, RuntimeModelComponentContractV2,
+    RuntimeModelFrontendContractV2, RuntimeModelGeometryContractV2, RuntimeModelLatencyContractV2,
+    RuntimeModelLicenseContractV2, RuntimeModelMicrophonePositionV2, RuntimeModelNumericalCaseV1,
+    RuntimeModelNumericalTensorV1, RuntimeModelNumericalToleranceV1,
+    RuntimeModelNumericalVectorsV1, RuntimeModelPackageManifestV2, RuntimeModelPackageV2Info,
+    RuntimeModelPrecisionProfileContractV2, RuntimeModelProvenanceContractV2,
+    RuntimeModelRuntimeContractV2, RuntimeModelStatePairContractV2, RuntimeModelTensorContractV2,
+    RuntimeModelTensorSetContractV2, RuntimeModelTrainingDatasetContractV2,
+    RUNTIME_MODEL_PACKAGE_SCHEMA_V2, RUNTIME_MODEL_PACKAGE_VERSION_V2,
+};
+
 pub const RUNTIME_MODEL_PACKAGE_SCHEMA: &str = "denoize-runtime-model-package-v1";
 pub const RUNTIME_MODEL_PACKAGE_VERSION: u32 = 1;
 
@@ -149,6 +164,9 @@ pub struct RuntimeModelPackageInfo {
     pub max_gpu_session_memory_bytes: u64,
     pub max_gpu_worker_memory_bytes: u64,
     pub accelerators: Vec<String>,
+    /// Extended v2 graph, state, latency, precision, and provenance summary.
+    /// This is `None` for a backward-compatible v1 package.
+    pub v2: Option<RuntimeModelPackageV2Info>,
 }
 
 /// One verified package retained as an immutable runtime configuration.
@@ -167,6 +185,7 @@ pub struct RuntimeModelPackage {
     manifest: RuntimeModelPackageManifest,
     model_offset: u64,
     license_offset: u64,
+    v2: Option<v2::OpenedRuntimeModelPackageV2>,
 }
 
 /// A bounded package component reader that authenticates the bytes it returns.
@@ -294,6 +313,7 @@ impl RuntimeModelPackage {
             manifest: prepared.manifest,
             model_offset: prepared.model_offset,
             license_offset: prepared.license_offset,
+            v2: prepared.v2,
         })
     }
 
@@ -322,6 +342,25 @@ impl RuntimeModelPackage {
         &self.manifest
     }
 
+    /// Return the authenticated v2 manifest, or `None` for a v1 package.
+    #[must_use]
+    pub fn manifest_v2(&self) -> Option<&RuntimeModelPackageManifestV2> {
+        self.v2.as_ref().map(|opened| &opened.manifest)
+    }
+
+    /// Select the signed v2 precision profile for an accelerator. The default
+    /// profile wins when it supports that runtime; otherwise manifest order is
+    /// the deterministic fallback. V1 packages return `Ok(None)`.
+    pub fn precision_profile_for(
+        &self,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Option<&RuntimeModelPrecisionProfileContractV2>, String> {
+        self.v2
+            .as_ref()
+            .map(|opened| v2::selected_profile(&opened.manifest, runtime))
+            .transpose()
+    }
+
     #[must_use]
     pub(crate) fn model_config(&self) -> OnnxModelConfig {
         OnnxModelConfig {
@@ -332,11 +371,15 @@ impl RuntimeModelPackage {
 
     #[must_use]
     pub fn info(&self) -> RuntimeModelPackageInfo {
-        package_info(
+        let mut info = package_info(
             &self.manifest,
             self.package_sha256.clone(),
             self.package_size_bytes,
-        )
+        );
+        if let Some(opened) = &self.v2 {
+            info.v2 = Some(opened.info.clone());
+        }
+        info
     }
 
     #[must_use]
@@ -348,8 +391,22 @@ impl RuntimeModelPackage {
             .any(|name| name == runtime.name())
     }
 
+    /// Reverify and open the model component selected by the signed profile
+    /// order for an accelerator. V1 packages always return their sole model.
     #[cfg(feature = "onnx")]
-    pub(crate) fn open_model_reader(&self) -> Result<RuntimeModelPackageReader, String> {
+    pub(crate) fn open_model_reader_for(
+        &self,
+        runtime: AcceleratorRuntime,
+    ) -> Result<RuntimeModelPackageReader, String> {
+        if let Some(opened) = &self.v2 {
+            let profile = v2::selected_profile(&opened.manifest, runtime)?;
+            let range = v2::range_for_component(&opened.components, &profile.model_component)?;
+            usize::try_from(range.length).map_err(|_| {
+                "runtime model package model length cannot be represented on this platform"
+                    .to_string()
+            })?;
+            return self.open_verified_range(range.offset, range.length, &range.sha256);
+        }
         usize::try_from(self.manifest.model.size_bytes).map_err(|_| {
             "runtime model package model length cannot be represented on this platform".to_string()
         })?;
@@ -358,6 +415,44 @@ impl RuntimeModelPackage {
             self.manifest.model.size_bytes,
             &self.manifest.model.sha256,
         )
+    }
+
+    /// Reverify and open the numerical-vector component selected for an
+    /// accelerator. V1 packages do not carry numerical vectors.
+    #[cfg(feature = "onnx")]
+    pub(crate) fn open_numerical_vectors_reader_for(
+        &self,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Option<RuntimeModelPackageReader>, String> {
+        let Some(opened) = &self.v2 else {
+            return Ok(None);
+        };
+        let profile = v2::selected_profile(&opened.manifest, runtime)?;
+        let range =
+            v2::range_for_component(&opened.components, &profile.numerical_vectors_component)?;
+        self.open_verified_range(range.offset, range.length, &range.sha256)
+            .map(Some)
+    }
+
+    /// Reverify, parse, and bound the numerical vectors selected for an
+    /// accelerator. V1 packages return `Ok(None)`.
+    #[cfg(feature = "onnx")]
+    pub(crate) fn numerical_vectors_for(
+        &self,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Option<RuntimeModelNumericalVectorsV1>, String> {
+        let Some(opened) = &self.v2 else {
+            return Ok(None);
+        };
+        let profile = v2::selected_profile(&opened.manifest, runtime)?;
+        let mut reader = self
+            .open_numerical_vectors_reader_for(runtime)?
+            .expect("v2 precision profiles require numerical vectors");
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read authenticated runtime model vectors: {error}"))?;
+        v2::parse_numerical_vectors(&bytes, &opened.manifest, profile).map(Some)
     }
 
     /// Reverify the package and open its authenticated license-notice range.
@@ -466,6 +561,7 @@ impl RuntimeModelPackage {
             manifest,
             model_offset: 0,
             license_offset: model_size_bytes,
+            v2: None,
         }
     }
 
@@ -477,6 +573,63 @@ impl RuntimeModelPackage {
         self.manifest.resources = resources;
         self
     }
+
+    #[cfg(all(test, feature = "onnx"))]
+    pub(crate) fn for_onnx_v2_contract_test(
+        package_path: PathBuf,
+        mut manifest: RuntimeModelPackageManifestV2,
+        components: Vec<Vec<u8>>,
+    ) -> Self {
+        assert_eq!(manifest.components.len(), components.len());
+        let parsed_key =
+            parse_public_key("RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3").unwrap();
+        manifest.signing_key_id = parsed_key.key_id.clone();
+        for (contract, bytes) in manifest.components.iter().zip(&components) {
+            assert_eq!(contract.file.size_bytes, bytes.len() as u64);
+            assert_eq!(contract.file.sha256, format!("{:x}", Sha256::digest(bytes)));
+        }
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let signature = b"test signature";
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&package_path)
+            .unwrap();
+        file.write_all(v2::PACKAGE_MAGIC_V2).unwrap();
+        file.write_all(&(manifest_bytes.len() as u64).to_be_bytes())
+            .unwrap();
+        file.write_all(&(signature.len() as u64).to_be_bytes())
+            .unwrap();
+        file.write_all(&(components.len() as u64).to_be_bytes())
+            .unwrap();
+        for bytes in &components {
+            file.write_all(&(bytes.len() as u64).to_be_bytes()).unwrap();
+        }
+        file.write_all(&manifest_bytes).unwrap();
+        file.write_all(signature).unwrap();
+        for bytes in &components {
+            file.write_all(bytes).unwrap();
+        }
+        file.flush().unwrap();
+        let size = file.metadata().unwrap().len();
+        let prepared =
+            v2::prepare_open_package_v2(&mut file, &package_path, size, &parsed_key, |_, _, _| {
+                Ok(())
+            })
+            .unwrap();
+        Self {
+            package_path,
+            public_key_path: PathBuf::from("test-v2.pub"),
+            package_sha256: prepared.info.package_sha256,
+            package_size_bytes: prepared.info.size_bytes,
+            public_key_sha256: format!("{:x}", Sha256::digest(b"test v2 key")),
+            manifest: prepared.compatibility_manifest,
+            model_offset: prepared.model_offset,
+            license_offset: prepared.license_offset,
+            v2: Some(prepared.opened),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -485,6 +638,7 @@ struct PreparedPackage {
     manifest: RuntimeModelPackageManifest,
     model_offset: u64,
     license_offset: u64,
+    v2: Option<v2::OpenedRuntimeModelPackageV2>,
 }
 
 /// Authenticate a package without retaining runtime configuration or parsing
@@ -595,7 +749,7 @@ pub fn build_runtime_model_package(
         output,
         size,
         &public_key,
-        |bytes, signature, key| verify_manifest_signature(bytes, signature, key),
+        verify_manifest_signature,
     )?;
     staged.commit(CommitMode::NoClobber)?;
     Ok(prepared.info)
@@ -687,6 +841,16 @@ where
     F: FnMut(&[u8], &[u8], &ParsedPublicKey) -> Result<(), String>,
 {
     let (mut file, size) = crate::input::open_regular_file(path, "runtime model package")?;
+    if v2::has_v2_magic(&mut file, path)? {
+        let prepared = v2::prepare_open_package_v2(&mut file, path, size, public_key, verify)?;
+        return Ok(PreparedPackage {
+            info: prepared.info,
+            manifest: prepared.compatibility_manifest,
+            model_offset: prepared.model_offset,
+            license_offset: prepared.license_offset,
+            v2: Some(prepared.opened),
+        });
+    }
     prepare_open_package(&mut file, path, size, public_key, verify)
 }
 
@@ -778,6 +942,7 @@ where
         manifest,
         model_offset,
         license_offset,
+        v2: None,
     })
 }
 
@@ -852,6 +1017,14 @@ fn validate_resources(
     resources: &RuntimeModelResourceContract,
     model_bytes: u64,
 ) -> Result<(), String> {
+    validate_resource_contract(resources, model_bytes, true)
+}
+
+pub(super) fn validate_resource_contract(
+    resources: &RuntimeModelResourceContract,
+    model_bytes: u64,
+    require_cpu: bool,
+) -> Result<(), String> {
     for (value, name) in [
         (resources.max_session_memory_bytes, "session memory"),
         (resources.max_worker_memory_bytes, "worker memory"),
@@ -887,10 +1060,10 @@ fn validate_resources(
             ));
         }
     }
-    if !unique.contains("cpu") {
+    if require_cpu && !unique.contains("cpu") {
         return Err("runtime model package must retain CPU compatibility".into());
     }
-    if unique.len() > 1 {
+    if unique.contains("metal") || unique.contains("cuda") {
         let gpu_baseline = crate::estimate_gpu_session_bytes(model_bytes)?;
         if resources.max_gpu_session_memory_bytes < gpu_baseline {
             return Err(format!(
@@ -989,6 +1162,7 @@ fn package_info(
         max_gpu_session_memory_bytes: manifest.resources.max_gpu_session_memory_bytes,
         max_gpu_worker_memory_bytes: manifest.resources.max_gpu_worker_memory_bytes,
         accelerators: manifest.resources.accelerators.clone(),
+        v2: None,
     }
 }
 

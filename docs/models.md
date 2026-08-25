@@ -206,6 +206,97 @@ Desktop users make the same two-file selection and see the authenticated
 identity, license, tensor layout, accelerators, and package digest before
 processing.
 
+### Runtime package v2
+
+V2 keeps every v1 trust and mutation check while replacing the fixed
+model/license pair with an ordered component table. Existing v1 packages and
+commands remain valid. A v2 package starts with its own magic value, bounded
+manifest and signature lengths, a framed component count of 1–32, and one
+bounded length for every component; a valid manifest references at least the
+required model, vector, license, and provenance components. The signed manifest
+fixes that exact order and rejects unreferenced components. The
+only accepted component kinds are `onnx-model`, `license-notice`,
+`provenance-json`, and `numerical-vectors-json`; there is no script, command,
+archive, extraction, external-data sidecar, or implicit path lookup.
+The authenticated provenance component must itself parse as a JSON object;
+opaque or mislabeled bytes fail package opening.
+
+The closed
+[`denoize-runtime-model-package-v2`](../schemas/denoize-runtime-model-package-v2.schema.json)
+manifest adds:
+
+- exact ONNX graph input/output names, interface element types, semantic roles,
+  rank, axis meaning, and fixed/dynamic dimensions;
+- explicit zero-initialized input/output state pairs for recurrent models;
+- typed primary audio, far-end reference, enrollment, microphone-geometry,
+  state, mask, control, and diagnostic tensors—never executable hooks;
+- independent-mono, program-multichannel, or microphone-array channel policy,
+  exhaustive fixed channel roles, and exactly one fixed right-handed
+  microphone geometry in integer millimetres or typed runtime geometry input;
+- frame/hop size, left/right context, lookahead, algorithmic latency, and flush
+  samples at the signed model rate;
+- one to eight deterministic precision profiles. Each profile binds one model,
+  one numerical-vector document, its CPU/Metal/CUDA allowlist, and conservative
+  host/device session and worker reservations. The default profile must remain
+  float32 and CPU compatible;
+- a consolidated SPDX notice plus exact source repository revision/digest and
+  license, checkpoint source/digest and terms, conversion tool revision, and
+  every disclosed training dataset's source, revision, digest when available,
+  and SPDX terms. Published sources are credential-free HTTPS URIs or URNs;
+  query strings, fragments, local paths, and embedded credentials are rejected.
+
+Profile selection is deterministic. The declared default wins whenever it
+supports the requested runtime; otherwise the first compatible profile in
+signed manifest order is selected. A publisher that wants a CUDA- or
+Metal-specific profile selected must therefore keep the CPU default's
+accelerator allowlist CPU-only.
+
+Every profile must carry a closed
+[`denoize-runtime-model-numerical-vectors-v1`](../schemas/denoize-runtime-model-numerical-vectors-v1.schema.json)
+document. Package inspection authenticates and bounds these documents. Session
+preparation then matches every declared name, type, rank, and fixed dimension
+against the parsed graph and executes all vectors on the actually selected
+runtime. Every case supplies every graph input, including inputs that a later
+dedicated adapter may otherwise treat as optional. Each expected output uses
+signed absolute and relative tolerances, each capped at `0.01`;
+wrong output counts, shapes, types, non-finite values, or out-of-tolerance
+elements fail before source audio is processed. Vector documents are limited
+to 16 cases, 1,048,576 elements per tensor, and 4,194,304 aggregate elements.
+
+The generic waveform backend can immediately execute a finite-capable,
+independent-mono v2 graph that has one required audio input, one audio output,
+no recurrent/auxiliary tensors, and the existing `[batch,samples]` or
+`[batch,channel,samples]` layout. More expressive v2
+packages can be authenticated and inspected now but fail closed with a
+dedicated-adapter requirement; restoration, target-speaker, AEC, and spatial
+stages consume those typed roles rather than guessing them.
+
+After serializing and signing the manifest, place every component under its
+exact manifest basename in one regular directory and build without extraction:
+
+```text
+denoize models package create-v2 OUTPUT.dmp MANIFEST.json MANIFEST.json.sig \
+  MINISIGN.pub COMPONENTS-DIR
+```
+
+The builder verifies the key ID, signature, component names, sizes, hashes,
+references, resource baselines, recurrent-state pairing, geometry, provenance,
+and numerical-vector structure before it stages output. It then reopens the
+staged bytes through the production parser and publishes with no-clobber
+semantics. Identical inputs produce identical package bytes.
+
+The contract follows ONNX's normative requirement that a main graph declare
+named input/output types and shapes, and uses test input/output pairs in the
+same spirit as the ONNX backend conformance suite. Provenance fields
+operationalize the disclosure goals of
+[Model Cards for Model Reporting](https://arxiv.org/abs/1810.03993)
+and [Datasheets for Datasets](https://arxiv.org/abs/1803.09010), while SPDX
+expressions and the SPDX 3 AI profile provide interoperable licensing terms.
+See the [ONNX IR specification](https://onnx.ai/onnx/repo-docs/IR.html),
+[ONNX backend tests](https://github.com/onnx/onnx/blob/main/docs/OnnxBackendTest.md),
+[SPDX 3 AI profile](https://spdx.github.io/spdx-spec/v3.0.1/model/AI/AI/), and
+[SLSA provenance model](https://slsa.dev/spec/v1.2/provenance).
+
 ## Catalog trust, rotation, expiry, and rollback safety
 
 The production trust root is compiled into denoize. Catalog JSON has its own
