@@ -405,6 +405,9 @@ USAGE:
     denoize live --list-devices
     denoize hardware [--json|--pretty]
     denoize recommend <INPUT> [--goal balanced|quality|speed|low-memory] [OPTIONS]
+    denoize diagnose <INPUT> [--analysis-seconds N] [--json|--pretty]
+    denoize assess <INPUT> [--analysis-seconds N] [--json|--pretty]
+    denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -5703,6 +5706,12 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("recommend") {
         return run_recommend(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("diagnose") {
+        return run_diagnose(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("assess") {
+        return run_assess(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("receipts") {
         return run_receipts(&args[1..]);
     }
@@ -7466,6 +7475,224 @@ fn run_recommend(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiagnosticPrintMode {
+    Human,
+    Json,
+    PrettyJson,
+}
+
+fn diagnose_usage() -> &'static str {
+    "\
+USAGE:
+    denoize diagnose <INPUT> [OPTIONS]
+
+Analyze a bounded input prefix for noise, clipping, hum, clicks, reverberation,
+bandwidth limitation, dropouts, wind/plosives, and codec risk. The native
+estimator is network-free and reports confidence and uncertainty; it is not a
+human-MOS or semantic-fidelity release gate.
+
+OPTIONS:
+        --analysis-seconds <N> analyze 1..60 seconds (default: 12)
+        --max-memory <MB>      bound denoize-owned decode and analysis memory
+        --json                 emit compact denoize-diagnostic-v1 JSON
+        --pretty               emit indented denoize-diagnostic-v1 JSON
+    -h, --help                 show this help
+"
+}
+
+fn assess_usage() -> &'static str {
+    "\
+USAGE:
+    denoize assess <INPUT> [OPTIONS]
+    denoize assess <BEFORE> <AFTER> [OPTIONS]
+
+Produce a single-input no-reference quality report or compare the same bounded
+metrics before and after processing. Before/after mode also verifies sample
+rate, channel count, and presentation duration. It never treats a proxy score
+as proof of semantic or speaker-identity fidelity.
+
+OPTIONS:
+        --analysis-seconds <N> analyze 1..60 seconds from each input (default: 12)
+        --max-memory <MB>      bound denoize-owned decode and analysis memory
+        --json                 emit compact denoize-assessment-v1 JSON
+        --pretty               emit indented denoize-assessment-v1 JSON
+    -h, --help                 show this help
+"
+}
+
+fn parse_diagnostic_args(
+    command: &str,
+    args: &[String],
+    maximum_inputs: usize,
+) -> Result<(Vec<String>, denoize::DiagnosticOptions, DiagnosticPrintMode), String> {
+    let mut inputs = Vec::new();
+    let mut analysis_seconds = 12_u32;
+    let mut max_memory_mb = None;
+    let mut output = DiagnosticPrintMode::Human;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--analysis-seconds" => {
+                analysis_seconds = parse_value(args, &mut index, "--analysis-seconds")?;
+            }
+            "--max-memory" => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--json" => {
+                if output != DiagnosticPrintMode::Human {
+                    return Err(format!("{command} accepts only one of --json or --pretty"));
+                }
+                output = DiagnosticPrintMode::Json;
+            }
+            "--pretty" => {
+                if output != DiagnosticPrintMode::Human {
+                    return Err(format!("{command} accepts only one of --json or --pretty"));
+                }
+                output = DiagnosticPrintMode::PrettyJson;
+            }
+            "-h" | "--help" => return Err(format!("{command} help requested")),
+            "-" => {
+                return Err(format!(
+                    "{command} requires regular-file input; stdin is supported only by --stream processing"
+                ));
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown {command} option: {value}"));
+            }
+            value => {
+                if inputs.len() == maximum_inputs {
+                    return Err(format!("unexpected extra {command} argument: {value}"));
+                }
+                inputs.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    if inputs.is_empty() {
+        return Err(format!("{command} requires INPUT"));
+    }
+    let maximum = checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    let limits = DecodeLimits::new(metadata_limits_for_available_bytes(maximum), maximum);
+    let options = denoize::DiagnosticOptions::new()
+        .with_analysis_seconds(analysis_seconds)
+        .with_decode_limits(limits);
+    options.validate()?;
+    Ok((inputs, options, output))
+}
+
+fn run_diagnose(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("diagnose --help accepts no other arguments".into());
+        }
+        print!("{}", diagnose_usage());
+        return Ok(());
+    }
+    let (inputs, options, mode) = parse_diagnostic_args("diagnose", args, 1)?;
+    let report = denoize::diagnose_file_with_options(&inputs[0], options)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!("{}", report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => print_diagnostic_report(&report),
+    }
+    Ok(())
+}
+
+fn run_assess(args: &[String]) -> Result<(), String> {
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("assess --help accepts no other arguments".into());
+        }
+        print!("{}", assess_usage());
+        return Ok(());
+    }
+    let (inputs, options, mode) = parse_diagnostic_args("assess", args, 2)?;
+    let report = if inputs.len() == 1 {
+        denoize::assess_file_with_options(&inputs[0], options)?
+    } else {
+        denoize::compare_files_with_options(&inputs[0], &inputs[1], options)?
+    };
+    match mode {
+        DiagnosticPrintMode::Json => println!("{}", report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => print_assessment_report(&report),
+    }
+    Ok(())
+}
+
+fn print_diagnostic_report(report: &denoize::DiagnosticReport) {
+    println!(
+        "quality: {:.1}/100 (MOS proxy {:.2}, uncertainty ±{:.2})",
+        report.quality.score, report.quality.estimated_mos_proxy, report.quality.uncertainty
+    );
+    println!(
+        "input: {} / {}, {} Hz, {} channel(s), {:.2} seconds analyzed at {} Hz ({})",
+        report.input.format,
+        report.input.codec,
+        report.input.sample_rate,
+        report.input.channels,
+        report.input.analyzed_seconds,
+        report.input.analysis_sample_rate,
+        report.input.analysis_mode
+    );
+    println!(
+        "signal: rms={:.1} dBFS peak={:.1} dBFS noise-floor={:.1} dBFS SNR-proxy={:.1} dB bandwidth={:.0} Hz",
+        report.metrics.rms_dbfs,
+        report.metrics.peak_dbfs,
+        report.metrics.noise_floor_dbfs,
+        report.metrics.estimated_snr_db,
+        report.metrics.estimated_bandwidth_hz
+    );
+    println!("findings:");
+    for finding in &report.findings {
+        println!(
+            "  {} detected={} severity={:.3} confidence={:.3}: {}",
+            finding.kind, finding.detected, finding.severity, finding.confidence, finding.evidence
+        );
+    }
+    println!(
+        "recommended pipeline: {}",
+        report.recommended_pipeline.join(" -> ")
+    );
+    println!(
+        "warning: this native proxy does not assess words, phonemes, speaker identity, or generative hallucination"
+    );
+}
+
+fn print_assessment_report(report: &denoize::AssessmentReport) {
+    println!("assessment: {}", report.verdict);
+    if let (Some(baseline), Some(comparison)) = (&report.baseline, &report.comparison) {
+        println!(
+            "quality: {:.1} -> {:.1} ({:+.1}); MOS proxy {:.2} -> {:.2} ({:+.2})",
+            baseline.quality.score,
+            report.candidate.quality.score,
+            comparison.quality_score_delta,
+            baseline.quality.estimated_mos_proxy,
+            report.candidate.quality.estimated_mos_proxy,
+            comparison.estimated_mos_proxy_delta
+        );
+        println!(
+            "presentation: rate={} channels={} duration={} semantic-fidelity-assessed={}",
+            comparison.sample_rate_equal,
+            comparison.channel_count_equal,
+            comparison.presentation_preserved,
+            comparison.semantic_fidelity_assessed
+        );
+    } else {
+        print_diagnostic_report(&report.candidate);
+    }
+    for warning in &report.warnings {
+        println!("warning: {warning}");
+    }
 }
 
 fn format_device_memory(bytes: u64) -> String {
@@ -10833,7 +11060,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "615725b48303953aa4733a7f8cfe03492332b778b9909874d7cd93c38693e08c";
+        "2eb2fcd7675995336ca3752b2e246223326fb7ea133fbb46b53953898268434a";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

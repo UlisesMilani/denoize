@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-diagnostic-v1.schema.json",
+  "title": "denoize native degradation diagnosis v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "network_accessed",
+    "input",
+    "quality",
+    "metrics",
+    "findings",
+    "recommended_pipeline",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-diagnostic-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1 },
+    "network_accessed": { "const": false },
+    "input": { "$ref": "#/$defs/input" },
+    "quality": { "$ref": "#/$defs/quality" },
+    "metrics": { "$ref": "#/$defs/metrics" },
+    "findings": {
+      "type": "array",
+      "minItems": 9,
+      "maxItems": 9,
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "recommended_pipeline": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "assess-only",
+          "enhance",
+          "declip",
+          "dehum",
+          "declick",
+          "dereverb",
+          "universal-restore",
+          "dewind"
+        ]
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 3,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "nullableInteger": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "null" }
+      ]
+    },
+    "nullableNumber": {
+      "oneOf": [
+        { "type": "number" },
+        { "type": "null" }
+      ]
+    },
+    "unit": { "type": "number", "minimum": 0, "maximum": 1 },
+    "score": { "type": "number", "minimum": 0, "maximum": 100 },
+    "input": {
+      "type": "object",
+      "required": [
+        "format",
+        "codec",
+        "sample_rate",
+        "analysis_sample_rate",
+        "channels",
+        "total_frames",
+        "source_analyzed_frames",
+        "analyzed_frames",
+        "analyzed_seconds",
+        "analysis_mode",
+        "analysis_sha256"
+      ],
+      "properties": {
+        "format": {
+          "enum": [
+            "wav",
+            "rf64",
+            "aiff",
+            "caf",
+            "flac",
+            "ogg-opus",
+            "ogg-vorbis",
+            "mp3",
+            "m4a",
+            "aac-adts",
+            "unknown"
+          ]
+        },
+        "codec": {
+          "enum": ["pcm", "flac", "opus", "vorbis", "mp3", "aac", "alac", "unknown"]
+        },
+        "sample_rate": { "type": "integer", "minimum": 1 },
+        "analysis_sample_rate": { "type": "integer", "minimum": 1, "maximum": 48000 },
+        "channels": { "type": "integer", "minimum": 1 },
+        "total_frames": { "$ref": "#/$defs/nullableInteger" },
+        "source_analyzed_frames": { "type": "integer", "minimum": 1 },
+        "analyzed_frames": { "type": "integer", "minimum": 1 },
+        "analyzed_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 60 },
+        "analysis_mode": {
+          "enum": ["bounded-stream", "whole-file-fallback", "decoded-audio"]
+        },
+        "analysis_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "quality": {
+      "type": "object",
+      "required": [
+        "method",
+        "score",
+        "estimated_mos_proxy",
+        "uncertainty",
+        "noise_cleanliness",
+        "distortion_freedom",
+        "spectral_completeness",
+        "continuity"
+      ],
+      "properties": {
+        "method": { "const": "denoize-native-no-reference-v1" },
+        "score": { "$ref": "#/$defs/score" },
+        "estimated_mos_proxy": { "type": "number", "minimum": 1, "maximum": 5 },
+        "uncertainty": { "type": "number", "minimum": 0.12, "maximum": 0.5 },
+        "noise_cleanliness": { "$ref": "#/$defs/score" },
+        "distortion_freedom": { "$ref": "#/$defs/score" },
+        "spectral_completeness": { "$ref": "#/$defs/score" },
+        "continuity": { "$ref": "#/$defs/score" }
+      },
+      "additionalProperties": false
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "rms_dbfs",
+        "peak_dbfs",
+        "dc_offset",
+        "clipped_sample_ratio",
+        "flat_clip_run_ratio",
+        "click_rate_per_second",
+        "dropout_seconds",
+        "spectral_flatness",
+        "low_frequency_energy_ratio",
+        "high_frequency_energy_ratio",
+        "estimated_bandwidth_hz",
+        "noise_floor_dbfs",
+        "estimated_snr_db",
+        "late_energy_ratio",
+        "hum_frequency_hz",
+        "hum_prominence_db"
+      ],
+      "properties": {
+        "rms_dbfs": { "type": "number", "minimum": -120, "maximum": 0 },
+        "peak_dbfs": { "type": "number", "minimum": -120, "maximum": 0 },
+        "dc_offset": { "type": "number", "minimum": -1, "maximum": 1 },
+        "clipped_sample_ratio": { "$ref": "#/$defs/unit" },
+        "flat_clip_run_ratio": { "$ref": "#/$defs/unit" },
+        "click_rate_per_second": { "type": "number", "minimum": 0 },
+        "dropout_seconds": { "type": "number", "minimum": 0, "maximum": 60 },
+        "spectral_flatness": { "$ref": "#/$defs/unit" },
+        "low_frequency_energy_ratio": { "$ref": "#/$defs/unit" },
+        "high_frequency_energy_ratio": { "$ref": "#/$defs/unit" },
+        "estimated_bandwidth_hz": { "type": "number", "minimum": 0, "maximum": 24000 },
+        "noise_floor_dbfs": { "type": "number", "minimum": -120, "maximum": 0 },
+        "estimated_snr_db": { "type": "number", "minimum": 0, "maximum": 60 },
+        "late_energy_ratio": { "$ref": "#/$defs/unit" },
+        "hum_frequency_hz": {
+          "oneOf": [
+            { "enum": [50, 60] },
+            { "type": "null" }
+          ]
+        },
+        "hum_prominence_db": { "type": "number", "minimum": 0, "maximum": 40 }
+      },
+      "additionalProperties": false
+    },
+    "finding": {
+      "type": "object",
+      "required": [
+        "kind",
+        "detected",
+        "confidence",
+        "severity",
+        "evidence",
+        "recommended_action"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "additive-noise",
+            "clipping",
+            "hum",
+            "clicks",
+            "reverberation",
+            "bandwidth-limitation",
+            "packet-loss-or-dropout",
+            "wind-or-plosive",
+            "codec-distortion"
+          ]
+        },
+        "detected": { "type": "boolean" },
+        "confidence": { "$ref": "#/$defs/unit" },
+        "severity": { "$ref": "#/$defs/unit" },
+        "evidence": { "type": "string", "minLength": 1 },
+        "recommended_action": {
+          "enum": [
+            "none",
+            "enhance",
+            "declip",
+            "dehum",
+            "declick",
+            "dereverb",
+            "universal-restore",
+            "dewind"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

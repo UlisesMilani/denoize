@@ -68,6 +68,9 @@ jobs:
       - name: Validate project JSON contracts
         run: python3 scripts/test-project-schemas.py --denoize target/debug/denoize
 
+      - name: Validate native diagnostic JSON contracts
+        run: python3 scripts/test-diagnostic-schemas.py --denoize target/debug/denoize
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -97,6 +100,7 @@ jobs:
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
+          python3 -c 'compile(open("scripts/test-diagnostic-schemas.py", encoding="utf-8").read(), "scripts/test-diagnostic-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -469,9 +473,11 @@ jobs:
           asset="$asset_dir/denoize-model-catalog-v1.json"
           trust_asset="$asset_dir/denoize-model-trust-root-v1.json"
           automation_schema="$asset_dir/denoize-automation-v1.schema.json"
+          assessment_schema="$asset_dir/denoize-assessment-v1.schema.json"
           cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
           daw_preset_schema="$asset_dir/denoize-daw-preset-v1.schema.json"
           daw_session_schema="$asset_dir/denoize-daw-session-v1.schema.json"
+          diagnostic_schema="$asset_dir/denoize-diagnostic-v1.schema.json"
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
           ipc_capability_summary_schema="$asset_dir/denoize-ipc-capability-summary-v1.schema.json"
           ipc_capability_schema="$asset_dir/denoize-ipc-capability-v1.schema.json"
@@ -508,9 +514,11 @@ jobs:
           cp models/catalog-v1.json "$asset"
           cp models/trust-root-v1.json "$trust_asset"
           cp schemas/denoize-automation-v1.schema.json "$automation_schema"
+          cp schemas/denoize-assessment-v1.schema.json "$assessment_schema"
           cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
           cp schemas/denoize-daw-preset-v1.schema.json "$daw_preset_schema"
           cp schemas/denoize-daw-session-v1.schema.json "$daw_session_schema"
+          cp schemas/denoize-diagnostic-v1.schema.json "$diagnostic_schema"
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
           cp schemas/denoize-ipc-capability-summary-v1.schema.json "$ipc_capability_summary_schema"
           cp schemas/denoize-ipc-capability-v1.schema.json "$ipc_capability_schema"
@@ -558,8 +566,9 @@ jobs:
             "$bundle" "$bundle_checksum" "$asset" "$asset.sig" "$trust_asset"
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
-            "$automation_schema" "$cli_schema" \
-            "$daw_preset_schema" "$daw_session_schema" "$hardware_schema" \
+            "$automation_schema" "$assessment_schema" "$cli_schema" \
+            "$daw_preset_schema" "$daw_session_schema" "$diagnostic_schema" \
+            "$hardware_schema" \
             "$ipc_capability_summary_schema" "$ipc_capability_schema" \
             "$ipc_discovery_schema" "$ipc_request_schema" "$ipc_response_schema" \
             "$job_dry_run_schema" "$job_history_schema" "$job_status_schema" \
@@ -753,7 +762,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.69.0 0.70.0)
+          rollback_versions=(0.70.0 0.71.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

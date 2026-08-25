@@ -44,6 +44,67 @@ participate in the worker weight. The CLI's optional `--isolate` child adds an
 Cooperative counters deliberately do not claim allocator-exact RSS, filesystem
 quota, or driver-exact VRAM enforcement.
 
+## Restoration platform roadmap
+
+The completed denoising and product stages are followed by a restoration
+roadmap. Work proceeds in dependency order. A stage is complete only when its
+Rust API, CLI, Desktop surface where applicable, closed automation schemas,
+bounded resource behavior, malformed-input tests, documentation, release
+assets, and cross-platform CI are present. A model-backed stage additionally
+requires distributable weights with independently audited code, checkpoint,
+and training-data terms; exact source revision and digest; CPU fallback;
+numerical parity vectors; stratified quality evidence; and explicit
+hallucination or target-leakage gates.
+
+| Order | Stage | Scope | Status |
+|---:|---:|---|---|
+| 1 | 24 | Bounded degradation diagnosis, native no-reference quality dimensions, uncertainty, recommended repair pipeline, and presentation-safe before/after assessment | Released in v0.72.0 |
+| 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Planned |
+| 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Planned |
+| 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and opt-in generative mode | Planned |
+| 5 | 28 | Neural CLAP processing, VST3, custom editor, sidechain foundation, off-callback inference, host latency, automation, overload fallback, then AUv3 and LV2 | Planned |
+| 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Planned |
+| 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
+| 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
+| 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, and multiple export formats | Planned |
+| 10 | 33 | Stable C ABI, WASM, and mobile SDKs after runtime and processing ABI stabilization | Planned |
+
+Stage 24 publishes
+[denoize-diagnostic-v1](schemas/denoize-diagnostic-v1.schema.json) and
+[denoize-assessment-v1](schemas/denoize-assessment-v1.schema.json). It analyzes
+at most 60 seconds and 48 kHz, records a domain-separated digest that binds the
+exact analysis PCM, rate, and channel count, reports nine independent
+degradation families with confidence and severity, and never claims semantic
+or speaker-identity fidelity. Native proxy scores are triage evidence only;
+signed reference evaluation and listening evidence remain the release
+authority.
+
+Stage 25 keeps v1 packages backward compatible and fail-closed. It does not
+permit arbitrary scripts or archive extraction. Enrollment, far-end reference,
+microphone geometry, and recurrent state are typed tensor roles rather than
+untrusted command hooks.
+
+Stage 26 establishes deterministic, inspectable baselines before a universal
+generative repair model can ship. An undamaged-input bypass corpus, repair-mask
+accuracy, transient/timbre preservation, stereo-image preservation, bounded
+streaming where applicable, and exact-duration output are acceptance gates.
+
+Stage 27 starts with the official URGENT BSRNN baseline because denoize already
+has a BSRNN frontend. Flow/diffusion models remain experimental and opt-in
+until human preference, ASR/phoneme fidelity, speaker similarity, language,
+age, accent, emotion, singing, whisper, and unseen-distortion gates all pass.
+
+Stages 28–31 depend on the v2 runtime contract. The audio callback may not
+allocate, block, load a model, perform filesystem or network I/O, or wait on
+inference. AEC requires a typed far-end reference and delay estimate. Spatial
+processing distinguishes microphone arrays from ordinary program stereo.
+Target-speaker enrollment audio is not retained by default.
+
+Stage 32 deliberately follows stable restoration chains so the project format
+does not encode provisional DSP semantics. Stage 33 follows runtime and
+timeline stabilization so exported ABI compatibility can be maintained rather
+than repeatedly broken.
+
 ## Investigation status
 
 | Model | Upstream artifact | Native integration gap | Status |

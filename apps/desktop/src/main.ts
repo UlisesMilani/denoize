@@ -732,6 +732,16 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
         <div class="grid two-col">
           <div class="stack">
             <article class="card">
+              <div class="card-heading"><div><span class="step">DIAGNOSE</span><h2>劣化診断・品質評価</h2></div><span class="hint">LOCAL · NO-REFERENCE</span></div>
+              <p class="section-copy">先頭の有限区間を端末内で解析し、雑音、クリップ、ハム、クリック、残響、帯域、ドロップアウト、風雑音を信頼度付きで表示します。推定値だけで生成音声を採用しません。</p>
+              <div class="file-row"><div><label>候補／診断対象</label><div id="diagnostic-candidate-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-diagnostic-candidate">選択</button></div>
+              <div class="file-row"><div><label>比較元（任意）</label><div id="diagnostic-baseline-display" class="path empty">指定なし</div></div><div class="button-row"><button class="secondary" id="clear-diagnostic-baseline" disabled>解除</button><button class="secondary" id="choose-diagnostic-baseline">選択</button></div></div>
+              <input type="hidden" id="diagnostic-candidate-path"><input type="hidden" id="diagnostic-baseline-path">
+              <label>解析秒数<input id="diagnostic-analysis-seconds" type="number" value="12" min="1" max="60"></label>
+              <div class="button-row"><button class="secondary" id="run-diagnostic">劣化を診断</button><button class="primary" id="run-assessment">品質を評価・比較</button></div>
+              <p class="field-hint">表示されるMOS proxyは人手MOSではありません。単語、音素、話者同一性、生成系のhallucinationは別の参照評価が必要です。</p>
+            </article>
+            <article class="card">
               <div class="card-heading"><div><span class="step">RUN</span><h2>コーパス評価を実行</h2></div></div>
               <p class="section-copy">ライセンス、取得元 revision、前処理、SHA-256 を固定した manifest だけを実行し、品質・出力健全性・速度を署名付き JSON に保存します。</p>
               <div class="file-row"><div><label>評価 manifest</label><div id="evaluation-manifest-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-evaluation-manifest">選択</button></div>
@@ -2807,6 +2817,67 @@ $("#choose-evaluation-output").addEventListener("click", async () => {
   if (path) setPath("#evaluation-output-path", "#evaluation-output-display", path);
 });
 
+for (const [button, input, display] of [
+  ["#choose-diagnostic-candidate", "#diagnostic-candidate-path", "#diagnostic-candidate-display"],
+  ["#choose-diagnostic-baseline", "#diagnostic-baseline-path", "#diagnostic-baseline-display"],
+] as const) {
+  $(button).addEventListener("click", async () => {
+    const path = await open({ multiple: false, filters: audioFilters });
+    if (typeof path === "string") {
+      setPath(input, display, path);
+      if (input === "#diagnostic-baseline-path") $<HTMLButtonElement>("#clear-diagnostic-baseline").disabled = false;
+    }
+  });
+}
+
+$("#clear-diagnostic-baseline").addEventListener("click", () => {
+  setPath("#diagnostic-baseline-path", "#diagnostic-baseline-display", null);
+  $("#diagnostic-baseline-display").textContent = tr("指定なし", "Not selected");
+  $<HTMLButtonElement>("#clear-diagnostic-baseline").disabled = true;
+});
+
+function diagnosticRequestValues() {
+  const candidate = evaluationPath("#diagnostic-candidate-path", tr("診断対象を選択してください", "Select an audio file to diagnose"));
+  const analysisSeconds = Number($<HTMLInputElement>("#diagnostic-analysis-seconds").value);
+  if (!Number.isInteger(analysisSeconds) || analysisSeconds < 1 || analysisSeconds > 60) {
+    throw new Error(tr("解析秒数は1〜60の整数にしてください", "Analysis seconds must be an integer from 1 to 60"));
+  }
+  const memoryRaw = $<HTMLInputElement>("#resource-process-memory").value;
+  const maxMemoryMb = memoryRaw ? Number(memoryRaw) : null;
+  return { candidate, analysisSeconds, maxMemoryMb };
+}
+
+$("#run-diagnostic").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  setEvaluationBusy(true);
+  try {
+    const { candidate, analysisSeconds, maxMemoryMb } = diagnosticRequestValues();
+    const report = await invoke<Record<string, unknown>>("diagnose_audio_input", { request: {
+      input: candidate, analysisSeconds, maxMemoryMb,
+    } });
+    renderEvaluationResult(report);
+    showToast(tr("劣化診断が完了しました", "Degradation diagnosis completed"));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
+$("#run-assessment").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  setEvaluationBusy(true);
+  try {
+    const { candidate, analysisSeconds, maxMemoryMb } = diagnosticRequestValues();
+    const baseline = $<HTMLInputElement>("#diagnostic-baseline-path").value || null;
+    const report = await invoke<Record<string, unknown>>("assess_audio_inputs", { request: {
+      baseline, candidate, analysisSeconds, maxMemoryMb,
+    } });
+    renderEvaluationResult(report);
+    showToast(baseline
+      ? tr("前後の品質とpresentationを比較しました", "Compared before/after quality and presentation")
+      : tr("非参照品質評価が完了しました", "No-reference quality assessment completed"));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
 function evaluationPath(selector: string, message: string): string {
   const value = $<HTMLInputElement>(selector).value;
   if (!value) throw new Error(message);
@@ -2821,7 +2892,7 @@ function renderEvaluationResult(value: unknown) {
 
 function setEvaluationBusy(running: boolean) {
   evaluationRunning = running;
-  for (const selector of ["#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
+  for (const selector of ["#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
     $<HTMLButtonElement>(selector).disabled = running;
   }
 }

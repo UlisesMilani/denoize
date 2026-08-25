@@ -124,6 +124,12 @@ but not URLs, credentials, user paths, or health tokens. The raw token exists
 only in the immediate apply/startup-health report and the owner-private state
 needed to confirm a restart; it is never copied into durable diagnostics.
 
+## v0.72.0 compatibility gate
+
+This release accepts exact transitions from v0.70.0 and v0.71.0. Every one of
+the six platform packages has two `.dub` assets, so both migrations carry
+their own authenticated offline rollback payload.
+
 ## v0.71.0 compatibility gate
 
 This release accepts exact transitions from v0.69.0 and v0.70.0. Every one of

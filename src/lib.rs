@@ -47,6 +47,7 @@ pub mod config;
 pub mod daw;
 pub mod decode;
 pub mod denoiser;
+pub mod diagnostics;
 pub mod encode;
 pub mod evaluation;
 pub mod execution;
@@ -117,6 +118,12 @@ pub use decode::{
     DecodedPcm,
 };
 pub use denoiser::{Denoiser, DenoiserConfig, Preset, ProcessingMode, StreamingDenoiser};
+pub use diagnostics::{
+    assess_file_with_options, compare_files_with_options, diagnose_audio, diagnose_file,
+    diagnose_file_with_options, AssessmentComparison, AssessmentReport, DiagnosticFinding,
+    DiagnosticInput, DiagnosticMetrics, DiagnosticOptions, DiagnosticReport, NoReferenceQuality,
+    ASSESSMENT_SCHEMA, ASSESSMENT_SCHEMA_VERSION, DIAGNOSTIC_SCHEMA, DIAGNOSTIC_SCHEMA_VERSION,
+};
 pub use encode::{
     estimate_spooled_stream_output_bytes, estimate_stream_encode_additional_bytes,
     estimate_stream_encode_output_bytes, estimate_stream_encode_temporary_bytes,
