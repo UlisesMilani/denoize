@@ -74,6 +74,9 @@ jobs:
       - name: Validate native diagnostic JSON contracts
         run: python3 scripts/test-diagnostic-schemas.py --denoize target/debug/denoize
 
+      - name: Validate deterministic restoration JSON contracts
+        run: python3 scripts/test-restoration-schemas.py
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -105,6 +108,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
           python3 -c 'compile(open("scripts/test-diagnostic-schemas.py", encoding="utf-8").read(), "scripts/test-diagnostic-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -531,6 +535,8 @@ jobs:
           runtime_model_package_schema="$asset_dir/denoize-runtime-model-package-v1.schema.json"
           runtime_model_package_v2_schema="$asset_dir/denoize-runtime-model-package-v2.schema.json"
           runtime_model_vectors_schema="$asset_dir/denoize-runtime-model-numerical-vectors-v1.schema.json"
+          restoration_mask_schema="$asset_dir/denoize-restoration-mask-v1.schema.json"
+          restoration_report_schema="$asset_dir/denoize-restoration-report-v1.schema.json"
           watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
           watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
           watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
@@ -577,6 +583,8 @@ jobs:
           cp schemas/denoize-runtime-model-package-v1.schema.json "$runtime_model_package_schema"
           cp schemas/denoize-runtime-model-package-v2.schema.json "$runtime_model_package_v2_schema"
           cp schemas/denoize-runtime-model-numerical-vectors-v1.schema.json "$runtime_model_vectors_schema"
+          cp schemas/denoize-restoration-mask-v1.schema.json "$restoration_mask_schema"
+          cp schemas/denoize-restoration-report-v1.schema.json "$restoration_report_schema"
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
@@ -613,6 +621,7 @@ jobs:
             "$stream_receipt_verification_schema" \
             "$runtime_model_package_schema" "$runtime_model_package_v2_schema" \
             "$runtime_model_vectors_schema" \
+            "$restoration_mask_schema" "$restoration_report_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
             "$asset_dir"/denoize-update-*.schema.json \

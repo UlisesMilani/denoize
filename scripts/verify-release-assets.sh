@@ -106,6 +106,8 @@ expected_assets=(
   "denoize-runtime-model-numerical-vectors-v1.schema.json"
   "denoize-runtime-model-package-v1.schema.json"
   "denoize-runtime-model-package-v2.schema.json"
+  "denoize-restoration-mask-v1.schema.json"
+  "denoize-restoration-report-v1.schema.json"
   "denoize-update-apply-v1.schema.json"
   "denoize-update-bundle-v1.schema.json"
   "denoize-update-check-v1.schema.json"
@@ -122,7 +124,7 @@ expected_assets=(
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
-update_rollback_versions=(0.71.0 0.72.0)
+update_rollback_versions=(0.72.0 0.73.0)
 update_platforms=(
   "darwin-aarch64-app"
   "darwin-x86_64-app"
@@ -269,6 +271,8 @@ gh release download "$tag" \
   --pattern 'denoize-runtime-model-numerical-vectors-v1.schema.json' \
   --pattern 'denoize-runtime-model-package-v1.schema.json' \
   --pattern 'denoize-runtime-model-package-v2.schema.json' \
+  --pattern 'denoize-restoration-mask-v1.schema.json' \
+  --pattern 'denoize-restoration-report-v1.schema.json' \
   --pattern 'denoize-update-*.schema.json' \
   --pattern 'denoize-update-manifest-v1.json' \
   --pattern 'denoize-watch-cycle-v1.schema.json' \
@@ -347,6 +351,8 @@ for schema in \
   denoize-runtime-model-numerical-vectors-v1.schema.json \
   denoize-runtime-model-package-v1.schema.json \
   denoize-runtime-model-package-v2.schema.json \
+  denoize-restoration-mask-v1.schema.json \
+  denoize-restoration-report-v1.schema.json \
   denoize-update-apply-v1.schema.json \
   denoize-update-bundle-v1.schema.json \
   denoize-update-check-v1.schema.json \
@@ -397,7 +403,7 @@ jq -e \
   .channel == "stable" and
   .version == $version and
   .source_commit == $commit and
-  .compatibility.accepted_from_versions == ["0.71.0", "0.72.0"] and
+  .compatibility.accepted_from_versions == ["0.72.0", "0.73.0"] and
   .rollback_policy.retained_last_known_good == 1 and
   .rollback_policy.manual_recovery == true and
   .rollback_policy.network_required_for_recovery == false and
@@ -423,7 +429,7 @@ jq -e \
     ($platform_row.candidate.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
-    ([$platform_row.rollbacks[].from_version] == ["0.71.0", "0.72.0"]) and
+    ([$platform_row.rollbacks[].from_version] == ["0.72.0", "0.73.0"]) and
     all($platform_row.rollbacks[]; . as $rollback |
       $rollback.payload.activation == $platform_row.candidate.activation and
       (.bundle_url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
