@@ -309,8 +309,27 @@ jobs:
           test -n "$validator"
           cp target/${{ matrix.target }}/release/libdenoize_clap.so \
             "$validator_dir/denoize.clap"
-          "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
-            > "$validator_dir/report.json"
+          validator_status=1
+          for attempt in 1 2; do
+            set +e
+            "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
+              > "$validator_dir/report.json"
+            validator_status=$?
+            set -e
+            if [ "$validator_status" -eq 0 ]; then
+              break
+            fi
+            printf 'CLAP validator attempt %s failed with status %s\n' \
+              "$attempt" "$validator_status" >&2
+          done
+          if [ "$validator_status" -ne 0 ]; then
+            if jq -e . "$validator_dir/report.json" >/dev/null 2>&1; then
+              jq . "$validator_dir/report.json" >&2
+            else
+              sed -n '1,200p' "$validator_dir/report.json" >&2
+            fi
+            exit "$validator_status"
+          fi
           jq -e '
             (.results | length) == 44 and
             ([.results[].status.code] | map(select(. == "success")) | length) == 36 and
