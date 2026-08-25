@@ -1,9 +1,12 @@
-//! ESPnet BSRNN adapter for the pinned VCTK+DEMAND xtiny checkpoint.
+//! ESPnet BSRNN spectral adapter.
 //!
 //! The converted ONNX graph receives a real/imaginary spectrum shaped
 //! `[1, frames, 481, 2]`. Rust reproduces ESPnet's variance normalization,
 //! centered periodic-Hann 960-point STFT, whole-utterance inference, inverse
-//! STFT, sample-rate conversion, and exact duration restoration.
+//! STFT, sample-rate conversion, and exact duration restoration. Raw ONNX files
+//! remain supported for compatibility. Universal-restoration callers should
+//! use a signed runtime-model package v2 so graph semantics, provenance,
+//! resources, and numerical vectors are authenticated before source audio.
 
 use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
@@ -53,8 +56,57 @@ impl BsrnnModel {
                 config.path.display()
             ));
         }
+        Self::from_template(load_template(config)?, runtime)
+    }
+
+    pub(crate) fn load_runtime_package(
+        package: &crate::RuntimeModelPackage,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
+        let manifest = package.manifest_v2().ok_or(
+            "BSRNN runtime packages must use format v2 with named spectral tensors and numerical vectors",
+        )?;
+        validate_runtime_package_contract(manifest)?;
+        let profile = package
+            .precision_profile_for(runtime)?
+            .expect("a v2 package always selects a precision profile");
+        let mut reader = package.open_model_reader_for(runtime)?;
+        let template = tract_onnx::onnx()
+            .model_for_read(&mut reader)
+            .map_err(|error| {
+                format!(
+                    "failed to load BSRNN ONNX model from authenticated package {}: {error:#}",
+                    package.package_path().display()
+                )
+            })?;
+        reader.finish().map_err(|error| {
+            format!(
+                "failed to authenticate BSRNN model bytes from package {}: {error}",
+                package.package_path().display()
+            )
+        })?;
+        let mut inspected = template.clone();
+        if inspected.analyse(false).is_ok() {
+            super::onnx::validate_v2_graph_contract(&inspected, manifest)?;
+        } else {
+            super::onnx::validate_v2_graph_contract(&template, manifest)?;
+        }
+        let vectors = package
+            .numerical_vectors_for(runtime)?
+            .expect("a v2 precision profile always carries numerical vectors");
+        super::onnx::validate_v2_numerical_vectors(
+            &template, manifest, profile, &vectors, runtime,
+        )?;
+        Self::from_template(template, runtime)
+    }
+
+    fn from_template(
+        template: InferenceModel,
+        runtime: AcceleratorRuntime,
+    ) -> Result<Self, String> {
+        validate_template(&template)?;
         Ok(Self {
-            template: load_template(config)?,
+            template,
             runtime,
             compiled: Mutex::new(None),
         })
@@ -227,6 +279,11 @@ fn load_template(config: &OnnxModelConfig) -> Result<InferenceModel, String> {
     let model = tract_onnx::onnx()
         .model_for_path(&config.path)
         .map_err(|error| model_error("load", error))?;
+    validate_template(&model)?;
+    Ok(model)
+}
+
+fn validate_template(model: &InferenceModel) -> Result<(), String> {
     if model
         .input_outlets()
         .map_err(|e| model_error("inspect", e))?
@@ -240,7 +297,47 @@ fn load_template(config: &OnnxModelConfig) -> Result<InferenceModel, String> {
     {
         return Err("BSRNN ONNX model must have one input and one output".into());
     }
-    Ok(model)
+    Ok(())
+}
+
+fn validate_runtime_package_contract(
+    manifest: &crate::RuntimeModelPackageManifestV2,
+) -> Result<(), String> {
+    let spectral_axes = |tensor: &crate::RuntimeModelTensorContractV2| {
+        tensor.element_type == "float32"
+            && tensor.role == "audio"
+            && !tensor.optional
+            && tensor.state_id.is_none()
+            && tensor.axes.len() == 4
+            && tensor.axes[0].kind == "batch"
+            && tensor.axes[0].fixed == Some(1)
+            && tensor.axes[1].kind == "frame"
+            && tensor.axes[1].fixed.is_none()
+            && tensor.axes[2].kind == "frequency"
+            && tensor.axes[2].fixed == Some(BINS as u64)
+            && tensor.axes[3].kind == "coordinate"
+            && tensor.axes[3].fixed == Some(2)
+    };
+    let valid = manifest.runtime.sample_rate_hz == MODEL_RATE
+        && manifest.runtime.mode == "finite"
+        && manifest.frontend.channels.policy == "independent-mono"
+        && manifest.frontend.channels.roles.is_empty()
+        && manifest.frontend.channels.geometry.is_none()
+        && manifest.tensors.inputs.len() == 1
+        && manifest.tensors.outputs.len() == 1
+        && spectral_axes(&manifest.tensors.inputs[0])
+        && spectral_axes(&manifest.tensors.outputs[0])
+        && manifest.tensors.inputs[0].axes == manifest.tensors.outputs[0].axes
+        && manifest.state_pairs.is_empty()
+        && manifest.latency.frame_samples == FFT_SIZE as u64
+        && manifest.latency.hop_samples == HOP_SIZE as u64;
+    if !valid {
+        return Err(
+            "authenticated BSRNN package must declare the finite independent-mono 48000 Hz [batch,frame,481,complex-coordinate] spectral contract with a 960-sample frame and 480-sample hop"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn compile_model(
@@ -322,6 +419,7 @@ fn reflect_index(mut index: isize, length: usize) -> usize {
 mod tests {
     use super::*;
     use prost::Message;
+    use sha2::Digest as _;
     use tract_onnx::pb::{
         tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
         OperatorSetIdProto, TensorShapeProto, TypeProto, ValueInfoProto,
@@ -388,6 +486,202 @@ mod tests {
             / input.len() as f64;
         assert_eq!(output[0].len(), input.len());
         assert!(mse < 1e-10, "spectral identity model MSE was {mse}");
+    }
+
+    #[test]
+    fn signed_v2_spectral_package_checks_contract_and_vectors_before_audio() {
+        let directory = tempfile::tempdir().unwrap();
+        let package_path = directory.path().join("bsrnn-v2.dmp");
+        let mut model_bytes = Vec::new();
+        spectral_identity_model().encode(&mut model_bytes).unwrap();
+        let license = b"fixture license".to_vec();
+        let provenance = br#"{"schema":"fixture-provenance-v1"}"#.to_vec();
+        let values = vec![0.0_f64; BINS * 2];
+        let vectors = serde_json::to_vec(&serde_json::json!({
+            "schema": "denoize-runtime-model-numerical-vectors-v1",
+            "profile_id": "fp32",
+            "cases": [{
+                "id": "spectral-identity",
+                "inputs": [{
+                    "name": "spectrum",
+                    "element_type": "float32",
+                    "shape": [1, 1, BINS, 2],
+                    "values": values
+                }],
+                "outputs": [{
+                    "name": "enhanced_spectrum",
+                    "element_type": "float32",
+                    "shape": [1, 1, BINS, 2],
+                    "values": vec![0.0_f64; BINS * 2]
+                }],
+                "tolerance": { "absolute": 0.000001, "relative": 0.000001 }
+            }]
+        }))
+        .unwrap();
+        let file = |filename: &str, bytes: &[u8]| crate::RuntimeModelFileContract {
+            filename: filename.into(),
+            size_bytes: bytes.len() as u64,
+            sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+        };
+        let axes = || {
+            vec![
+                crate::RuntimeModelAxisContractV2 {
+                    name: "batch".into(),
+                    kind: "batch".into(),
+                    fixed: Some(1),
+                },
+                crate::RuntimeModelAxisContractV2 {
+                    name: "frames".into(),
+                    kind: "frame".into(),
+                    fixed: None,
+                },
+                crate::RuntimeModelAxisContractV2 {
+                    name: "frequency".into(),
+                    kind: "frequency".into(),
+                    fixed: Some(BINS as u64),
+                },
+                crate::RuntimeModelAxisContractV2 {
+                    name: "complex".into(),
+                    kind: "coordinate".into(),
+                    fixed: Some(2),
+                },
+            ]
+        };
+        let resources = crate::RuntimeModelResourceContract {
+            max_session_memory_bytes: crate::estimate_model_session_bytes(model_bytes.len() as u64)
+                .unwrap(),
+            max_worker_memory_bytes: 4096,
+            max_gpu_session_memory_bytes: 0,
+            max_gpu_worker_memory_bytes: 0,
+            accelerators: vec!["cpu".into()],
+        };
+        let manifest = crate::RuntimeModelPackageManifestV2 {
+            schema: crate::RUNTIME_MODEL_PACKAGE_SCHEMA_V2.into(),
+            format_version: crate::RUNTIME_MODEL_PACKAGE_VERSION_V2,
+            package_id: "denoize.test.bsrnn-v2".into(),
+            package_revision: "1".into(),
+            signing_key_id: "0000000000000001".into(),
+            runtime: crate::RuntimeModelRuntimeContractV2 {
+                kind: "onnx-audio-graph-v2".into(),
+                sample_rate_hz: MODEL_RATE,
+                mode: "finite".into(),
+            },
+            frontend: crate::RuntimeModelFrontendContractV2 {
+                normalization: "pcm-f32-minus-one-to-one-v1".into(),
+                resampling: "bandlimited-waveform-v1".into(),
+                duration: "preserve-input-frames-v1".into(),
+                channels: crate::RuntimeModelChannelContractV2 {
+                    policy: "independent-mono".into(),
+                    roles: vec![],
+                    geometry: None,
+                },
+            },
+            tensors: crate::RuntimeModelTensorSetContractV2 {
+                inputs: vec![crate::RuntimeModelTensorContractV2 {
+                    name: "spectrum".into(),
+                    role: "audio".into(),
+                    element_type: "float32".into(),
+                    axes: axes(),
+                    optional: false,
+                    state_id: None,
+                }],
+                outputs: vec![crate::RuntimeModelTensorContractV2 {
+                    name: "enhanced_spectrum".into(),
+                    role: "audio".into(),
+                    element_type: "float32".into(),
+                    axes: axes(),
+                    optional: false,
+                    state_id: None,
+                }],
+            },
+            state_pairs: vec![],
+            latency: crate::RuntimeModelLatencyContractV2 {
+                frame_samples: FFT_SIZE as u64,
+                hop_samples: HOP_SIZE as u64,
+                left_context_samples: (FFT_SIZE / 2) as u64,
+                right_context_samples: (FFT_SIZE / 2) as u64,
+                lookahead_samples: (FFT_SIZE / 2) as u64,
+                algorithmic_latency_samples: (FFT_SIZE / 2) as u64,
+                flush_samples: (FFT_SIZE / 2) as u64,
+            },
+            components: vec![
+                crate::RuntimeModelComponentContractV2 {
+                    id: "model-fp32".into(),
+                    kind: "onnx-model".into(),
+                    file: file("model.onnx", &model_bytes),
+                },
+                crate::RuntimeModelComponentContractV2 {
+                    id: "license".into(),
+                    kind: "license-notice".into(),
+                    file: file("LICENSE.txt", &license),
+                },
+                crate::RuntimeModelComponentContractV2 {
+                    id: "provenance".into(),
+                    kind: "provenance-json".into(),
+                    file: file("provenance.json", &provenance),
+                },
+                crate::RuntimeModelComponentContractV2 {
+                    id: "vectors-fp32".into(),
+                    kind: "numerical-vectors-json".into(),
+                    file: file("vectors-fp32.json", &vectors),
+                },
+            ],
+            precision_profiles: vec![crate::RuntimeModelPrecisionProfileContractV2 {
+                id: "fp32".into(),
+                element_type: "float32".into(),
+                model_component: "model-fp32".into(),
+                numerical_vectors_component: "vectors-fp32".into(),
+                resources,
+            }],
+            default_precision_profile: "fp32".into(),
+            license: crate::RuntimeModelLicenseContractV2 {
+                spdx: "MIT".into(),
+                notice_component: "license".into(),
+            },
+            provenance: crate::RuntimeModelProvenanceContractV2 {
+                component: "provenance".into(),
+                source_repository: "https://example.invalid/urgent".into(),
+                source_revision: "b1dc3ad1e86419ff0bd666f455bda7936bff0e9a".into(),
+                source_sha256: "0".repeat(64),
+                source_license_spdx: "Apache-2.0".into(),
+                checkpoint_source: "https://example.invalid/bsrnn.ckpt".into(),
+                checkpoint_sha256: "1".repeat(64),
+                checkpoint_license_spdx: "MIT".into(),
+                conversion_tool: "fixture-converter".into(),
+                conversion_revision: "1".into(),
+                training_datasets: vec![crate::RuntimeModelTrainingDatasetContractV2 {
+                    id: "synthetic".into(),
+                    source: "urn:denoize:test:synthetic".into(),
+                    revision: "1".into(),
+                    sha256: Some("2".repeat(64)),
+                    license_spdx: "CC0-1.0".into(),
+                }],
+            },
+        };
+        let mut invalid = manifest.clone();
+        invalid.runtime.mode = "finite-and-streaming".into();
+        assert!(validate_runtime_package_contract(&invalid).is_err());
+        let package = crate::RuntimeModelPackage::for_onnx_v2_contract_test(
+            package_path,
+            manifest,
+            vec![model_bytes, license, provenance, vectors],
+        );
+        let model = BsrnnModel::load_runtime_package(&package, AcceleratorRuntime::Cpu).unwrap();
+        let input: Vec<f64> = (0..4_800)
+            .map(|index| {
+                0.1 * (2.0 * std::f64::consts::PI * 440.0 * index as f64 / MODEL_RATE as f64).sin()
+            })
+            .collect();
+        let output = model
+            .process(std::slice::from_ref(&input), MODEL_RATE)
+            .unwrap();
+        let mse = input
+            .iter()
+            .zip(&output[0])
+            .map(|(expected, actual)| (expected - actual).powi(2))
+            .sum::<f64>()
+            / input.len() as f64;
+        assert!(mse < 1e-10, "packaged spectral identity MSE was {mse}");
     }
 
     fn spectral_identity_model() -> ModelProto {

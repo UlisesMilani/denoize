@@ -55,6 +55,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" restore --help
   echo '```'
   echo
+  echo '## Fail-closed universal speech restoration'
+  echo
+  echo '```text'
+  "$binary" universal --help
+  echo '```'
+  echo
   echo '## Watch-folder automation'
   echo
   echo '```text'

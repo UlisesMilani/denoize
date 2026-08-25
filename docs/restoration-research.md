@@ -162,9 +162,12 @@ Use the discriminative checkpoint as the default. Evaluate the BSRNN-Flow
 baseline and newer generative systems only as labeled alternate renders.
 UniPASE is the strongest newly published challenger: it reports first place in
 the URGENT 2026 objective evaluation, retains the input sample rate, includes a
-packet-loss path, and publishes MIT-licensed code and checkpoints
+packet-loss path, and publishes code and checkpoints
 ([Rong et al., TASLP 2026](https://arxiv.org/abs/2604.14606),
-[official repository](https://github.com/xiaobin-rong/unipase)). That result
+[official repository](https://github.com/Xiaobin-Rong/unipase)). Its source
+repository and Hugging Face metadata do not currently provide one consistent
+license conclusion, and the four-model inference path depends on DeWavLM,
+Adapter, vocoder, and PostNet artifacts. That result
 does not supersede the safety policy: it reconstructs through a learned
 representation and vocoder, so its exact checkpoint, WavLM/vocoder dependencies,
 and every training dataset still require a separate audit, and its claims must
@@ -198,6 +201,41 @@ ITU-T P.804-based protocol used by the ICASSP 2024 Audio Deep Packet Loss
 Concealment Challenge
 ([challenge report](https://arxiv.org/abs/2402.16927)); ordinary enhancement
 scores are not accepted as proof that concealed gaps are temporally faithful.
+
+### Immutable artifact and redistribution audit
+
+The audit was repeated on 2026-08-26 and pins repositories instead of mutable
+`main` references:
+
+| Candidate | Source identity | Checkpoint identity | Distribution decision |
+|---|---|---|---|
+| URGENT discriminative BSRNN | repository commit `b1dc3ad1e86419ff0bd666f455bda7936bff0e9a`; Apache-2.0 source | Hugging Face revision `d4add2435a74b3f2dd54a9bbd417a058c68983b1`; `bsrnn.ckpt`, 151,456,890 bytes, SHA-256 `5d6b24eb0ba387428f3490a36238d17902cdc96da534fd2707a8e44f0d2431c8` | External conversion candidate; do not bundle |
+| URGENT BSRNN-Flow | same source and revision | `flow_bsrnn.ckpt`, 1,239,788,006 bytes, SHA-256 `f9201821243797fd5f9b852779040057b6f204267935712f96ccf0353cd9d438` | Experimental alternate only; do not bundle |
+| UniPASE | repository commit `857b60ad05d37a2cf6d7a89883ec9fc4fc164b45` | Hugging Face revision `f0b4d4c4411fe08fc2dddbf2d9f33260c27ac4a0`; DeWavLM, Adapter, vocoder, and PostNet artifacts | License metadata conflict and incomplete training-data redistribution chain; do not bundle |
+
+The URGENT checkpoint repository labels itself MIT, but its model card is only a
+minimal placeholder and does not grant or enumerate rights inherited from each
+dataset in the 700-hour curated mixture. The official preparation instructions
+explicitly omit licensed ESD-derived material from the downloadable simulated
+set and discuss other corpus-specific restrictions. “Code is Apache-2.0” and
+“model page says MIT” therefore cannot be collapsed into a checkpoint
+redistribution decision. The checkpoint files are also PyTorch pickle payloads;
+conversion must occur in an isolated, pinned environment and the original files
+must never be deserialized as an incidental application action.
+
+The UniPASE GitHub and Hugging Face license declarations differ at the audited
+revisions. Its paper describes a generative representation/vocoder path and the
+repository loads multiple checkpoints, so a single page-level license is not a
+bill of materials for the derived weights. Until upstream publishes consistent
+artifact-level terms and every training dataset/dependency is auditable, it
+remains a research comparison rather than a denoize release asset.
+
+The implementation consequence is strict: denoize ships the BSRNN spectral
+adapter, package schema, safety gates, and evidence verifier, but no official
+URGENT or UniPASE weights. A private operator may convert a checkpoint only
+after recording its exact upstream bytes, source/converter revisions, graph
+digest, numerical vectors, licenses, datasets, and resource ceilings in a
+signed runtime package v2. See [Fail-closed universal speech restoration](universal-restoration.md).
 
 ## Stage 28 — neural plug-ins and real-time scheduling
 

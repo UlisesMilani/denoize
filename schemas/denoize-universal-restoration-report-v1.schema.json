@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-universal-restoration-report-v1.schema.json",
+  "title": "denoize fail-closed universal restoration report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "network_accessed",
+    "model_family",
+    "render_role",
+    "model",
+    "decision",
+    "model_invoked",
+    "candidate_accepted",
+    "deterministic",
+    "sample_rate",
+    "channels",
+    "frames",
+    "input_pcm_sha256",
+    "candidate_pcm_sha256",
+    "output_pcm_sha256",
+    "mask_sha256",
+    "changed_samples",
+    "degradations",
+    "measurements",
+    "safety_gates",
+    "semantic_fidelity_assessed",
+    "speaker_identity_assessed",
+    "promotion_evidence_verified",
+    "limitations",
+    "warnings"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-universal-restoration-report-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "network_accessed": { "const": false },
+    "model_family": { "$ref": "#/$defs/model_family" },
+    "render_role": { "enum": ["primary", "alternate"] },
+    "model": { "$ref": "#/$defs/model" },
+    "decision": { "enum": ["bypassed-clean", "accepted", "rejected-safety-gate"] },
+    "model_invoked": { "type": "boolean" },
+    "candidate_accepted": { "type": "boolean" },
+    "deterministic": { "const": true },
+    "sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "frames": { "type": "integer", "minimum": 0 },
+    "input_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_pcm_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
+    "output_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "mask_sha256": { "$ref": "#/$defs/sha256" },
+    "changed_samples": { "type": "integer", "minimum": 0 },
+    "degradations": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/degradation" }
+    },
+    "measurements": { "$ref": "#/$defs/measurements" },
+    "safety_gates": {
+      "type": "array",
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/gate" }
+    },
+    "semantic_fidelity_assessed": { "const": false },
+    "speaker_identity_assessed": { "const": false },
+    "promotion_evidence_verified": { "const": false },
+    "limitations": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "model_family": { "enum": ["hybrid", "generative"] } } },
+      "then": { "properties": { "render_role": { "const": "alternate" } } }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "bypassed-clean" } } },
+      "then": {
+        "properties": {
+          "model_invoked": { "const": false },
+          "candidate_accepted": { "const": false },
+          "candidate_pcm_sha256": { "type": "null" },
+          "changed_samples": { "const": 0 },
+          "safety_gates": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "accepted" } } },
+      "then": {
+        "properties": {
+          "model_invoked": { "const": true },
+          "candidate_accepted": { "const": true },
+          "candidate_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "safety_gates": { "minItems": 7, "maxItems": 7 }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "rejected-safety-gate" } } },
+      "then": {
+        "properties": {
+          "model_invoked": { "const": true },
+          "candidate_accepted": { "const": false },
+          "candidate_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "changed_samples": { "const": 0 },
+          "safety_gates": { "minItems": 7, "maxItems": 7 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "finite_db": { "type": "number", "minimum": -240, "maximum": 240 },
+    "model_family": { "enum": ["discriminative", "hybrid", "generative"] },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_sha256",
+        "public_key_sha256",
+        "package_id",
+        "package_revision",
+        "precision_profile",
+        "source_revision",
+        "source_sha256",
+        "source_license_spdx",
+        "checkpoint_sha256",
+        "checkpoint_license_spdx",
+        "accelerator"
+      ],
+      "properties": {
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "public_key_sha256": { "$ref": "#/$defs/sha256" },
+        "package_id": { "$ref": "#/$defs/id" },
+        "package_revision": { "$ref": "#/$defs/id" },
+        "precision_profile": { "$ref": "#/$defs/id" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "accelerator": { "enum": ["cpu", "metal", "cuda"] }
+      }
+    },
+    "id": { "type": "string", "pattern": "^[a-z0-9._+-]{1,256}$" },
+    "degradation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["degradation", "detected", "confidence", "severity", "score"],
+      "properties": {
+        "degradation": {
+          "enum": [
+            "additive-noise",
+            "reverberation",
+            "clipping",
+            "bandwidth-limitation",
+            "codec-distortion",
+            "packet-loss",
+            "wind"
+          ]
+        },
+        "detected": { "type": "boolean" },
+        "confidence": { "$ref": "#/$defs/score" },
+        "severity": { "$ref": "#/$defs/score" },
+        "score": { "$ref": "#/$defs/score" }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_rms_dbfs",
+        "candidate_rms_dbfs",
+        "input_peak_dbfs",
+        "candidate_peak_dbfs",
+        "energy_delta_db",
+        "input_clipping_ratio",
+        "candidate_clipping_ratio",
+        "native_quality_score_delta"
+      ],
+      "properties": {
+        "input_rms_dbfs": { "$ref": "#/$defs/finite_db" },
+        "candidate_rms_dbfs": { "$ref": "#/$defs/nullable_db" },
+        "input_peak_dbfs": { "$ref": "#/$defs/finite_db" },
+        "candidate_peak_dbfs": { "$ref": "#/$defs/nullable_db" },
+        "energy_delta_db": { "$ref": "#/$defs/nullable_db" },
+        "input_clipping_ratio": { "$ref": "#/$defs/score" },
+        "candidate_clipping_ratio": {
+          "oneOf": [{ "$ref": "#/$defs/score" }, { "type": "null" }]
+        },
+        "native_quality_score_delta": {
+          "oneOf": [
+            { "type": "number", "minimum": -100, "maximum": 100 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "nullable_db": {
+      "oneOf": [{ "$ref": "#/$defs/finite_db" }, { "type": "null" }]
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "observed", "limit", "passed"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "geometry",
+            "finite-samples",
+            "energy-gain",
+            "peak-gain",
+            "new-clipping",
+            "silence-injection",
+            "native-quality-regression"
+          ]
+        },
+        "observed": { "type": "number", "minimum": -240, "maximum": 240 },
+        "limit": { "type": "number", "minimum": -240, "maximum": 240 },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}

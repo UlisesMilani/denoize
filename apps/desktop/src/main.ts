@@ -318,6 +318,11 @@ type DesktopRestorationResult = {
   report: Record<string, unknown>;
   mask: Record<string, unknown>;
 };
+type DesktopUniversalRestorationResult = {
+  output: string;
+  report: Record<string, unknown> & { decision?: string; candidate_accepted?: boolean };
+  mask: Record<string, unknown>;
+};
 type WatchCycleReport = {
   observed: number; pending: number; attempted: number; succeeded: number;
   retrying: number; quarantined: number; superseded: number; scan_errors: number;
@@ -747,6 +752,37 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <section class="page" id="page-evaluation" role="tabpanel" aria-labelledby="nav-evaluation" aria-hidden="true">
         <div class="grid two-col">
           <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">UNIVERSAL</span><h2>汎用音声復元</h2></div><span class="hint">SIGNED · FAIL-CLOSED</span></div>
+              <p class="section-copy">署名済みBSRNN package v2だけを使い、雑音、残響、クリップ、帯域制限、codec歪み、packet loss、風雑音を一つの経路で復元します。安全ゲートに失敗した候補は破棄し、入力音声をそのまま出力します。</p>
+              <div class="file-row"><div><label>汎用復元入力</label><div id="universal-input-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-universal-input">選択</button></div>
+              <div class="file-row"><div><label>汎用復元音声の保存先</label><div id="universal-output-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-universal-output">保存先</button></div>
+              <div class="file-row"><div><label>署名付きBSRNN package v2</label><div id="universal-package-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-universal-package">選択</button></div>
+              <div class="file-row"><div><label>信頼済みMinisign公開鍵</label><div id="universal-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-universal-key">選択</button></div>
+              <input type="hidden" id="universal-input-path"><input type="hidden" id="universal-output-path"><input type="hidden" id="universal-package-path"><input type="hidden" id="universal-key-path">
+              <div class="form-grid three">
+                <label>モデル種別<select id="universal-family"><option value="discriminative" selected>識別型（安全既定）</option><option value="hybrid">Hybrid（実験）</option><option value="generative">生成型（実験）</option></select></label>
+                <label>レンダー役割<select id="universal-render-role"><option value="primary" selected>Primary</option><option value="alternate">Alternate</option></select></label>
+                <label>アクセラレータ<select id="universal-accelerator"><option value="cpu" selected>CPU</option><option value="auto">Auto</option><option value="gpu">GPU</option><option value="metal">Metal</option><option value="cuda">CUDA</option></select></label>
+              </div>
+              <label class="toggle inline"><input id="universal-experimental" type="checkbox"><span></span><div><b>実験的alternateを許可</b><small>Hybrid／生成型では明示的に必要</small></div></label>
+              <details class="watch-advanced"><summary>高度な安全ゲート</summary>
+                <div class="form-grid three">
+                  <label>解析秒数<input id="universal-analysis-seconds" type="number" value="12" min="1" max="60"></label>
+                  <label>最小劣化score<input id="universal-minimum-degradation" type="number" value="0.08" min="0" max="1" step="0.01"></label>
+                  <label>最大energy増加 dB<input id="universal-maximum-energy" type="number" value="6" min="0" max="24" step="0.1"></label>
+                  <label>最大peak増加 dB<input id="universal-maximum-peak" type="number" value="6" min="0" max="24" step="0.1"></label>
+                  <label>最大新規clipping率<input id="universal-maximum-clipping" type="number" value="0.0001" min="0" max="0.1" step="0.0001"></label>
+                  <label>最大品質score低下<input id="universal-maximum-quality-regression" type="number" value="5" min="0" max="25" step="0.1"></label>
+                </div>
+              </details>
+              <div class="toggle-grid">
+                <label class="toggle"><input id="universal-preserve-metadata" type="checkbox" checked><span></span><div><b>メタデータ保持</b><small>タグとアートワークをコピー</small></div></label>
+                <label class="toggle"><input id="universal-replace" type="checkbox"><span></span><div><b>既存を上書き</b><small>未選択時は no-clobber</small></div></label>
+              </div>
+              <button class="primary wide" id="run-universal">汎用復元を実行</button>
+              <p class="field-hint">Clean入力は推論を迂回します。信号ゲートは単語・音素・話者同一性を証明しないため、生成型はPrimaryへ昇格できません。</p>
+            </article>
             <article class="card">
               <div class="card-heading"><div><span class="step">RESTORE</span><h2>決定的音声修復</h2></div><span class="hint">LOCAL · INSPECTABLE</span></div>
               <p class="section-copy">クリップ、クリック、ハム、残響、風・破裂音を保守的に検出・修復し、完全な区間マスクと信頼度付きレポートを表示します。</p>
@@ -2860,6 +2896,84 @@ $("#choose-evaluation-output").addEventListener("click", async () => {
   if (path) setPath("#evaluation-output-path", "#evaluation-output-display", path);
 });
 
+for (const [button, input, display] of [
+  ["#choose-universal-input", "#universal-input-path", "#universal-input-display"],
+] as const) {
+  $(button).addEventListener("click", async () => {
+    const path = await open({ multiple: false, filters: audioFilters });
+    if (typeof path === "string") setPath(input, display, path);
+  });
+}
+
+$("#choose-universal-output").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "universal-restored.wav", filters: audioFilters });
+  if (path) setPath("#universal-output-path", "#universal-output-display", path);
+});
+
+$("#choose-universal-package").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize runtime model package", extensions: ["dmp"] }] });
+  if (typeof path === "string") setPath("#universal-package-path", "#universal-package-display", path);
+});
+
+$("#choose-universal-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Minisign public key", extensions: ["pub"] }] });
+  if (typeof path === "string") setPath("#universal-key-path", "#universal-key-display", path);
+});
+
+$("#universal-family").addEventListener("change", () => {
+  const experimental = $<HTMLSelectElement>("#universal-family").value !== "discriminative";
+  $<HTMLSelectElement>("#universal-render-role").value = experimental ? "alternate" : "primary";
+  if (!experimental) $<HTMLInputElement>("#universal-experimental").checked = false;
+});
+
+function universalGateValue(selector: string, minimum: number, maximum: number, label: string, integer = false): number {
+  const value = Number($<HTMLInputElement>(selector).value);
+  if (!Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isInteger(value))) {
+    throw new Error(tr(`${label}は${minimum}〜${maximum}の${integer ? "整数" : "有限値"}にしてください`, `${label} must be ${integer ? "an integer" : "a finite value"} from ${minimum} to ${maximum}`));
+  }
+  return value;
+}
+
+$("#run-universal").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning
+    || !$("#stop-live").classList.contains("hidden")) {
+    return showToast(tr("別の処理が実行中です", "Another job is running"), true);
+  }
+  setEvaluationBusy(true);
+  try {
+    const memoryRaw = $<HTMLInputElement>("#resource-process-memory").value;
+    const result = await invoke<DesktopUniversalRestorationResult>("restore_universal_audio_input", { request: {
+      input: evaluationPath("#universal-input-path", tr("汎用復元入力を選択してください", "Select an audio file for universal restoration")),
+      output: evaluationPath("#universal-output-path", tr("汎用復元音声の保存先を選択してください", "Select a universal-restoration destination")),
+      modelPackage: evaluationPath("#universal-package-path", tr("署名付きBSRNN package v2を選択してください", "Select a signed BSRNN package v2")),
+      modelPackageKey: evaluationPath("#universal-key-path", tr("信頼済みMinisign公開鍵を選択してください", "Select a trusted Minisign public key")),
+      modelFamily: $<HTMLSelectElement>("#universal-family").value,
+      renderRole: $<HTMLSelectElement>("#universal-render-role").value,
+      allowExperimental: $<HTMLInputElement>("#universal-experimental").checked,
+      analysisSeconds: universalGateValue("#universal-analysis-seconds", 1, 60, tr("解析秒数", "Analysis seconds"), true),
+      minimumDegradationScore: universalGateValue("#universal-minimum-degradation", 0, 1, tr("最小劣化score", "Minimum degradation score")),
+      maximumEnergyGainDb: universalGateValue("#universal-maximum-energy", 0, 24, tr("最大energy増加", "Maximum energy gain")),
+      maximumPeakGainDb: universalGateValue("#universal-maximum-peak", 0, 24, tr("最大peak増加", "Maximum peak gain")),
+      maximumNewClippingRatio: universalGateValue("#universal-maximum-clipping", 0, 0.1, tr("最大新規clipping率", "Maximum new clipping ratio")),
+      maximumQualityRegression: universalGateValue("#universal-maximum-quality-regression", 0, 25, tr("最大品質score低下", "Maximum quality-score regression")),
+      accelerator: $<HTMLSelectElement>("#universal-accelerator").value,
+      maxMemoryMb: memoryRaw ? Number(memoryRaw) : null,
+      preserveMetadata: $<HTMLInputElement>("#universal-preserve-metadata").checked,
+      replace: $<HTMLInputElement>("#universal-replace").checked,
+    } });
+    renderEvaluationResult(result);
+    const rejected = result.report.decision === "rejected-safety-gate";
+    const bypassed = result.report.decision === "bypassed-clean";
+    showToast(rejected
+      ? tr("候補を安全ゲートで破棄し、入力音声をそのまま保存しました", "The candidate failed safety gates; the input audio was saved unchanged")
+      : bypassed
+        ? tr("Clean入力を推論せず、そのまま保存しました", "The clean input bypassed inference and was saved unchanged")
+        : tr("汎用音声復元が安全ゲートを通過しました", "Universal restoration passed all safety gates"));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
 $("#choose-restoration-input").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: audioFilters });
   if (typeof path === "string") setPath("#restoration-input-path", "#restoration-input-display", path);
@@ -2993,7 +3107,7 @@ function renderEvaluationResult(value: unknown) {
 
 function setEvaluationBusy(running: boolean) {
   evaluationRunning = running;
-  for (const selector of ["#run-restoration", "#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
+  for (const selector of ["#run-universal", "#run-restoration", "#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
     $<HTMLButtonElement>(selector).disabled = running;
   }
 }

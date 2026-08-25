@@ -111,10 +111,28 @@ impl BackendSession {
                 accelerator.effective(),
             )?),
             #[cfg(feature = "bsrnn")]
-            Backend::Bsrnn => PreparedBackend::Bsrnn(super::bsrnn::BsrnnModel::load(
-                required_model(&options, "BSRNN")?,
-                accelerator.effective(),
-            )?),
+            Backend::Bsrnn => {
+                let model = match options.runtime_package.as_ref() {
+                    Some(package) => {
+                        if !package.supports_accelerator(accelerator.effective()) {
+                            return Err(format!(
+                                "runtime model package {} does not permit the {} accelerator",
+                                package.package_path().display(),
+                                accelerator.effective().name()
+                            ));
+                        }
+                        super::bsrnn::BsrnnModel::load_runtime_package(
+                            package,
+                            accelerator.effective(),
+                        )?
+                    }
+                    None => super::bsrnn::BsrnnModel::load(
+                        required_model(&options, "BSRNN")?,
+                        accelerator.effective(),
+                    )?,
+                };
+                PreparedBackend::Bsrnn(model)
+            }
             #[cfg(feature = "mossformer2")]
             Backend::Mossformer2 => {
                 PreparedBackend::Mossformer2(super::mossformer2::Mossformer2Model::load(

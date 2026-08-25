@@ -65,7 +65,7 @@ stop/rollback conditions behind this order are maintained in
 | 1 | 24 | Bounded degradation diagnosis, native no-reference quality dimensions, uncertainty, recommended repair pipeline, and presentation-safe before/after assessment | Released in v0.72.0 |
 | 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
-| 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Planned |
+| 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
 | 5 | 28 | Neural CLAP processing, VST3, custom editor, sidechain foundation, off-callback inference, host latency, automation, overload fallback, then AUv3 and LV2 | Planned |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Planned |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
@@ -111,9 +111,22 @@ ceiling and all outputs retain no-clobber defaults. See
 [Deterministic restoration](docs/restoration.md).
 
 Stage 27 starts with the official URGENT BSRNN baseline because denoize already
-has a BSRNN frontend. Flow/diffusion models remain experimental and opt-in
+has a BSRNN frontend. The v0.75.0 implementation adds a dedicated Rust API,
+`denoize universal`, and Desktop workflow. Flow/diffusion models remain experimental and opt-in
 until human preference, ASR/phoneme fidelity, speaker similarity, language,
 age, accent, emotion, singing, whisper, and unseen-distortion gates all pass.
+The Stage 27 implementation accepts only signed package v2 BSRNN graphs whose
+48 kHz spectral tensor contract, source/checkpoint/training-data provenance,
+runtime resources, and numerical vectors authenticate before audio. Clean
+input bypasses inference; a private candidate must pass geometry, finite-value,
+energy, peak, clipping, silence-injection, and native-quality gates or the
+decoded input is published unchanged. Closed reports and exact RLE masks bind
+PCM, package, key, source, checkpoint, and mask digests without paths.
+Separately signed promotion evidence requires 20 protected strata, nine
+content/speaker/quality/output/performance metrics per stratum, and human
+listening evidence. No URGENT or UniPASE checkpoint is bundled until the full
+artifact-level training-data redistribution chain is resolved. See
+[Fail-closed universal speech restoration](docs/universal-restoration.md).
 
 Stages 28–31 depend on the v2 runtime contract. The audio callback may not
 allocate, block, load a model, perform filesystem or network I/O, or wait on

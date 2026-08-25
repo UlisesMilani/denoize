@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.74.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.75.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -17,6 +17,7 @@ USAGE:
     denoize assess <INPUT> [--analysis-seconds N] [--json|--pretty]
     denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
+    denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -71,7 +72,7 @@ OPTIONS:
         --true-peak <DBTP>    finite ceiling in -20..0 dBTP with --loudness (default: -1)
         --onnx-model <PATH>   waveform ONNX model (required for -b onnx)
         --onnx-rate <HZ>      model sample rate in 1..768000 Hz (default: 16000)
-        --model-package <PATH> signed custom-model runtime package (.dmp; -b onnx)
+        --model-package <PATH> signed runtime package (.dmp; -b onnx or bsrnn)
         --model-package-key <PATH> trusted Minisign public key for --model-package
         --channels <MODE>     independent|linked|mid-side (default: independent)
         --sgmse-profile <P>   fast|balanced|quality (default: balanced)
@@ -203,10 +204,46 @@ OPTIONS:
     -h, --help                          show this help
 ```
 
+## Fail-closed universal speech restoration
+
+```text
+USAGE:
+    denoize universal <INPUT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> [OPTIONS]
+    denoize universal evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Run fail-closed universal speech restoration through an authenticated BSRNN
+spectral package v2. The safe default is discriminative and primary. Clean
+input bypasses inference. A candidate is published only after geometry,
+finite-sample, energy, peak, clipping, silence-injection, and native-quality
+gates pass; otherwise OUTPUT contains the bit-exact decoded input.
+
+OPTIONS:
+        --model-package <PATH>            required signed runtime package v2
+        --model-package-key <PATH>        trusted Minisign public key
+        --family <FAMILY>                 discriminative|hybrid|generative
+        --render-role <ROLE>              primary|alternate
+        --experimental                    required for hybrid/generative alternate renders
+        --analysis-seconds <N>            bounded diagnosis prefix, 1..60 (default: 12)
+        --minimum-degradation-score <F>   inference threshold, 0..1 (default: 0.08)
+        --maximum-energy-gain-db <DB>     fail-closed candidate ceiling, 0..24 (default: 6)
+        --maximum-peak-gain-db <DB>       fail-closed peak-rise ceiling, 0..24 (default: 6)
+        --maximum-new-clipping-ratio <F>  added clipping ceiling, 0..0.1 (default: 0.0001)
+        --maximum-quality-regression <F>  native proxy regression ceiling, 0..25 (default: 5)
+        --accelerator <NAME>              cpu|auto|gpu|metal|cuda (default: cpu)
+        --report <PATH.json>              atomically write the closed report
+        --mask <PATH.json>                atomically write the complete RLE change mask
+        --max-memory <MB>                 bound decode, model, candidate, and mask memory
+        --no-metadata                     do not copy input metadata
+        --replace                         atomically replace output/report/mask destinations
+        --json                            emit compact report JSON
+        --pretty                          emit indented report JSON
+    -h, --help                            show this help
+```
+
 ## Watch-folder automation
 
 ```text
-denoize 0.74.0 watch-folder automation
+denoize 0.75.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
