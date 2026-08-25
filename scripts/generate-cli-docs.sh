@@ -49,6 +49,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" assess --help
   echo '```'
   echo
+  echo '## Deterministic audio restoration'
+  echo
+  echo '```text'
+  "$binary" restore --help
+  echo '```'
+  echo
   echo '## Watch-folder automation'
   echo
   echo '```text'

@@ -124,6 +124,12 @@ but not URLs, credentials, user paths, or health tokens. The raw token exists
 only in the immediate apply/startup-health report and the owner-private state
 needed to confirm a restart; it is never copied into durable diagnostics.
 
+## v0.74.0 compatibility gate
+
+This release accepts exact transitions from v0.72.0 and v0.73.0. Every one of
+the six application targets includes both authenticated offline rollback
+payloads and verifies them before candidate activation.
+
 ## v0.73.0 compatibility gate
 
 This release accepts exact transitions from v0.71.0 and v0.72.0. Every one of

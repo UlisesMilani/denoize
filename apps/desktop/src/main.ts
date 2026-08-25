@@ -313,6 +313,11 @@ type EvaluationComparisonReport = {
   schema: string; schema_version: number; baseline_version: string; candidate_version: string;
   environment_comparable: boolean; regressions: Array<Record<string, unknown>>; passed: boolean;
 };
+type DesktopRestorationResult = {
+  output: string | null;
+  report: Record<string, unknown>;
+  mask: Record<string, unknown>;
+};
 type WatchCycleReport = {
   observed: number; pending: number; attempted: number; succeeded: number;
   retrying: number; quarantined: number; superseded: number; scan_errors: number;
@@ -742,6 +747,27 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
       <section class="page" id="page-evaluation" role="tabpanel" aria-labelledby="nav-evaluation" aria-hidden="true">
         <div class="grid two-col">
           <div class="stack">
+            <article class="card">
+              <div class="card-heading"><div><span class="step">RESTORE</span><h2>決定的音声修復</h2></div><span class="hint">LOCAL · INSPECTABLE</span></div>
+              <p class="section-copy">クリップ、クリック、ハム、残響、風・破裂音を保守的に検出・修復し、完全な区間マスクと信頼度付きレポートを表示します。</p>
+              <div class="file-row"><div><label>修復入力</label><div id="restoration-input-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-restoration-input">選択</button></div>
+              <div class="file-row"><div><label>修復音声の保存先（適用時は必須）</label><div id="restoration-output-display" class="path empty">保存しない</div></div><div class="button-row"><button class="secondary" id="clear-restoration-output" disabled>解除</button><button class="secondary" id="choose-restoration-output">保存先</button></div></div>
+              <input type="hidden" id="restoration-input-path"><input type="hidden" id="restoration-output-path">
+              <div class="toggle-grid">
+                <label class="toggle"><input type="checkbox" data-restoration-operation="declip" checked><span></span><div><b>Declip</b><small>クリップ波形を制約付きで復元</small></div></label>
+                <label class="toggle"><input type="checkbox" data-restoration-operation="declick" checked><span></span><div><b>Declick</b><small>短いクリックを予測補間</small></div></label>
+                <label class="toggle"><input type="checkbox" data-restoration-operation="dehum" checked><span></span><div><b>Dehum</b><small>50/60 Hz 系の高調波を追跡</small></div></label>
+                <label class="toggle"><input type="checkbox" data-restoration-operation="dereverb" checked><span></span><div><b>WPE Dereverb</b><small>有限反復で後期残響を抑制</small></div></label>
+                <label class="toggle"><input type="checkbox" data-restoration-operation="wind-plosive" checked><span></span><div><b>Wind / Plosive</b><small>低域バーストだけを局所補正</small></div></label>
+              </div>
+              <div class="form-grid two"><label>WPEチャンネル処理<select id="restoration-wpe-channel-mode"><option value="independent">独立（各チャンネル）</option><option value="multichannel">多チャンネル</option></select></label><label class="toggle"><input id="restoration-detect-only" type="checkbox"><span></span><div><b>検出のみ</b><small>音声を書き換えずマスクを確認</small></div></label></div>
+              <div class="toggle-grid">
+                <label class="toggle"><input id="restoration-preserve-metadata" type="checkbox" checked><span></span><div><b>メタデータ保持</b><small>タグとアートワークをコピー</small></div></label>
+                <label class="toggle"><input id="restoration-replace" type="checkbox"><span></span><div><b>既存を上書き</b><small>未選択時は no-clobber</small></div></label>
+              </div>
+              <button class="primary wide" id="run-restoration">修復を実行</button>
+              <p class="field-hint">検出・置換範囲、信頼度、処理別のエネルギー差を評価結果へ表示します。検出のみでは保存先を省略できます。</p>
+            </article>
             <article class="card">
               <div class="card-heading"><div><span class="step">DIAGNOSE</span><h2>劣化診断・品質評価</h2></div><span class="hint">LOCAL · NO-REFERENCE</span></div>
               <p class="section-copy">先頭の有限区間を端末内で解析し、雑音、クリップ、ハム、クリック、残響、帯域、ドロップアウト、風雑音を信頼度付きで表示します。推定値だけで生成音声を採用しません。</p>
@@ -2834,6 +2860,64 @@ $("#choose-evaluation-output").addEventListener("click", async () => {
   if (path) setPath("#evaluation-output-path", "#evaluation-output-display", path);
 });
 
+$("#choose-restoration-input").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: audioFilters });
+  if (typeof path === "string") setPath("#restoration-input-path", "#restoration-input-display", path);
+});
+
+$("#choose-restoration-output").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "restored.wav", filters: audioFilters });
+  if (path) {
+    setPath("#restoration-output-path", "#restoration-output-display", path);
+    $<HTMLButtonElement>("#clear-restoration-output").disabled = false;
+  }
+});
+
+$("#clear-restoration-output").addEventListener("click", () => {
+  setPath("#restoration-output-path", "#restoration-output-display", null);
+  $("#restoration-output-display").textContent = tr("保存しない", "Do not save");
+  $<HTMLButtonElement>("#clear-restoration-output").disabled = true;
+});
+
+$("#run-restoration").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning
+    || !$("#stop-live").classList.contains("hidden")) {
+    return showToast(tr("別の処理が実行中です", "Another job is running"), true);
+  }
+  setEvaluationBusy(true);
+  try {
+    const input = evaluationPath("#restoration-input-path", tr("修復入力を選択してください", "Select an audio file to restore"));
+    const detectOnly = $<HTMLInputElement>("#restoration-detect-only").checked;
+    const output = $<HTMLInputElement>("#restoration-output-path").value || null;
+    if (!detectOnly && !output) {
+      throw new Error(tr("適用時は修復音声の保存先を選択してください", "Select a restored-audio destination when applying repairs"));
+    }
+    const operations = [...document.querySelectorAll<HTMLInputElement>("[data-restoration-operation]:checked")]
+      .map((element) => element.dataset.restorationOperation!);
+    if (operations.length === 0) {
+      throw new Error(tr("修復処理を1つ以上選択してください", "Select at least one restoration operation"));
+    }
+    const memoryRaw = $<HTMLInputElement>("#resource-process-memory").value;
+    const maxMemoryMb = memoryRaw ? Number(memoryRaw) : null;
+    const result = await invoke<DesktopRestorationResult>("restore_audio_input", { request: {
+      input,
+      output,
+      operations,
+      detectOnly,
+      maxMemoryMb,
+      preserveMetadata: $<HTMLInputElement>("#restoration-preserve-metadata").checked,
+      replace: $<HTMLInputElement>("#restoration-replace").checked,
+      wpeChannelMode: $<HTMLSelectElement>("#restoration-wpe-channel-mode").value,
+    } });
+    renderEvaluationResult(result);
+    showToast(detectOnly
+      ? tr("修復候補の検出と完全マスクの作成が完了しました", "Restoration detection and complete-mask generation completed")
+      : tr("音声修復と完全マスクの作成が完了しました", "Audio restoration and complete-mask generation completed"));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
 for (const [button, input, display] of [
   ["#choose-diagnostic-candidate", "#diagnostic-candidate-path", "#diagnostic-candidate-display"],
   ["#choose-diagnostic-baseline", "#diagnostic-baseline-path", "#diagnostic-baseline-display"],
@@ -2909,7 +2993,7 @@ function renderEvaluationResult(value: unknown) {
 
 function setEvaluationBusy(running: boolean) {
   evaluationRunning = running;
-  for (const selector of ["#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
+  for (const selector of ["#run-restoration", "#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
     $<HTMLButtonElement>(selector).disabled = running;
   }
 }

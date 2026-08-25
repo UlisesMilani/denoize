@@ -73,6 +73,9 @@ jobs:
       - name: Validate native diagnostic JSON contracts
         run: python3 scripts/test-diagnostic-schemas.py --denoize target/debug/denoize
 
+      - name: Validate deterministic restoration JSON contracts
+        run: python3 scripts/test-restoration-schemas.py
+
       - name: Run bounded deterministic resilience matrix
         env:
           DENOIZE_RESILIENCE_FEATURES: full
@@ -113,6 +116,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-application-update-manifest.py", encoding="utf-8").read(), "scripts/test-application-update-manifest.py", "exec")'
           python3 -c 'compile(open("scripts/test-diagnostic-schemas.py", encoding="utf-8").read(), "scripts/test-diagnostic-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do

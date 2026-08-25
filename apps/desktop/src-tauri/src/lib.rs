@@ -1097,6 +1097,27 @@ struct AssessmentRequest {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RestorationRequest {
+    input: String,
+    output: Option<String>,
+    operations: Vec<String>,
+    detect_only: bool,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    replace: bool,
+    wpe_channel_mode: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopRestorationResult {
+    output: Option<String>,
+    report: denoize::RestorationReport,
+    mask: denoize::RestorationMask,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EvaluationValidationRequest {
     manifest: String,
     corpus_root: String,
@@ -2007,6 +2028,120 @@ async fn assess_audio_inputs(
         })
         .await
         .map_err(|error| format!("品質評価タスクに失敗しました: {error}"))??,
+    )
+}
+
+fn desktop_restoration_config(
+    request: &RestorationRequest,
+) -> Result<denoize::RestorationConfig, String> {
+    let mut config = denoize::RestorationConfig::default();
+    config.mode = if request.detect_only {
+        denoize::RestorationMode::DetectOnly
+    } else {
+        denoize::RestorationMode::Apply
+    };
+    config.operations = request
+        .operations
+        .iter()
+        .map(|operation| match operation.as_str() {
+            "declip" => Ok(denoize::RestorationOperation::Declip),
+            "declick" => Ok(denoize::RestorationOperation::Declick),
+            "dehum" => Ok(denoize::RestorationOperation::Dehum),
+            "dereverb" => Ok(denoize::RestorationOperation::Dereverb),
+            "wind-plosive" => Ok(denoize::RestorationOperation::WindPlosive),
+            _ => Err(format!("不明な復元処理です: {operation}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    config.dereverb.channel_mode = match request.wpe_channel_mode.as_str() {
+        "independent" => denoize::WpeChannelMode::Independent,
+        "multichannel" => denoize::WpeChannelMode::Multichannel,
+        value => return Err(format!("不明なWPEチャンネルモードです: {value}")),
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn run_desktop_restoration(
+    request: RestorationRequest,
+) -> Result<DesktopRestorationResult, String> {
+    const MAX_DESKTOP_MASK_RUNS: usize = 200_000;
+    if request.input.trim().is_empty() {
+        return Err("復元する入力ファイルを選択してください".into());
+    }
+    if !request.detect_only && request.output.as_deref().is_none_or(str::is_empty) {
+        return Err("適用モードでは音声の保存先を選択してください".into());
+    }
+    let config = desktop_restoration_config(&request)?;
+    let input = Path::new(&request.input);
+    let output_path = request.output.as_deref().map(Path::new);
+    let mut paths = vec![("入力", input)];
+    if let Some(output) = output_path {
+        paths.push(("出力", output));
+        ensure_output_available(output, request.replace)?;
+    }
+    require_distinct_execution_paths(&paths)?;
+    let maximum = checked_desktop_mib(request.max_memory_mb, "プロセスメモリ上限")?;
+    let limits = DecodeLimits::new(
+        denoize::metadata_limits_for_available_memory(maximum),
+        maximum,
+    );
+    let mut input_session = denoize::AudioInputSession::open(input)?;
+    denoize::ensure_memory_limit(
+        denoize::estimate_session_memory_bytes(&input_session),
+        request.max_memory_mb,
+        "desktop restoration input preflight",
+    )?;
+    let audio = read_audio_from_session_with_limits(&mut input_session, limits)?;
+    let working_set = denoize::estimate_restoration_memory_bytes(&audio, &config);
+    denoize::ensure_memory_limit(
+        working_set,
+        request.max_memory_mb,
+        "desktop restoration working set",
+    )?;
+    let metadata = if output_path.is_some() && request.preserve_metadata {
+        input_session
+            .read_metadata_with_limits(desktop_retained_metadata_limits(maximum, working_set))?
+    } else {
+        None
+    };
+    let result = denoize::restore_audio(&audio, &config)?;
+    if result.mask.runs.len() > MAX_DESKTOP_MASK_RUNS {
+        return Err(format!(
+            "復元マスクがDesktop表示上限の{MAX_DESKTOP_MASK_RUNS} runsを超えました。CLIの--maskを使用してください"
+        ));
+    }
+    if let Some(output) = output_path {
+        let format = OutputFormat::from_path(output)?;
+        let encode = EncodeOptions::default();
+        encode.validate_options(format)?;
+        format.validate_config(&result.audio, &encode)?;
+        denoize::write_audio_transactional(
+            output,
+            &result.audio,
+            encode,
+            metadata,
+            if request.replace {
+                CommitMode::Replace
+            } else {
+                CommitMode::NoClobber
+            },
+        )?;
+    }
+    Ok(DesktopRestorationResult {
+        output: request.output,
+        report: result.report,
+        mask: result.mask,
+    })
+}
+
+#[tauri::command]
+async fn restore_audio_input(
+    request: RestorationRequest,
+) -> DesktopResult<DesktopRestorationResult> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || run_desktop_restoration(request))
+            .await
+            .map_err(|error| format!("決定的復元タスクに失敗しました: {error}"))??,
     )
 }
 
@@ -8967,6 +9102,7 @@ pub fn run() {
             recommend_settings,
             diagnose_audio_input,
             assess_audio_inputs,
+            restore_audio_input,
             plan_process,
             plan_batch,
             inspect_project_manifest,
@@ -9119,6 +9255,76 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn desktop_restoration_contract_is_closed_and_maps_explicit_operations() {
+        let request: RestorationRequest = serde_json::from_value(serde_json::json!({
+            "input": "recording.wav",
+            "output": null,
+            "operations": ["declip", "dereverb", "wind-plosive"],
+            "detectOnly": true,
+            "maxMemoryMb": 64,
+            "preserveMetadata": false,
+            "replace": false,
+            "wpeChannelMode": "multichannel"
+        }))
+        .unwrap();
+        let config = desktop_restoration_config(&request).unwrap();
+        assert_eq!(config.mode, denoize::RestorationMode::DetectOnly);
+        assert_eq!(
+            config.operations,
+            vec![
+                denoize::RestorationOperation::Declip,
+                denoize::RestorationOperation::Dereverb,
+                denoize::RestorationOperation::WindPlosive,
+            ]
+        );
+        assert_eq!(
+            config.dereverb.channel_mode,
+            denoize::WpeChannelMode::Multichannel
+        );
+
+        assert!(
+            serde_json::from_value::<RestorationRequest>(serde_json::json!({
+                "input": "recording.wav",
+                "output": null,
+                "operations": ["declick"],
+                "detectOnly": true,
+                "maxMemoryMb": null,
+                "preserveMetadata": false,
+                "replace": false,
+                "wpeChannelMode": "independent",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn desktop_restoration_rejects_invalid_configuration_before_file_io() {
+        let mut request = RestorationRequest {
+            input: "missing.wav".into(),
+            output: None,
+            operations: vec!["declick".into()],
+            detect_only: false,
+            max_memory_mb: None,
+            preserve_metadata: false,
+            replace: false,
+            wpe_channel_mode: "independent".into(),
+        };
+        assert!(run_desktop_restoration(request.clone())
+            .unwrap_err()
+            .contains("適用モードでは音声の保存先"));
+        request.detect_only = true;
+        request.operations.clear();
+        assert!(run_desktop_restoration(request.clone())
+            .unwrap_err()
+            .contains("between 1 and 5"));
+        request.operations = vec!["unknown".into()];
+        assert!(run_desktop_restoration(request)
+            .unwrap_err()
+            .contains("不明な復元処理"));
     }
 
     #[test]
