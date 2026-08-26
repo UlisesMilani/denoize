@@ -61,6 +61,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" universal --help
   echo '```'
   echo
+  echo '## Fail-closed target-speaker extraction'
+  echo
+  echo '```text'
+  "$binary" target-speaker --help
+  echo '```'
+  echo
   echo '## Watch-folder automation'
   echo
   echo '```text'

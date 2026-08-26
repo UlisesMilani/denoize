@@ -12,6 +12,8 @@ mod stream;
     feature = "gtcrn"
 ))]
 mod tract_runtime;
+#[cfg(feature = "onnx")]
+pub(crate) mod target_speaker;
 
 use std::path::PathBuf;
 

@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.76.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.77.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -18,6 +18,7 @@ USAGE:
     denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
+    denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -240,10 +241,46 @@ OPTIONS:
     -h, --help                            show this help
 ```
 
+## Fail-closed target-speaker extraction
+
+```text
+USAGE:
+    denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-speaker evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Run offline target-speaker extraction through a signed package v2 graph with
+mixture and enrollment inputs, extracted-audio output, and calibrated
+absent/uncertain/present probabilities. The exact package must also have
+accepted, signed promotion evidence covering REAL-T, TS-SUPERB, target absence,
+similar voices, enrollment mismatch, ASR, identity, leakage, and listening
+gates. Audio is published only for a confidently present target whose candidate
+passes every runtime gate. Absent, uncertain, and unsafe candidates publish no
+audio; they never fall back to the mixture or an unverified voice.
+
+OPTIONS:
+        --model-package <PATH>             required signed runtime package v2
+        --model-package-key <PATH>         trusted Minisign public key
+        --promotion-evidence <PATH>        accepted signed evaluation evidence
+        --promotion-evidence-key <PATH>    trusted Ed25519 evidence public key
+        --minimum-present-probability <F>  present threshold, 0.5..1 (default: 0.9)
+        --minimum-absent-probability <F>   absent threshold, 0.5..1 (default: 0.9)
+        --maximum-energy-gain-db <DB>      candidate energy-rise ceiling, 0..12 (default: 3)
+        --maximum-peak-gain-db <DB>        candidate peak-rise ceiling, 0..12 (default: 3)
+        --maximum-new-clipping-ratio <F>   added clipping ceiling, 0..0.01 (default: 0.0001)
+        --accelerator <NAME>               cpu|auto|gpu|metal|cuda (deterministic v1 uses CPU)
+        --report <PATH.json>               atomically write the closed path-free report
+        --max-memory <MB>                  bound decode, model, enrollment, and candidate memory
+        --no-metadata                      do not copy mixture metadata to accepted output
+        --replace                          atomically replace output/report destinations
+        --json                             emit compact report JSON
+        --pretty                           emit indented report JSON
+    -h, --help                             show this help
+```
+
 ## Watch-folder automation
 
 ```text
-denoize 0.76.0 watch-folder automation
+denoize 0.77.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

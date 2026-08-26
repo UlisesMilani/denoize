@@ -66,12 +66,22 @@ stop/rollback conditions behind this order are maintained in
 | 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
-| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and format-parity gates | CLAP foundation released in v0.76.0; format expansion planned |
-| 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Planned |
+| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP foundation released in v0.76.0; format expansion planned |
+| 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline implementation complete; v0.77.0 release pending; causal substage planned |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
 | 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Planned |
-| 10 | 33 | Stable C ABI, WASM, and mobile SDKs after runtime and processing ABI stabilization | Planned |
+| 10 | 33 | Stable C ABI, finite/live WASM, mobile SDKs, and optional Web Audio Module packaging after runtime and processing ABI stabilization | Planned |
+
+Post-roadmap candidates remain research-gated rather than silently extending the
+implementation commitment:
+
+| Candidate order | Capability | Status |
+|---:|---|---|
+| 34 | Bounded continuous speech separation and anonymous diarization into meeting speaker tracks, with optional Stage 29 enrollment mapping | Recommended after Stages 29, 31, and 32; artifact and privacy gates pending |
+| 35 | Music/general-audio restoration, beginning with mixture-preserving codec/bandwidth repair before opt-in dry-stem estimation | Recommended after Stage 33; exact checkpoint/training-data redistribution chain pending |
+| Watch | Semantic target-sound extraction by closed class/query | Target-absence, residual-conservation, licensing, and real-time gates pending |
+| Watch | Audio-visual target extraction | Consent, biometric retention, synchronization, occlusion/spoofing, and fallback design pending |
 
 Stage 24 publishes
 [denoize-diagnostic-v1](schemas/denoize-diagnostic-v1.schema.json) and
@@ -156,10 +166,55 @@ not imply untested host support:
 | Substage | Scope | Status |
 |---|---|---|
 | 28a | CLAP neural reference, shared scheduler/state/sidechain foundation | Released in v0.76.0 |
-| 28b | VST3 3.8 component/controller, buses, automation, latency restart, validator, packaging, and signed host matrix | Planned |
+| 28b | VST3 3.8 component/controller, buses, automation, latency restart, validator, packaging, and signed host matrix; compare a pinned CLAP wrapper with the official VST3 C API | Planned |
 | 28c | Accessible custom editor with generic-host fallback and UI-thread/lifecycle tests | Planned |
 | 28d | AUv3 sandbox/lifecycle/state/render parity and signed Apple host matrix | Planned |
 | 28e | LV2 worker/atom/state parity, validation, packaging, and Linux host matrix | Planned |
+
+Stage 29 now has a dedicated finite package-v2 adapter and is scheduled for
+v0.77.0. The graph must expose exactly one mixture input, one enrollment input,
+one same-length extracted-audio output, and calibrated
+`absent`/`uncertain`/`present` probabilities. Package bytes, graph semantics,
+runtime vectors, and separately signed promotion evidence are verified before
+either user audio file is decoded. Enrollment working buffers are zeroized
+immediately after inference and reports never contain its PCM, embedding,
+digest, or path.
+
+Only `accepted-present` publishes audio. Target absence, uncertainty, and any
+signal/evidence failure publish no file and never substitute the mixture or an
+unverified voice. The 22-stratum promotion matrix binds REAL-T and TS-SUPERB
+results and jointly gates ASR, SI-SDR, target/interferer similarity, word
+leakage, target activity, calibration, output integrity, DNSMOS-P808, and human
+preference. No upstream checkpoint is bundled because the artifact-level
+redistribution and complete protected-stratum evidence chain is not yet
+established. CLI and Desktop expose the same memory, no-clobber, metadata,
+accelerator, probability, energy, peak, and clipping boundary. See
+[Fail-closed target-speaker extraction](docs/target-speaker.md).
+
+The causal substage remains planned. It must be non-inferior to the offline
+matrix, use authenticated recurrent-state/reset vectors, measure effective
+latency at no more than 100 ms, suppress late/stale results, and pass the Stage
+28 real-time callback rules before consuming the reserved DAW reference port.
+
+Stage 30 retains a native delay tracker, partitioned frequency-domain adaptive
+filter, double-talk control, and conservative residual suppressor as the safe
+path. A causal neural post-filter may consume aligned microphone/reference,
+linear echo, and error signals only after package-v2 authentication. Release
+evidence covers positive/negative delay, independent clock drift, delay and room
+changes, nonlinear speakers, reference loss, near/far single talk, double talk,
+music, clipping, AECMOS/WAcc/listening, bounded reconvergence, single-thread
+RTF, and no more than 20 ms algorithmic-plus-buffering latency on the named
+reference system. ERLE is reported only in valid far-only regions.
+
+Stage 31 accepts array processing only with explicit channel roles and signed or
+typed coordinates; program stereo/surround is never inferred to be an array.
+Multichannel WPE plus conditioned mask-MVDR and reference-channel fallback form
+the inspectable baseline. SpatialNet/OnlineSpatialNet, DFSNet, DeFTAN-AA, and
+coordinate-aware models remain comparisons until exact weights and data terms
+clear the package gate. Evaluation permutes unseen geometries and channels,
+moving sources, bad channels, clock/gain/phase mismatch, real and simulated
+rooms, diffuse/directional noise, leakage, ASR, DOA/spatial-image error,
+resources, latency, and exact stereo bypass.
 
 Stages 28–31 depend on the v2 runtime contract. The audio callback may not
 allocate, block, load a model, perform filesystem or network I/O, or wait on
@@ -168,17 +223,26 @@ processing distinguishes microphone arrays from ordinary program stereo.
 Target-speaker enrollment audio is not retained by default.
 
 Stage 32 deliberately follows stable restoration chains so the project format
-does not encode provisional DSP semantics. Its C2PA export appends verifiable
-operation and model fingerprints without claiming that provenance assertions
-prove truth. Stage 33 follows runtime and
-timeline stabilization so exported ABI compatibility can be maintained rather
-than repeatedly broken.
+does not encode provisional DSP semantics. OTIO and ADM/BW64 are explicit,
+loss-reporting interchange adapters, not the executable effect graph. Its C2PA
+export appends verifiable operation and model fingerprints without claiming that
+provenance assertions prove truth. WAV/FLAC/M4A/MP3 may use a pinned Rust SDK
+carrier; Ogg/Opus remains detached until the specification's carrier has a
+merged, conformance-tested implementation.
 
-Music/general-audio restoration, unified audio foundation models, and
-audio-visual target extraction remain a documented research watchlist rather
-than committed stages. The current evidence, redistributable-weight status, or
-privacy/fidelity gates are not yet strong enough to place them ahead of Stages
-25–33; promotion conditions are recorded in
+Stage 33 follows runtime and timeline stabilization so exported ABI
+compatibility can be maintained rather than repeatedly broken. It ships in
+substage order: C ABI, scalar finite WASM, AudioWorklet streaming, Android/iOS,
+then optional Web Audio Module packaging. Browser code observes the actual
+render quantum (128 frames is only the Web Audio default), and mobile routes
+rebuild state after sample-rate, buffer, or channel changes.
+
+Meeting speaker tracks and music/general-audio restoration are the leading
+post-roadmap candidates. Semantic target-sound extraction, unified audio
+foundation models, and audio-visual target extraction remain a documented
+research watchlist rather than committed stages. The current evidence,
+redistributable-weight status, or privacy/fidelity gates are not yet strong
+enough to place them ahead of Stages 25–33; promotion conditions are recorded in
 [docs/restoration-research.md](docs/restoration-research.md).
 
 ## Investigation status

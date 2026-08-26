@@ -1120,6 +1120,7 @@ struct DesktopRestorationResult {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(not(feature = "full"), allow(dead_code))]
 struct UniversalRestorationRequest {
     input: String,
     output: String,
@@ -1146,6 +1147,35 @@ struct DesktopUniversalRestorationResult {
     output: String,
     report: denoize::UniversalRestorationReport,
     mask: denoize::UniversalRestorationMask,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(not(feature = "full"), allow(dead_code))]
+struct TargetSpeakerRequest {
+    mixture: String,
+    enrollment: String,
+    output: String,
+    model_package: String,
+    model_package_key: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    minimum_present_probability: f64,
+    minimum_absent_probability: f64,
+    maximum_energy_gain_db: f64,
+    maximum_peak_gain_db: f64,
+    maximum_new_clipping_ratio: f64,
+    accelerator: String,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    replace: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopTargetSpeakerResult {
+    output: Option<String>,
+    report: denoize::TargetSpeakerExtractionReport,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2177,6 +2207,7 @@ async fn restore_audio_input(
     )
 }
 
+#[cfg_attr(not(feature = "full"), allow(dead_code))]
 fn desktop_universal_restoration_config(
     request: &UniversalRestorationRequest,
 ) -> Result<denoize::UniversalRestorationConfig, String> {
@@ -2326,6 +2357,196 @@ async fn restore_universal_audio_input(
         tauri::async_runtime::spawn_blocking(move || run_desktop_universal_restoration(request))
             .await
             .map_err(|error| format!("汎用音声復元タスクに失敗しました: {error}"))??,
+    )
+}
+
+#[cfg_attr(not(feature = "full"), allow(dead_code))]
+fn desktop_target_speaker_config(
+    request: &TargetSpeakerRequest,
+) -> Result<denoize::TargetSpeakerExtractionConfig, String> {
+    let config = denoize::TargetSpeakerExtractionConfig {
+        minimum_present_probability: request.minimum_present_probability,
+        minimum_absent_probability: request.minimum_absent_probability,
+        maximum_energy_gain_db: request.maximum_energy_gain_db,
+        maximum_peak_gain_db: request.maximum_peak_gain_db,
+        maximum_new_clipping_ratio: request.maximum_new_clipping_ratio,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+#[cfg_attr(not(feature = "full"), allow(dead_code))]
+fn desktop_target_speaker_preflight(
+    request: &TargetSpeakerRequest,
+) -> Result<
+    (
+        denoize::TargetSpeakerExtractionConfig,
+        AcceleratorPreference,
+        Option<u64>,
+    ),
+    String,
+> {
+    for (value, label) in [
+        (&request.mixture, "対象話者抽出の混合音声"),
+        (&request.enrollment, "対象話者の登録音声"),
+        (&request.output, "対象話者音声の保存先"),
+        (&request.model_package, "署名付き対象話者モデルパッケージ"),
+        (&request.model_package_key, "モデルパッケージ公開鍵"),
+        (&request.promotion_evidence, "対象話者promotion evidence"),
+        (&request.promotion_evidence_key, "promotion evidence公開鍵"),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("{label}を選択してください"));
+        }
+    }
+    let config = desktop_target_speaker_config(request)?;
+    let accelerator = AcceleratorPreference::parse(&request.accelerator)
+        .ok_or_else(|| format!("不明なアクセラレータです: {}", request.accelerator))?;
+    let maximum = checked_desktop_mib(request.max_memory_mb, "プロセスメモリ上限")?;
+    require_distinct_execution_paths(&[
+        ("混合音声", Path::new(&request.mixture)),
+        ("登録音声", Path::new(&request.enrollment)),
+        ("出力", Path::new(&request.output)),
+        ("モデルパッケージ", Path::new(&request.model_package)),
+        ("モデル公開鍵", Path::new(&request.model_package_key)),
+        ("promotion evidence", Path::new(&request.promotion_evidence)),
+        (
+            "promotion evidence公開鍵",
+            Path::new(&request.promotion_evidence_key),
+        ),
+    ])?;
+    Ok((config, accelerator, maximum))
+}
+
+#[cfg(feature = "full")]
+fn run_desktop_target_speaker(
+    request: TargetSpeakerRequest,
+) -> Result<DesktopTargetSpeakerResult, String> {
+    use zeroize::Zeroize as _;
+
+    let (config, accelerator, maximum) = desktop_target_speaker_preflight(&request)?;
+
+    let mixture_path = Path::new(&request.mixture);
+    let enrollment_path = Path::new(&request.enrollment);
+    let output_path = Path::new(&request.output);
+    let package_path = Path::new(&request.model_package);
+    let package_key_path = Path::new(&request.model_package_key);
+    let evidence_path = Path::new(&request.promotion_evidence);
+    let evidence_key_path = Path::new(&request.promotion_evidence_key);
+    ensure_output_available(output_path, request.replace)?;
+
+    // Authenticate the complete package, graph contract, numerical vectors,
+    // and promotion claim before either biometric audio source is opened.
+    let evidence = denoize::SignedTargetSpeakerPromotionEvidence::from_file(evidence_path)?;
+    let evidence_key = ReceiptPublicKey::from_file(evidence_key_path)?;
+    let package = denoize::RuntimeModelPackage::open(package_path, package_key_path)?;
+    let session = denoize::TargetSpeakerSession::prepare(
+        package,
+        &evidence,
+        &evidence_key,
+        accelerator,
+    )?;
+    let model_working_set = session.model_working_set_bytes()?;
+    denoize::ensure_memory_limit(
+        model_working_set,
+        request.max_memory_mb,
+        "desktop target-speaker model working set",
+    )?;
+
+    let mut mixture_session = denoize::AudioInputSession::open(mixture_path)?;
+    let mut enrollment_session = denoize::AudioInputSession::open(enrollment_path)?;
+    let session_memory = denoize::estimate_session_memory_bytes(&mixture_session)
+        .saturating_add(denoize::estimate_session_memory_bytes(&enrollment_session));
+    denoize::ensure_memory_limit(
+        model_working_set.saturating_add(session_memory),
+        request.max_memory_mb,
+        "desktop target-speaker input/model preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(model_working_set)
+            .saturating_sub(session_memory)
+    });
+    let mixture = read_audio_from_session_with_limits(
+        &mut mixture_session,
+        DecodeLimits::new(
+            denoize::metadata_limits_for_available_memory(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let retained_mixture = denoize::estimate_audio_memory_bytes(&mixture);
+    let enrollment_maximum = decode_maximum.map(|limit| limit.saturating_sub(retained_mixture));
+    let mut enrollment = read_audio_from_session_with_limits(
+        &mut enrollment_session,
+        DecodeLimits::new(
+            denoize::metadata_limits_for_available_memory(enrollment_maximum),
+            enrollment_maximum,
+        ),
+    )?;
+    let working_set = denoize::estimate_target_speaker_memory_bytes(&mixture, &enrollment)
+        .saturating_add(model_working_set)
+        .saturating_add(session_memory);
+    if let Err(error) = denoize::ensure_memory_limit(
+        working_set,
+        request.max_memory_mb,
+        "desktop target-speaker decoded/model working set",
+    ) {
+        for channel in &mut enrollment.channels {
+            channel.zeroize();
+        }
+        return Err(error);
+    }
+    let result = session.extract(&mixture, enrollment, &config)?;
+    let output = if let Some(audio) = result.audio.as_ref() {
+        let format = OutputFormat::from_path(output_path)?;
+        let encode = EncodeOptions::default();
+        encode.validate_options(format)?;
+        format.validate_config(audio, &encode)?;
+        let metadata = if request.preserve_metadata {
+            mixture_session.read_metadata_with_limits(desktop_retained_metadata_limits(
+                maximum,
+                working_set,
+            ))?
+        } else {
+            None
+        };
+        denoize::write_audio_transactional(
+            output_path,
+            audio,
+            encode,
+            metadata,
+            if request.replace {
+                CommitMode::Replace
+            } else {
+                CommitMode::NoClobber
+            },
+        )?;
+        Some(request.output)
+    } else {
+        None
+    };
+    Ok(DesktopTargetSpeakerResult {
+        output,
+        report: result.report,
+    })
+}
+
+#[cfg(not(feature = "full"))]
+fn run_desktop_target_speaker(
+    request: TargetSpeakerRequest,
+) -> Result<DesktopTargetSpeakerResult, String> {
+    let _ = desktop_target_speaker_preflight(&request)?;
+    Err("このDesktopビルドでは対象話者抽出を利用できません".into())
+}
+
+#[tauri::command]
+async fn extract_target_speaker_audio(
+    request: TargetSpeakerRequest,
+) -> DesktopResult<DesktopTargetSpeakerResult> {
+    Ok(
+        tauri::async_runtime::spawn_blocking(move || run_desktop_target_speaker(request))
+            .await
+            .map_err(|error| format!("対象話者抽出タスクに失敗しました: {error}"))??,
     )
 }
 
@@ -9378,6 +9599,7 @@ pub fn run() {
             assess_audio_inputs,
             restore_audio_input,
             restore_universal_audio_input,
+            extract_target_speaker_audio,
             plan_process,
             plan_batch,
             inspect_project_manifest,
@@ -9698,6 +9920,92 @@ mod tests {
             .contains("analysis_seconds"));
     }
 
+    fn target_speaker_desktop_request() -> TargetSpeakerRequest {
+        TargetSpeakerRequest {
+            mixture: "missing-mixture.wav".into(),
+            enrollment: "missing-enrollment.wav".into(),
+            output: "target.wav".into(),
+            model_package: "target-speaker.dmp".into(),
+            model_package_key: "package.pub".into(),
+            promotion_evidence: "promotion.json".into(),
+            promotion_evidence_key: "evaluator.json".into(),
+            minimum_present_probability: 0.9,
+            minimum_absent_probability: 0.9,
+            maximum_energy_gain_db: 3.0,
+            maximum_peak_gain_db: 3.0,
+            maximum_new_clipping_ratio: 0.0001,
+            accelerator: "cpu".into(),
+            max_memory_mb: Some(256),
+            preserve_metadata: true,
+            replace: false,
+        }
+    }
+
+    #[test]
+    fn desktop_target_speaker_contract_is_closed_and_safe_by_default() {
+        let request: TargetSpeakerRequest = serde_json::from_value(serde_json::json!({
+            "mixture": "meeting.wav",
+            "enrollment": "enrollment.wav",
+            "output": "target.wav",
+            "modelPackage": "target-speaker.dmp",
+            "modelPackageKey": "package.pub",
+            "promotionEvidence": "promotion.json",
+            "promotionEvidenceKey": "evaluator.json",
+            "minimumPresentProbability": 0.9,
+            "minimumAbsentProbability": 0.9,
+            "maximumEnergyGainDb": 3.0,
+            "maximumPeakGainDb": 3.0,
+            "maximumNewClippingRatio": 0.0001,
+            "accelerator": "cpu",
+            "maxMemoryMb": 256,
+            "preserveMetadata": true,
+            "replace": false
+        }))
+        .unwrap();
+        let config = desktop_target_speaker_config(&request).unwrap();
+        assert_eq!(config.minimum_present_probability, 0.9);
+        assert_eq!(config.minimum_absent_probability, 0.9);
+        assert_eq!(config.maximum_energy_gain_db, 3.0);
+        assert_eq!(config.maximum_peak_gain_db, 3.0);
+        assert_eq!(config.maximum_new_clipping_ratio, 0.0001);
+
+        assert!(serde_json::from_value::<TargetSpeakerRequest>(serde_json::json!({
+            "mixture": "meeting.wav",
+            "enrollment": "enrollment.wav",
+            "output": "target.wav",
+            "modelPackage": "target-speaker.dmp",
+            "modelPackageKey": "package.pub",
+            "promotionEvidence": "promotion.json",
+            "promotionEvidenceKey": "evaluator.json",
+            "minimumPresentProbability": 0.9,
+            "minimumAbsentProbability": 0.9,
+            "maximumEnergyGainDb": 3.0,
+            "maximumPeakGainDb": 3.0,
+            "maximumNewClippingRatio": 0.0001,
+            "accelerator": "cpu",
+            "maxMemoryMb": null,
+            "preserveMetadata": true,
+            "replace": false,
+            "unexpected": true
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn desktop_target_speaker_rejects_invalid_config_before_file_io() {
+        let mut request = target_speaker_desktop_request();
+        request.minimum_present_probability = 0.49;
+        assert!(run_desktop_target_speaker(request)
+            .unwrap_err()
+            .contains("minimum_present_probability"));
+
+        let mut request = target_speaker_desktop_request();
+        request.enrollment = request.mixture.clone();
+        assert!(run_desktop_target_speaker(request)
+            .unwrap_err()
+            .contains("別のパス"));
+    }
+
     #[test]
     fn application_update_platform_tracks_the_packaged_bundle_type() {
         assert_eq!(
@@ -9819,7 +10127,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "7ebb51d1a202b04f2ede91a0b99022608422c63e9f1c34b4299b8a60d7510c8a";
+        "208849136433c25281efc45267050ede5afb6ef86e414ba59ad9927d7a9b2d88";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

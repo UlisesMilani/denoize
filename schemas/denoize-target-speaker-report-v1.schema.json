@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-target-speaker-report-v1.schema.json",
+  "title": "denoize fail-closed target-speaker extraction report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "network_accessed",
+    "deterministic",
+    "model",
+    "promotion_evidence",
+    "decision",
+    "model_invoked",
+    "candidate_accepted",
+    "output_published",
+    "candidate_retained",
+    "source_sample_rate",
+    "source_channels",
+    "source_frames",
+    "output_channels",
+    "output_frames",
+    "mixture_mixdown_policy",
+    "mixture_pcm_sha256",
+    "candidate_pcm_sha256",
+    "output_pcm_sha256",
+    "enrollment",
+    "presence",
+    "measurements",
+    "safety_gates",
+    "runtime_speaker_identity_verified",
+    "interferer_leakage_measured_at_runtime",
+    "limitations",
+    "warnings"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-target-speaker-report-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "network_accessed": { "const": false },
+    "deterministic": { "const": true },
+    "model": { "$ref": "#/$defs/model" },
+    "promotion_evidence": { "$ref": "#/$defs/evidence" },
+    "decision": {
+      "enum": ["accepted-present", "withheld-absent", "withheld-uncertain", "withheld-safety-gate"]
+    },
+    "model_invoked": { "const": true },
+    "candidate_accepted": { "type": "boolean" },
+    "output_published": { "type": "boolean" },
+    "candidate_retained": { "type": "boolean" },
+    "source_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "source_channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "source_frames": { "type": "integer", "minimum": 1 },
+    "output_channels": { "const": 1 },
+    "output_frames": {
+      "oneOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }]
+    },
+    "mixture_mixdown_policy": { "const": "arithmetic-mean-mono-v1" },
+    "mixture_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "candidate_pcm_sha256": { "$ref": "#/$defs/nullable_sha256" },
+    "output_pcm_sha256": { "$ref": "#/$defs/nullable_sha256" },
+    "enrollment": { "$ref": "#/$defs/enrollment" },
+    "presence": { "$ref": "#/$defs/presence" },
+    "measurements": { "$ref": "#/$defs/measurements" },
+    "safety_gates": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/gate" }
+    },
+    "runtime_speaker_identity_verified": { "const": false },
+    "interferer_leakage_measured_at_runtime": { "const": false },
+    "limitations": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "decision": { "const": "accepted-present" } } },
+      "then": {
+        "properties": {
+          "candidate_accepted": { "const": true },
+          "output_published": { "const": true },
+          "candidate_retained": { "const": true },
+          "output_frames": { "type": "integer", "minimum": 1 },
+          "candidate_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "output_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "presence": {
+            "allOf": [{ "$ref": "#/$defs/presence" }, { "properties": { "state": { "const": "present" } } }]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_accepted": { "const": false },
+          "output_published": { "const": false },
+          "candidate_retained": { "const": false },
+          "output_frames": { "type": "null" },
+          "candidate_pcm_sha256": { "type": "null" },
+          "output_pcm_sha256": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "withheld-absent" } } },
+      "then": { "properties": { "presence": { "allOf": [{ "$ref": "#/$defs/presence" }, { "properties": { "state": { "const": "absent" } } }] } } }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "withheld-uncertain" } } },
+      "then": { "properties": { "presence": { "allOf": [{ "$ref": "#/$defs/presence" }, { "properties": { "state": { "const": "uncertain" } } }] } } }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullable_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+    "id": { "type": "string", "pattern": "^[a-z0-9._+-]{1,256}$" },
+    "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+    "db": { "type": "number", "minimum": -240, "maximum": 240 },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_sha256", "public_key_sha256", "package_id", "package_revision",
+        "precision_profile", "source_revision", "source_sha256", "source_license_spdx",
+        "checkpoint_sha256", "checkpoint_license_spdx", "accelerator"
+      ],
+      "properties": {
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "public_key_sha256": { "$ref": "#/$defs/sha256" },
+        "package_id": { "$ref": "#/$defs/id" },
+        "package_revision": { "$ref": "#/$defs/id" },
+        "precision_profile": { "$ref": "#/$defs/id" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "accelerator": { "enum": ["cpu", "metal", "cuda"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signing_key_id", "corpus_manifest_sha256", "evaluation_result_sha256",
+        "real_t_result_sha256", "ts_superb_result_sha256", "strata",
+        "target_speakers", "interferer_speakers", "languages", "accepted"
+      ],
+      "properties": {
+        "signing_key_id": { "$ref": "#/$defs/sha256" },
+        "corpus_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "real_t_result_sha256": { "$ref": "#/$defs/sha256" },
+        "ts_superb_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": { "type": "integer", "minimum": 22, "maximum": 256 },
+        "target_speakers": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "interferer_speakers": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "languages": { "type": "integer", "minimum": 2, "maximum": 1000 },
+        "accepted": { "const": true }
+      }
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_sample_rate", "input_channels", "input_frames", "model_sample_rate",
+        "model_samples", "mixdown_policy", "raw_audio_retained", "embedding_retained",
+        "digest_recorded"
+      ],
+      "properties": {
+        "input_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "input_channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "input_frames": { "type": "integer", "minimum": 1 },
+        "model_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "model_samples": { "type": "integer", "minimum": 1 },
+        "mixdown_policy": { "const": "arithmetic-mean-mono-v1" },
+        "raw_audio_retained": { "const": false },
+        "embedding_retained": { "const": false },
+        "digest_recorded": { "const": false }
+      }
+    },
+    "presence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state", "absent_probability", "uncertain_probability", "present_probability",
+        "minimum_absent_probability", "minimum_present_probability"
+      ],
+      "properties": {
+        "state": { "enum": ["present", "absent", "uncertain"] },
+        "absent_probability": { "$ref": "#/$defs/probability" },
+        "uncertain_probability": { "$ref": "#/$defs/probability" },
+        "present_probability": { "$ref": "#/$defs/probability" },
+        "minimum_absent_probability": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "minimum_present_probability": { "type": "number", "minimum": 0.5, "maximum": 1 }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mixture_rms_dbfs", "candidate_rms_dbfs", "mixture_peak_dbfs",
+        "candidate_peak_dbfs", "energy_delta_db", "mixture_clipping_ratio",
+        "candidate_clipping_ratio"
+      ],
+      "properties": {
+        "mixture_rms_dbfs": { "$ref": "#/$defs/db" },
+        "candidate_rms_dbfs": { "$ref": "#/$defs/db" },
+        "mixture_peak_dbfs": { "$ref": "#/$defs/db" },
+        "candidate_peak_dbfs": { "$ref": "#/$defs/db" },
+        "energy_delta_db": { "$ref": "#/$defs/db" },
+        "mixture_clipping_ratio": { "$ref": "#/$defs/probability" },
+        "candidate_clipping_ratio": { "$ref": "#/$defs/probability" }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "observed", "limit", "passed"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "geometry", "finite-normalized-samples", "energy-gain", "peak-gain",
+            "new-clipping", "target-presence", "promotion-evidence"
+          ]
+        },
+        "observed": { "$ref": "#/$defs/db" },
+        "limit": { "$ref": "#/$defs/db" },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}

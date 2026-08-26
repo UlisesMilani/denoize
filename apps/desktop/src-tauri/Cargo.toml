@@ -1,6 +1,6 @@
 [package]
 name = "denoize-desktop"
-version = "0.76.0"
+version = "0.77.0"
 description = "Desktop interface for denoize"
 authors = ["denoize"]
 edition = "2021"
@@ -26,6 +26,7 @@ rayon = "1.11"
 sha2 = "0.10.9"
 fs2 = "0.4.3"
 tempfile = "3.27.0"
+zeroize = "1.8.2"
 tauri = { version = "2.11.5", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2.7.2"
 

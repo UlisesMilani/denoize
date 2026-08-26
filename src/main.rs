@@ -413,6 +413,7 @@ USAGE:
     denoize assess <BEFORE> <AFTER> [--analysis-seconds N] [--json|--pretty]
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
+    denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -6046,6 +6047,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("universal") {
         return run_universal(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("target-speaker") {
+        return run_target_speaker(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("receipts") {
         return run_receipts(&args[1..]);
     }
@@ -8822,6 +8826,559 @@ fn run_universal_audio(options: UniversalCliOptions) -> Result<(), String> {
 #[cfg(not(feature = "bsrnn"))]
 fn run_universal_audio(_options: UniversalCliOptions) -> Result<(), String> {
     Err("universal audio restoration requires a build with the bsrnn feature".into())
+}
+
+fn target_speaker_usage() -> &'static str {
+    "\
+USAGE:
+    denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-speaker evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Run offline target-speaker extraction through a signed package v2 graph with
+mixture and enrollment inputs, extracted-audio output, and calibrated
+absent/uncertain/present probabilities. The exact package must also have
+accepted, signed promotion evidence covering REAL-T, TS-SUPERB, target absence,
+similar voices, enrollment mismatch, ASR, identity, leakage, and listening
+gates. Audio is published only for a confidently present target whose candidate
+passes every runtime gate. Absent, uncertain, and unsafe candidates publish no
+audio; they never fall back to the mixture or an unverified voice.
+
+OPTIONS:
+        --model-package <PATH>             required signed runtime package v2
+        --model-package-key <PATH>         trusted Minisign public key
+        --promotion-evidence <PATH>        accepted signed evaluation evidence
+        --promotion-evidence-key <PATH>    trusted Ed25519 evidence public key
+        --minimum-present-probability <F>  present threshold, 0.5..1 (default: 0.9)
+        --minimum-absent-probability <F>   absent threshold, 0.5..1 (default: 0.9)
+        --maximum-energy-gain-db <DB>      candidate energy-rise ceiling, 0..12 (default: 3)
+        --maximum-peak-gain-db <DB>        candidate peak-rise ceiling, 0..12 (default: 3)
+        --maximum-new-clipping-ratio <F>   added clipping ceiling, 0..0.01 (default: 0.0001)
+        --accelerator <NAME>               cpu|auto|gpu|metal|cuda (deterministic v1 uses CPU)
+        --report <PATH.json>               atomically write the closed path-free report
+        --max-memory <MB>                  bound decode, model, enrollment, and candidate memory
+        --no-metadata                      do not copy mixture metadata to accepted output
+        --replace                          atomically replace output/report destinations
+        --json                             emit compact report JSON
+        --pretty                           emit indented report JSON
+    -h, --help                             show this help
+"
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+#[derive(Debug)]
+struct TargetSpeakerCliOptions {
+    mixture: String,
+    enrollment: String,
+    output: String,
+    package: String,
+    package_key: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    report: Option<String>,
+    config: denoize::TargetSpeakerExtractionConfig,
+    accelerator: AcceleratorPreference,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_target_speaker_args(args: &[String]) -> Result<TargetSpeakerCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut package = None;
+    let mut package_key = None;
+    let mut promotion_evidence = None;
+    let mut promotion_evidence_key = None;
+    let mut report = None;
+    let mut config = denoize::TargetSpeakerExtractionConfig::default();
+    let mut accelerator = AcceleratorPreference::Cpu;
+    let mut accelerator_seen = false;
+    let mut max_memory_mb = None;
+    let mut preserve_metadata = true;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut scalar_options = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--minimum-present-probability"
+                | "--minimum-absent-probability"
+                | "--maximum-energy-gain-db"
+                | "--maximum-peak-gain-db"
+                | "--maximum-new-clipping-ratio"
+        ) && !scalar_options.insert(argument)
+        {
+            return Err(format!("{argument} may be supplied only once"));
+        }
+        match argument {
+            "--model-package" if package.is_none() => {
+                package = Some(parse_value(args, &mut index, "--model-package")?);
+            }
+            "--model-package" => return Err("--model-package may be supplied only once".into()),
+            "--model-package-key" if package_key.is_none() => {
+                package_key = Some(parse_value(args, &mut index, "--model-package-key")?);
+            }
+            "--model-package-key" => {
+                return Err("--model-package-key may be supplied only once".into());
+            }
+            "--promotion-evidence" if promotion_evidence.is_none() => {
+                promotion_evidence = Some(parse_value(args, &mut index, "--promotion-evidence")?);
+            }
+            "--promotion-evidence" => {
+                return Err("--promotion-evidence may be supplied only once".into());
+            }
+            "--promotion-evidence-key" if promotion_evidence_key.is_none() => {
+                promotion_evidence_key = Some(parse_value(
+                    args,
+                    &mut index,
+                    "--promotion-evidence-key",
+                )?);
+            }
+            "--promotion-evidence-key" => {
+                return Err("--promotion-evidence-key may be supplied only once".into());
+            }
+            "--minimum-present-probability" => {
+                config.minimum_present_probability =
+                    parse_value(args, &mut index, "--minimum-present-probability")?;
+            }
+            "--minimum-absent-probability" => {
+                config.minimum_absent_probability =
+                    parse_value(args, &mut index, "--minimum-absent-probability")?;
+            }
+            "--maximum-energy-gain-db" => {
+                config.maximum_energy_gain_db =
+                    parse_value(args, &mut index, "--maximum-energy-gain-db")?;
+            }
+            "--maximum-peak-gain-db" => {
+                config.maximum_peak_gain_db =
+                    parse_value(args, &mut index, "--maximum-peak-gain-db")?;
+            }
+            "--maximum-new-clipping-ratio" => {
+                config.maximum_new_clipping_ratio =
+                    parse_value(args, &mut index, "--maximum-new-clipping-ratio")?;
+            }
+            "--accelerator" if !accelerator_seen => {
+                accelerator_seen = true;
+                let value: String = parse_value(args, &mut index, "--accelerator")?;
+                accelerator = AcceleratorPreference::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown target-speaker accelerator: {value} (expected cpu, auto, gpu, metal, or cuda)"
+                    )
+                })?;
+            }
+            "--accelerator" => return Err("--accelerator may be supplied only once".into()),
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--no-metadata" if preserve_metadata => preserve_metadata = false,
+            "--no-metadata" => return Err("--no-metadata may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("target-speaker accepts only one of --json or --pretty".into());
+            }
+            "-h" | "--help" => return Err("target-speaker help requested".into()),
+            "-" => {
+                return Err(
+                    "target-speaker extraction requires regular-file paths; stdin/stdout are unsupported"
+                        .into(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown target-speaker option: {value}"));
+            }
+            value => {
+                if positional.len() == 3 {
+                    return Err(format!("unexpected extra target-speaker argument: {value}"));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let mixture = positional
+        .first()
+        .cloned()
+        .ok_or("target-speaker requires MIXTURE")?;
+    let enrollment = positional
+        .get(1)
+        .cloned()
+        .ok_or("target-speaker requires ENROLLMENT")?;
+    let output = positional
+        .get(2)
+        .cloned()
+        .ok_or("target-speaker requires OUTPUT")?;
+    let package = package.ok_or("target-speaker requires --model-package")?;
+    let package_key = package_key.ok_or("target-speaker requires --model-package-key")?;
+    let promotion_evidence =
+        promotion_evidence.ok_or("target-speaker requires --promotion-evidence")?;
+    let promotion_evidence_key =
+        promotion_evidence_key.ok_or("target-speaker requires --promotion-evidence-key")?;
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    config.validate()?;
+    Ok(TargetSpeakerCliOptions {
+        mixture,
+        enrollment,
+        output,
+        package,
+        package_key,
+        promotion_evidence,
+        promotion_evidence_key,
+        report,
+        config,
+        accelerator,
+        max_memory_mb,
+        preserve_metadata,
+        commit_mode,
+        print_mode,
+    })
+}
+
+#[cfg(feature = "onnx")]
+fn validate_target_speaker_publication_paths(
+    options: &TargetSpeakerCliOptions,
+) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (&options.mixture, "target-speaker mixture"),
+        (&options.enrollment, "target-speaker enrollment"),
+        (&options.package, "target-speaker model package"),
+        (&options.package_key, "target-speaker model package key"),
+        (
+            &options.promotion_evidence,
+            "target-speaker promotion evidence",
+        ),
+        (
+            &options.promotion_evidence_key,
+            "target-speaker promotion evidence key",
+        ),
+    ] {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (Some(options.output.as_str()), "target-speaker audio output"),
+        (options.report.as_deref(), "target-speaker report"),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace a mixture, enrollment, package, evidence, or key"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+fn run_target_speaker(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("evidence") {
+        return run_target_speaker_evidence(&args[1..]);
+    }
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        if args.len() != 1 {
+            return Err("target-speaker --help accepts no other arguments".into());
+        }
+        print!("{}", target_speaker_usage());
+        return Ok(());
+    }
+    let options = parse_target_speaker_args(args)?;
+    #[cfg(feature = "onnx")]
+    {
+        validate_target_speaker_publication_paths(&options)?;
+        run_target_speaker_audio(options)
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        run_target_speaker_audio(options)
+    }
+}
+
+fn run_target_speaker_evidence(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", target_speaker_usage());
+        return Ok(());
+    }
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err("target-speaker evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]".into());
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("target-speaker evidence verify accepts only one output mode".into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown target-speaker evidence option: {value}"));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(
+            "target-speaker evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into(),
+        );
+    }
+    let evidence = denoize::SignedTargetSpeakerPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence).map_err(|error| format!(
+                "serialize target-speaker promotion evidence: {error}"
+            ))?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified target-speaker promotion evidence: package={}, strata={}, targets={}, interferers={}, languages={}, accepted={}",
+            evidence.payload.model_package_sha256,
+            evidence.payload.strata.len(),
+            evidence.payload.target_speaker_count,
+            evidence.payload.interferer_speaker_count,
+            evidence.payload.language_count,
+            evidence.payload.accepted
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err(
+            "target-speaker promotion evidence is authentic but does not pass promotion gates"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "onnx")]
+fn run_target_speaker_audio(options: TargetSpeakerCliOptions) -> Result<(), String> {
+    use zeroize::Zeroize as _;
+
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let evidence =
+        denoize::SignedTargetSpeakerPromotionEvidence::from_file(&options.promotion_evidence)?;
+    let evidence_key = ReceiptPublicKey::from_file(&options.promotion_evidence_key)?;
+    let package = RuntimeModelPackage::open(&options.package, &options.package_key)?;
+    // Session preparation authenticates the selected model bytes, graph tensor
+    // names/shapes, signed numerical vectors, and promotion evidence before
+    // either user-controlled audio source is opened.
+    let session = denoize::TargetSpeakerSession::prepare(
+        package,
+        &evidence,
+        &evidence_key,
+        options.accelerator,
+    )?;
+    let model_working_set = session.model_working_set_bytes()?;
+    ensure_memory_limit(
+        model_working_set,
+        options.max_memory_mb,
+        "target-speaker model working set",
+    )?;
+    let mut mixture_session = AudioInputSession::open(&options.mixture)?;
+    let mut enrollment_session = AudioInputSession::open(&options.enrollment)?;
+    let session_memory = estimate_session_memory_bytes(&mixture_session)
+        .saturating_add(estimate_session_memory_bytes(&enrollment_session));
+    ensure_memory_limit(
+        model_working_set.saturating_add(session_memory),
+        options.max_memory_mb,
+        "target-speaker input/model preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(model_working_set)
+            .saturating_sub(session_memory)
+    });
+    let mixture = read_audio_from_session_with_limits(
+        &mut mixture_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let retained_mixture = denoize::estimate_audio_memory_bytes(&mixture);
+    let enrollment_maximum = decode_maximum.map(|limit| limit.saturating_sub(retained_mixture));
+    let mut enrollment = read_audio_from_session_with_limits(
+        &mut enrollment_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(enrollment_maximum),
+            enrollment_maximum,
+        ),
+    )?;
+    let working_set = denoize::estimate_target_speaker_memory_bytes(&mixture, &enrollment)
+        .saturating_add(model_working_set)
+        .saturating_add(session_memory);
+    if let Err(error) = ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "target-speaker decoded/model working set",
+    ) {
+        for channel in &mut enrollment.channels {
+            channel.zeroize();
+        }
+        return Err(error);
+    }
+    let result = session.extract(&mixture, enrollment, &options.config)?;
+    let mut staged_report = options
+        .report
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.report))
+        .transpose()?;
+    if let Some(audio) = result.audio.as_ref() {
+        let format = OutputFormat::from_path(std::path::Path::new(&options.output))?;
+        let encode_options = EncodeOptions::default();
+        encode_options.validate_options(format)?;
+        format.validate_config(audio, &encode_options)?;
+        let metadata = if options.preserve_metadata {
+            mixture_session.read_metadata_with_limits(retained_metadata_limits(
+                options.max_memory_mb,
+                working_set,
+            )?)?
+        } else {
+            None
+        };
+        denoize::write_audio_transactional(
+            &options.output,
+            audio,
+            encode_options,
+            metadata,
+            options.commit_mode,
+        )?;
+    }
+    if let Some(report) = staged_report.take() {
+        report.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => {
+            println!(
+                "target-speaker extraction: decision={:?} presence={:?} published={} frames={} package={}",
+                result.report.decision,
+                result.report.presence.state,
+                result.report.output_published,
+                result.report.source_frames,
+                result.report.model.package_sha256
+            );
+            for warning in &result.report.warnings {
+                println!("warning: {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "onnx"))]
+fn run_target_speaker_audio(_options: TargetSpeakerCliOptions) -> Result<(), String> {
+    Err("target-speaker extraction requires a build with the onnx feature".into())
+}
+
+#[cfg(test)]
+mod target_speaker_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parser_requires_all_authenticated_inputs_without_opening_them() {
+        let base = ["mixture.wav", "enrollment.wav", "output.wav"];
+        let error = parse_target_speaker_args(&arguments(&base)).unwrap_err();
+        assert_eq!(error, "target-speaker requires --model-package");
+        let parsed = parse_target_speaker_args(&arguments(&[
+            "mixture.wav",
+            "enrollment.wav",
+            "output.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "evidence.pub.json",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.config.minimum_present_probability, 0.9);
+        assert_eq!(parsed.commit_mode, CommitMode::NoClobber);
+    }
+
+    #[test]
+    fn parser_rejects_weak_or_ambiguous_options() {
+        let common = [
+            "mixture.wav",
+            "enrollment.wav",
+            "output.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "evidence.pub.json",
+        ];
+        let mut weak = common.iter().map(|value| (*value).into()).collect::<Vec<String>>();
+        weak.extend(["--minimum-present-probability".into(), "0.2".into()]);
+        assert!(parse_target_speaker_args(&weak)
+            .unwrap_err()
+            .contains("0.5..=1"));
+        let mut modes = common.iter().map(|value| (*value).into()).collect::<Vec<String>>();
+        modes.extend(["--json".into(), "--pretty".into()]);
+        assert!(parse_target_speaker_args(&modes)
+            .unwrap_err()
+            .contains("only one"));
+    }
 }
 
 #[cfg(test)]
@@ -12383,7 +12940,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "7ebb51d1a202b04f2ede91a0b99022608422c63e9f1c34b4299b8a60d7510c8a";
+        "208849136433c25281efc45267050ede5afb6ef86e414ba59ad9927d7a9b2d88";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

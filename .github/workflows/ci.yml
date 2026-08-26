@@ -82,6 +82,9 @@ jobs:
       - name: Validate neural DAW JSON contracts
         run: python3 scripts/test-neural-daw-schemas.py --denoize target/debug/denoize
 
+      - name: Validate target-speaker JSON contracts
+        run: python3 scripts/test-target-speaker-schemas.py
+
       - name: Run bounded deterministic resilience matrix
         env:
           DENOIZE_RESILIENCE_FEATURES: full
@@ -125,6 +128,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do

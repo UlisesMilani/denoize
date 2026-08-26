@@ -158,6 +158,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
     "denoize-${package_version}/src/neural_daw.rs" \
+    "denoize-${package_version}/src/target_speaker.rs" \
+    "denoize-${package_version}/src/backend/target_speaker.rs" \
     "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/src/universal_restoration.rs" \
     "denoize-${package_version}/src/project.rs" \
@@ -170,6 +172,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/evaluation.md" \
     "denoize-${package_version}/docs/diagnostics.md" \
     "denoize-${package_version}/docs/neural-plugin.md" \
+    "denoize-${package_version}/docs/target-speaker.md" \
     "denoize-${package_version}/docs/projects.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/docs/restoration-research.md" \
@@ -228,6 +231,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-universal-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-universal-restoration-mask-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-universal-restoration-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-target-speaker-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-target-speaker-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-apply-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-bundle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-check-v1.schema.json" \
@@ -246,6 +251,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-universal-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-neural-daw-schemas.py" \
+    "denoize-${package_version}/scripts/test-target-speaker-schemas.py" \
     "denoize-${package_version}/scripts/test-runtime-model-package-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
