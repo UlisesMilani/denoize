@@ -81,7 +81,7 @@
     "artifacts": {
       "type": "array",
       "minItems": 18,
-      "maxItems": 18,
+      "maxItems": 22,
       "items": {
         "$ref": "#/$defs/artifact"
       }

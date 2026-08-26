@@ -1,0 +1,44 @@
+diff --git a/src/wrapasvst3_entry.cpp b/src/wrapasvst3_entry.cpp
+index 0f31ce6..bb35a39 100644
+--- a/src/wrapasvst3_entry.cpp
++++ b/src/wrapasvst3_entry.cpp
+@@ -71,6 +71,7 @@ struct CreationContext
+   PClassInfo2 classinfo;
+ };
+ 
++#if !STATICALLY_LINKED_CLAP_ENTRY
+ bool findPlugin(Clap::Library &lib, const std::string &pluginfilename)
+ {
+   auto parentfolder = os::getParentFolderName();
+@@ -120,6 +121,7 @@ bool findPlugin(Clap::Library &lib, const std::string &pluginfilename)
+ 
+   return false;
+ }
++#endif
+ 
+ /*
+     The Steinberg APIs retain 'COM compatibility' by flipping the first pair of ints
+@@ -157,6 +159,15 @@ IPluginFactory *GetPluginFactoryEntryPoint()
+ 
+   static std::vector<std::shared_ptr<CreationContext>> gCreationContexts;
+ 
++#if STATICALLY_LINKED_CLAP_ENTRY
++  // A self-contained denoize bundle must fail closed if its linked CLAP entry
++  // cannot initialize. It must never substitute a same-named user or system
++  // plug-in from a CLAP search path.
++  if (!gClapLibrary.hasEntryPoint() || !gClapLibrary._pluginFactory)
++  {
++    return nullptr;
++  }
++#else
+   // if there is no ClapLibrary yet
+   if (!gClapLibrary._pluginFactory)
+   {
+@@ -178,6 +189,7 @@ IPluginFactory *GetPluginFactoryEntryPoint()
+       LOGDETAIL("detected entrypoint in this binary");
+     }
+   }
++#endif
+   if (gClapLibrary.plugins.empty())
+   {
+     // with no plugins there is nothing to do..

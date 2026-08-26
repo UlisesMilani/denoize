@@ -43,6 +43,18 @@ expected_assets=(
   "denoize-plugin-${tag}-x86_64-pc-windows-msvc.zip.sha256"
   "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz"
   "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-vst3-${tag}-aarch64-apple-darwin.tar.gz"
+  "denoize-vst3-${tag}-aarch64-apple-darwin.tar.gz.sha256"
+  "denoize-vst3-${tag}-x86_64-apple-darwin.tar.gz"
+  "denoize-vst3-${tag}-x86_64-apple-darwin.tar.gz.sha256"
+  "denoize-vst3-${tag}-x86_64-pc-windows-msvc.zip"
+  "denoize-vst3-${tag}-x86_64-pc-windows-msvc.zip.sha256"
+  "denoize-vst3-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+  "denoize-vst3-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-vst3-host-matrix-v1.json"
+  "denoize-vst3-host-matrix-v1.sigstore.json"
+  "denoize-vst3-ardour-${tag}-x86_64-unknown-linux-gnu.txt"
+  "denoize-vst3-validator-${tag}-x86_64-unknown-linux-gnu.txt"
   "denoize_${version}_aarch64.app.tar.gz"
   "denoize_${version}_aarch64.app.tar.gz.sig"
   "denoize_${version}_aarch64.dmg"
@@ -87,6 +99,7 @@ expected_assets=(
   "denoize-job-status-v1.schema.json"
   "denoize-listening-result-v1.schema.json"
   "denoize-presentation-region-v1.schema.json"
+  "denoize-plugin-host-matrix-v1.schema.json"
   "denoize-project-batch-v1.schema.json"
   "denoize-project-bundle-import-v1.schema.json"
   "denoize-project-bundle-v1.schema.json"
@@ -238,6 +251,8 @@ gh release download "$tag" \
   --pattern '*.crate' \
   --pattern '*.sigstore.json' \
   --pattern '*.jsonl' \
+  --pattern 'denoize-vst3-ardour-*.txt' \
+  --pattern 'denoize-vst3-validator-*.txt' \
   --pattern 'denoize-model-catalog-v1.json' \
   --pattern 'denoize-model-trust-root-v1.json' \
   --pattern 'denoize-assessment-v1.schema.json' \
@@ -267,6 +282,7 @@ gh release download "$tag" \
   --pattern 'denoize-job-status-v1.schema.json' \
   --pattern 'denoize-listening-result-v1.schema.json' \
   --pattern 'denoize-presentation-region-v1.schema.json' \
+  --pattern 'denoize-plugin-host-matrix-v1.schema.json' \
   --pattern 'denoize-project-*.schema.json' \
   --pattern 'denoize-receipt-public-key-v1.schema.json' \
   --pattern 'denoize-receipt-secret-key-v1.schema.json' \
@@ -344,6 +360,7 @@ for schema in \
   denoize-job-status-v1.schema.json \
   denoize-listening-result-v1.schema.json \
   denoize-presentation-region-v1.schema.json \
+  denoize-plugin-host-matrix-v1.schema.json \
   denoize-project-batch-v1.schema.json \
   denoize-project-bundle-import-v1.schema.json \
   denoize-project-bundle-v1.schema.json \
@@ -389,6 +406,87 @@ for schema in \
   fi
   jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
     "$tmp_dir/$schema" >/dev/null
+done
+
+source_commit=$(git rev-parse HEAD)
+vst3_matrix="$tmp_dir/denoize-vst3-host-matrix-v1.json"
+vst3_report="$tmp_dir/denoize-vst3-validator-${tag}-x86_64-unknown-linux-gnu.txt"
+vst3_host_report="$tmp_dir/denoize-vst3-ardour-${tag}-x86_64-unknown-linux-gnu.txt"
+vst3_provenance="$tmp_dir/denoize-vst3-host-matrix-v1.sigstore.json"
+report_digest=$(sha256sum "$vst3_report" | cut -d' ' -f1)
+report_size=$(wc -c < "$vst3_report")
+host_report_digest=$(sha256sum "$vst3_host_report" | cut -d' ' -f1)
+host_report_size=$(wc -c < "$vst3_host_report")
+if ! jq -e \
+  --arg tag "$tag" \
+  --arg repository "$repo" \
+  --arg commit "$source_commit" \
+  --arg report_name "$(basename "$vst3_report")" \
+  --arg report_digest "$report_digest" \
+  --argjson report_size "$report_size" \
+  --arg host_report_name "$(basename "$vst3_host_report")" \
+  --arg host_report_digest "$host_report_digest" \
+  --argjson host_report_size "$host_report_size" '
+  .schema == "denoize-plugin-host-matrix-v1" and
+  .schema_version == 1 and
+  .tag == $tag and
+  .source.repository == $repository and
+  .source.commit == $commit and
+  .format == "vst3" and
+  .claims.official_validator == true and
+  .claims.real_host_smoke == true and
+  .claims.single_precision_audio == true and
+  .claims.double_precision_audio == false and
+  (.limitations | index("proprietary-hosts-not-exercised")) != null and
+  (.runs | length) == 2 and
+  .runs[0].status == "passed" and
+  .runs[0].evidence_kind == "official-validator" and
+  .runs[0].tests_passed == 94 and
+  .runs[0].tests_failed == 0 and
+  .runs[0].maximum_exercised_sample_rate_hz == 1234567.8 and
+  .runs[0].report.name == $report_name and
+  .runs[0].report.sha256 == $report_digest and
+  .runs[0].report.size_bytes == $report_size and
+  .runs[1].host == "Ardour" and
+  .runs[1].host_version == "8.4.0~ds1" and
+  .runs[1].operating_system == "ubuntu-24.04" and
+  .runs[1].architecture == "x86_64" and
+  .runs[1].evidence_kind == "real-host-smoke" and
+  .runs[1].status == "passed" and
+  .runs[1].tests_passed == 2 and
+  .runs[1].tests_failed == 0 and
+  .runs[1].maximum_exercised_sample_rate_hz == 48000 and
+  .runs[1].descriptors_exercised == 2 and
+  .runs[1].first_pass_frames > 0 and
+  .runs[1].restored_pass_frames > 0 and
+  .runs[1].state_reload == true and
+  .runs[1].teardown == true and
+  .runs[1].report.name == $host_report_name and
+  .runs[1].report.sha256 == $host_report_digest and
+  .runs[1].report.size_bytes == $host_report_size
+' "$vst3_matrix" >/dev/null; then
+  echo "VST3 host matrix does not bind the tagged validator and Ardour evidence" >&2
+  exit 1
+fi
+python3 - schemas/denoize-plugin-host-matrix-v1.schema.json "$vst3_matrix" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+document = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+Draft202012Validator(schema).validate(document)
+PY
+for vst3_subject in "$vst3_matrix" "$vst3_report" "$vst3_host_report"; do
+  gh attestation verify "$vst3_subject" \
+    --repo "$repo" \
+    --bundle "$vst3_provenance" \
+    --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
+    --source-digest "$source_commit" \
+    --source-ref "refs/tags/$tag" \
+    --signer-workflow "$repo/.github/workflows/release.yml" \
+    --deny-self-hosted-runners >/dev/null
 done
 
 cargo build --locked --no-default-features --bin denoize

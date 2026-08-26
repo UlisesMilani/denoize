@@ -100,6 +100,7 @@ impl StreamingBackendSession {
             denoiser,
             backend_options,
             accelerator,
+            false,
             #[cfg(feature = "gtcrn")]
             None,
         )
@@ -117,6 +118,74 @@ impl StreamingBackendSession {
         backend_options: BackendOptions,
         model: &super::gtcrn::GtcrnModel,
     ) -> Result<Self, String> {
+        Self::new_gtcrn_with_prepared_model_contract(
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            model,
+            false,
+        )
+    }
+
+    /// Construct the GTCRN stream at the wider, bounded DAW host-rate limit.
+    ///
+    /// This is format-neutral and retains the ordinary backend, resource, and
+    /// accelerator checks. Only file/offline sample-rate validation is
+    /// replaced by the plug-in host contract.
+    #[cfg(feature = "gtcrn")]
+    pub fn new_gtcrn_for_daw(
+        sample_rate: u32,
+        channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+    ) -> Result<Self, String> {
+        let backend = Backend::Gtcrn;
+        let accelerator = select_accelerator_for_options(backend, &backend_options)?;
+        Self::new_with_accelerator_inner(
+            backend,
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            accelerator,
+            true,
+            None,
+        )
+    }
+
+    /// Create a prepared GTCRN stream at the wider, bounded DAW host-rate limit.
+    ///
+    /// This is format-neutral and retains the ordinary backend, model,
+    /// resource, and accelerator checks. Only file/offline sample-rate
+    /// validation is replaced by the plug-in host contract.
+    #[cfg(feature = "gtcrn")]
+    pub fn new_gtcrn_for_daw_with_prepared_model(
+        sample_rate: u32,
+        channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+        model: &super::gtcrn::GtcrnModel,
+    ) -> Result<Self, String> {
+        Self::new_gtcrn_with_prepared_model_contract(
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            model,
+            true,
+        )
+    }
+
+    #[cfg(feature = "gtcrn")]
+    fn new_gtcrn_with_prepared_model_contract(
+        sample_rate: u32,
+        channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+        model: &super::gtcrn::GtcrnModel,
+        daw_host_rate: bool,
+    ) -> Result<Self, String> {
         let backend = Backend::Gtcrn;
         let accelerator = select_accelerator_for_options(backend, &backend_options)?;
         if model.runtime() != accelerator.effective() {
@@ -133,6 +202,7 @@ impl StreamingBackendSession {
             denoiser,
             backend_options,
             accelerator,
+            daw_host_rate,
             Some(model),
         )
     }
@@ -144,6 +214,7 @@ impl StreamingBackendSession {
         mut denoiser: DenoiserConfig,
         backend_options: BackendOptions,
         accelerator: AcceleratorSelection,
+        daw_host_rate: bool,
         #[cfg(feature = "gtcrn")] prepared_gtcrn: Option<&super::gtcrn::GtcrnModel>,
     ) -> Result<Self, String> {
         if channels == 0 || channels > MAX_STREAM_CHANNELS {
@@ -155,9 +226,15 @@ impl StreamingBackendSession {
             return Err("selected backend does not support stateful streaming".into());
         }
         denoiser.sample_rate = sample_rate;
-        denoiser
-            .validate_config()
-            .map_err(|error| error.to_string())?;
+        if daw_host_rate {
+            denoiser
+                .validate_daw_config()
+                .map_err(|error| error.to_string())?;
+        } else {
+            denoiser
+                .validate_config()
+                .map_err(|error| error.to_string())?;
+        }
         backend_options.validate_resolved_resources(backend)?;
         crate::hardware::validate_accelerator_selection(
             backend,

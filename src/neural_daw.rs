@@ -17,7 +17,7 @@ pub const NEURAL_DAW_MODEL_SHA256: &str =
 pub const NEURAL_DAW_CHUNK_MILLIS: u32 = 10;
 pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
 pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
-pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = 768_000;
+pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -277,7 +277,9 @@ mod tests {
         assert_eq!(neural_daw_latency_frames(44_100.5).unwrap(), 10_608);
         assert!(neural_daw_latency_frames(f64::NAN).is_err());
         assert!(neural_daw_latency_frames(0.0).is_err());
-        assert!(neural_daw_latency_frames(768_000.1).is_err());
+        assert_eq!(neural_daw_chunk_frames(1_234_567.8).unwrap(), 12_346);
+        assert_eq!(neural_daw_latency_frames(1_234_567.8).unwrap(), 296_304);
+        assert!(neural_daw_latency_frames(f64::from(NEURAL_DAW_MAX_SAMPLE_RATE) + 0.1).is_err());
     }
 
     #[test]

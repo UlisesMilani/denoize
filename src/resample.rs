@@ -3,7 +3,7 @@
 use rubato::{FftFixedIn, Resampler};
 
 use crate::audio::sanitize_sample;
-use crate::config::MAX_SAMPLE_RATE;
+use crate::config::MAX_HOST_SAMPLE_RATE;
 
 const CHUNK_FRAMES: usize = 1024;
 const SUB_CHUNKS: usize = 2;
@@ -387,9 +387,13 @@ pub fn resample_channels(
 }
 
 fn validate_sample_rates(from_rate: u32, to_rate: u32) -> Result<(), String> {
-    if from_rate == 0 || to_rate == 0 || from_rate > MAX_SAMPLE_RATE || to_rate > MAX_SAMPLE_RATE {
+    if from_rate == 0
+        || to_rate == 0
+        || from_rate > MAX_HOST_SAMPLE_RATE
+        || to_rate > MAX_HOST_SAMPLE_RATE
+    {
         return Err(format!(
-            "sample rates must be between 1 and {MAX_SAMPLE_RATE} Hz"
+            "sample rates must be between 1 and {MAX_HOST_SAMPLE_RATE} Hz"
         ));
     }
     Ok(())
@@ -766,14 +770,19 @@ mod tests {
 
     #[test]
     fn hostile_rate_and_capacity_plans_fail_without_allocating() {
-        assert!(resample(&[0.0], 48_000, MAX_SAMPLE_RATE + 1).is_err());
+        assert!(
+            validate_resampler_plan(1, MAX_HOST_SAMPLE_RATE, 48_000).is_ok(),
+            "the official VST3 validator boundary must have a bounded plan"
+        );
+        assert!(resample(&[0.0], 48_000, MAX_HOST_SAMPLE_RATE + 1).is_err());
         assert!(resample(&[], 0, 48_000).is_err());
-        assert!(validate_resampler_plan(usize::MAX, 1, MAX_SAMPLE_RATE).is_err());
+        assert!(validate_resampler_plan(usize::MAX, 1, MAX_HOST_SAMPLE_RATE).is_err());
         let tiny_many_channel_input = vec![vec![0.0]; 100];
-        let error = resample_channels(&tiny_many_channel_input, MAX_SAMPLE_RATE, 1).unwrap_err();
+        let error =
+            resample_channels(&tiny_many_channel_input, MAX_HOST_SAMPLE_RATE, 1).unwrap_err();
         assert!(error.contains("working set"), "unexpected error: {error}");
         if usize::BITS < 128 {
-            assert!(planned_output_frames(usize::MAX, 1, MAX_SAMPLE_RATE).is_err());
+            assert!(planned_output_frames(usize::MAX, 1, MAX_HOST_SAMPLE_RATE).is_err());
         }
     }
 }

@@ -1,0 +1,64 @@
+diff --git a/src/wrapasvst3.h b/src/wrapasvst3.h
+index adf68d0..e84b961 100644
+--- a/src/wrapasvst3.h
++++ b/src/wrapasvst3.h
+@@ -246,7 +246,7 @@ struct ClapAsVst3 : SingleComponentEffect,
+   OBJ_METHODS(ClapAsVst3, SingleComponentEffect)
+   DEFINE_INTERFACES
+   // dynamic interfaces
+-  if (::Steinberg::FUnknownPrivate::iidEqual(iid, IMidiMapping::iid))
++  if (::Steinberg::FUnknownPrivate::iidEqual(_iid, IMidiMapping::iid))
+   {
+     // when queried for the IMididMapping interface, check if the CLAP supports MIDI dialect on the MIDI Input busses and only return IMidiMapping then
+     if (_useIMidiMapping)
+@@ -254,28 +254,28 @@ struct ClapAsVst3 : SingleComponentEffect,
+       DEF_INTERFACE(IMidiMapping)
+     }
+   }
+-  if (::Steinberg::FUnknownPrivate::iidEqual(iid, IContextMenuTarget::iid))
++  if (::Steinberg::FUnknownPrivate::iidEqual(_iid, IContextMenuTarget::iid))
+   {
+     if (_plugin->_ext._contextmenu)
+     {
+       DEF_INTERFACE(IContextMenuTarget);
+     }
+   }
+-  if (::Steinberg::FUnknownPrivate::iidEqual(iid, IPlugInEntryPoint::iid))
++  if (::Steinberg::FUnknownPrivate::iidEqual(_iid, IPlugInEntryPoint::iid))
+   {
+     if (_plugin->_ext._ara)
+     {
+       DEF_INTERFACE(IPlugInEntryPoint)
+     }
+   }
+-  if (::Steinberg::FUnknownPrivate::iidEqual(iid, IPlugInEntryPoint2::iid))
++  if (::Steinberg::FUnknownPrivate::iidEqual(_iid, IPlugInEntryPoint2::iid))
+   {
+     if (_plugin->_ext._ara)
+     {
+       DEF_INTERFACE(IPlugInEntryPoint2)
+     }
+   }
+-  if (::Steinberg::FUnknownPrivate::iidEqual(iid, Presonus::IGainReductionInfo::iid))
++  if (::Steinberg::FUnknownPrivate::iidEqual(_iid, Presonus::IGainReductionInfo::iid))
+   {
+     if (_plugin->_ext._gainreduc)
+     {
+@@ -282,7 +282,7 @@ struct ClapAsVst3 : SingleComponentEffect,
+       DEF_INTERFACE(Presonus::IGainReductionInfo);
+     }
+   }
+-  if (::Steinberg::FUnknownPrivate::iidEqual(iid, Steinberg::Vst::ChannelContext::IInfoListener::iid))
++  if (::Steinberg::FUnknownPrivate::iidEqual(_iid, Steinberg::Vst::ChannelContext::IInfoListener::iid))
+   {
+     if (_plugin->_ext._trackinfo)
+     {
+@@ -291,7 +291,7 @@ struct ClapAsVst3 : SingleComponentEffect,
+ 
+   // add any other interfaces here:
+-  //if (::Steinberg::FUnknownPrivate::iidEqual(iid, IExampleSomething::iid))
++  //if (::Steinberg::FUnknownPrivate::iidEqual(_iid, IExampleSomething::iid))
+   //{
+   //  DEF_INTERFACE(IExampleSomething)
+   //}
+ 

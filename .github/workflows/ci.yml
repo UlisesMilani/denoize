@@ -108,17 +108,21 @@ jobs:
         run: |
           bash -n \
             scripts/build-offline-model-bundle.sh \
+            scripts/build-vst3-plugin.sh \
             scripts/generate-cli-docs.sh \
             scripts/package-clap-plugin.sh \
+            scripts/package-vst3-plugin.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
             scripts/test-evaluation-evidence.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
+            scripts/test-vst3-ardour-host.sh \
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \
-            scripts/verify-release-version.sh
+            scripts/verify-release-version.sh \
+            scripts/validate-vst3-plugin.sh
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
@@ -129,6 +133,8 @@ jobs:
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
+          python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -140,6 +146,7 @@ jobs:
         run: |
           python3 scripts/test-application-update-manifest.py
           python3 scripts/test-release-updater-metadata.py
+          python3 scripts/test-vst3-host-matrix.py
           bash scripts/test-release-evidence.sh
 
   clap-plugin:
@@ -238,6 +245,103 @@ jobs:
           tar -tzf "$output_dir/denoize-plugin-v9.8.7-aarch64-apple-darwin.tar.gz" \
             | grep -Fx 'denoize-plugin-v9.8.7-aarch64-apple-darwin/denoize.clap/Contents/Info.plist'
           unzip -t "$output_dir/denoize-plugin-v9.8.7-x86_64-pc-windows-msvc.zip"
+
+  vst3-plugin:
+    name: VST3 plug-in
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Install validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            ardour=1:8.4.0+ds1-2ubuntu8 \
+            libasound2-dev \
+            python3-jsonschema
+
+      - name: Install pinned neural model
+        env:
+          DENOIZE_MODEL_DIR: /tmp/denoize-vst3-models-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          cargo run --locked --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
+
+      - name: Build statically bound VST3 bundle
+        shell: bash
+        run: bash scripts/build-vst3-plugin.sh x86_64-unknown-linux-gnu
+
+      - name: Check VST3 linkage hardening
+        shell: bash
+        run: |
+          module=target/vst3-build/x86_64-unknown-linux-gnu/Release/denoize.vst3/Contents/x86_64-linux/denoize.so
+          test -s "$module"
+          nm -D "$module" | grep -Eq '[[:space:]]GetPluginFactory$'
+          nm -D "$module" | grep -Eq '[[:space:]]clap_entry$'
+          ldd "$module" | grep -Fq 'libopus.so.0'
+          if ldd "$module" | grep -Fq 'not found'; then
+            ldd "$module" >&2
+            exit 1
+          fi
+          readelf -W -l "$module" | awk '
+            /GNU_STACK/ { found = 1; if ($0 ~ /RWE/) exit 1 }
+            END { if (!found) exit 1 }
+          '
+          readelf -d "$module" | grep -Fq 'BIND_NOW'
+
+      - name: Validate both descriptors and exercise Ardour 8.4
+        shell: bash
+        env:
+          DENOIZE_MODEL_DIR: /tmp/denoize-vst3-models-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          report_dir=$(mktemp -d /tmp/denoize-vst3-report.XXXXXX)
+          bundle=target/vst3-build/x86_64-unknown-linux-gnu/Release/denoize.vst3
+          report="$report_dir/denoize-vst3-validator-v9.8.7-x86_64-unknown-linux-gnu.txt"
+          host_report="$report_dir/denoize-vst3-ardour-v9.8.7-x86_64-unknown-linux-gnu.txt"
+          bash scripts/validate-vst3-plugin.sh "$bundle" "$report" >/dev/null
+          bash scripts/test-vst3-ardour-host.sh "$bundle" "$host_report" >/dev/null
+          python3 scripts/generate-vst3-host-matrix.py \
+            --tag v9.8.7 \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --operating-system ubuntu-24.04 \
+            --architecture x86_64 \
+            --validator-report "$report" \
+            --real-host-report "$host_report" \
+            --output "$report_dir/denoize-vst3-host-matrix-v1.json"
+          python3 - "$report_dir/denoize-vst3-host-matrix-v1.json" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-plugin-host-matrix-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
+
+      - name: Test VST3 release archive layouts
+        shell: bash
+        run: |
+          output_dir=$(mktemp -d /tmp/denoize-vst3-package.XXXXXX)
+          bundle=target/vst3-build/x86_64-unknown-linux-gnu/Release/denoize.vst3
+          for target in \
+            x86_64-unknown-linux-gnu \
+            aarch64-apple-darwin \
+            x86_64-pc-windows-msvc; do
+            bash scripts/package-vst3-plugin.sh \
+              "$target" v9.8.7 "$output_dir" "$bundle"
+          done
+          tar -tzf "$output_dir/denoize-vst3-v9.8.7-x86_64-unknown-linux-gnu.tar.gz" \
+            | grep -Fq 'denoize.vst3/Contents/x86_64-linux/denoize.so'
+          tar -tzf "$output_dir/denoize-vst3-v9.8.7-aarch64-apple-darwin.tar.gz" \
+            | grep -Fq 'denoize.vst3/Contents/x86_64-linux/denoize.so'
+          unzip -t "$output_dir/denoize-vst3-v9.8.7-x86_64-pc-windows-msvc.zip"
 
   cli-docs:
     name: CLI documentation

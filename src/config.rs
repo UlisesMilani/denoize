@@ -9,6 +9,12 @@ pub const MIN_DENOISER_FRAME_SIZE: usize = 256;
 pub const MAX_DENOISER_FRAME_SIZE: usize = 65_536;
 /// Largest supported input sample rate.
 pub const MAX_SAMPLE_RATE: u32 = 768_000;
+/// Largest sample rate accepted at a plug-in host boundary.
+///
+/// This deliberately includes the VST3 3.8 validator's 1,234,567.8 Hz
+/// boundary. File decoding, encoding, and offline restoration retain the
+/// smaller [`MAX_SAMPLE_RATE`] limit.
+pub const MAX_HOST_SAMPLE_RATE: u32 = 1_234_568;
 /// Largest explicit leading-noise profile duration.
 pub const MAX_PROFILE_MS: f64 = 60_000.0;
 /// Largest supported Kaiser beta for externally supplied configurations.
@@ -87,7 +93,10 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidValue { field, expected } => {
-                write!(f, "invalid configuration field `{field}`: expected {expected}")
+                write!(
+                    f,
+                    "invalid configuration field `{field}`: expected {expected}"
+                )
             }
             Self::ResourceOverflow { resource } => {
                 write!(f, "resource plan overflow for `{resource}`")

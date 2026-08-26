@@ -111,8 +111,8 @@ pub use config::{ConfigError, ResourcePlan};
 pub use daw::{
     read_daw_preset, read_daw_session, write_daw_preset, write_daw_session, DawParameters,
     DawPortConfiguration, DawPreset, DawRealtimeParameters, DawRealtimeProcessor, DawSessionState,
-    DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY, DAW_PLUGIN_ID, DAW_PRESET_SCHEMA,
-    DAW_PRESET_SCHEMA_VERSION, DAW_SESSION_SCHEMA, DAW_SESSION_SCHEMA_VERSION,
+    DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY, DAW_MAX_SAMPLE_RATE, DAW_PLUGIN_ID,
+    DAW_PRESET_SCHEMA, DAW_PRESET_SCHEMA_VERSION, DAW_SESSION_SCHEMA, DAW_SESSION_SCHEMA_VERSION,
 };
 pub use decode::{
     decode_file, decode_file_from_session_with_limits, decode_file_with_limits,

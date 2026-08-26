@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-plugin-host-matrix-v1.schema.json",
+  "title": "denoize plug-in host matrix v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "tag",
+    "source",
+    "format",
+    "adapter",
+    "descriptors",
+    "runs",
+    "claims",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-plugin-host-matrix-v1" },
+    "schema_version": { "const": 1 },
+    "tag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "format": { "const": "vst3" },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "clap_wrapper", "clap_sdk", "vst3_sdk"],
+      "properties": {
+        "strategy": { "const": "statically-linked-clap-wrapper" },
+        "clap_wrapper": { "$ref": "#/$defs/dependency" },
+        "clap_sdk": { "$ref": "#/$defs/dependency" },
+        "vst3_sdk": { "$ref": "#/$defs/dependency" }
+      }
+    },
+    "descriptors": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/descriptor" }
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/run" }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "official_validator",
+        "real_host_smoke",
+        "single_precision_audio",
+        "double_precision_audio",
+        "custom_editor"
+      ],
+      "properties": {
+        "official_validator": { "type": "boolean" },
+        "real_host_smoke": { "type": "boolean" },
+        "single_precision_audio": { "type": "boolean" },
+        "double_precision_audio": { "type": "boolean" },
+        "custom_editor": { "type": "boolean" }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "custom-editor-not-present",
+          "double-precision-audio-not-supported-by-wrapper",
+          "proprietary-hosts-not-exercised",
+          "reference-input-reserved"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "commit"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "audio_inputs", "audio_outputs", "parameters"],
+      "properties": {
+        "id": {
+          "enum": [
+            "org.penguin425.denoize",
+            "org.penguin425.denoize.neural"
+          ]
+        },
+        "name": { "enum": ["denoize", "denoize Neural"] },
+        "audio_inputs": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "audio_outputs": { "const": 1 },
+        "parameters": { "type": "integer", "minimum": 4, "maximum": 7 }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 2097152 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "host_version",
+        "operating_system",
+        "architecture",
+        "evidence_kind",
+        "status",
+        "tests_passed",
+        "tests_failed",
+        "maximum_exercised_sample_rate_hz",
+        "report"
+      ],
+      "properties": {
+        "host": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "host_version": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+~-]{0,63}$"
+        },
+        "operating_system": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "architecture": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "evidence_kind": { "enum": ["official-validator", "real-host-smoke"] },
+        "status": { "enum": ["passed", "failed", "not-run"] },
+        "tests_passed": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "tests_failed": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "maximum_exercised_sample_rate_hz": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 1234568
+        },
+        "descriptors_exercised": { "const": 2 },
+        "first_pass_frames": { "type": "integer", "minimum": 1 },
+        "restored_pass_frames": { "type": "integer", "minimum": 1 },
+        "state_reload": { "const": true },
+        "teardown": { "const": true },
+        "report": { "$ref": "#/$defs/file" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "evidence_kind": { "const": "real-host-smoke" } },
+            "required": ["evidence_kind"]
+          },
+          "then": {
+            "required": [
+              "descriptors_exercised",
+              "first_pass_frames",
+              "restored_pass_frames",
+              "state_reload",
+              "teardown"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

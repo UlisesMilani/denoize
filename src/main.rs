@@ -12940,7 +12940,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "208849136433c25281efc45267050ede5afb6ef86e414ba59ad9927d7a9b2d88";
+        "5450b812c186e2262d3554c0ca3f6b361fab66eb09e054113a7638f18be3f690";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

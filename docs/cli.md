@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.77.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.78.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -280,7 +280,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.77.0 watch-folder automation
+denoize 0.78.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -687,7 +687,8 @@ capabilities, factory presets, fixed latency policy, and zero-allocation audio
 callback contract. `plugin latency` sends an f64 bypass impulse through the
 same processor, reports both the host frame count and measured first-output
 frame, and fails if they differ. It accepts every finite sample rate supported
-by CLAP validation up to 768 kHz.
+by the CLAP and VST3 host contracts through 1,234,568 Hz. File decoding and
+offline restoration retain their separate 768 kHz resource ceiling.
 
 Preset and session creation is no-clobber by default; `--replace` is explicit.
 Both readers accept only bounded regular non-symlink JSON files. Preset v1
