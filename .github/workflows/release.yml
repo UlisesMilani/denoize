@@ -282,6 +282,10 @@ jobs:
   plugin-build:
     name: CLAP ${{ matrix.target }}
     needs: prepare
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -303,6 +307,14 @@ jobs:
       - name: Check out tagged source
         # actions/checkout v6.
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Install embedded-editor host dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            dbus-x11 libxtst6 python3-jsonschema xvfb
 
       - name: Select release Rust
         shell: bash
@@ -398,6 +410,42 @@ jobs:
                 >/dev/null
           done
 
+      - name: Validate and bind embedded-editor host evidence
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          report="$RUNNER_TEMP/denoize-clap-editor-host-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
+          evidence="$RUNNER_TEMP/denoize-plugin-editor-evidence-v1.json"
+          bash scripts/test-clap-editor-host.sh \
+            target/${{ matrix.target }}/release/libdenoize_clap.so "$report" >/dev/null
+          python3 scripts/generate-plugin-editor-evidence.py \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --operating-system ubuntu-24.04 \
+            --architecture x86_64 \
+            --report "$report" \
+            --output "$evidence"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-plugin-editor-evidence-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
+
+      - name: Attest embedded-editor host evidence
+        if: runner.os == 'Linux'
+        id: attest-plugin-editor
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            ${{ runner.temp }}/denoize-plugin-editor-evidence-v1.json
+            ${{ runner.temp }}/denoize-clap-editor-host-${{ github.ref_name }}-${{ matrix.target }}.txt
+
       - name: Package CLAP plug-in
         shell: bash
         run: |
@@ -418,6 +466,20 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             denoize-plugin-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }} \
             denoize-plugin-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256 \
+            --clobber
+
+      - name: Upload signed embedded-editor host evidence
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          provenance="$RUNNER_TEMP/denoize-plugin-editor-evidence-v1.sigstore.json"
+          cp "${{ steps.attest-plugin-editor.outputs.bundle-path }}" "$provenance"
+          gh release upload "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/denoize-plugin-editor-evidence-v1.json" \
+            "$RUNNER_TEMP/denoize-clap-editor-host-${GITHUB_REF_NAME}-${{ matrix.target }}.txt" \
+            "$provenance" \
             --clobber
 
   vst3-build:
@@ -706,6 +768,7 @@ jobs:
           job_status_schema="$asset_dir/denoize-job-status-v1.schema.json"
           listening_result_schema="$asset_dir/denoize-listening-result-v1.schema.json"
           presentation_region_schema="$asset_dir/denoize-presentation-region-v1.schema.json"
+          plugin_editor_evidence_schema="$asset_dir/denoize-plugin-editor-evidence-v1.schema.json"
           plugin_host_matrix_schema="$asset_dir/denoize-plugin-host-matrix-v1.schema.json"
           recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
           release_evidence_schema="$asset_dir/denoize-release-evidence-v1.schema.json"
@@ -758,6 +821,7 @@ jobs:
           cp schemas/denoize-job-status-v1.schema.json "$job_status_schema"
           cp schemas/denoize-listening-result-v1.schema.json "$listening_result_schema"
           cp schemas/denoize-presentation-region-v1.schema.json "$presentation_region_schema"
+          cp schemas/denoize-plugin-editor-evidence-v1.schema.json "$plugin_editor_evidence_schema"
           cp schemas/denoize-plugin-host-matrix-v1.schema.json "$plugin_host_matrix_schema"
           for project_schema in schemas/denoize-project-*.schema.json; do
             cp "$project_schema" "$asset_dir/"
@@ -813,7 +877,7 @@ jobs:
             "$job_dry_run_schema" "$job_history_schema" "$job_status_schema" \
             "$listening_result_schema" \
             "$presentation_region_schema" \
-            "$plugin_host_matrix_schema" \
+            "$plugin_editor_evidence_schema" "$plugin_host_matrix_schema" \
             "$asset_dir"/denoize-project-*.schema.json \
             "$recommendation_schema" "$release_evidence_schema" \
             "$execution_plan_schema" "$stream_execution_plan_schema" \

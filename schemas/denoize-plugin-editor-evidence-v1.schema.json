@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-plugin-editor-evidence-v1.schema.json",
+  "title": "denoize plug-in editor evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "tag",
+    "source",
+    "editor",
+    "descriptors",
+    "run",
+    "claims",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-plugin-editor-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "tag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "editor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "embedding",
+        "window_api",
+        "baseview_commit",
+        "renderer",
+        "accessibility_core"
+      ],
+      "properties": {
+        "format": { "const": "clap" },
+        "embedding": { "const": "native-child-window" },
+        "window_api": { "const": "x11" },
+        "baseview_commit": {
+          "const": "aba6ad070828ba31174ae1e60c9b20d90d699e87"
+        },
+        "renderer": { "const": "softbuffer-0.4.8" },
+        "accessibility_core": { "const": "accesskit-0.24.1" }
+      }
+    },
+    "descriptors": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": { "$ref": "#/$defs/descriptor" }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "host_version",
+        "operating_system",
+        "architecture",
+        "display",
+        "descriptors_exercised",
+        "status",
+        "report"
+      ],
+      "properties": {
+        "host": { "const": "clack-host" },
+        "host_version": { "const": "0.1.1" },
+        "operating_system": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "architecture": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "display": { "const": "Xvfb/X11" },
+        "descriptors_exercised": { "const": 2 },
+        "status": { "const": "passed" },
+        "report": { "$ref": "#/$defs/file" }
+      }
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "custom_editor",
+        "native_embedded",
+        "host_parameter_automation",
+        "generic_parameter_fallback",
+        "lifecycle_contract",
+        "resize_contract"
+      ],
+      "properties": {
+        "custom_editor": { "const": true },
+        "native_embedded": { "const": true },
+        "host_parameter_automation": { "const": true },
+        "generic_parameter_fallback": { "const": true },
+        "lifecycle_contract": { "const": true },
+        "resize_contract": { "const": true }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "floating-window-not-supported",
+          "linux-x11-evidence-only",
+          "proprietary-hosts-not-exercised",
+          "wayland-custom-editor-not-supported"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "descriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "rendered_colors",
+        "automation_events",
+        "bypass_value",
+        "lifecycle",
+        "resize_contract"
+      ],
+      "properties": {
+        "id": {
+          "enum": [
+            "org.penguin425.denoize",
+            "org.penguin425.denoize.neural"
+          ]
+        },
+        "name": { "enum": ["denoize", "denoize Neural"] },
+        "rendered_colors": { "type": "integer", "minimum": 4 },
+        "automation_events": { "const": 3 },
+        "bypass_value": { "const": 1.0 },
+        "lifecycle": { "const": true },
+        "resize_contract": { "const": true }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 2097152 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

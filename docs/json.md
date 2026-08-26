@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes sixty-six versioned JSON contracts for local automation. Their
+denoize publishes sixty-eight versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -23,6 +23,13 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-daw-session-v1.schema.json`](../schemas/denoize-daw-session-v1.schema.json)
   describes the exact preset, channel layout, plug-in identity, and fixed
   latency policy needed for deterministic session restoration.
+- [`denoize-plugin-editor-evidence-v1.schema.json`](../schemas/denoize-plugin-editor-evidence-v1.schema.json)
+  binds the tagged CLAP custom-editor source, native embedding stack,
+  per-descriptor rendering/automation/lifecycle observations, real-host report,
+  and explicit platform limitations.
+- [`denoize-plugin-host-matrix-v1.schema.json`](../schemas/denoize-plugin-host-matrix-v1.schema.json)
+  binds the VST3 adapter revisions, validator and real-host runs, descriptor
+  geometry, evidence digests, supported claims, and untested host capabilities.
 - [`denoize-execution-plan-v1.schema.json`](../schemas/denoize-execution-plan-v1.schema.json)
   describes a deterministic, read-only finite-file or batch plan.
 - [`denoize-execution-plan-v2.schema.json`](../schemas/denoize-execution-plan-v2.schema.json)
@@ -205,6 +212,7 @@ authorization, admission, trust, or source-binding decisions. Diagnostic,
 assessment, deterministic and universal restoration reports and masks,
 universal promotion evidence, and both target-speaker contracts also reject
 unknown fields so a consumer cannot silently ignore a new safety dimension.
+Signed plug-in editor evidence and host matrices are closed for the same reason.
 
 ## Portable project contracts
 
