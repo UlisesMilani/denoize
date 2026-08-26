@@ -267,6 +267,97 @@ smoke matrices. RTNeural is useful evidence that compact recurrent inference can
 meet real-time systems constraints, not a substitute for measuring this graph
 ([RTNeural](https://arxiv.org/abs/2106.03037)).
 
+### Selected first deployment
+
+The v0.76 reference deployment is a second CLAP effect, `denoize Neural`
+(`org.penguin425.denoize.neural`), in the existing bundle. It does not change
+the identity or state of the deterministic DSP effect. The first graph is the
+official causal GTCRN streaming ONNX model at upstream revision
+`3862c44808dca492ea5a8a145d2dc2a1028d08c8`: 535,190 bytes, MIT-licensed, and
+fixed by SHA-256
+`b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87`.
+The upstream ICASSP 2024 implementation reports 48.2K parameters, 33 MMAC/s,
+and streaming RTF 0.07 on its reference CPU
+([GTCRN repository](https://github.com/Xiaobin-Rong/gtcrn),
+[poster](https://sigport.org/sites/default/files/docs/GTCRN_poster.pdf)). These
+figures select a candidate; they do not certify a DAW deadline, resampler,
+host-block pattern, or target machine.
+
+The graph is never embedded in or downloaded by a host process. A managed-model
+install records the source revision, artifact size and digest, and license;
+activation verifies that identity and creates the inference session on the
+permanent worker before it succeeds. Missing or redirected model storage,
+digest drift, graph-init failure, or unsupported channel geometry therefore
+fails activation instead of substituting another model.
+
+The public scheduler is `fixed-24x10ms-worker-v1`:
+`chunk_frames = ceil(host_sample_rate * 0.010)` and reported latency is twenty-
+four chunks. This is 10,584, 11,520, and 23,040 frames at 44.1, 48, and 96 kHz
+respectively (240 ms). CLAP carries sample rate as a floating-point value, so
+finite fractional rates use the same formula rather than being rejected; the
+integer-rate backend receives the nearest rate only for its resampling ratio.
+The callback owns a 40-block pool and bounded 16-block input/result queues. An
+absolute input-frame identity plus reset generation prevents late work from a
+previous transport/session from being replayed.
+
+The budget was selected from the complete shipped Rust path, not the upstream
+paper's isolated runtime. On the release profile used for artifacts, the pinned
+graph processed 100 consecutive 10 ms blocks in 567 ms in the reference build
+environment (RTF 0.567), while the first resampler/WOLA-aligned output became
+available only after the eleventh input block. A 120 ms prototype passed in the
+release profile but left roughly one scheduler quantum of start-up margin and
+failed under the less optimized test profile. Doubling the public budget to
+240 ms makes both profiles produce a complete exact-identity wet block in the
+real-time-paced gate while retaining delayed-dry behavior for slower machines.
+This measurement is release evidence for one machine, not a minimum-hardware
+guarantee; sustained RTF above one still invokes the declared fallback.
+
+The default overload result is latency-aligned dry audio. Users may explicitly
+select the last validated gain or silence; none of these choices lets the
+callback wait for a worker. Bypass is also latency-aligned so host delay
+compensation does not jump. Results containing non-finite values or peaks above
+the declared safety ceiling are invalidated. Mono and stereo are implemented;
+a typed reference sidechain is advertised but reserved until target-speaker or
+AEC semantics exist. Portable state is closed, capped, model/digest/latency
+bound, path-free, and atomically published without clobber by default.
+
+### Candidate and format watchlist
+
+CoFi-Lite is the strongest new efficiency comparison found in the July 2026
+search. Its paper reports 12.87M MAC/s, 83.12K parameters, and better reported
+speech-enhancement scores than GTCRN
+([CoFi-Lite](https://arxiv.org/abs/2607.10142)). It remains research-only until
+an official immutable graph, artifact-level license, training-data provenance,
+streaming-state semantics, numerical vectors, and adversarial/resource audit
+exist. A paper table alone is not sufficient authority to replace the pinned
+production graph.
+
+VST3 follows CLAP only after parity is measured. VST 3.8 is now MIT-licensed
+([Steinberg licensing](https://steinbergmedia.github.io/vst3_dev_portal/pages/VST%2B3%2BLicensing/Index.html),
+[3.8 announcement](https://www.steinberg.net/press/2025/vst-3-8/)), removing a
+historical distribution obstacle but not its engineering obligations. The
+adapter must implement component/controller state, sample-accurate parameter
+queues, bus negotiation and sidechains, dynamic latency restart, process-
+context requirements, validator coverage, signing, and real-host smoke tests;
+it must reuse the scheduler rather than run a second inference design. AUv3 and
+LV2 remain separate gates for lifecycle/sandbox and worker/atom semantics.
+
+A custom editor is also independent of the audio engine. It must stay on the
+host-approved UI thread, expose every control through host parameters, support
+keyboard navigation, scaling and accessible names, bound persisted UI state,
+and fall back completely to a host generic editor. No editor failure may affect
+activation, processing, state recovery, or automation.
+
+Release stops if any descriptor fails the official validator; activation or
+reset touches the network; the post-activation callback allocates, locks,
+performs I/O/logging/inference, or waits; an injected worker stall lengthens the
+callback path; the impulse differs from reported latency; reset permits stale
+audio; queue exhaustion lacks the selected fallback; state accepts unknown or
+mismatched model identity; the pinned real graph smoke test fails; or a release
+artifact cannot reproduce the exact model, state schema, validator report, and
+source revision. VST3/editor/AUv3/LV2 claims stay out of release status until
+their own equivalent matrices pass.
+
 ## Stage 29 — target-speaker extraction
 
 The v2 `enrollment` role supplies a bounded reference waveform or a derived

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-neural-daw-session-v1.schema.json",
+  "title": "denoize neural DAW session v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "schema_version",
+    "plugin_id",
+    "model_id",
+    "model_sha256",
+    "latency_policy",
+    "port_configuration",
+    "parameters"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-neural-daw-session-v1" },
+    "schema_version": { "const": 1 },
+    "plugin_id": { "const": "org.penguin425.denoize.neural" },
+    "model_id": { "const": "gtcrn-dns3" },
+    "model_sha256": {
+      "const": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+    },
+    "latency_policy": { "const": "fixed-24x10ms-worker-v1" },
+    "port_configuration": { "enum": ["mono", "stereo"] },
+    "parameters": {
+      "type": "object",
+      "required": ["bypass", "mix", "output_gain_db", "overload_fallback"],
+      "properties": {
+        "bypass": { "type": "boolean" },
+        "mix": { "type": "number", "minimum": 0, "maximum": 1 },
+        "output_gain_db": { "type": "number", "minimum": -24, "maximum": 24 },
+        "overload_fallback": {
+          "enum": ["delayed-dry", "last-safe-gain", "silence"]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

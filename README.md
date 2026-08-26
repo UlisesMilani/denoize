@@ -774,15 +774,15 @@ denoize long-noisy.flac long-clean.wav --stream --resume \
   --stream-frames 4096 --max-memory 64 --max-temp-space 8192
 ```
 
-## DAW plug-in
+## DAW plug-ins
 
-The first DAW integration is a CLAP audio effect with the stable plug-in ID
-`org.penguin425.denoize`. It supports mono and stereo ports, `f32` and `f64`
+The `denoize.clap` bundle exposes two effects with independent stable IDs. The
+fixed-memory DSP effect is `org.penguin425.denoize`. It supports mono and stereo
+ports, `f32` and `f64`
 audio, in-place and out-of-place buffers, sample-accurate automation, bypass,
 stereo linking, dry/wet mix, and output gain. Activation allocates all delay
 and DSP state up front. The audio callback performs no allocation, locking,
-filesystem or network I/O, or system calls. v0.68 uses host-rendered parameter
-controls; it does not yet provide a custom in-host editor.
+filesystem or network I/O, or system calls.
 
 The plug-in reports the fixed `fixed-10ms-v1` latency policy to the host. The
 exact frame count is `ceil(sample_rate * 0.010)`: 441 frames at 44.1 kHz, 480
@@ -800,6 +800,28 @@ denoize plugin session create speech.json session.json --stereo --pretty
 denoize plugin session validate session.json --json
 ```
 
+The model-backed effect is `denoize Neural`
+(`org.penguin425.denoize.neural`). Install the pinned managed `gtcrn-dns3`
+graph before a DAW activates it; the host process never downloads a model:
+
+```sh
+denoize models install gtcrn
+denoize plugin neural info --sample-rate 48000 --pretty
+denoize plugin neural latency --sample-rate 48000 --pretty
+denoize plugin neural session create neural.json --stereo --fallback delayed-dry --pretty
+denoize plugin neural session validate neural.json --json
+```
+
+Neural inference, graph preparation, resampling, and recurrent state run on one
+permanent worker. The callback only copies through preallocated blocks and
+bounded lock-free queues; it performs no model work, allocation, locks, waits,
+I/O, network access, or logging. Its fixed policy is
+`fixed-24x10ms-worker-v1`: `24 * ceil(sample_rate * 0.010)`, or 240 ms at
+ordinary rates. Finite fractional CLAP sample rates are supported. A late,
+invalid, or missing result uses latency-aligned dry audio by default; last-safe
+gain and silence require an explicit parameter choice. The advertised
+reference input is reserved for later typed target-speaker/AEC semantics.
+
 Portable presets use
 [`denoize-daw-preset-v1`](schemas/denoize-daw-preset-v1.schema.json). Complete
 session state uses
@@ -811,6 +833,13 @@ no-clobber as the default. CLAP host state serializes the same deterministic
 session document, so standalone files and DAW restoration cannot drift into
 separate state formats.
 
+Neural state uses
+[`denoize-neural-daw-session-v1`](schemas/denoize-neural-daw-session-v1.schema.json)
+and additionally binds the exact model ID, graph SHA-256, overload fallback,
+and scheduler policy. It is also path-free, closed, bounded, non-symlink, and
+atomically no-clobber. See [Neural DAW plug-in](docs/neural-plugin.md) for the
+scheduler, model trust boundary, state contract, evidence, and limitations.
+
 From a repository checkout, build a local plug-in with
 `cargo build --release -p denoize-clap`. On Linux,
 copy `target/release/libdenoize_clap.so` to `~/.clap/denoize.clap`. Tagged
@@ -818,8 +847,10 @@ releases provide ready-to-copy archives for Linux x86-64, macOS Intel and Apple
 Silicon, and Windows x86-64. macOS archives contain a complete
 `denoize.clap` bundle. After copying it to a standard CLAP directory, restart
 the DAW or run its plug-in rescan. CI and the tagged release workflow verify
-the plug-in with the pinned official CLAP validator 0.4.1: 44 tests, 36
-applicable passes, no failures or warnings, and 8 capability-based skips.
+both descriptors with the pinned official CLAP validator 0.4.1: 81 tests, 68
+applicable passes, no failures or warnings, and 13 capability-based skips.
+v0.76 uses host-rendered parameter controls; it does not claim a custom in-host
+editor or VST3/AUv3/LV2 support.
 
 ## Desktop app
 
@@ -887,11 +918,13 @@ model to be installed (or an explicit model path) and keeps one optimized graph
 with independent recurrent state per processed channel. Headphones help
 prevent acoustic feedback.
 
-The DAW plug-in page displays the exact reported and measured latency for a
-selected sample rate, loads the three factory presets, edits every stable
-parameter, and imports or atomically exports portable preset and deterministic
-session JSON. All validation and file publication remain in Rust; the WebView
-does not implement a second parser or state contract.
+The DAW plug-in page displays the exact reported and measured latency for both
+DSP and Neural effects at a selected sample rate. It also shows the pinned
+neural model/install state, bounded queue and overload policy, loads the three
+DSP factory presets, edits every stable DSP parameter, and imports or atomically
+exports portable preset and deterministic session JSON. All validation and file
+publication remain in Rust; the WebView does not implement a second parser or
+state contract.
 
 The Project page loads and validates source-bound manifests, selects a linear
 sample-accurate timeline, previews or saves its exact execution plan, assembles

@@ -64,6 +64,7 @@ pub mod loudness;
 pub mod metadata;
 pub mod model_package;
 pub mod models;
+pub mod neural_daw;
 pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
@@ -184,6 +185,14 @@ pub use model_package::{
     RuntimeModelTrainingDatasetContractV2, RUNTIME_MODEL_PACKAGE_SCHEMA,
     RUNTIME_MODEL_PACKAGE_SCHEMA_V2, RUNTIME_MODEL_PACKAGE_VERSION,
     RUNTIME_MODEL_PACKAGE_VERSION_V2,
+};
+pub use neural_daw::{
+    neural_daw_chunk_frames, neural_daw_latency_frames, neural_daw_latency_millis,
+    read_neural_daw_session, write_neural_daw_session, NeuralDawOverloadFallback,
+    NeuralDawParameters, NeuralDawPortConfiguration, NeuralDawSessionState,
+    NEURAL_DAW_CHUNK_MILLIS, NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_LATENCY_POLICY,
+    NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID,
+    NEURAL_DAW_SESSION_SCHEMA, NEURAL_DAW_SESSION_SCHEMA_VERSION,
 };
 pub use project::{
     assemble_project_timeline, build_project_bundle, import_project_bundle, inspect_project_bundle,

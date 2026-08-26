@@ -13,16 +13,18 @@ use denoize::metadata::MetadataLimits;
 use denoize::models::{ModelAuthentication, ModelDownloadOptions, ModelProxy};
 use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::{
-    AacEncoder, AcceleratorPreference, AtomicOutput, AudioStreamInfo, AudioStreamReader,
-    AudioStreamWriter, Backend, BackendOptions, BackendSession, ChannelMode, CommitMode,
-    DawPortConfiguration, DawPreset, DawRealtimeProcessor, DawSessionState, DecodeLimits,
-    DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
-    ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
-    PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
-    ReceiptVerificationReport, ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest,
-    SgmseProfile, SignedExecutionReceipt, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
-    StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob,
-    WatchProcessError, DAW_LATENCY_POLICY, DAW_PLUGIN_ID,
+    neural_daw_chunk_frames, neural_daw_latency_frames, neural_daw_latency_millis, AacEncoder,
+    AcceleratorPreference, AtomicOutput, AudioStreamInfo, AudioStreamReader, AudioStreamWriter,
+    Backend, BackendOptions, BackendSession, ChannelMode, CommitMode, DawPortConfiguration,
+    DawPreset, DawRealtimeProcessor, DawSessionState, DecodeLimits, DownmixMode, EncodeOptions,
+    ExecutionKind, ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, OnnxModelConfig,
+    OutputFormat, PlannedArtifact, PlannedOutput, PlannedResources, ReceiptItem, ReceiptPublicKey,
+    ReceiptSecretKey, ReceiptTrustPolicy, ReceiptVerificationReport, ResourceGovernor,
+    ResourceLimits, ResourcePermit, ResourceRequest, SgmseProfile, SignedExecutionReceipt,
+    StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool, StreamingBackendSession,
+    WatchCycleReport, WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError,
+    DAW_LATENCY_POLICY, DAW_PLUGIN_ID, NEURAL_DAW_LATENCY_POLICY, NEURAL_DAW_MODEL_ID,
+    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -5229,6 +5231,96 @@ fn daw_plugin_info(sample_rate: f64) -> DesktopResult<DawPluginInfo> {
     })
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NeuralDawPluginInfo {
+    plugin_id: &'static str,
+    version: &'static str,
+    format: &'static str,
+    backend: &'static str,
+    model_id: &'static str,
+    model_sha256: &'static str,
+    model_installed: bool,
+    latency_policy: &'static str,
+    sample_rate: f64,
+    chunk_frames: u32,
+    latency_frames: u32,
+    measured_latency_frames: u32,
+    matches_reported: bool,
+    latency_millis: f64,
+    port_configurations: [&'static str; 2],
+    reference_port: &'static str,
+    sample_formats: [&'static str; 2],
+    queue_blocks: u32,
+    block_pool: u32,
+    overload_fallbacks: [&'static str; 3],
+    realtime_allocations: u32,
+}
+
+#[tauri::command]
+fn neural_daw_plugin_info(sample_rate: f64) -> DesktopResult<NeuralDawPluginInfo> {
+    let chunk_frames = neural_daw_chunk_frames(sample_rate)?;
+    let latency_frames = neural_daw_latency_frames(sample_rate)?;
+    let mut delay = vec![0.0_f64; latency_frames as usize];
+    let mut cursor = 0usize;
+    let measured_latency_frames = (0..=latency_frames.saturating_add(1))
+        .find(|&frame| {
+            let input = if frame == 0 { 1.0 } else { 0.0 };
+            let delayed = delay[cursor];
+            delay[cursor] = input;
+            cursor += 1;
+            if cursor == delay.len() {
+                cursor = 0;
+            }
+            delayed != 0.0
+        })
+        .ok_or_else(|| {
+            DesktopError::new(
+                "operation.failed",
+                "neural DAW delayed-dry latency measurement produced no output",
+            )
+        })?;
+    if measured_latency_frames != latency_frames {
+        return Err(DesktopError::new(
+            "operation.failed",
+            format!(
+                "neural DAW measured latency {measured_latency_frames} frames differs from reported latency {latency_frames} frames"
+            ),
+        ));
+    }
+    let model_installed = denoize::models::MODELS
+        .iter()
+        .find(|model| {
+            model.name == NEURAL_DAW_MODEL_ID
+                && model.backend == "gtcrn"
+                && model.sha256 == NEURAL_DAW_MODEL_SHA256
+        })
+        .is_some_and(|model| denoize::models::verify(model).is_ok());
+    Ok(NeuralDawPluginInfo {
+        plugin_id: NEURAL_DAW_PLUGIN_ID,
+        version: env!("CARGO_PKG_VERSION"),
+        format: "CLAP",
+        backend: "gtcrn",
+        model_id: NEURAL_DAW_MODEL_ID,
+        model_sha256: NEURAL_DAW_MODEL_SHA256,
+        model_installed,
+        latency_policy: NEURAL_DAW_LATENCY_POLICY,
+        sample_rate,
+        chunk_frames,
+        latency_frames,
+        measured_latency_frames,
+        matches_reported: true,
+        latency_millis: neural_daw_latency_millis(sample_rate)?,
+        port_configurations: ["mono", "stereo"],
+        reference_port: "reserved-independent-input",
+        sample_formats: ["f32", "f64"],
+        queue_blocks: 16,
+        block_pool: 40,
+        overload_fallbacks: ["delayed-dry", "last-safe-gain", "silence"],
+        realtime_allocations: 0,
+    })
+}
+
 #[tauri::command]
 fn daw_factory_preset(factory: String) -> DesktopResult<DawPreset> {
     DawPreset::factory(&factory).ok_or_else(|| {
@@ -9340,6 +9432,7 @@ pub fn run() {
             confirm_application_update_startup,
             save_automation_snapshot,
             daw_plugin_info,
+            neural_daw_plugin_info,
             daw_factory_preset,
             import_daw_preset,
             export_daw_preset,
@@ -9661,6 +9754,15 @@ mod tests {
         assert!(info.matches_reported);
         assert_eq!(info.realtime_allocations, 0);
 
+        let neural = neural_daw_plugin_info(44_100.5).unwrap();
+        assert_eq!(neural.plugin_id, NEURAL_DAW_PLUGIN_ID);
+        assert_eq!(neural.model_id, NEURAL_DAW_MODEL_ID);
+        assert_eq!(neural.chunk_frames, 442);
+        assert_eq!(neural.latency_frames, 10_608);
+        assert_eq!(neural.measured_latency_frames, 10_608);
+        assert!(neural.matches_reported);
+        assert_eq!(neural.realtime_allocations, 0);
+
         let directory = tempfile::tempdir().unwrap();
         let preset_path = directory.path().join("studio.json");
         let session_path = directory.path().join("session.json");
@@ -9717,7 +9819,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "976b34c1ee4fa13ae4d9e428362b7cf41799efd1cf98be633d1f7fc4acf6f875";
+        "7ebb51d1a202b04f2ede91a0b99022608422c63e9f1c34b4299b8a60d7510c8a";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

@@ -79,6 +79,9 @@ jobs:
       - name: Validate universal restoration JSON contracts
         run: python3 scripts/test-universal-restoration-schemas.py
 
+      - name: Validate neural DAW JSON contracts
+        run: python3 scripts/test-neural-daw-schemas.py --denoize target/debug/denoize
+
       - name: Run bounded deterministic resilience matrix
         env:
           DENOIZE_RESILIENCE_FEATURES: full
@@ -121,6 +124,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -137,6 +141,8 @@ jobs:
   clap-plugin:
     name: CLAP plug-in
     runs-on: ubuntu-22.04
+    env:
+      DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-clap-models
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -148,7 +154,11 @@ jobs:
 
       - name: Test real-time and portable-state contracts
         run: |
+          cargo run --locked --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
           cargo test --locked -p denoize-clap
+          cargo test --locked --release -p denoize-clap \
+            neural::tests::pinned_gtcrn_release_worker_meets_sustained_deadlines -- --ignored --exact
           cargo test --locked --no-default-features --test daw_realtime_allocations
           cargo test --locked --no-default-features --test cli_daw_plugin
 
@@ -192,9 +202,9 @@ jobs:
             exit "$validator_status"
           fi
           jq -e '
-            (.results | length) == 44 and
-            ([.results[].status.code] | map(select(. == "success")) | length) == 36 and
-            ([.results[].status.code] | map(select(. == "skipped")) | length) == 8 and
+            (.results | length) == 81 and
+            ([.results[].status.code] | map(select(. == "success")) | length) == 68 and
+            ([.results[].status.code] | map(select(. == "skipped")) | length) == 13 and
             ([.results[].status.code] | all(. == "success" or . == "skipped"))
           ' "$validator_dir/report.json" >/dev/null
 

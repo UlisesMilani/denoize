@@ -1,10 +1,13 @@
 //! CLAP adapter for the allocation-free denoize DAW processing core.
 
+mod neural;
+
 use clack_extensions::audio_ports::*;
 use clack_extensions::audio_ports_config::*;
 use clack_extensions::latency::{PluginLatency, PluginLatencyImpl};
 use clack_extensions::params::*;
 use clack_extensions::state::{PluginState, PluginStateImpl};
+use clack_plugin::entry::prelude::*;
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
 use clack_plugin::process::audio::{ChannelPair, PairedChannels, SampleType};
@@ -722,7 +725,75 @@ fn write_channel<S: AudioSample>(channel: &mut ChannelPair<'_, S>, frame: usize,
     }
 }
 
-clack_plugin::clack_export_entry!(SinglePluginEntry<DenoizePlugin>);
+struct DenoizeEntry {
+    plugin_factory: PluginFactoryWrapper<DenoizeFactory>,
+}
+
+impl Entry for DenoizeEntry {
+    fn new(_plugin_path: Option<&CStr>) -> Result<Self, EntryLoadError> {
+        Ok(Self {
+            plugin_factory: PluginFactoryWrapper::new(DenoizeFactory::new()),
+        })
+    }
+
+    fn declare_factories<'a>(&'a self, builder: &mut EntryFactories<'a>) {
+        builder.register_factory(&self.plugin_factory);
+    }
+}
+
+struct DenoizeFactory {
+    realtime: PluginDescriptor,
+    neural: PluginDescriptor,
+}
+
+impl DenoizeFactory {
+    fn new() -> Self {
+        Self {
+            realtime: <DenoizePlugin as DefaultPluginFactory>::get_descriptor(),
+            neural: <neural::NeuralPlugin as DefaultPluginFactory>::get_descriptor(),
+        }
+    }
+}
+
+impl PluginFactoryImpl for DenoizeFactory {
+    fn plugin_count(&self) -> u32 {
+        2
+    }
+
+    fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
+        match index {
+            0 => Some(&self.realtime),
+            1 => Some(&self.neural),
+            _ => None,
+        }
+    }
+
+    fn create_plugin<'a>(
+        &'a self,
+        host_info: HostInfo<'a>,
+        plugin_id: &CStr,
+    ) -> Option<PluginInstance<'a>> {
+        if plugin_id == self.realtime.id().unwrap_or_default() {
+            Some(PluginInstance::new::<DenoizePlugin>(
+                host_info,
+                &self.realtime,
+                <DenoizePlugin as DefaultPluginFactory>::new_shared,
+                <DenoizePlugin as DefaultPluginFactory>::new_main_thread,
+            ))
+        } else if plugin_id == self.neural.id().unwrap_or_default() {
+            Some(PluginInstance::new::<neural::NeuralPlugin>(
+                host_info,
+                &self.neural,
+                <neural::NeuralPlugin as DefaultPluginFactory>::new_shared,
+                <neural::NeuralPlugin as DefaultPluginFactory>::new_main_thread,
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+clack_plugin::clack_export_entry!(DenoizeEntry);
 
 #[cfg(test)]
 mod tests {
@@ -756,6 +827,33 @@ mod tests {
         shared.restore(expected);
         assert_eq!(shared.parameters.snapshot(), expected);
         assert_eq!(shared.reset_generation.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn bundle_exposes_stable_realtime_and_neural_plugin_ids() {
+        let factory = DenoizeFactory::new();
+        assert_eq!(factory.plugin_count(), 2);
+        assert_eq!(
+            factory
+                .plugin_descriptor(0)
+                .unwrap()
+                .id()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            DAW_PLUGIN_ID
+        );
+        assert_eq!(
+            factory
+                .plugin_descriptor(1)
+                .unwrap()
+                .id()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            neural::NEURAL_PLUGIN_ID
+        );
+        assert!(factory.plugin_descriptor(2).is_none());
     }
 
     #[test]

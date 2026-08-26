@@ -80,6 +80,9 @@ jobs:
       - name: Validate universal restoration JSON contracts
         run: python3 scripts/test-universal-restoration-schemas.py
 
+      - name: Validate neural DAW JSON contracts
+        run: python3 scripts/test-neural-daw-schemas.py --denoize target/debug/denoize
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -113,6 +116,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-project-schemas.py", encoding="utf-8").read(), "scripts/test-project-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -267,6 +271,8 @@ jobs:
   plugin-build:
     name: CLAP ${{ matrix.target }}
     needs: prepare
+    env:
+      DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-clap-models
     strategy:
       fail-fast: false
       matrix:
@@ -299,6 +305,20 @@ jobs:
       - name: Build release CLAP plug-in
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}" -p denoize-clap
+
+      - name: Install pinned neural model for validation
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run --locked --release --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
+
+      - name: Exercise pinned neural model on the permanent worker
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo test --locked --release -p denoize-clap \
+            neural::tests::pinned_gtcrn_release_worker_meets_sustained_deadlines -- --ignored --exact
 
       - name: Validate tagged plug-in with official CLAP validator
         if: runner.os == 'Linux'
@@ -339,14 +359,20 @@ jobs:
             exit "$validator_status"
           fi
           jq -e '
-            (.results | length) == 44 and
-            ([.results[].status.code] | map(select(. == "success")) | length) == 36 and
-            ([.results[].status.code] | map(select(. == "skipped")) | length) == 8 and
+            (.results | length) == 81 and
+            ([.results[].status.code] | map(select(. == "success")) | length) == 68 and
+            ([.results[].status.code] | map(select(. == "skipped")) | length) == 13 and
             ([.results[].status.code] | all(. == "success" or . == "skipped"))
           ' "$validator_dir/report.json" >/dev/null
           for rate in 44100 48000 96000; do
             cargo run --locked --release --no-default-features --bin denoize -- \
               plugin latency --sample-rate "$rate" --json \
+              | jq -e '.matches_reported == true and .latency_frames == .measured_latency_frames' \
+                >/dev/null
+          done
+          for rate in 44100 44100.5 48000 96000; do
+            cargo run --locked --release --no-default-features --bin denoize -- \
+              plugin neural latency --sample-rate "$rate" --json \
               | jq -e '.matches_reported == true and .latency_frames == .measured_latency_frames' \
                 >/dev/null
           done
@@ -508,6 +534,7 @@ jobs:
           cli_schema="$asset_dir/denoize-cli-output-v1.schema.json"
           daw_preset_schema="$asset_dir/denoize-daw-preset-v1.schema.json"
           daw_session_schema="$asset_dir/denoize-daw-session-v1.schema.json"
+          neural_daw_session_schema="$asset_dir/denoize-neural-daw-session-v1.schema.json"
           diagnostic_schema="$asset_dir/denoize-diagnostic-v1.schema.json"
           hardware_schema="$asset_dir/denoize-hardware-v1.schema.json"
           ipc_capability_summary_schema="$asset_dir/denoize-ipc-capability-summary-v1.schema.json"
@@ -556,6 +583,7 @@ jobs:
           cp schemas/denoize-cli-output-v1.schema.json "$cli_schema"
           cp schemas/denoize-daw-preset-v1.schema.json "$daw_preset_schema"
           cp schemas/denoize-daw-session-v1.schema.json "$daw_session_schema"
+          cp schemas/denoize-neural-daw-session-v1.schema.json "$neural_daw_session_schema"
           cp schemas/denoize-diagnostic-v1.schema.json "$diagnostic_schema"
           cp schemas/denoize-hardware-v1.schema.json "$hardware_schema"
           cp schemas/denoize-ipc-capability-summary-v1.schema.json "$ipc_capability_summary_schema"
@@ -612,7 +640,8 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             "$asset" "$asset.sig" "$trust_asset" \
             "$automation_schema" "$assessment_schema" "$cli_schema" \
-            "$daw_preset_schema" "$daw_session_schema" "$diagnostic_schema" \
+            "$daw_preset_schema" "$daw_session_schema" "$neural_daw_session_schema" \
+            "$diagnostic_schema" \
             "$hardware_schema" \
             "$ipc_capability_summary_schema" "$ipc_capability_schema" \
             "$ipc_discovery_schema" "$ipc_request_schema" "$ipc_response_schema" \
@@ -811,7 +840,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.73.0 0.74.0)
+          rollback_versions=(0.74.0 0.75.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

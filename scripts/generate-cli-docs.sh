@@ -218,6 +218,16 @@ contains every stable parameter. Session v1 adds the plug-in identity,
 host snapshots use the same canonical session bytes, so file and host state
 round trips restore one deterministic contract.
 
+`denoize plugin neural info` reports the independent `denoize Neural` CLAP ID,
+pinned GTCRN model identity/install state, mono/stereo plus reserved reference
+ports, bounded worker queues, overload fallbacks, and the zero-work callback
+contract. `plugin neural latency` measures the latency-aligned dry impulse for
+the `fixed-24x10ms-worker-v1` policy, including finite fractional CLAP sample
+rates. Neural session v1 binds the exact model ID/SHA-256, port layout,
+parameters, fallback, and latency policy; it is closed, path-free, 64 KiB
+bounded, non-symlink, and no-clobber by default. The host process never
+downloads a model; install it beforehand with `denoize models install gtcrn`.
+
 ## Stable JSON automation
 
 `denoize models snapshot --json` emits one compact, network-free

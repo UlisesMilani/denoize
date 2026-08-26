@@ -26,19 +26,22 @@ use denoize::service::{self, BackendChoice, ProcessingOptions};
 use denoize::window::MAX_DENOISER_DPSS_NW;
 use denoize::AudioInputSession;
 use denoize::{
-    read_daw_preset, read_daw_session, verify_stream_output_file, write_daw_preset,
-    write_daw_session, AacEncoder, AcceleratorPreference, AcceleratorSelection, Algorithm,
-    AtomicOutput, AudioStreamWriter, Backend, BackendOptions, BackendSession, ChannelMode,
-    CommitMode, DawParameters, DawPortConfiguration, DawPreset, DawRealtimeProcessor,
-    DawSessionState, DownmixMode, EncodeOptions, ExecutionKind, ExecutionPlan, ExecutionPlanItem,
-    ExecutionReceiptPayload, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
-    PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
-    RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
-    ResourceRequest, RuntimeModelPackage, SgmseProfile, SignedExecutionReceipt,
-    SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
-    StreamSpoolLimits, StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig,
-    WatchFolderJob, WatchProcessError, WindowType, DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY,
-    DAW_PLUGIN_ID, WATCH_CYCLE_SCHEMA,
+    neural_daw_chunk_frames, neural_daw_latency_frames, neural_daw_latency_millis, read_daw_preset,
+    read_daw_session, read_neural_daw_session, verify_stream_output_file, write_daw_preset,
+    write_daw_session, write_neural_daw_session, AacEncoder, AcceleratorPreference,
+    AcceleratorSelection, Algorithm, AtomicOutput, AudioStreamWriter, Backend, BackendOptions,
+    BackendSession, ChannelMode, CommitMode, DawParameters, DawPortConfiguration, DawPreset,
+    DawRealtimeProcessor, DawSessionState, DownmixMode, EncodeOptions, ExecutionKind,
+    ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, NeuralDawOverloadFallback,
+    NeuralDawParameters, NeuralDawPortConfiguration, NeuralDawSessionState, OnnxModelConfig,
+    OutputFormat, PlannedArtifact, PlannedOutput, PlannedResources, ReceiptItem, ReceiptPublicKey,
+    ReceiptSecretKey, ReceiptTrustPolicy, RecommendationGoal, RecommendationOptions,
+    ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, RuntimeModelPackage,
+    SgmseProfile, SignedExecutionReceipt, SpooledAudioStreamWriter, StreamEncodeLimits,
+    StreamEncodeSpec, StreamPcmSpool, StreamSpoolLimits, StreamingBackendSession, WatchCycleReport,
+    WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError, WindowType,
+    DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY, DAW_PLUGIN_ID, NEURAL_DAW_LATENCY_POLICY,
+    NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, WATCH_CYCLE_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -3069,6 +3072,10 @@ fn plugin_usage() -> &'static str {
 USAGE:
     denoize plugin info [--json|--pretty]
     denoize plugin latency [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin neural info [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin neural latency [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin neural session create <OUTPUT.json> [OPTIONS]
+    denoize plugin neural session inspect|validate <SESSION.json> [--json|--pretty]
     denoize plugin preset create <speech|gentle|music> <OUTPUT.json> [OPTIONS]
     denoize plugin preset inspect|validate <PRESET.json> [--json|--pretty]
     denoize plugin session create <PRESET.json> <OUTPUT.json> [--mono|--stereo] [OPTIONS]
@@ -3091,8 +3098,17 @@ SESSION CREATE OPTIONS:
     --replace                 atomically replace an existing output
     --json|--pretty           print the created contract as JSON
 
+NEURAL SESSION CREATE OPTIONS:
+    --mono|--stereo           main and reserved-reference layout (default: stereo)
+    --mix <0..1>
+    --output-gain-db <-24..24>
+    --fallback <delayed-dry|last-safe-gain|silence>
+    --bypass|--no-bypass
+    --replace                 atomically replace an existing output
+    --json|--pretty           print the created contract as JSON
+
 CLAP state and these JSON contracts use the same stable parameter IDs, fixed
-10 ms latency policy, and deterministic compact serialization."
+latency policies, and deterministic compact serialization."
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3135,11 +3151,311 @@ fn run_plugin(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("info") => run_plugin_info(&args[1..]),
         Some("latency") => run_plugin_latency(&args[1..]),
+        Some("neural") => run_neural_plugin(&args[1..]),
         Some("preset") => run_plugin_preset(&args[1..]),
         Some("session") => run_plugin_session(&args[1..]),
         Some(command) => Err(format!("unknown plugin command: {command}")),
         None => Err("plugin requires a command (run `denoize plugin --help`)".into()),
     }
+}
+
+fn run_neural_plugin(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("info") => run_neural_plugin_info(&args[1..]),
+        Some("latency") => run_neural_plugin_latency(&args[1..]),
+        Some("session") => run_neural_plugin_session(&args[1..]),
+        Some(command) => Err(format!("unknown plugin neural command: {command}")),
+        None => Err("plugin neural requires info, latency, or session".into()),
+    }
+}
+
+fn parse_neural_sample_rate_output(
+    args: &[String],
+    command: &str,
+) -> Result<(f64, PluginOutputMode), String> {
+    let mut sample_rate = 48_000.0_f64;
+    let mut sample_rate_seen = false;
+    let mut output = PluginOutputMode::Human;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--sample-rate" if !sample_rate_seen => {
+                sample_rate_seen = true;
+                index += 1;
+                sample_rate = args
+                    .get(index)
+                    .ok_or_else(|| format!("{command} requires a value for --sample-rate"))?
+                    .parse::<f64>()
+                    .map_err(|error| format!("invalid --sample-rate: {error}"))?;
+            }
+            "--sample-rate" => {
+                return Err(format!("{command} accepts --sample-rate only once"));
+            }
+            "--json" if output == PluginOutputMode::Human => output = PluginOutputMode::Json,
+            "--pretty" if output == PluginOutputMode::Human => output = PluginOutputMode::Pretty,
+            "--json" | "--pretty" => {
+                return Err(format!("{command} accepts only one of --json or --pretty"));
+            }
+            option => return Err(format!("unknown {command} option: {option}")),
+        }
+        index += 1;
+    }
+    // Validate before any managed-model cache inspection.
+    neural_daw_chunk_frames(sample_rate)?;
+    Ok((sample_rate, output))
+}
+
+fn run_neural_plugin_info(args: &[String]) -> Result<(), String> {
+    let (sample_rate, output) = parse_neural_sample_rate_output(args, "plugin neural info")?;
+    let chunk_frames = neural_daw_chunk_frames(sample_rate)?;
+    let latency_frames = neural_daw_latency_frames(sample_rate)?;
+    let latency_millis = neural_daw_latency_millis(sample_rate)?;
+    let model_installed = denoize::models::MODELS
+        .iter()
+        .find(|model| {
+            model.name == NEURAL_DAW_MODEL_ID
+                && model.backend == "gtcrn"
+                && model.sha256 == NEURAL_DAW_MODEL_SHA256
+        })
+        .is_some_and(|model| denoize::models::verify(model).is_ok());
+    let report = serde_json::json!({
+        "schema": CLI_JSON_SCHEMA,
+        "schema_version": CLI_JSON_SCHEMA_VERSION,
+        "event": "plugin-neural-info",
+        "plugin_id": NEURAL_DAW_PLUGIN_ID,
+        "name": "denoize Neural",
+        "version": VERSION,
+        "format": "CLAP",
+        "backend": "gtcrn",
+        "model_id": NEURAL_DAW_MODEL_ID,
+        "model_sha256": NEURAL_DAW_MODEL_SHA256,
+        "model_installed": model_installed,
+        "port_configurations": ["mono", "stereo"],
+        "reference_port": "reserved-independent-input",
+        "sample_formats": ["f32", "f64"],
+        "sample_rate": sample_rate,
+        "chunk_frames": chunk_frames,
+        "latency_policy": NEURAL_DAW_LATENCY_POLICY,
+        "latency_frames": latency_frames,
+        "latency_millis": latency_millis,
+        "queue_blocks": 16,
+        "overload_fallbacks": ["delayed-dry", "last-safe-gain", "silence"],
+        "realtime_contract": {
+            "allocations": 0,
+            "locks": 0,
+            "file_io": false,
+            "network_io": false,
+            "logging": false,
+            "worker_waits": false,
+            "inference_on_callback": false
+        }
+    });
+    if output != PluginOutputMode::Human {
+        return print_plugin_json(&report, output);
+    }
+    println!("denoize Neural {VERSION} CLAP ({NEURAL_DAW_PLUGIN_ID})");
+    println!(
+        "model: {NEURAL_DAW_MODEL_ID} ({})",
+        if model_installed {
+            "verified"
+        } else {
+            "not installed; run `denoize models install gtcrn`"
+        }
+    );
+    println!("ports: mono/stereo main + reserved reference; samples: f32, f64");
+    println!(
+        "latency: {latency_frames} frames ({latency_millis:.6} ms at {sample_rate:.0} Hz; {NEURAL_DAW_LATENCY_POLICY})"
+    );
+    println!("audio callback: bounded lock-free queues; zero allocation, locks, I/O, logging, inference, or worker waits");
+    Ok(())
+}
+
+fn run_neural_plugin_latency(args: &[String]) -> Result<(), String> {
+    let (sample_rate, output) = parse_neural_sample_rate_output(args, "plugin neural latency")?;
+    let reported_frames = neural_daw_latency_frames(sample_rate)?;
+    let mut delay = vec![0.0_f64; reported_frames as usize];
+    let mut cursor = 0usize;
+    let mut measured_frames = None;
+    for frame in 0..=reported_frames.saturating_add(1) {
+        let input = if frame == 0 { 1.0 } else { 0.0 };
+        let delayed = delay[cursor];
+        delay[cursor] = input;
+        cursor += 1;
+        if cursor == delay.len() {
+            cursor = 0;
+        }
+        if delayed != 0.0 {
+            measured_frames = Some(frame);
+            break;
+        }
+    }
+    let measured_frames =
+        measured_frames.ok_or("neural DAW delayed-dry impulse measurement produced no output")?;
+    if measured_frames != reported_frames {
+        return Err(format!(
+            "neural DAW measured latency {measured_frames} differs from reported latency {reported_frames} frames"
+        ));
+    }
+    let report = serde_json::json!({
+        "schema": CLI_JSON_SCHEMA,
+        "schema_version": CLI_JSON_SCHEMA_VERSION,
+        "event": "plugin-neural-latency",
+        "plugin_id": NEURAL_DAW_PLUGIN_ID,
+        "latency_policy": NEURAL_DAW_LATENCY_POLICY,
+        "sample_rate": sample_rate,
+        "chunk_frames": neural_daw_chunk_frames(sample_rate)?,
+        "latency_frames": reported_frames,
+        "latency_millis": neural_daw_latency_millis(sample_rate)?,
+        "measured_latency_frames": measured_frames,
+        "matches_reported": true,
+        "measurement": "f64-delayed-dry-impulse-v1"
+    });
+    if output != PluginOutputMode::Human {
+        return print_plugin_json(&report, output);
+    }
+    println!(
+        "{sample_rate:.0} Hz: {reported_frames} frames ({:.6} ms; {NEURAL_DAW_LATENCY_POLICY})",
+        neural_daw_latency_millis(sample_rate)?
+    );
+    println!("measured delayed-dry impulse: {measured_frames} frames (matches reported)");
+    Ok(())
+}
+
+fn run_neural_plugin_session(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("create") => run_neural_plugin_session_create(&args[1..]),
+        Some("inspect") => run_neural_plugin_session_read(&args[1..], false),
+        Some("validate") => run_neural_plugin_session_read(&args[1..], true),
+        Some(command) => Err(format!("unknown plugin neural session command: {command}")),
+        None => Err("plugin neural session requires create, inspect, or validate".into()),
+    }
+}
+
+fn run_neural_plugin_session_create(args: &[String]) -> Result<(), String> {
+    let path = args
+        .first()
+        .ok_or("plugin neural session create requires OUTPUT.json")?;
+    let mut port_configuration = NeuralDawPortConfiguration::Stereo;
+    let mut parameters = NeuralDawParameters::default();
+    let mut mode = CommitMode::NoClobber;
+    let mut output = PluginOutputMode::Human;
+    let mut seen = BTreeSet::<&str>::new();
+    let mut index = 1usize;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let unique = matches!(
+            option,
+            "--mono"
+                | "--stereo"
+                | "--mix"
+                | "--output-gain-db"
+                | "--fallback"
+                | "--bypass"
+                | "--no-bypass"
+                | "--replace"
+        );
+        if unique && !seen.insert(option) {
+            return Err(format!("{option} may be supplied only once"));
+        }
+        match option {
+            "--mono" if !seen.contains("--stereo") => {
+                port_configuration = NeuralDawPortConfiguration::Mono
+            }
+            "--stereo" if !seen.contains("--mono") => {
+                port_configuration = NeuralDawPortConfiguration::Stereo
+            }
+            "--mono" | "--stereo" => {
+                return Err("neural session accepts only one of --mono or --stereo".into());
+            }
+            "--mix" => parameters.mix = plugin_number_value(args, &mut index, option)?,
+            "--output-gain-db" => {
+                parameters.output_gain_db = plugin_number_value(args, &mut index, option)?
+            }
+            "--fallback" => {
+                let value = plugin_option_value(args, &mut index, option)?;
+                parameters.overload_fallback = NeuralDawOverloadFallback::parse(&value)
+                    .ok_or("--fallback must be delayed-dry, last-safe-gain, or silence")?;
+            }
+            "--bypass" if !seen.contains("--no-bypass") => parameters.bypass = true,
+            "--no-bypass" if !seen.contains("--bypass") => parameters.bypass = false,
+            "--bypass" | "--no-bypass" => {
+                return Err("neural session accepts only one of --bypass or --no-bypass".into());
+            }
+            "--replace" => mode = CommitMode::Replace,
+            "--json" if output == PluginOutputMode::Human => output = PluginOutputMode::Json,
+            "--pretty" if output == PluginOutputMode::Human => output = PluginOutputMode::Pretty,
+            "--json" | "--pretty" => {
+                return Err("neural session accepts only one of --json or --pretty".into());
+            }
+            value => return Err(format!("unknown plugin neural session option: {value}")),
+        }
+        index += 1;
+    }
+    parameters.validate()?;
+    let state = NeuralDawSessionState::new(port_configuration, parameters)?;
+    write_neural_daw_session(path, &state, mode)?;
+    if output != PluginOutputMode::Human {
+        print_plugin_json(&state, output)
+    } else {
+        println!(
+            "created {:?} neural DAW session: {path}",
+            port_configuration
+        );
+        Ok(())
+    }
+}
+
+fn run_neural_plugin_session_read(args: &[String], validate: bool) -> Result<(), String> {
+    let path = args
+        .first()
+        .ok_or("plugin neural session inspect/validate requires SESSION.json")?;
+    let output = parse_plugin_output_mode(
+        &args[1..],
+        if validate {
+            "plugin neural session validate"
+        } else {
+            "plugin neural session inspect"
+        },
+    )?;
+    let state = read_neural_daw_session(path)?;
+    if output != PluginOutputMode::Human {
+        if validate {
+            return print_plugin_json(
+                &serde_json::json!({
+                    "schema": CLI_JSON_SCHEMA,
+                    "schema_version": CLI_JSON_SCHEMA_VERSION,
+                    "event": "plugin-neural-session-validation",
+                    "valid": true,
+                    "path": path,
+                    "plugin_id": state.plugin_id,
+                    "model_id": state.model_id,
+                    "model_sha256": state.model_sha256,
+                    "port_configuration": state.port_configuration,
+                    "latency_policy": state.latency_policy
+                }),
+                output,
+            );
+        }
+        return print_plugin_json(&state, output);
+    }
+    if validate {
+        println!("valid neural DAW session: {path}");
+    } else {
+        println!("plugin: {}", state.plugin_id);
+        println!("model: {} ({})", state.model_id, state.model_sha256);
+        println!(
+            "ports: {:?}; latency: {}",
+            state.port_configuration, state.latency_policy
+        );
+        println!(
+            "bypass={} mix={:.3} output={:.1} dB fallback={:?}",
+            state.parameters.bypass,
+            state.parameters.mix,
+            state.parameters.output_gain_db,
+            state.parameters.overload_fallback
+        );
+    }
+    Ok(())
 }
 
 fn run_plugin_info(args: &[String]) -> Result<(), String> {
@@ -12067,7 +12383,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "976b34c1ee4fa13ae4d9e428362b7cf41799efd1cf98be633d1f7fc4acf6f875";
+        "7ebb51d1a202b04f2ede91a0b99022608422c63e9f1c34b4299b8a60d7510c8a";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

@@ -1,0 +1,313 @@
+//! Portable contracts shared by the off-callback neural DAW plug-in and its
+//! CLI/Desktop control surfaces.
+
+use crate::daw::{
+    read_bounded_regular_file, serialize_bounded, write_document, MAX_DAW_DOCUMENT_BYTES,
+};
+use crate::CommitMode;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+pub const NEURAL_DAW_PLUGIN_ID: &str = "org.penguin425.denoize.neural";
+pub const NEURAL_DAW_SESSION_SCHEMA: &str = "denoize-neural-daw-session-v1";
+pub const NEURAL_DAW_SESSION_SCHEMA_VERSION: u32 = 1;
+pub const NEURAL_DAW_MODEL_ID: &str = "gtcrn-dns3";
+pub const NEURAL_DAW_MODEL_SHA256: &str =
+    "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87";
+pub const NEURAL_DAW_CHUNK_MILLIS: u32 = 10;
+pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
+pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
+pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = 768_000;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NeuralDawOverloadFallback {
+    #[default]
+    DelayedDry,
+    LastSafeGain,
+    Silence,
+}
+
+impl NeuralDawOverloadFallback {
+    pub const fn index(self) -> u32 {
+        match self {
+            Self::DelayedDry => 0,
+            Self::LastSafeGain => 1,
+            Self::Silence => 2,
+        }
+    }
+
+    pub const fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::LastSafeGain,
+            2 => Self::Silence,
+            _ => Self::DelayedDry,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DelayedDry => "Delayed Dry",
+            Self::LastSafeGain => "Last Safe Gain",
+            Self::Silence => "Silence",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().replace([' ', '_'], "-").as_str() {
+            "delayed-dry" | "dry" => Some(Self::DelayedDry),
+            "last-safe-gain" | "gain" => Some(Self::LastSafeGain),
+            "silence" => Some(Self::Silence),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeuralDawParameters {
+    pub bypass: bool,
+    pub mix: f32,
+    pub output_gain_db: f32,
+    pub overload_fallback: NeuralDawOverloadFallback,
+}
+
+impl Default for NeuralDawParameters {
+    fn default() -> Self {
+        Self {
+            bypass: false,
+            mix: 1.0,
+            output_gain_db: 0.0,
+            overload_fallback: NeuralDawOverloadFallback::DelayedDry,
+        }
+    }
+}
+
+impl NeuralDawParameters {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.mix.is_finite() || !(0.0..=1.0).contains(&self.mix) {
+            return Err("neural plug-in mix must be finite and within [0, 1]".into());
+        }
+        if !self.output_gain_db.is_finite() || !(-24.0..=24.0).contains(&self.output_gain_db) {
+            return Err("neural plug-in output gain must be finite and within [-24, 24] dB".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NeuralDawPortConfiguration {
+    Mono,
+    #[default]
+    Stereo,
+}
+
+impl NeuralDawPortConfiguration {
+    pub const fn channels(self) -> usize {
+        match self {
+            Self::Mono => 1,
+            Self::Stereo => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeuralDawSessionState {
+    pub schema: String,
+    pub schema_version: u32,
+    pub plugin_id: String,
+    pub model_id: String,
+    pub model_sha256: String,
+    pub latency_policy: String,
+    pub port_configuration: NeuralDawPortConfiguration,
+    pub parameters: NeuralDawParameters,
+}
+
+impl NeuralDawSessionState {
+    pub fn new(
+        port_configuration: NeuralDawPortConfiguration,
+        parameters: NeuralDawParameters,
+    ) -> Result<Self, String> {
+        let state = Self {
+            schema: NEURAL_DAW_SESSION_SCHEMA.to_owned(),
+            schema_version: NEURAL_DAW_SESSION_SCHEMA_VERSION,
+            plugin_id: NEURAL_DAW_PLUGIN_ID.to_owned(),
+            model_id: NEURAL_DAW_MODEL_ID.to_owned(),
+            model_sha256: NEURAL_DAW_MODEL_SHA256.to_owned(),
+            latency_policy: NEURAL_DAW_LATENCY_POLICY.to_owned(),
+            port_configuration,
+            parameters,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != NEURAL_DAW_SESSION_SCHEMA
+            || self.schema_version != NEURAL_DAW_SESSION_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "unsupported neural DAW session {} version {}; expected {} version {}",
+                self.schema,
+                self.schema_version,
+                NEURAL_DAW_SESSION_SCHEMA,
+                NEURAL_DAW_SESSION_SCHEMA_VERSION
+            ));
+        }
+        if self.plugin_id != NEURAL_DAW_PLUGIN_ID {
+            return Err(format!(
+                "neural DAW session targets {}, expected {NEURAL_DAW_PLUGIN_ID}",
+                self.plugin_id
+            ));
+        }
+        if self.model_id != NEURAL_DAW_MODEL_ID || self.model_sha256 != NEURAL_DAW_MODEL_SHA256 {
+            return Err("neural DAW session model identity does not match this build".into());
+        }
+        if self.latency_policy != NEURAL_DAW_LATENCY_POLICY {
+            return Err(format!(
+                "unsupported neural DAW latency policy {}; expected {}",
+                self.latency_policy, NEURAL_DAW_LATENCY_POLICY
+            ));
+        }
+        self.parameters.validate()
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        serialize_bounded(self, "neural DAW session")
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() as u64 > MAX_DAW_DOCUMENT_BYTES {
+            return Err(format!(
+                "neural DAW session is {} bytes, exceeding the {MAX_DAW_DOCUMENT_BYTES}-byte limit",
+                bytes.len()
+            ));
+        }
+        let state: Self = serde_json::from_slice(bytes)
+            .map_err(|error| format!("parse neural DAW session JSON: {error}"))?;
+        state.validate()?;
+        Ok(state)
+    }
+}
+
+pub fn read_neural_daw_session(path: impl AsRef<Path>) -> Result<NeuralDawSessionState, String> {
+    NeuralDawSessionState::from_bytes(&read_bounded_regular_file(
+        path.as_ref(),
+        "neural DAW session",
+    )?)
+}
+
+pub fn write_neural_daw_session(
+    path: impl AsRef<Path>,
+    state: &NeuralDawSessionState,
+    mode: CommitMode,
+) -> Result<(), String> {
+    write_document(
+        path.as_ref(),
+        &state.to_canonical_bytes()?,
+        mode,
+        "neural DAW session",
+    )
+}
+
+pub fn neural_daw_chunk_frames(sample_rate: f64) -> Result<u32, String> {
+    validate_sample_rate(sample_rate)?;
+    let frames = (sample_rate * f64::from(NEURAL_DAW_CHUNK_MILLIS) / 1_000.0).ceil();
+    if !frames.is_finite() || frames < 1.0 || frames > f64::from(u32::MAX) {
+        return Err("neural DAW chunk geometry exceeds the public contract".to_owned());
+    }
+    Ok(frames as u32)
+}
+
+pub fn neural_daw_latency_frames(sample_rate: f64) -> Result<u32, String> {
+    neural_daw_chunk_frames(sample_rate)?
+        .checked_mul(NEURAL_DAW_LATENCY_CHUNKS)
+        .ok_or_else(|| "neural DAW latency geometry overflow".to_owned())
+}
+
+pub fn neural_daw_latency_millis(sample_rate: f64) -> Result<f64, String> {
+    Ok(f64::from(neural_daw_latency_frames(sample_rate)?) * 1_000.0 / sample_rate)
+}
+
+fn validate_sample_rate(sample_rate: f64) -> Result<(), String> {
+    if !sample_rate.is_finite()
+        || sample_rate < 1.0
+        || sample_rate > f64::from(NEURAL_DAW_MAX_SAMPLE_RATE)
+    {
+        return Err(format!(
+            "neural DAW processing requires a finite sample rate within [1, {NEURAL_DAW_MAX_SAMPLE_RATE}], got {sample_rate}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_round_trips_and_rejects_unknown_or_mismatched_identity() {
+        let state = NeuralDawSessionState::new(
+            NeuralDawPortConfiguration::Stereo,
+            NeuralDawParameters::default(),
+        )
+        .unwrap();
+        let bytes = state.to_canonical_bytes().unwrap();
+        assert_eq!(NeuralDawSessionState::from_bytes(&bytes).unwrap(), state);
+
+        let mut object = serde_json::to_value(&state).unwrap();
+        object["future"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<NeuralDawSessionState>(object).is_err());
+
+        let mut mismatch = state;
+        mismatch.model_sha256.replace_range(..1, "0");
+        assert!(mismatch.validate().is_err());
+    }
+
+    #[test]
+    fn latency_is_a_closed_finite_rate_contract() {
+        assert_eq!(neural_daw_chunk_frames(44_100.0).unwrap(), 441);
+        assert_eq!(neural_daw_latency_frames(44_100.0).unwrap(), 10_584);
+        assert_eq!(neural_daw_latency_frames(48_000.0).unwrap(), 11_520);
+        assert_eq!(neural_daw_latency_frames(96_000.0).unwrap(), 23_040);
+        assert_eq!(neural_daw_chunk_frames(44_100.5).unwrap(), 442);
+        assert_eq!(neural_daw_latency_frames(44_100.5).unwrap(), 10_608);
+        assert!(neural_daw_latency_frames(f64::NAN).is_err());
+        assert!(neural_daw_latency_frames(0.0).is_err());
+        assert!(neural_daw_latency_frames(768_000.1).is_err());
+    }
+
+    #[test]
+    fn session_publication_is_no_clobber_and_handles_symlinks_safely() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("neural.json");
+        let state = NeuralDawSessionState::new(
+            NeuralDawPortConfiguration::Mono,
+            NeuralDawParameters::default(),
+        )
+        .unwrap();
+        write_neural_daw_session(&path, &state, CommitMode::NoClobber).unwrap();
+        assert_eq!(read_neural_daw_session(&path).unwrap(), state);
+        assert!(write_neural_daw_session(&path, &state, CommitMode::NoClobber).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = directory.path().join("neural-link.json");
+            symlink(&path, &link).unwrap();
+            assert!(read_neural_daw_session(&link).is_err());
+            assert!(write_neural_daw_session(&link, &state, CommitMode::NoClobber).is_err());
+            write_neural_daw_session(&link, &state, CommitMode::Replace).unwrap();
+            assert!(!std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(read_neural_daw_session(&link).unwrap(), state);
+            assert_eq!(read_neural_daw_session(&path).unwrap(), state);
+        }
+    }
+}

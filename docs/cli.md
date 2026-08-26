@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.75.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.76.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -243,7 +243,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.75.0 watch-folder automation
+denoize 0.76.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -421,6 +421,10 @@ pause at verified durable checkpoint/publication boundaries.
 USAGE:
     denoize plugin info [--json|--pretty]
     denoize plugin latency [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin neural info [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin neural latency [--sample-rate <HZ>] [--json|--pretty]
+    denoize plugin neural session create <OUTPUT.json> [OPTIONS]
+    denoize plugin neural session inspect|validate <SESSION.json> [--json|--pretty]
     denoize plugin preset create <speech|gentle|music> <OUTPUT.json> [OPTIONS]
     denoize plugin preset inspect|validate <PRESET.json> [--json|--pretty]
     denoize plugin session create <PRESET.json> <OUTPUT.json> [--mono|--stereo] [OPTIONS]
@@ -443,8 +447,17 @@ SESSION CREATE OPTIONS:
     --replace                 atomically replace an existing output
     --json|--pretty           print the created contract as JSON
 
+NEURAL SESSION CREATE OPTIONS:
+    --mono|--stereo           main and reserved-reference layout (default: stereo)
+    --mix <0..1>
+    --output-gain-db <-24..24>
+    --fallback <delayed-dry|last-safe-gain|silence>
+    --bypass|--no-bypass
+    --replace                 atomically replace an existing output
+    --json|--pretty           print the created contract as JSON
+
 CLAP state and these JSON contracts use the same stable parameter IDs, fixed
-10 ms latency policy, and deterministic compact serialization.
+latency policies, and deterministic compact serialization.
 ```
 
 ## Signed licensed-corpus evaluation evidence
@@ -645,6 +658,16 @@ contains every stable parameter. Session v1 adds the plug-in identity,
 `fixed-10ms-v1` policy, mono/stereo port configuration, and the preset. CLAP
 host snapshots use the same canonical session bytes, so file and host state
 round trips restore one deterministic contract.
+
+`denoize plugin neural info` reports the independent `denoize Neural` CLAP ID,
+pinned GTCRN model identity/install state, mono/stereo plus reserved reference
+ports, bounded worker queues, overload fallbacks, and the zero-work callback
+contract. `plugin neural latency` measures the latency-aligned dry impulse for
+the `fixed-24x10ms-worker-v1` policy, including finite fractional CLAP sample
+rates. Neural session v1 binds the exact model ID/SHA-256, port layout,
+parameters, fallback, and latency policy; it is closed, path-free, 64 KiB
+bounded, non-symlink, and no-clobber by default. The host process never
+downloads a model; install it beforehand with `denoize models install gtcrn`.
 
 ## Stable JSON automation
 
