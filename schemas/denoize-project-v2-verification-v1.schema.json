@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-verification-v1.schema.json",
+  "title": "denoize project v2 verification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "project_id", "manifest_digest", "sources", "graphs", "tracks", "buses", "clips", "transitions", "effects", "models", "max_nesting_depth", "artifacts_verified", "sources_verified", "models_verified"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-verification-v1" },
+    "schema_version": { "const": 1 },
+    "project_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "manifest_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "sources": { "type": "integer", "minimum": 1, "maximum": 4096 },
+    "graphs": { "type": "integer", "minimum": 1, "maximum": 1024 },
+    "tracks": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "buses": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "clips": { "type": "integer", "minimum": 1, "maximum": 200000 },
+    "transitions": { "type": "integer", "minimum": 0, "maximum": 200000 },
+    "effects": { "type": "integer", "minimum": 0, "maximum": 65536 },
+    "models": { "type": "integer", "minimum": 0, "maximum": 16384 },
+    "max_nesting_depth": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "artifacts_verified": { "type": "boolean" },
+    "sources_verified": { "type": "integer", "minimum": 0, "maximum": 4096 },
+    "models_verified": { "type": "integer", "minimum": 0, "maximum": 16384 }
+  }
+}

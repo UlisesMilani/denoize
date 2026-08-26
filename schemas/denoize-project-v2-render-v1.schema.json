@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-render-v1.schema.json",
+  "title": "denoize project v2 render report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "project_id", "manifest_digest", "graph_id", "graph_revision", "deterministic", "requested_jobs", "stable_mix_order", "sample_rate", "channels", "frames", "rendered_clips", "rendered_tracks", "rendered_buses", "peak_accounted_bytes", "sources", "output_pcm_sha256", "output"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-render-v1" },
+    "schema_version": { "const": 1 },
+    "project_id": { "$ref": "#/$defs/identifier" },
+    "manifest_digest": { "$ref": "#/$defs/digest" },
+    "graph_id": { "$ref": "#/$defs/identifier" },
+    "graph_revision": { "$ref": "#/$defs/positive" },
+    "deterministic": { "const": true },
+    "requested_jobs": { "type": "integer", "minimum": 1, "maximum": 256 },
+    "stable_mix_order": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "frames": { "$ref": "#/$defs/positive" },
+    "rendered_clips": { "type": "integer", "minimum": 0, "maximum": 200000 },
+    "rendered_tracks": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "rendered_buses": { "type": "integer", "minimum": 1, "maximum": 8192 },
+    "peak_accounted_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "sources": { "type": "array", "maxItems": 4096, "items": { "$ref": "#/$defs/source" } },
+    "output_pcm_sha256": { "$ref": "#/$defs/digest" },
+    "output": { "oneOf": [{ "$ref": "#/$defs/fingerprint" }, { "type": "null" }] }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "positive": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "fingerprint": { "type": "object", "additionalProperties": false, "required": ["len", "digest"], "properties": { "len": { "$ref": "#/$defs/positive" }, "digest": { "$ref": "#/$defs/digest" } } },
+    "source": { "type": "object", "additionalProperties": false, "required": ["source_id", "fingerprint"], "properties": { "source_id": { "$ref": "#/$defs/identifier" }, "fingerprint": { "$ref": "#/$defs/fingerprint" } } }
+  }
+}

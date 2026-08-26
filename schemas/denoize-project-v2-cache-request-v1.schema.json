@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-cache-request-v1.schema.json",
+  "title": "denoize project v2 cache request",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "schema_version", "manifest_digest", "graph_id", "graph_revision", "graph_digest", "sources", "effects", "models", "runtime", "output"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-cache-request-v1" }, "schema_version": { "const": 1 },
+    "manifest_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" },
+    "graph_revision": { "$ref": "denoize-project-v2.schema.json#/$defs/revision" }, "graph_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "sources": { "type": "array", "minItems": 1, "maxItems": 4096, "items": { "$ref": "#/$defs/source" } },
+    "effects": { "type": "array", "maxItems": 65536, "items": { "$ref": "#/$defs/effect" } },
+    "models": { "type": "array", "maxItems": 16384, "items": { "$ref": "#/$defs/model" } },
+    "runtime": { "$ref": "#/$defs/runtime" }, "output": { "$ref": "#/$defs/output" }
+  },
+  "$defs": {
+    "source": { "type": "object", "additionalProperties": false, "required": ["source_id", "fingerprint"], "properties": { "source_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "fingerprint": { "$ref": "denoize-project-v2.schema.json#/$defs/fingerprint" } } },
+    "effect": { "type": "object", "additionalProperties": false, "required": ["effect_id", "revision", "digest"], "properties": { "effect_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "revision": { "$ref": "denoize-project-v2.schema.json#/$defs/revision" }, "digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" } } },
+    "model": { "type": "object", "additionalProperties": false, "required": ["model_id", "package_locator", "package_fingerprint", "public_key_locator", "public_key_fingerprint", "package_id", "package_revision", "signing_key_id", "license_spdx"], "properties": { "model_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "package_locator": { "$ref": "denoize-project-v2.schema.json#/$defs/locator" }, "package_fingerprint": { "$ref": "denoize-project-v2.schema.json#/$defs/fingerprint" }, "public_key_locator": { "$ref": "denoize-project-v2.schema.json#/$defs/locator" }, "public_key_fingerprint": { "$ref": "denoize-project-v2.schema.json#/$defs/fingerprint" }, "package_id": { "$ref": "denoize-project-v2.schema.json#/$defs/text" }, "package_revision": { "$ref": "denoize-project-v2.schema.json#/$defs/text" }, "signing_key_id": { "type": "string", "pattern": "^[0-9A-F]{16}$" }, "license_spdx": { "$ref": "denoize-project-v2.schema.json#/$defs/text" } } },
+    "runtime": { "type": "object", "additionalProperties": false, "required": ["denoize_version", "deterministic", "backend", "accelerator", "jobs", "floating_point_contract"], "properties": { "denoize_version": { "$ref": "denoize-project-v2.schema.json#/$defs/text" }, "deterministic": { "type": "boolean" }, "backend": { "enum": ["scalar", "rayon", "onnx-cpu", "onnx-accelerator"] }, "accelerator": { "$ref": "denoize-project-v2.schema.json#/$defs/text" }, "jobs": { "type": "integer", "minimum": 1, "maximum": 256 }, "floating_point_contract": { "$ref": "denoize-project-v2.schema.json#/$defs/text" } } },
+    "output": { "type": "object", "additionalProperties": false, "required": ["format", "sample_rate", "channels", "bitrate_bps", "metadata_policy", "provenance_policy_digest"], "properties": { "format": { "enum": ["wav-float32", "wav-pcm24", "flac24", "ogg-opus", "mp3", "m4a"] }, "sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 }, "channels": { "type": "integer", "minimum": 1, "maximum": 64 }, "bitrate_bps": { "oneOf": [{ "type": "integer", "minimum": 8000, "maximum": 1536000 }, { "type": "null" }] }, "metadata_policy": { "enum": ["preserve", "drop"] }, "provenance_policy_digest": { "oneOf": [{ "$ref": "denoize-project-v2.schema.json#/$defs/digest" }, { "type": "null" }] } } }
+  }
+}

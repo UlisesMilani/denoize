@@ -187,6 +187,259 @@ fn project_cli_rejects_future_records_without_changing_existing_output() {
 }
 
 #[test]
+fn project_v2_cli_migrates_renders_and_authenticates_detached_provenance() {
+    use std::io::Write as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source.wav");
+    let v1 = directory.path().join("project-v1.json");
+    let v2 = directory.path().join("project-v2.json");
+    let output = directory.path().join("output.wav");
+    let provenance = directory.path().join("output.provenance.json");
+    let wrong_format_provenance = directory.path().join("wrong.provenance.json");
+    let secret = directory.path().join("provenance-secret.json");
+    let public = directory.path().join("provenance-public.json");
+    write_wav(&source, &[0.1, 0.2, 0.3, 0.4]);
+
+    success_json(&[
+        "project".into(),
+        "create".into(),
+        path(&v1),
+        "--root".into(),
+        path(directory.path()),
+        "--project-id".into(),
+        "project-v2-cli".into(),
+        "--source".into(),
+        "source=source.wav".into(),
+        "--selection".into(),
+        "selection=source,0,0.0005".into(),
+    ]);
+    let v1_before = std::fs::read(&v1).unwrap();
+    let self_migration = run(&[
+        "project".into(),
+        "v2".into(),
+        "migrate".into(),
+        path(&v1),
+        path(&v1),
+        "--root".into(),
+        path(directory.path()),
+        "--force".into(),
+    ]);
+    assert!(!self_migration.status.success());
+    assert!(String::from_utf8_lossy(&self_migration.stderr).contains("must not replace"));
+    assert_eq!(std::fs::read(&v1).unwrap(), v1_before);
+    let source_before_migration = std::fs::read(&source).unwrap();
+    let source_migration = run(&[
+        "project".into(),
+        "v2".into(),
+        "migrate".into(),
+        path(&v1),
+        path(&source),
+        "--root".into(),
+        path(directory.path()),
+        "--force".into(),
+    ]);
+    assert!(!source_migration.status.success());
+    assert!(String::from_utf8_lossy(&source_migration.stderr)
+        .contains("collides with referenced v1 artifact"));
+    assert_eq!(std::fs::read(&source).unwrap(), source_before_migration);
+    let migrated = success_json(&[
+        "project".into(),
+        "v2".into(),
+        "migrate".into(),
+        path(&v1),
+        path(&v2),
+        "--root".into(),
+        path(directory.path()),
+    ]);
+    assert_eq!(migrated["schema"], "denoize-project-v2-verification-v1");
+    assert_eq!(migrated["project_id"], "project-v2-cli");
+    assert_eq!(migrated["artifacts_verified"], true);
+    let validated = success_json(&[
+        "project".into(),
+        "v2".into(),
+        "validate".into(),
+        path(&v2),
+        "--root".into(),
+        path(directory.path()),
+    ]);
+    assert_eq!(validated["manifest_digest"], migrated["manifest_digest"]);
+    assert_eq!(validated["artifacts_verified"], true);
+    assert_eq!(validated["sources_verified"], 1);
+
+    let v2_before = std::fs::read(&v2).unwrap();
+    let self_render = run(&[
+        "project".into(),
+        "v2".into(),
+        "render".into(),
+        path(&v2),
+        path(&v2),
+        "--root".into(),
+        path(directory.path()),
+        "--force".into(),
+    ]);
+    assert!(!self_render.status.success());
+    assert!(String::from_utf8_lossy(&self_render.stderr).contains("must not replace"));
+    assert_eq!(std::fs::read(&v2).unwrap(), v2_before);
+
+    let rendered = success_json(&[
+        "project".into(),
+        "v2".into(),
+        "render".into(),
+        path(&v2),
+        path(&output),
+        "--root".into(),
+        path(directory.path()),
+        "--jobs".into(),
+        "4".into(),
+    ]);
+    assert_eq!(rendered["schema"], "denoize-project-v2-render-v1");
+    assert_eq!(rendered["frames"], 4);
+    assert_eq!(rendered["requested_jobs"], 4);
+
+    let generated = run(&[
+        "receipts".into(),
+        "keygen".into(),
+        path(&secret),
+        path(&public),
+    ]);
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    let output_before = std::fs::read(&output).unwrap();
+    let provenance_collision = run(&[
+        "project".into(),
+        "v2".into(),
+        "provenance".into(),
+        "sign".into(),
+        path(&v2),
+        path(&output),
+        path(&output),
+        "--root".into(),
+        path(directory.path()),
+        "--secret-key".into(),
+        path(&secret),
+        "--format".into(),
+        "wav-f32".into(),
+        "--force".into(),
+    ]);
+    assert!(!provenance_collision.status.success());
+    assert!(String::from_utf8_lossy(&provenance_collision.stderr).contains("published audio"));
+    assert_eq!(std::fs::read(&output).unwrap(), output_before);
+
+    let secret_before = std::fs::read(&secret).unwrap();
+    let secret_collision = run(&[
+        "project".into(),
+        "v2".into(),
+        "provenance".into(),
+        "sign".into(),
+        path(&v2),
+        path(&output),
+        path(&secret),
+        "--root".into(),
+        path(directory.path()),
+        "--secret-key".into(),
+        path(&secret),
+        "--format".into(),
+        "wav-f32".into(),
+        "--force".into(),
+    ]);
+    assert!(!secret_collision.status.success());
+    assert!(String::from_utf8_lossy(&secret_collision.stderr).contains("provenance secret key"));
+    assert_eq!(std::fs::read(&secret).unwrap(), secret_before);
+
+    let source_before = std::fs::read(&source).unwrap();
+    let otio_collision = run(&[
+        "project".into(),
+        "v2".into(),
+        "otio".into(),
+        "export".into(),
+        path(&v2),
+        path(&source),
+        "--root".into(),
+        path(directory.path()),
+        "--accept-losses".into(),
+        "--force".into(),
+    ]);
+    assert!(!otio_collision.status.success());
+    assert!(String::from_utf8_lossy(&otio_collision.stderr).contains("must not replace a source"));
+    assert_eq!(std::fs::read(&source).unwrap(), source_before);
+
+    let wrong_format = run(&[
+        "project".into(),
+        "v2".into(),
+        "provenance".into(),
+        "sign".into(),
+        path(&v2),
+        path(&output),
+        path(&wrong_format_provenance),
+        "--root".into(),
+        path(directory.path()),
+        "--secret-key".into(),
+        path(&secret),
+        "--format".into(),
+        "mp3".into(),
+    ]);
+    assert!(!wrong_format.status.success());
+    assert!(String::from_utf8_lossy(&wrong_format.stderr).contains("declared Mp3"));
+    assert!(!wrong_format_provenance.exists());
+
+    let signed = success_json(&[
+        "project".into(),
+        "v2".into(),
+        "provenance".into(),
+        "sign".into(),
+        path(&v2),
+        path(&output),
+        path(&provenance),
+        "--root".into(),
+        path(directory.path()),
+        "--secret-key".into(),
+        path(&secret),
+        "--format".into(),
+        "wav-f32".into(),
+    ]);
+    assert_eq!(signed["schema"], "denoize-project-v2-provenance-v1");
+    assert_eq!(signed["payload"]["carrier"], "detached-generic");
+    assert_eq!(signed["payload"]["c2pa_manifest_store_embedded"], false);
+    assert_eq!(signed["payload"]["signer_disclosure_required"], true);
+
+    let verified = success_json(&[
+        "project".into(),
+        "v2".into(),
+        "provenance".into(),
+        "verify".into(),
+        path(&provenance),
+        path(&output),
+        "--public-key".into(),
+        path(&public),
+    ]);
+    assert_eq!(verified, signed);
+
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&output)
+        .unwrap()
+        .write_all(b"tampered")
+        .unwrap();
+    let tampered = run(&[
+        "project".into(),
+        "v2".into(),
+        "provenance".into(),
+        "verify".into(),
+        path(&provenance),
+        path(&output),
+        "--public-key".into(),
+        path(&public),
+    ]);
+    assert!(!tampered.status.success());
+    assert!(String::from_utf8_lossy(&tampered.stderr).contains("output bytes differ"));
+}
+
+#[test]
 fn project_writers_never_replace_manifests_or_referenced_artifacts() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("source.wav");

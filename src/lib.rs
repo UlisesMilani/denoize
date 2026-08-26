@@ -75,6 +75,7 @@ pub mod noise;
 pub mod perceptual;
 pub mod postfilter;
 pub mod project;
+pub mod project_v2;
 pub mod quality;
 pub mod recommendation;
 pub mod region;

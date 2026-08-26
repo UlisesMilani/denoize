@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-checkpoint-v1.schema.json",
+  "title": "denoize project v2 checkpoint",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "schema_version", "snapshot", "snapshot_digest", "prior_root_digest", "journal_prefix_digest", "compacted_entries"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-checkpoint-v1" }, "schema_version": { "const": 1 },
+    "snapshot": { "$ref": "denoize-project-v2.schema.json" },
+    "snapshot_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "prior_root_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "journal_prefix_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "compacted_entries": { "type": "integer", "minimum": 0, "maximum": 200000 }
+  }
+}

@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes sixty-eight versioned JSON contracts for local automation. Their
+denoize publishes eighty-nine versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -105,6 +105,43 @@ schemas are shipped in every GitHub release and in the crates.io source package:
 - [`denoize-project-v1.schema.json`](../schemas/denoize-project-v1.schema.json)
   describes a portable source-bound project, its linear sample-accurate
   timelines, and fingerprinted settings, presets, models, plans, and receipts.
+- [`denoize-project-v2.schema.json`](../schemas/denoize-project-v2.schema.json)
+  describes the closed durable graph: content-addressed sources/models, rational
+  time, nested graphs, tracks/buses, arbitrary clips, transitions, immutable
+  effect revisions, automation, and repair masks.
+- [`denoize-project-v2-verification-v1.schema.json`](../schemas/denoize-project-v2-verification-v1.schema.json)
+  distinguishes structural graph validation from rooted current-file
+  verification and reports exact manifest identity, graph counts/depth, and
+  verified source/model counts.
+- [`denoize-project-v2-render-v1.schema.json`](../schemas/denoize-project-v2-render-v1.schema.json)
+  describes stable-order deterministic rendering, bounded resources, verified
+  sources, decoded PCM identity, and the optional published output fingerprint.
+- [`denoize-project-v2-journal-entry-v1.schema.json`](../schemas/denoize-project-v2-journal-entry-v1.schema.json)
+  describes one hash-linked, typed, append-only edit command and the exact parent
+  and result roots.
+- [`denoize-project-v2-journal-inspection-v1.schema.json`](../schemas/denoize-project-v2-journal-inspection-v1.schema.json)
+  describes the authenticated complete journal prefix and any recoverable
+  truncated final-record bytes.
+- [`denoize-project-v2-checkpoint-v1.schema.json`](../schemas/denoize-project-v2-checkpoint-v1.schema.json)
+  binds a compacted snapshot to the prior root and journal-prefix digest.
+- [`denoize-project-v2-cache-request-v1.schema.json`](../schemas/denoize-project-v2-cache-request-v1.schema.json)
+  describes the complete manifest/graph/source/effect/model/runtime/output cache
+  identity.
+- [`denoize-project-v2-cache-key-v1.schema.json`](../schemas/denoize-project-v2-cache-key-v1.schema.json)
+  describes the domain-separated render-cache digest and its full request.
+- [`denoize-project-v2-cache-record-v1.schema.json`](../schemas/denoize-project-v2-cache-record-v1.schema.json)
+  binds one cached output byte fingerprint and decoded PCM digest to its request.
+- [`denoize-project-v2-cache-verification-v1.schema.json`](../schemas/denoize-project-v2-cache-verification-v1.schema.json)
+  describes a verified hit or explicit fail-closed miss reason.
+- [`denoize-project-v2-interchange-v1.schema.json`](../schemas/denoize-project-v2-interchange-v1.schema.json)
+  reports mapped editorial structure and every explicit OTIO/OTIOZ/OTIOD or
+  ADM/BW64 semantic loss.
+- [`denoize-project-v2-external-inspection-v1.schema.json`](../schemas/denoize-project-v2-external-inspection-v1.schema.json)
+  describes bounded read-only recognition of an external editorial document.
+- [`denoize-project-v2-provenance-v1.schema.json`](../schemas/denoize-project-v2-provenance-v1.schema.json)
+  describes a detached Ed25519-signed, C2PA-2.4-targeted edit assertion binding
+  sources, owner-graph-qualified nested operations/root-clock ranges, models,
+  output bytes, and decoded PCM.
 - [`denoize-project-verification-v1.schema.json`](../schemas/denoize-project-verification-v1.schema.json)
   describes read-only verification of every project source and referenced
   artifact.

@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2.schema.json",
+  "title": "denoize durable project graph v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "project_id", "denoize_version", "root_graph_id", "root_revision", "parent_digest", "sources", "models", "effects", "graphs"],
+  "oneOf": [
+    { "properties": { "root_revision": { "const": 1 }, "parent_digest": { "type": "null" } } },
+    { "properties": { "root_revision": { "type": "integer", "minimum": 2, "maximum": 9007199254740991 }, "parent_digest": { "$ref": "#/$defs/digest" } } }
+  ],
+  "properties": {
+    "schema": { "const": "denoize-project-v2" },
+    "schema_version": { "const": 2 },
+    "project_id": { "$ref": "#/$defs/identifier" },
+    "denoize_version": { "$ref": "#/$defs/text" },
+    "root_graph_id": { "$ref": "#/$defs/identifier" },
+    "root_revision": { "$ref": "#/$defs/revision" },
+    "parent_digest": { "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }] },
+    "sources": { "type": "array", "minItems": 1, "maxItems": 4096, "items": { "$ref": "#/$defs/source" } },
+    "models": { "type": "array", "maxItems": 16384, "items": { "$ref": "#/$defs/model" } },
+    "effects": { "type": "array", "maxItems": 65536, "items": { "$ref": "#/$defs/effect" } },
+    "graphs": { "type": "array", "minItems": 1, "maxItems": 1024, "items": { "$ref": "#/$defs/graph" } }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+    "text": { "type": "string", "minLength": 1, "maxLength": 4096 },
+    "locator": { "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^(?!\\.\\.?(?:/|$))(?!.*[/]\\.\\.?(?:/|$))(?!.*//)(?!.*[\\\\:])[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255}(?:/[^/\\u0000-\\u001f\\u007f-\\u009f]{1,255})*$" },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "jsonInteger": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "fingerprint": {
+      "type": "object", "additionalProperties": false, "required": ["len", "digest"],
+      "properties": { "len": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }, "digest": { "$ref": "#/$defs/digest" } }
+    },
+    "time": {
+      "type": "object", "additionalProperties": false, "required": ["value", "rate"],
+      "properties": { "value": { "$ref": "#/$defs/jsonInteger" }, "rate": { "type": "integer", "minimum": 1, "maximum": 768000 } }
+    },
+    "positiveTime": {
+      "type": "object", "additionalProperties": false, "required": ["value", "rate"],
+      "properties": { "value": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }, "rate": { "type": "integer", "minimum": 1, "maximum": 768000 } }
+    },
+    "rational": {
+      "type": "object", "additionalProperties": false, "required": ["numerator", "denominator"],
+      "properties": { "numerator": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 }, "denominator": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 } }
+    },
+    "source": {
+      "type": "object", "additionalProperties": false, "required": ["id", "storage", "fingerprint", "sample_rate", "channels", "presentation_frames"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "storage": { "$ref": "#/$defs/sourceStorage" },
+        "fingerprint": { "$ref": "#/$defs/fingerprint" },
+        "sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "presentation_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "sourceStorage": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["storage", "locator"], "properties": { "storage": { "const": "external" }, "locator": { "$ref": "#/$defs/locator" } } },
+        { "type": "object", "additionalProperties": false, "required": ["storage", "locator"], "properties": { "storage": { "const": "embedded" }, "locator": { "$ref": "#/$defs/locator" } } }
+      ]
+    },
+    "model": {
+      "type": "object", "additionalProperties": false, "required": ["id", "package_locator", "package_fingerprint", "public_key_locator", "public_key_fingerprint", "package_id", "package_revision", "signing_key_id", "license_spdx"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" }, "package_locator": { "$ref": "#/$defs/locator" },
+        "package_fingerprint": { "$ref": "#/$defs/fingerprint" }, "public_key_locator": { "$ref": "#/$defs/locator" },
+        "public_key_fingerprint": { "$ref": "#/$defs/fingerprint" }, "package_id": { "$ref": "#/$defs/text" },
+        "package_revision": { "$ref": "#/$defs/text" }, "signing_key_id": { "type": "string", "pattern": "^[0-9A-F]{16}$" },
+        "license_spdx": { "$ref": "#/$defs/text" }
+      }
+    },
+    "fade": {
+      "type": "object", "additionalProperties": false, "required": ["duration", "curve"],
+      "properties": { "duration": { "$ref": "#/$defs/positiveTime" }, "curve": { "enum": ["linear", "equal-power"] } }
+    },
+    "clipSource": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "source_id"], "properties": { "kind": { "const": "media" }, "source_id": { "$ref": "#/$defs/identifier" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "graph_id"], "properties": { "kind": { "const": "nested-graph" }, "graph_id": { "$ref": "#/$defs/identifier" } } }
+      ]
+    },
+    "clip": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "revision", "track_id", "source", "timeline_start", "source_start", "duration", "channel_map", "fade_in", "fade_out", "gain"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" }, "revision": { "$ref": "#/$defs/revision" }, "track_id": { "$ref": "#/$defs/identifier" },
+        "source": { "$ref": "#/$defs/clipSource" }, "timeline_start": { "$ref": "#/$defs/time" }, "source_start": { "$ref": "#/$defs/time" }, "duration": { "$ref": "#/$defs/positiveTime" },
+        "channel_map": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "type": "integer", "minimum": 0, "maximum": 63 } },
+        "fade_in": { "oneOf": [{ "$ref": "#/$defs/fade" }, { "type": "null" }] }, "fade_out": { "oneOf": [{ "$ref": "#/$defs/fade" }, { "type": "null" }] },
+        "gain": { "$ref": "#/$defs/rational" }
+      }
+    },
+    "transition": {
+      "type": "object", "additionalProperties": false, "required": ["id", "from_clip_id", "to_clip_id", "start", "duration", "curve"],
+      "properties": { "id": { "$ref": "#/$defs/identifier" }, "from_clip_id": { "$ref": "#/$defs/identifier" }, "to_clip_id": { "$ref": "#/$defs/identifier" }, "start": { "$ref": "#/$defs/time" }, "duration": { "$ref": "#/$defs/positiveTime" }, "curve": { "enum": ["linear", "equal-power"] } }
+    },
+    "parameter": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "boolean" }, "value": { "type": "boolean" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "integer" }, "value": { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "rational" }, "value": { "$ref": "#/$defs/rational" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "text" }, "value": { "$ref": "#/$defs/text" } } },
+        { "type": "object", "additionalProperties": false, "required": ["kind", "value"], "properties": { "kind": { "const": "digest" }, "value": { "$ref": "#/$defs/digest" } } }
+      ]
+    },
+    "automationPoint": {
+      "type": "object", "additionalProperties": false, "required": ["time", "value"],
+      "properties": { "time": { "$ref": "#/$defs/time" }, "value": { "$ref": "#/$defs/rational" } }
+    },
+    "automation": {
+      "type": "object", "additionalProperties": false, "required": ["parameter", "interpolation", "points"],
+      "properties": { "parameter": { "$ref": "#/$defs/identifier" }, "interpolation": { "enum": ["step", "linear"] }, "points": { "type": "array", "minItems": 1, "maxItems": 2000000, "items": { "$ref": "#/$defs/automationPoint" } } }
+    },
+    "repairMask": {
+      "type": "object", "additionalProperties": false, "required": ["start", "duration", "channel", "gain"],
+      "properties": { "start": { "$ref": "#/$defs/time" }, "duration": { "$ref": "#/$defs/positiveTime" }, "channel": { "oneOf": [{ "type": "integer", "minimum": 0, "maximum": 63 }, { "type": "null" }] }, "gain": { "$ref": "#/$defs/rational" } }
+    },
+    "effect": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision", "implementation", "parameters", "automation", "repair_masks", "model_id"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" }, "revision": { "$ref": "#/$defs/revision" },
+        "implementation": { "enum": ["gain-v1", "polarity-v1", "repair-mask-v1", "denoise-recipe-v1"] },
+        "parameters": { "type": "object", "maxProperties": 256, "propertyNames": { "$ref": "#/$defs/identifier" }, "additionalProperties": { "$ref": "#/$defs/parameter" } },
+        "automation": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/automation" } },
+        "repair_masks": { "type": "array", "maxItems": 200000, "items": { "$ref": "#/$defs/repairMask" } },
+        "model_id": { "oneOf": [{ "$ref": "#/$defs/identifier" }, { "type": "null" }] }
+      }
+    },
+    "effectReference": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision", "digest"],
+      "properties": { "id": { "$ref": "#/$defs/identifier" }, "revision": { "$ref": "#/$defs/revision" }, "digest": { "$ref": "#/$defs/digest" } }
+    },
+    "effectChain": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/effectReference" } },
+    "track": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision", "parent_bus_id", "muted", "effect_chain"],
+      "properties": { "id": { "$ref": "#/$defs/identifier" }, "revision": { "$ref": "#/$defs/revision" }, "parent_bus_id": { "$ref": "#/$defs/identifier" }, "muted": { "type": "boolean" }, "effect_chain": { "$ref": "#/$defs/effectChain" } }
+    },
+    "bus": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision", "parent_bus_id", "muted", "effect_chain"],
+      "properties": { "id": { "$ref": "#/$defs/identifier" }, "revision": { "$ref": "#/$defs/revision" }, "parent_bus_id": { "oneOf": [{ "$ref": "#/$defs/identifier" }, { "type": "null" }] }, "muted": { "type": "boolean" }, "effect_chain": { "$ref": "#/$defs/effectChain" } }
+    },
+    "graph": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision", "sample_rate", "channels", "root_bus_id", "tracks", "buses", "clips", "transitions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" }, "revision": { "$ref": "#/$defs/revision" }, "sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 }, "channels": { "type": "integer", "minimum": 1, "maximum": 64 }, "root_bus_id": { "$ref": "#/$defs/identifier" },
+        "tracks": { "type": "array", "minItems": 1, "maxItems": 8192, "items": { "$ref": "#/$defs/track" } },
+        "buses": { "type": "array", "minItems": 1, "maxItems": 8192, "items": { "$ref": "#/$defs/bus" } },
+        "clips": { "type": "array", "minItems": 1, "maxItems": 200000, "items": { "$ref": "#/$defs/clip" } },
+        "transitions": { "type": "array", "maxItems": 200000, "items": { "$ref": "#/$defs/transition" } }
+      }
+    }
+  }
+}

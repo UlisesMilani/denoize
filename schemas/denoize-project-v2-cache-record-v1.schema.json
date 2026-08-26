@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-cache-record-v1.schema.json",
+  "title": "denoize project v2 cache record",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "schema_version", "key", "request", "output_locator", "output_fingerprint", "output_pcm_sha256"],
+  "properties": { "schema": { "const": "denoize-project-v2-cache-record-v1" }, "schema_version": { "const": 1 }, "key": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" }, "request": { "$ref": "denoize-project-v2-cache-request-v1.schema.json" }, "output_locator": { "$ref": "denoize-project-v2.schema.json#/$defs/locator" }, "output_fingerprint": { "$ref": "denoize-project-v2.schema.json#/$defs/fingerprint" }, "output_pcm_sha256": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" } }
+}

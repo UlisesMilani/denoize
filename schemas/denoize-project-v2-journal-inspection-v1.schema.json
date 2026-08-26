@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-journal-inspection-v1.schema.json",
+  "title": "denoize project v2 journal inspection",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "schema_version", "entries", "truncated_tail_bytes", "prefix_digest"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-journal-inspection-v1" }, "schema_version": { "const": 1 },
+    "entries": { "type": "array", "maxItems": 200000, "items": { "$ref": "denoize-project-v2-journal-entry-v1.schema.json" } },
+    "truncated_tail_bytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+    "prefix_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" }
+  }
+}
