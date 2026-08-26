@@ -53,7 +53,10 @@ const REQUIRED_STRATA: &[(&str, TargetSpeakerStratumKind)] = &[
     ("many-interferers", TargetSpeakerStratumKind::TargetPresent),
     ("noisy-enrollment", TargetSpeakerStratumKind::TargetPresent),
     ("one-interferer", TargetSpeakerStratumKind::TargetPresent),
-    ("real-t-conversation", TargetSpeakerStratumKind::TargetPresent),
+    (
+        "real-t-conversation",
+        TargetSpeakerStratumKind::TargetPresent,
+    ),
     (
         "reverberant-enrollment",
         TargetSpeakerStratumKind::TargetPresent,
@@ -72,7 +75,10 @@ const REQUIRED_STRATA: &[(&str, TargetSpeakerStratumKind)] = &[
         "target-absent-similar-interferer",
         TargetSpeakerStratumKind::TargetAbsent,
     ),
-    ("target-present-clean", TargetSpeakerStratumKind::TargetPresent),
+    (
+        "target-present-clean",
+        TargetSpeakerStratumKind::TargetPresent,
+    ),
     ("ts-superb", TargetSpeakerStratumKind::TargetPresent),
     ("unseen-domain", TargetSpeakerStratumKind::TargetPresent),
     ("whisper", TargetSpeakerStratumKind::TargetPresent),
@@ -201,9 +207,7 @@ impl TargetSpeakerPromotionEvidencePayload {
                 "target-speaker evidence timestamp exceeds the JSON safe-integer limit".into(),
             );
         }
-        if self.strata.is_empty()
-            || self.strata.len() > MAX_TARGET_SPEAKER_EVIDENCE_STRATA
-        {
+        if self.strata.is_empty() || self.strata.len() > MAX_TARGET_SPEAKER_EVIDENCE_STRATA {
             return Err(format!(
                 "target-speaker evidence must contain 1..={MAX_TARGET_SPEAKER_EVIDENCE_STRATA} strata"
             ));
@@ -231,9 +235,7 @@ impl TargetSpeakerPromotionEvidencePayload {
                 ));
             }
             if !(10..=1_000_000).contains(&stratum.cases) {
-                return Err(
-                    "target-speaker evidence stratum cases must be in 10..=1000000".into(),
-                );
+                return Err("target-speaker evidence stratum cases must be in 10..=1000000".into());
             }
             if stratum.metrics.is_empty()
                 || stratum.metrics.len() > MAX_TARGET_SPEAKER_EVIDENCE_METRICS
@@ -246,8 +248,10 @@ impl TargetSpeakerPromotionEvidencePayload {
                 TargetSpeakerStratumKind::TargetPresent => PRESENT_METRICS,
                 TargetSpeakerStratumKind::TargetAbsent => ABSENT_METRICS,
             };
-            let policy_by_name: BTreeMap<_, _> =
-                policies.iter().map(|policy| (policy.name, policy)).collect();
+            let policy_by_name: BTreeMap<_, _> = policies
+                .iter()
+                .map(|policy| (policy.name, policy))
+                .collect();
             let mut observed_metrics = BTreeSet::new();
             let mut previous_metric = None;
             for metric in &stratum.metrics {
@@ -396,8 +400,9 @@ impl SignedTargetSpeakerPromotionEvidence {
 
     pub fn verify_signature(&self, key: &ReceiptPublicKey) -> Result<(), String> {
         self.validate_structure()?;
-        let document = serde_json::to_vec(&self.payload)
-            .map_err(|error| format!("serialize target-speaker evidence for verification: {error}"))?;
+        let document = serde_json::to_vec(&self.payload).map_err(|error| {
+            format!("serialize target-speaker evidence for verification: {error}")
+        })?;
         key.verify_domain_document(
             PROMOTION_SIGNATURE_DOMAIN,
             &document,
@@ -494,12 +499,7 @@ impl TargetSpeakerExtractionConfig {
             0.0,
             12.0,
         )?;
-        validate_range(
-            "maximum_peak_gain_db",
-            self.maximum_peak_gain_db,
-            0.0,
-            12.0,
-        )?;
+        validate_range("maximum_peak_gain_db", self.maximum_peak_gain_db, 0.0, 12.0)?;
         validate_range(
             "maximum_new_clipping_ratio",
             self.maximum_new_clipping_ratio,
@@ -832,11 +832,8 @@ impl TargetSpeakerSession {
             }
         }
         let enrollment_model_samples = enrollment_model.len();
-        let mixture_model_f64 = crate::resample::resample(
-            &mixture_mono,
-            mixture.sample_rate,
-            model_rate,
-        )?;
+        let mixture_model_f64 =
+            crate::resample::resample(&mixture_mono, mixture.sample_rate, model_rate)?;
         if mixture_model_f64.is_empty() {
             return Err("target-speaker mixture becomes empty at the model sample rate".into());
         }
@@ -873,12 +870,10 @@ impl TargetSpeakerSession {
         let finite_normalized_passed = candidate
             .iter()
             .all(|sample| sample.is_finite() && (-1.0..=1.0).contains(sample));
-        let energy_delta_db =
-            candidate_measurements.rms_dbfs - mixture_measurements.rms_dbfs;
+        let energy_delta_db = candidate_measurements.rms_dbfs - mixture_measurements.rms_dbfs;
         let peak_delta_db = candidate_measurements.peak_dbfs - mixture_measurements.peak_dbfs;
-        let new_clipping = (candidate_measurements.clipping_ratio
-            - mixture_measurements.clipping_ratio)
-            .max(0.0);
+        let new_clipping =
+            (candidate_measurements.clipping_ratio - mixture_measurements.clipping_ratio).max(0.0);
         let gates = vec![
             safety_gate(
                 TargetSpeakerSafetyGateKind::Geometry,
@@ -1156,9 +1151,7 @@ fn classify_presence(
     let present = f64::from(probabilities[2]);
     if present >= config.minimum_present_probability && present > absent && present > uncertain {
         TargetSpeakerPresence::Present
-    } else if absent >= config.minimum_absent_probability
-        && absent > present
-        && absent > uncertain
+    } else if absent >= config.minimum_absent_probability && absent > present && absent > uncertain
     {
         TargetSpeakerPresence::Absent
     } else {
@@ -1195,11 +1188,8 @@ fn signal_measurements(samples: &[f64]) -> SignalMeasurements {
         .iter()
         .map(|sample| sample.abs())
         .fold(0.0_f64, f64::max);
-    let clipping = samples
-        .iter()
-        .filter(|sample| sample.abs() >= 1.0)
-        .count() as f64
-        / samples.len() as f64;
+    let clipping =
+        samples.iter().filter(|sample| sample.abs() >= 1.0).count() as f64 / samples.len() as f64;
     SignalMeasurements {
         rms_dbfs: amplitude_dbfs(rms),
         peak_dbfs: amplitude_dbfs(peak),
@@ -1233,7 +1223,11 @@ fn safety_gate(
 
 #[cfg(feature = "onnx")]
 const fn bool_value(value: bool) -> f64 {
-    if value { 1.0 } else { 0.0 }
+    if value {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 #[cfg(feature = "onnx")]
@@ -1339,7 +1333,10 @@ mod tests {
 
         let mut missing = payload.clone();
         missing.strata.remove(0);
-        assert!(missing.validate().unwrap_err().contains("omits required stratum"));
+        assert!(missing
+            .validate()
+            .unwrap_err()
+            .contains("omits required stratum"));
 
         let mut weak = payload.clone();
         let metric = weak

@@ -1093,6 +1093,7 @@ dependencies = [
  "base64",
  "claxon",
  "cpal",
+ "crossbeam-queue",
  "ctrlc",
  "cudarc",
  "deep_filter",

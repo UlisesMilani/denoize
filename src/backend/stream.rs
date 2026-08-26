@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::config::{ConfigError, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS};
 use crate::{
-    AcceleratorSelection, DenoiserConfig, StreamingDenoiser, select_accelerator_for_options,
+    select_accelerator_for_options, AcceleratorSelection, DenoiserConfig, StreamingDenoiser,
 };
 
 #[cfg(feature = "rnnoise")]

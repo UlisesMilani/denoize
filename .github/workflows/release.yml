@@ -1037,6 +1037,8 @@ jobs:
           universal_promotion_evidence_schema="$asset_dir/denoize-universal-promotion-evidence-v1.schema.json"
           target_speaker_promotion_evidence_schema="$asset_dir/denoize-target-speaker-promotion-evidence-v1.schema.json"
           target_speaker_report_schema="$asset_dir/denoize-target-speaker-report-v1.schema.json"
+          causal_target_speaker_promotion_evidence_schema="$asset_dir/denoize-causal-target-speaker-promotion-evidence-v1.schema.json"
+          causal_target_speaker_report_schema="$asset_dir/denoize-causal-target-speaker-report-v1.schema.json"
           watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
           watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
           watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
@@ -1095,6 +1097,8 @@ jobs:
           cp schemas/denoize-universal-promotion-evidence-v1.schema.json "$universal_promotion_evidence_schema"
           cp schemas/denoize-target-speaker-promotion-evidence-v1.schema.json "$target_speaker_promotion_evidence_schema"
           cp schemas/denoize-target-speaker-report-v1.schema.json "$target_speaker_report_schema"
+          cp schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json "$causal_target_speaker_promotion_evidence_schema"
+          cp schemas/denoize-causal-target-speaker-report-v1.schema.json "$causal_target_speaker_report_schema"
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
@@ -1139,6 +1143,7 @@ jobs:
             "$universal_restoration_mask_schema" "$universal_restoration_report_schema" \
             "$universal_promotion_evidence_schema" \
             "$target_speaker_promotion_evidence_schema" "$target_speaker_report_schema" \
+            "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
             "$asset_dir"/denoize-update-*.schema.json \

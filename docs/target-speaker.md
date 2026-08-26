@@ -1,10 +1,12 @@
 # Fail-closed target-speaker extraction
 
-Stage 29 adds an offline, enrollment-conditioned extraction path for recovering
-one speaker from a conversational mixture. It is not generic denoising or blind
-source separation: the graph must consume a mixture and a bounded reference
-utterance from the intended speaker, and it must return both extracted audio
-and calibrated target-presence probabilities.
+Stage 29 adds offline and causal enrollment-conditioned extraction paths for
+recovering one speaker from a conversational mixture. It is not generic
+denoising or blind source separation: the graph consumes a mixture and a
+bounded reference utterance from the intended speaker and returns extracted
+audio plus calibrated target-presence probabilities. The causal path adds an
+authenticated recurrent state machine, explicit latency/flush geometry, and a
+bounded off-callback scheduler; it does not weaken the offline gate.
 
 No target-speaker checkpoint is bundled in the crate, GitHub release, Desktop
 application, or managed-model catalog. The adapter and evidence contracts are
@@ -54,6 +56,41 @@ denoize target-speaker evidence verify \
 Authentic evidence whose mechanically recomputed promotion result is rejected
 returns a failing status.
 
+The causal renderer requires the accepted offline evidence and an additional
+accepted causal non-inferiority document for the exact same package:
+
+```sh
+denoize target-speaker causal meeting.wav enrollment.wav target.wav \
+  --model-package causal-target-speaker.dmp \
+  --model-package-key package-publisher.pub \
+  --offline-promotion-evidence offline-evidence.json \
+  --offline-promotion-evidence-key offline-evaluator.pub.json \
+  --causal-promotion-evidence causal-evidence.json \
+  --causal-promotion-evidence-key causal-evaluator.pub.json \
+  --present-hold-blocks 3 \
+  --report causal-target-speaker-report.json \
+  --max-memory 4096 \
+  --pretty
+```
+
+The eight authenticated/audio inputs must be distinct regular files. The audio
+and optional report destinations must be distinct from every source and each
+other. Both are transactional and no-clobber unless `--replace` is explicit.
+Package authentication, both evidence signatures and bindings, graph
+preparation, and signed recurrent vectors are checked before either audio file
+is opened. Causal evidence alone can be checked with:
+
+```sh
+denoize target-speaker causal evidence verify \
+  causal-evidence.json causal-evaluator.pub.json --pretty
+```
+
+The file renderer keeps exact source duration. It produces complete signed
+flush context, removes the declared algorithmic latency at model rate, then
+resamples to a mono output with the source rate and frame count. Absent,
+uncertain, warm-up, unsafe, and unsafe-flush blocks remain time-aligned silence;
+they are counted separately in the report and never fall back to the mixture.
+
 ## Signed graph contract
 
 The dedicated adapter deliberately rejects the looser generic waveform path.
@@ -80,6 +117,32 @@ between 500 ms and 30 seconds, or match the package's stricter fixed dimension.
 Mixtures are capped at one hour. Output is always mono and, when published, is
 resampled to the mixture rate and restored to the mixture frame count.
 
+### Causal graph and state contract
+
+The causal adapter accepts only runtime mode `streaming` or
+`finite-and-streaming`, independent mono, equal fixed frame/hop sizes, one
+audio input, one enrollment input, one extracted-audio output, one `[1,3]`
+presence output, and at least one explicit state pair. Every state axis is
+fixed; each input/output pair has the same shape and float32 or int64 type and
+uses deterministic zero initialization. The mixture and output sample axes
+must exactly equal the signed frame size. Enrollment may have a signed fixed
+length or a dynamic sample axis, but still must be 0.5--30 seconds after
+resampling.
+
+The package must declare algorithmic latency no greater than 100 ms and enough
+flush samples to cover it. Its signed numerical-vector set must contain exactly
+the semantic cases needed by the generic graph parity gate plus named
+`causal-reset`, `causal-recurrent`, and `causal-flush` cases. Reset supplies
+zero to every state input, recurrent supplies at least one nonzero state, and
+flush supplies zero audio. The real graph and all signed outputs run before
+user audio. Runtime rejects a changed state shape/type, non-finite float state,
+wrong audio geometry, non-finite audio, or non-normalized presence values.
+
+Reset zeroes recurrent tensors and the stream generation changes. Ordinary
+drop overwrites the retained enrollment and concrete recurrent storage where
+the tensor representation permits it. The same operating-system and allocator
+limitations described in the enrollment section still apply.
+
 ## Publication decisions
 
 The model always renders a private candidate. The default presence thresholds
@@ -105,6 +168,35 @@ evidence. Defaults limit RMS and peak rise to 3 dB and new clipping to 0.0001.
 These checks detect structural and signal failures; they do not perform runtime
 ASR, independent speaker verification, or interferer transcription. The closed
 report fixes those two unperformed claims to `false`.
+
+For causal audio, each fixed model block is classified independently. Defaults
+require `present >= 0.90`, a strict lead over the other classes, and three
+consecutive present blocks. Candidate RMS may rise by at most 3 dB over the
+corresponding mixture block, while the absolute peak is configurable only in
+0.5--1.0 and defaults to 1.0. Decisions
+are `published-present`, `muted-absent`, `muted-uncertain`,
+`muted-present-warmup`, `muted-safety-gate`, and `muted-flush`. Muting preserves
+the continuous clock; it is not evidence that the target was absent.
+
+### Bounded real-time bridge
+
+`CausalTargetSpeakerRealtimeScheduler` moves inference to one permanent worker
+created on the control thread. It owns a fixed 40-block pool, 16-block input
+queue, 16-block output queue, and one preallocated pending result. Callback-side
+`try_submit`, `try_receive_due`, and `reset` copy fixed buffers and use bounded
+lock-free queues and atomics only: they allocate no memory, acquire no mutex,
+perform no filesystem/network/log I/O, call no inference, and never wait. Pool
+or queue exhaustion is an explicit overload and advances the absolute clock;
+the host must render silence.
+
+Every block carries `(generation,start_frame)`. Results from an earlier
+generation are discarded as stale; results older than the requested frame are
+discarded as late; a future result is retained in the single pending slot. A
+gap or generation change resets model state before the next inference. Worker
+shutdown and join are control-thread operations, not callback operations. This
+bridge is an API foundation for host integration; it does not claim that a
+specific DAW format consumes enrollment until that format's own privacy,
+automation, latency, and host-evidence gate is released.
 
 ## Enrollment privacy
 
@@ -159,6 +251,42 @@ consent, correct metric implementations, fair listener sampling, or freedom
 from benchmark contamination. Release review must inspect the referenced raw
 results and corpus license chain.
 
+### Causal promotion evidence
+
+[`denoize-causal-target-speaker-promotion-evidence-v1`](../schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json)
+is a second Ed25519-signed statement. It binds the same package, source,
+checkpoint, and accepted offline evaluation digest, plus raw causal evaluation,
+state/reset/flush, perturbation-latency, callback-audit, and transition-result
+digests. Runtime requires both signatures and exact package, source,
+checkpoint, evaluation, and stream-geometry equality; neither document can
+substitute for the other.
+
+All 22 offline strata and hard limits remain required. Every stratum contains
+at least ten offline and ten causal cases and reports both values. Causal
+preparation requires each offline case count, operator, value, and declared
+limit to exactly reproduce the separately signed offline document; a stricter
+offline threshold cannot be relaxed in the causal layer. Causal
+regression is capped per metric: WER 0.02, SI-SDRi 0.5 dB, target and
+interferer similarity 0.02, word leakage 0.005, DNSMOS-P808 0.1, presence
+recall 0.02, absent-output RMS 3 dB, false-positive rate 0.005, and zero
+regression for duration/non-finite output. A permitted regression does not
+excuse crossing a hard limit; both conditions must pass.
+
+At least 100 perturbation cases must measure effective input-to-output latency,
+which must be no greater than both the declared limit and 100 ms. A callback
+audit must contain at least 10,000 paced blocks, a queue capacity in 16--256,
+maximum depth below capacity, zero deadline misses/overloads, and zero callback
+allocations, locks, waits, file I/O, network I/O, logs, or inference calls.
+Transition evidence requires at least 100 cases each for absent-to-present,
+present-to-absent, uncertainty, enrollment mismatch, reference loss, injected
+late results, and injected stale-generation results. Every injected late/stale
+result must be discarded and false-attribution publications must be zero.
+
+The signed document authenticates the evaluator's measurements; it does not
+make a model available. denoize still bundles no target-speaker checkpoint
+until artifact redistribution, training-data terms, consent, and the complete
+independent evaluation pass.
+
 ## Why this gate exists
 
 VoiceFilter established speaker-conditioned masking and VoiceFilter-Lite made
@@ -183,17 +311,17 @@ and listening evidence instead of accepting one learned score.
 
 ## Known limits and next gate
 
-- v1 is whole-utterance offline processing and mixes program channels to mono;
-  it does not preserve spatial position or program stereo.
+- Both paths mix program channels to mono; they do not preserve spatial
+  position or program stereo. Offline v1 is whole-utterance processing; causal
+  v1 preserves time with per-block silence when publication is unsafe.
 - Runtime presence is the model's own head, not an independent verifier. A
   compromised model could collude across audio and diagnostic outputs; signed
   vectors and external promotion evidence reduce but cannot eliminate that
   risk.
-- Causal processing remains planned. It must pass offline non-inferiority,
-  signed recurrent-state/reset vectors, measured effective latency no greater
-  than 100 ms, target-absence transition tests, late-result suppression, and
-  callback allocation/lock/I/O/deadline gates before sharing the Stage 28 DAW
-  reference port.
+- The causal API and CLI implement the non-inferiority, recurrent-vector,
+  latency, transition, stale/late, and callback evidence boundary. No Stage 28
+  plug-in consumes enrollment yet; each plug-in format still needs its own
+  consent, state, automation, host-latency, and real-host evidence gate.
 - Generative candidates such as MeanFlow-TSE remain research-only until they
   pass the same REAL-T, absence, ASR, identity, leakage, calibration, and human
   gates. Synthetic Libri2Mix scores alone are insufficient.
@@ -201,8 +329,17 @@ and listening evidence instead of accepting one learned score.
   basis, consent, retention, access control, data-subject rights, and regional
   biometric rules remain deployment responsibilities outside this API.
 
-The path-free runtime report is
+The path-free offline runtime report is
 [`denoize-target-speaker-report-v1`](../schemas/denoize-target-speaker-report-v1.schema.json).
 It binds model/evidence identity, input and accepted-output PCM digests,
 presence probabilities, signal measurements, gates, decisions, limitations,
 and warnings. Withheld reports contain no candidate or output digest.
+
+The causal renderer emits
+[`denoize-causal-target-speaker-report-v1`](../schemas/denoize-causal-target-speaker-report-v1.schema.json).
+It binds model and both evidence identities, source/output PCM, exact source,
+model, latency, and flush geometry, all block decisions, transition counts, and
+bounded enrollment geometry. It fixes network access, runtime independent
+speaker verification, runtime interferer-leakage measurement, enrollment PCM
+retention, embedding retention, and enrollment digest recording to `false`;
+filesystem paths are not schema fields.

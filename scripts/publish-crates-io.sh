@@ -160,6 +160,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/neural_daw.rs" \
     "denoize-${package_version}/src/target_speaker.rs" \
     "denoize-${package_version}/src/backend/target_speaker.rs" \
+    "denoize-${package_version}/src/causal_target_speaker.rs" \
+    "denoize-${package_version}/src/backend/causal_target_speaker.rs" \
     "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/src/universal_restoration.rs" \
     "denoize-${package_version}/src/project.rs" \
@@ -233,6 +235,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-universal-restoration-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-target-speaker-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-target-speaker-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-causal-target-speaker-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-apply-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-bundle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-check-v1.schema.json" \

@@ -247,6 +247,8 @@ OPTIONS:
 USAGE:
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
     denoize target-speaker evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+    denoize target-speaker causal <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> --offline-promotion-evidence <EVIDENCE.json> --offline-promotion-evidence-key <PUBLIC-KEY.json> --causal-promotion-evidence <EVIDENCE.json> --causal-promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-speaker causal evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
 
 Run offline target-speaker extraction through a signed package v2 graph with
 mixture and enrollment inputs, extracted-audio output, and calibrated
@@ -275,6 +277,16 @@ OPTIONS:
         --json                             emit compact report JSON
         --pretty                           emit indented report JSON
     -h, --help                             show this help
+
+CAUSAL OPTIONS:
+        --offline-promotion-evidence <PATH>      accepted signed offline evidence
+        --offline-promotion-evidence-key <PATH> trusted offline evidence public key
+        --causal-promotion-evidence <PATH>       accepted signed causal evidence
+        --causal-promotion-evidence-key <PATH>  trusted causal evidence public key
+        --present-hold-blocks <N>                consecutive present blocks, 1..100 (default: 3)
+        --maximum-peak <F>                       absolute candidate peak, 0.5..1 (default: 1)
+    The remaining model, probability, energy, accelerator, report, memory,
+    metadata, replacement, and JSON options above also apply to causal mode.
 ```
 
 ## Watch-folder automation

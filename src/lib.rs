@@ -42,6 +42,8 @@ pub mod backend;
 pub mod batch_resume;
 pub mod benchmark;
 pub mod bessel;
+#[cfg(feature = "onnx")]
+pub mod causal_target_speaker;
 pub mod channel_layout;
 pub mod config;
 pub mod daw;
@@ -106,6 +108,23 @@ pub use backend::{
     OnnxModelConfig, SgmseProfile, StreamingBackendSession,
 };
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
+#[cfg(feature = "onnx")]
+pub use causal_target_speaker::{
+    estimate_causal_target_speaker_memory_bytes, sign_causal_target_speaker_promotion_evidence,
+    CausalTargetSpeakerBlock, CausalTargetSpeakerBlockDecision, CausalTargetSpeakerConfig,
+    CausalTargetSpeakerDecisionCounts, CausalTargetSpeakerEnrollmentSummary,
+    CausalTargetSpeakerEvidenceIdentity, CausalTargetSpeakerMetricEvidence,
+    CausalTargetSpeakerModelIdentity, CausalTargetSpeakerPromotionEvidencePayload,
+    CausalTargetSpeakerRealtimeAudit, CausalTargetSpeakerRealtimeMetrics,
+    CausalTargetSpeakerRealtimeReceiveError, CausalTargetSpeakerRealtimeResult,
+    CausalTargetSpeakerRealtimeScheduler, CausalTargetSpeakerRealtimeSubmitError,
+    CausalTargetSpeakerRealtimeToken, CausalTargetSpeakerRenderReport,
+    CausalTargetSpeakerRenderResult, CausalTargetSpeakerSession,
+    CausalTargetSpeakerStratumEvidence, CausalTargetSpeakerStream,
+    CausalTargetSpeakerTransitionAudit, SignedCausalTargetSpeakerPromotionEvidence,
+    CAUSAL_TARGET_SPEAKER_PROMOTION_EVIDENCE_SCHEMA, CAUSAL_TARGET_SPEAKER_REPORT_SCHEMA,
+    CAUSAL_TARGET_SPEAKER_SCHEMA_VERSION,
+};
 pub use channel_layout::{ChannelLayout, ChannelMask, ChannelPosition, PanInfo};
 pub use config::{ConfigError, ResourcePlan};
 pub use daw::{

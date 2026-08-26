@@ -58,17 +58,17 @@ use std::collections::VecDeque;
 
 use crate::audio::sanitize_sample;
 use crate::config::{
-    ConfigError, MAX_DENOISER_FRAME_SIZE, MAX_KAISER_BETA, MAX_MAKEUP_GAIN_DB, MAX_PROFILE_MS,
-    MAX_SAMPLE_RATE, MIN_DENOISER_FRAME_SIZE, MIN_MAKEUP_GAIN_DB, ResourcePlan,
-    checked_stream_memory_bytes,
+    checked_stream_memory_bytes, ConfigError, ResourcePlan, MAX_DENOISER_FRAME_SIZE,
+    MAX_KAISER_BETA, MAX_MAKEUP_GAIN_DB, MAX_PROFILE_MS, MAX_SAMPLE_RATE, MIN_DENOISER_FRAME_SIZE,
+    MIN_MAKEUP_GAIN_DB,
 };
 use crate::fft::Complex;
-use crate::gain::{Algorithm, GainParams, SpecSubLaw, compute_gain, multiband_specsub_gains};
+use crate::gain::{compute_gain, multiband_specsub_gains, Algorithm, GainParams, SpecSubLaw};
 use crate::noise::{NoiseConfig, NoiseEstimator};
-use crate::perceptual::{N_BARK_BANDS, apply_perceptual_weights, bin_to_bark_band};
+use crate::perceptual::{apply_perceptual_weights, bin_to_bark_band, N_BARK_BANDS};
 use crate::postfilter::{MusicalNoisePostFilter, PostFilterConfig};
 use crate::stft::{Stft, StftConfig};
-use crate::window::{MAX_DENOISER_DPSS_NW, WindowParams, WindowType, validate_dpss_bandwidth};
+use crate::window::{validate_dpss_bandwidth, WindowParams, WindowType, MAX_DENOISER_DPSS_NW};
 
 /// Top-level configuration.
 ///
@@ -1976,12 +1976,10 @@ mod tests {
     #[test]
     fn streaming_rejects_channels_profiles_and_aggregate_resource_exhaustion() {
         let config = DenoiserConfig::default(48_000);
-        assert!(
-            StreamingDenoiser::new(config.clone(), 0)
-                .err()
-                .unwrap()
-                .contains("channels")
-        );
+        assert!(StreamingDenoiser::new(config.clone(), 0)
+            .err()
+            .unwrap()
+            .contains("channels"));
         assert!(
             StreamingDenoiser::new(config.clone(), crate::config::MAX_STREAM_CHANNELS + 1)
                 .err()
@@ -1991,23 +1989,19 @@ mod tests {
 
         let mut invalid_profile = config.clone();
         invalid_profile.profile_ms = f64::INFINITY;
-        assert!(
-            StreamingDenoiser::new(invalid_profile, 1)
-                .err()
-                .unwrap()
-                .contains("profile_ms")
-        );
+        assert!(StreamingDenoiser::new(invalid_profile, 1)
+            .err()
+            .unwrap()
+            .contains("profile_ms"));
 
         let mut oversized = config;
         oversized.frame_size = MAX_DENOISER_FRAME_SIZE;
         oversized.sample_rate = MAX_SAMPLE_RATE;
         oversized.profile_ms = MAX_PROFILE_MS;
-        assert!(
-            StreamingDenoiser::new(oversized, 1)
-                .err()
-                .unwrap()
-                .contains("streaming state")
-        );
+        assert!(StreamingDenoiser::new(oversized, 1)
+            .err()
+            .unwrap()
+            .contains("streaming state"));
     }
 
     #[test]

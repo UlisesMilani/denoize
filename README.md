@@ -223,7 +223,8 @@ contracts.
 ### Fail-closed target-speaker extraction
 
 **denoize target-speaker** extracts one enrolled speaker from a mixture through
-a dedicated signed package v2 graph. It is offline and mono in Stage 29:
+a dedicated signed package v2 graph. Stage 29 provides a fail-closed offline
+renderer and a separately gated causal mono renderer:
 
 ~~~sh
 denoize target-speaker meeting.wav enrollment.wav target.wav \
@@ -248,12 +249,37 @@ the mixture, silence, or an unverified voice. Enrollment working buffers are
 zeroized immediately after inference; reports contain no enrollment samples,
 embedding, digest, or path.
 
+The causal command additionally requires accepted offline evidence and a
+signed 22-stratum non-inferiority, recurrent reset/flush, <=100 ms perturbation
+latency, 10,000-block callback, and target-transition audit:
+
+~~~sh
+denoize target-speaker causal meeting.wav enrollment.wav target.wav \
+  --model-package causal-target-speaker.dmp \
+  --model-package-key publisher.pub \
+  --offline-promotion-evidence offline.json \
+  --offline-promotion-evidence-key offline-evaluator.pub.json \
+  --causal-promotion-evidence causal.json \
+  --causal-promotion-evidence-key causal-evaluator.pub.json \
+  --report causal-target-speaker-report.json \
+  --max-memory 4096 --pretty
+~~~
+
+It authenticates both evidence layers and recurrent vectors before decoding,
+removes only the signed latency after a complete flush, preserves exact source
+duration, and renders silence for absent, uncertain, warm-up, or unsafe blocks.
+The public real-time bridge uses fixed lock-free queues, discards late/stale
+results, and keeps inference off the callback; no plug-in consumes enrollment
+until its own privacy and real-host gate passes.
+
 No checkpoint is bundled because the audited WeSep/REAL-TSE/MeanFlow candidates
 do not yet provide a complete artifact-level redistribution and protected-
 stratum evidence chain. See [Target-speaker extraction](docs/target-speaker.md),
 the [paper and artifact audit](docs/restoration-research.md#stage-29--target-speaker-extraction),
 and the closed [report](schemas/denoize-target-speaker-report-v1.schema.json)
 and [promotion evidence](schemas/denoize-target-speaker-promotion-evidence-v1.schema.json)
+contracts, plus the causal [report](schemas/denoize-causal-target-speaker-report-v1.schema.json)
+and [promotion evidence](schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json)
 contracts.
 
 ## Supported input formats

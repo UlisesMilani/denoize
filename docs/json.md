@@ -169,6 +169,14 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   identity, 22 target-present/absent strata, content, extraction, identity,
   leakage, presence, output and quality limits, calibration, and listening
   evidence.
+- [`denoize-causal-target-speaker-report-v1.schema.json`](../schemas/denoize-causal-target-speaker-report-v1.schema.json)
+  describes a path-free continuous causal render, both promotion identities,
+  source/model/latency/flush geometry, per-block publication and mute counts,
+  presence transitions, PCM bindings, and non-retained enrollment geometry.
+- [`denoize-causal-target-speaker-promotion-evidence-v1.schema.json`](../schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json)
+  describes Ed25519-signed offline/causal non-inferiority across all 22 strata,
+  recurrent reset/flush, <=100 ms perturbation latency, callback-safety, and
+  absent/present/uncertain/late/stale transition evidence.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -210,7 +218,7 @@ runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
 assessment, deterministic and universal restoration reports and masks,
-universal promotion evidence, and both target-speaker contracts also reject
+universal promotion evidence, and all four target-speaker contracts also reject
 unknown fields so a consumer cannot silently ignore a new safety dimension.
 Signed plug-in editor evidence and host matrices are closed for the same reason.
 

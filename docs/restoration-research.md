@@ -559,14 +559,41 @@ presence, and promotion-evidence gates. Only `accepted-present` writes audio.
 audio and never substitute the mixture, candidate, silence, or a possible
 interferer. See [the complete Stage 29 contract](target-speaker.md).
 
-### Deferred paths and stop conditions
+### Implemented causal boundary and remaining deferrals
 
-Causal TSE is the next increment, not part of offline acceptance. It needs
-offline non-inferiority on all strata, signed recurrent-state/reset/flush
-vectors, effective latency <= 100 ms, bounded queues, late/stale-result
-discard, target-presence transition tests, and the Stage 28 callback matrix
-(zero allocation, lock, wait, I/O, network, log, or inference). A nominal
-chunk size is not sufficient latency evidence.
+The causal increment is implemented for v0.82.0 without changing offline
+acceptance. A dedicated package-v2 adapter requires streaming mode, fixed equal
+frame/hop geometry, at least one explicit zero-initialized recurrent pair,
+signed algorithmic latency <= 100 ms, enough flush to cover that latency, and
+named reset/recurrent/zero-audio-flush vectors. State shapes/types and float
+finiteness are checked every block. Reset and ordinary drop overwrite concrete
+state and enrollment storage where possible.
+
+A second signed evidence document retains every offline hard limit and records
+offline and causal values for all 22 strata. Preparation exactly cross-checks
+every offline case count, operator, value, and limit against the separately
+signed offline matrix, so a stricter offline limit cannot be relaxed. Maximum
+causal regressions are WER
+0.02, SI-SDRi 0.5 dB, target/interferer similarity 0.02, word leakage 0.005,
+DNSMOS-P808 0.1, presence recall 0.02, absent RMS 3 dB, false-positive rate
+0.005, and zero duration/non-finite regression. It additionally requires at
+least 100 perturbation-latency cases at <=100 ms, at least 10,000 paced callback
+blocks with zero misses/overloads/callback operations, and at least 100 cases
+for every target-presence, uncertainty, enrollment mismatch, reference loss,
+late, and stale transition. Every injected late/stale result must be discarded
+and false-attribution publication must remain zero. Thus a nominal chunk size
+still is not accepted as latency evidence.
+
+The real-time API uses a fixed pool and 16-block lock-free input/output queues
+around one permanent worker. Callback submit/receive/reset perform no
+allocation, mutex, wait, I/O, network, logging, or inference. Absolute
+generation/frame tokens prevent an old voice from being relabeled after reset
+or deadline loss. The file CLI produces complete flush context, removes only
+the authenticated latency, preserves source length, and records every muted or
+published block in a closed path-free report. A plug-in enrollment sidechain
+remains deferred until each format adds consent, non-retaining state,
+automation, latency, and real-host evidence; the generic Stage 28 reference
+port is not silently reinterpreted.
 
 Audio-visual conditioning is also deferred rather than silently added to
 enrollment. Online AV-CrossNet demonstrates causal 4.73 ms inference with
@@ -576,12 +603,16 @@ model
 ([Yu et al., Interspeech 2025](https://www.isca-archive.org/interspeech_2025/yu25b_interspeech.html)).
 
 Release stops if the package/evidence binding differs; any component or vector
-fails authentication; the graph exposes extra tensors/state; probabilities are
-not finite normalized values; enrollment data or a path enters logs/reports/
-state; an absent/uncertain/unsafe run creates audio; any required stratum or
-metric is missing/weaker; learned quality improves while ASR, activity, target
-identity, or interferer leakage regresses; or artifact-level redistribution is
-not independently established.
+fails authentication; an offline graph exposes extra tensors/state or a causal
+graph exposes an unpaired/unsupported tensor; probabilities are not finite
+normalized values; enrollment data or a path enters logs/reports/state; an
+offline absent/uncertain/unsafe run creates audio; a causal unsafe block emits
+non-silence; any required stratum or metric is missing/weaker/non-inferior only
+by crossing a hard limit; effective latency exceeds 100 ms; callback work,
+deadline loss, queue overload, undiscarded late/stale work, or false attribution
+is observed; learned quality improves while ASR, activity, target identity, or
+interferer leakage regresses; or artifact-level redistribution is not
+independently established.
 
 ## Stage 30 — acoustic echo cancellation
 

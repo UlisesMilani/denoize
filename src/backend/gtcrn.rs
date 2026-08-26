@@ -4,10 +4,10 @@
 //! three recurrent state tensors. The tensor layout follows the upstream MIT
 //! implementation in `Xiaobin-Rong/gtcrn`.
 
-use super::OnnxModelConfig;
 use super::tract_runtime::SharedRunnable;
+use super::OnnxModelConfig;
 use crate::AcceleratorRuntime;
-use rustfft::{Fft, FftPlanner, num_complex::Complex32};
+use rustfft::{num_complex::Complex32, Fft, FftPlanner};
 use std::sync::Arc;
 use tract_onnx::prelude::*;
 
@@ -690,8 +690,8 @@ mod tests {
     use super::*;
     use prost::Message;
     use tract_onnx::pb::{
-        GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorShapeProto, TypeProto,
-        ValueInfoProto, tensor_proto, tensor_shape_proto, type_proto,
+        tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
+        OperatorSetIdProto, TensorShapeProto, TypeProto, ValueInfoProto,
     };
 
     #[test]

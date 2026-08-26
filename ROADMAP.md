@@ -67,7 +67,7 @@ stop/rollback conditions behind this order are maintained in
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
 | 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP released in v0.76.0; VST3 in v0.78.1; accessible CLAP editor in v0.79.0; macOS AUv3 implemented for v0.80.0; Linux LV2 implemented for v0.81.0 |
-| 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline released in v0.77.0; causal substage planned |
+| 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline released in v0.77.0; causal implementation complete for v0.82.0, release pending |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
 | 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Planned |
@@ -205,10 +205,23 @@ established. CLI and Desktop expose the same memory, no-clobber, metadata,
 accelerator, probability, energy, peak, and clipping boundary. See
 [Fail-closed target-speaker extraction](docs/target-speaker.md).
 
-The causal substage remains planned. It must be non-inferior to the offline
-matrix, use authenticated recurrent-state/reset vectors, measure effective
-latency at no more than 100 ms, suppress late/stale results, and pass the Stage
-28 real-time callback rules before consuming the reserved DAW reference port.
+The causal substage is implemented for v0.82.0 behind the `onnx` feature. Its
+dedicated streaming graph admits only fixed equal frame/hop geometry, explicit
+zero-initialized recurrent pairs, signed reset/recurrent/flush vectors, enough
+flush context to remove declared latency, and normalized three-state presence.
+Both accepted offline evidence and a second signed causal document must bind
+the exact package, source/checkpoint, offline result, 22-stratum
+non-inferiority, <=100 ms perturbation latency, 10,000 paced callback blocks,
+and absent/present/uncertain/late/stale transitions.
+
+The finite causal CLI preserves exact source duration and publishes silence for
+unsafe blocks. The public real-time scheduler owns a fixed 40-block pool,
+16-block input/output queues and one worker; callback submission, receipt, and
+reset allocate, lock, wait, log, perform I/O, and infer zero times. Absolute
+generation/frame tokens discard stale and late work. Two closed schemas and
+release/crates.io asset checks cover causal evidence and reports. This does not
+activate the Stage 28 reference port: each plug-in still needs separate
+enrollment-consent, automation/state, latency, and real-host promotion evidence.
 
 Stage 30 retains a native delay tracker, partitioned frequency-domain adaptive
 filter, double-talk control, and conservative residual suppressor as the safe
