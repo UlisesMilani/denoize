@@ -338,9 +338,9 @@ jobs:
               "$target" v9.8.7 "$output_dir" "$bundle"
           done
           tar -tzf "$output_dir/denoize-vst3-v9.8.7-x86_64-unknown-linux-gnu.tar.gz" \
-            | grep -Fq 'denoize.vst3/Contents/x86_64-linux/denoize.so'
+            | grep -F 'denoize.vst3/Contents/x86_64-linux/denoize.so' >/dev/null
           tar -tzf "$output_dir/denoize-vst3-v9.8.7-aarch64-apple-darwin.tar.gz" \
-            | grep -Fq 'denoize.vst3/Contents/x86_64-linux/denoize.so'
+            | grep -F 'denoize.vst3/Contents/x86_64-linux/denoize.so' >/dev/null
           unzip -t "$output_dir/denoize-vst3-v9.8.7-x86_64-pc-windows-msvc.zip"
 
   cli-docs:
