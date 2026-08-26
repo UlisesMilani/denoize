@@ -251,6 +251,7 @@ gh release download "$tag" \
   --pattern '*.crate' \
   --pattern '*.sigstore.json' \
   --pattern '*.jsonl' \
+  --pattern 'denoize-vst3-host-matrix-v1.json' \
   --pattern 'denoize-vst3-ardour-*.txt' \
   --pattern 'denoize-vst3-validator-*.txt' \
   --pattern 'denoize-model-catalog-v1.json' \
