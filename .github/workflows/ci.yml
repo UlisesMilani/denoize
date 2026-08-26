@@ -141,8 +141,6 @@ jobs:
   clap-plugin:
     name: CLAP plug-in
     runs-on: ubuntu-22.04
-    env:
-      DENOIZE_MODEL_DIR: ${{ github.workspace }}/target/denoize-clap-models
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -153,6 +151,8 @@ jobs:
           rustup default 1.96.0
 
       - name: Test real-time and portable-state contracts
+        env:
+          DENOIZE_MODEL_DIR: /tmp/denoize-clap-models-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           cargo run --locked --no-default-features --features gtcrn --bin denoize -- \
             models install gtcrn

@@ -271,8 +271,6 @@ jobs:
   plugin-build:
     name: CLAP ${{ matrix.target }}
     needs: prepare
-    env:
-      DENOIZE_MODEL_DIR: ${{ github.workspace }}/target/denoize-clap-models
     strategy:
       fail-fast: false
       matrix:
@@ -309,6 +307,8 @@ jobs:
       - name: Install pinned neural model for validation
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          DENOIZE_MODEL_DIR: /tmp/denoize-clap-models-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           cargo run --locked --release --no-default-features --features gtcrn --bin denoize -- \
             models install gtcrn
@@ -316,6 +316,8 @@ jobs:
       - name: Exercise pinned neural model on the permanent worker
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          DENOIZE_MODEL_DIR: /tmp/denoize-clap-models-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           cargo test --locked --release -p denoize-clap \
             neural::tests::pinned_gtcrn_release_worker_meets_sustained_deadlines -- --ignored --exact
