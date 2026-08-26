@@ -142,7 +142,7 @@ jobs:
     name: CLAP plug-in
     runs-on: ubuntu-22.04
     env:
-      DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-clap-models
+      DENOIZE_MODEL_DIR: ${{ github.workspace }}/target/denoize-clap-models
     steps:
       - name: Check out source
         uses: actions/checkout@v6

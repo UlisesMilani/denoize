@@ -272,7 +272,7 @@ jobs:
     name: CLAP ${{ matrix.target }}
     needs: prepare
     env:
-      DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-clap-models
+      DENOIZE_MODEL_DIR: ${{ github.workspace }}/target/denoize-clap-models
     strategy:
       fail-fast: false
       matrix:
