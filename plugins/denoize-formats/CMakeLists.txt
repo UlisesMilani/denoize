@@ -53,6 +53,15 @@ set_target_properties(denoize_clap_rust PROPERTIES
   IMPORTED_LOCATION "${DENOIZE_CLAP_STATICLIB}")
 
 set(denoize_rust_native_libs ${DENOIZE_RUST_NATIVE_LIBS})
+set(denoize_rust_native_link_options)
+if(MSVC AND "/defaultlib:msvcrt" IN_LIST denoize_rust_native_libs)
+  # rustc reports the MSVC CRT directive beside native .lib dependencies.
+  # Passing it through INTERFACE_LINK_LIBRARIES makes CMake normalize the
+  # leading slash into a path and MSBuild then searches for
+  # `\defaultlib:msvcrt.obj`.  Preserve it as a linker option instead.
+  list(REMOVE_ITEM denoize_rust_native_libs "/defaultlib:msvcrt")
+  list(APPEND denoize_rust_native_link_options "/defaultlib:msvcrt")
+endif()
 if(UNIX AND NOT APPLE AND ("-lopus" IN_LIST denoize_rust_native_libs
     OR "opus" IN_LIST denoize_rust_native_libs))
   # Accept the runtime SONAME so developer machines do not need an otherwise
@@ -63,6 +72,10 @@ if(UNIX AND NOT APPLE AND ("-lopus" IN_LIST denoize_rust_native_libs
 endif()
 set_property(TARGET denoize_clap_rust PROPERTY INTERFACE_LINK_LIBRARIES
   "${denoize_rust_native_libs}")
+if(denoize_rust_native_link_options)
+  set_property(TARGET denoize_clap_rust PROPERTY INTERFACE_LINK_OPTIONS
+    "${denoize_rust_native_link_options}")
+endif()
 
 # The wrapper must resolve the exact Rust CLAP entry linked into the bundle. It
 # must never scan user or system CLAP paths for a same-named binary.
