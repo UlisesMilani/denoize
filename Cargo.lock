@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "denoize"
-version = "0.78.1"
+version = "0.78.2"
 dependencies = [
  "audio_samples",
  "audio_samples_qoe",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-clap"
-version = "0.78.1"
+version = "0.78.2"
 dependencies = [
  "clack-extensions",
  "clack-plugin",
