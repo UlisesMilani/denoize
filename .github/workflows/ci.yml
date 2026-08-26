@@ -187,32 +187,38 @@ jobs:
           test -n "$validator"
           cp target/release/libdenoize_clap.so "$validator_dir/denoize.clap"
           validator_status=1
+          report_status=1
           for attempt in 1 2; do
             set +e
             "$validator" --verbosity quiet validate --json "$validator_dir/denoize.clap" \
               > "$validator_dir/report.json"
             validator_status=$?
-            set -e
             if [ "$validator_status" -eq 0 ]; then
+              jq -e '
+                (.results | length) == 81 and
+                ([.results[].status.code] | map(select(. == "success")) | length) == 68 and
+                ([.results[].status.code] | map(select(. == "skipped")) | length) == 13 and
+                ([.results[].status.code] | all(. == "success" or . == "skipped"))
+              ' "$validator_dir/report.json" >/dev/null
+              report_status=$?
+            else
+              report_status=1
+            fi
+            set -e
+            if [ "$validator_status" -eq 0 ] && [ "$report_status" -eq 0 ]; then
               break
             fi
-            printf 'CLAP validator attempt %s failed with status %s\n' \
-              "$attempt" "$validator_status" >&2
+            printf 'CLAP validator attempt %s failed: validator status %s, report contract status %s\n' \
+              "$attempt" "$validator_status" "$report_status" >&2
           done
-          if [ "$validator_status" -ne 0 ]; then
+          if [ "$validator_status" -ne 0 ] || [ "$report_status" -ne 0 ]; then
             if jq -e . "$validator_dir/report.json" >/dev/null 2>&1; then
               jq . "$validator_dir/report.json" >&2
             else
               sed -n '1,200p' "$validator_dir/report.json" >&2
             fi
-            exit "$validator_status"
+            exit 1
           fi
-          jq -e '
-            (.results | length) == 81 and
-            ([.results[].status.code] | map(select(. == "success")) | length) == 68 and
-            ([.results[].status.code] | map(select(. == "skipped")) | length) == 13 and
-            ([.results[].status.code] | all(. == "success" or . == "skipped"))
-          ' "$validator_dir/report.json" >/dev/null
 
       - name: Test release archive layouts
         shell: bash
