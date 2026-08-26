@@ -608,6 +608,42 @@ fn manifest_has_pinned_integrity_and_metadata() {
 }
 
 #[test]
+fn bundled_model_root_uses_the_nearest_loaded_audio_bundle() {
+    let module = Path::new(
+        "/Applications/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/PlugIns/denoize.clap/Contents/MacOS/denoize",
+    );
+    assert_eq!(
+        bundled_model_root_from_module_path(module),
+        Some(PathBuf::from(
+            "/Applications/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/PlugIns/denoize.clap/Contents/Resources/denoize-models"
+        ))
+    );
+}
+
+#[test]
+fn bundled_model_root_supports_a_statically_linked_appex() {
+    let module = Path::new(
+        "/Applications/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/MacOS/denoize",
+    );
+    assert_eq!(
+        bundled_model_root_from_module_path(module),
+        Some(PathBuf::from(
+            "/Applications/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/Resources/denoize-models"
+        ))
+    );
+}
+
+#[test]
+fn bundled_model_root_rejects_non_audio_bundle_executables() {
+    assert_eq!(
+        bundled_model_root_from_module_path(Path::new(
+            "/Applications/denoize.app/Contents/MacOS/denoize"
+        )),
+        None
+    );
+}
+
+#[test]
 fn verification_requires_the_manifest_size_and_checksum() {
     let directory = tempfile::tempdir().unwrap();
     let destination = directory.path().join("model.onnx");

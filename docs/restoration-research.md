@@ -358,6 +358,21 @@ plus contention and teardown tests in real hosts; a validator-only pass is not
 format parity. LV2 remains a direct adapter because its worker, atom, state, URI,
 and bundle semantics are not a CLAP projection.
 
+Stage 28d implements the macOS AUv3 branch in v0.80.0. Apple's
+[`AUAudioUnit`](https://developer.apple.com/documentation/audiotoolbox/auaudiounit)
+and app-extension model require component declarations in the extension
+`Info.plist`, sandbox-compatible resources, host-controlled lifecycle, and a
+containing app for normal installation. The pinned clap-wrapper build helper
+enumerates both authenticated CLAP descriptors and emits one Audio Component
+and factory class for each. Explicit factory metadata freezes them as
+`aufx/Dn01/Dnze` and `aufx/Dn02/Dnze` instead of accepting hash-derived public
+identities. A signed nested CLAP carries the verified GTCRN graph/provenance;
+Apple `auval` and a separate AVFoundation process cover registration,
+out-of-process instantiation, render-resource allocation/reset/deallocation,
+state round-trip, and teardown on both macOS architectures. iOS provisioning,
+mobile hosts, proprietary DAWs, and automated AU custom-view interaction stay
+outside the claim until their own evidence exists.
+
 A custom editor is also independent of the audio engine. It must stay on the
 host-approved UI thread, expose every control through host parameters, support
 keyboard navigation, scaling and accessible names, bound persisted UI state,
@@ -382,8 +397,9 @@ audio; queue exhaustion lacks the selected fallback; state accepts unknown or
 mismatched model identity; the pinned real graph smoke test fails; or a release
 artifact cannot reproduce the exact model, state schema, validator report, and
 source revision. VST3, editor, AUv3, and LV2 claims stay out of release status
-until their own equivalent evidence passes; Stage 28b and the native CLAP
-portion of 28c now satisfy their separately documented gates.
+until their own equivalent evidence passes; Stage 28b, the native CLAP portion
+of 28c, and the macOS portion of 28d now satisfy their separately documented
+gates.
 
 ## Stage 29 — target-speaker extraction
 

@@ -102,7 +102,9 @@ jobs:
       - name: Verify release evidence tooling
         run: |
           bash -n \
+            scripts/build-auv3-plugin.sh \
             scripts/build-vst3-plugin.sh \
+            scripts/package-auv3-plugin.sh \
             scripts/package-clap-plugin.sh \
             scripts/package-vst3-plugin.sh \
             scripts/package-release-evidence.sh \
@@ -111,10 +113,13 @@ jobs:
             scripts/test-evaluation-evidence.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
+            scripts/test-auv3-host.sh \
             scripts/test-vst3-ardour-host.sh \
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \
+            scripts/validate-auv3-plugin.sh \
             scripts/validate-vst3-plugin.sh
+          python3 -c 'compile(open("scripts/generate-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/generate-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
@@ -127,6 +132,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
+          python3 -c 'compile(open("scripts/test-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/test-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -136,6 +142,7 @@ jobs:
           python3 scripts/test-release-updater-metadata.py
           python3 scripts/test-application-update-manifest.py
           python3 scripts/test-vst3-host-matrix.py
+          python3 scripts/test-auv3-host-evidence.py
           DENOIZE_BIN=target/debug/denoize bash scripts/test-evaluation-evidence.sh
           bash scripts/test-release-evidence.sh
 
@@ -620,6 +627,121 @@ jobs:
             "$provenance" \
             --clobber
 
+  auv3-build:
+    name: AUv3 ${{ matrix.target }}
+    needs: prepare
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out tagged source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install pinned JSON Schema validator
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/denoize-python"
+          "$RUNNER_TEMP/denoize-python/bin/python" -m pip install \
+            --disable-pip-version-check 'jsonschema==4.25.1'
+          echo "$RUNNER_TEMP/denoize-python/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned neural model
+        shell: bash
+        env:
+          DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-auv3-models-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          cargo run --locked --release --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
+
+      - name: Build signed AUv3 containing app
+        shell: bash
+        env:
+          DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-auv3-models-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/build-auv3-plugin.sh "${{ matrix.target }}"
+
+      - name: Validate and bind AUv3 host evidence
+        shell: bash
+        run: |
+          app=$(find "target/auv3-build/${{ matrix.target }}" \
+            -type d -name 'denoize AUv3.app' -print -quit)
+          test -n "$app"
+          auval_report="$RUNNER_TEMP/denoize-auv3-auval-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
+          host_report="$RUNNER_TEMP/denoize-auv3-host-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
+          evidence="$RUNNER_TEMP/denoize-auv3-host-evidence-${GITHUB_REF_NAME}-${{ matrix.target }}.json"
+          bash scripts/validate-auv3-plugin.sh "$app" "$auval_report" >/dev/null
+          bash scripts/test-auv3-host.sh "$app" "$host_report" >/dev/null
+          python3 scripts/generate-auv3-host-evidence.py \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --auval-report "$auval_report" \
+            --host-report "$host_report" \
+            --output "$evidence"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-auv3-host-evidence-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
+
+      - name: Attest AUv3 host evidence and reports
+        id: attest-auv3-host-evidence
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            ${{ runner.temp }}/denoize-auv3-host-evidence-${{ github.ref_name }}-${{ matrix.target }}.json
+            ${{ runner.temp }}/denoize-auv3-auval-${{ github.ref_name }}-${{ matrix.target }}.txt
+            ${{ runner.temp }}/denoize-auv3-host-${{ github.ref_name }}-${{ matrix.target }}.txt
+
+      - name: Package AUv3 plug-in
+        shell: bash
+        run: |
+          app=$(find "target/auv3-build/${{ matrix.target }}" \
+            -type d -name 'denoize AUv3.app' -print -quit)
+          test -n "$app"
+          bash scripts/package-auv3-plugin.sh \
+            "${{ matrix.target }}" "$GITHUB_REF_NAME" . "$app"
+          archive="denoize-auv3-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Upload AUv3 release assets and signed host evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="denoize-auv3-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          evidence="$RUNNER_TEMP/denoize-auv3-host-evidence-${GITHUB_REF_NAME}-${{ matrix.target }}.json"
+          auval_report="$RUNNER_TEMP/denoize-auv3-auval-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
+          host_report="$RUNNER_TEMP/denoize-auv3-host-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
+          provenance="$RUNNER_TEMP/denoize-auv3-host-evidence-${GITHUB_REF_NAME}-${{ matrix.target }}.sigstore.json"
+          cp "${{ steps.attest-auv3-host-evidence.outputs.bundle-path }}" "$provenance"
+          gh release upload "$GITHUB_REF_NAME" \
+            "$archive" "$archive.sha256" \
+            "$evidence" "$auval_report" "$host_report" "$provenance" \
+            --clobber
+
   desktop-build:
     name: Desktop ${{ matrix.target }}
     needs: prepare
@@ -768,6 +890,7 @@ jobs:
           job_status_schema="$asset_dir/denoize-job-status-v1.schema.json"
           listening_result_schema="$asset_dir/denoize-listening-result-v1.schema.json"
           presentation_region_schema="$asset_dir/denoize-presentation-region-v1.schema.json"
+          auv3_host_evidence_schema="$asset_dir/denoize-auv3-host-evidence-v1.schema.json"
           plugin_editor_evidence_schema="$asset_dir/denoize-plugin-editor-evidence-v1.schema.json"
           plugin_host_matrix_schema="$asset_dir/denoize-plugin-host-matrix-v1.schema.json"
           recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
@@ -821,6 +944,7 @@ jobs:
           cp schemas/denoize-job-status-v1.schema.json "$job_status_schema"
           cp schemas/denoize-listening-result-v1.schema.json "$listening_result_schema"
           cp schemas/denoize-presentation-region-v1.schema.json "$presentation_region_schema"
+          cp schemas/denoize-auv3-host-evidence-v1.schema.json "$auv3_host_evidence_schema"
           cp schemas/denoize-plugin-editor-evidence-v1.schema.json "$plugin_editor_evidence_schema"
           cp schemas/denoize-plugin-host-matrix-v1.schema.json "$plugin_host_matrix_schema"
           for project_schema in schemas/denoize-project-*.schema.json; do
@@ -877,6 +1001,7 @@ jobs:
             "$job_dry_run_schema" "$job_history_schema" "$job_status_schema" \
             "$listening_result_schema" \
             "$presentation_region_schema" \
+            "$auv3_host_evidence_schema" \
             "$plugin_editor_evidence_schema" "$plugin_host_matrix_schema" \
             "$asset_dir"/denoize-project-*.schema.json \
             "$recommendation_schema" "$release_evidence_schema" \
@@ -901,7 +1026,7 @@ jobs:
 
   release-evidence:
     name: Generate release SBOMs and provenance
-    needs: [build, plugin-build, vst3-build, desktop-build, model-catalog, updater-metadata]
+    needs: [build, plugin-build, vst3-build, auv3-build, desktop-build, model-catalog, updater-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write

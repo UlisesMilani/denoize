@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "denoize"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "audio_samples",
  "audio_samples_qoe",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-clap"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "clack-extensions",
  "clack-plugin",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-plugin-editor"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "accesskit",
  "accesskit_macos",

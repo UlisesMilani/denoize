@@ -58,6 +58,18 @@ expected_assets=(
   "denoize-vst3-host-matrix-v1.sigstore.json"
   "denoize-vst3-ardour-${tag}-x86_64-unknown-linux-gnu.txt"
   "denoize-vst3-validator-${tag}-x86_64-unknown-linux-gnu.txt"
+  "denoize-auv3-${tag}-aarch64-apple-darwin.tar.gz"
+  "denoize-auv3-${tag}-aarch64-apple-darwin.tar.gz.sha256"
+  "denoize-auv3-host-evidence-${tag}-aarch64-apple-darwin.json"
+  "denoize-auv3-host-evidence-${tag}-aarch64-apple-darwin.sigstore.json"
+  "denoize-auv3-auval-${tag}-aarch64-apple-darwin.txt"
+  "denoize-auv3-host-${tag}-aarch64-apple-darwin.txt"
+  "denoize-auv3-${tag}-x86_64-apple-darwin.tar.gz"
+  "denoize-auv3-${tag}-x86_64-apple-darwin.tar.gz.sha256"
+  "denoize-auv3-host-evidence-${tag}-x86_64-apple-darwin.json"
+  "denoize-auv3-host-evidence-${tag}-x86_64-apple-darwin.sigstore.json"
+  "denoize-auv3-auval-${tag}-x86_64-apple-darwin.txt"
+  "denoize-auv3-host-${tag}-x86_64-apple-darwin.txt"
   "denoize_${version}_aarch64.app.tar.gz"
   "denoize_${version}_aarch64.app.tar.gz.sig"
   "denoize_${version}_aarch64.dmg"
@@ -102,6 +114,7 @@ expected_assets=(
   "denoize-job-status-v1.schema.json"
   "denoize-listening-result-v1.schema.json"
   "denoize-presentation-region-v1.schema.json"
+  "denoize-auv3-host-evidence-v1.schema.json"
   "denoize-plugin-editor-evidence-v1.schema.json"
   "denoize-plugin-host-matrix-v1.schema.json"
   "denoize-project-batch-v1.schema.json"
@@ -256,6 +269,9 @@ gh release download "$tag" \
   --pattern '*.sigstore.json' \
   --pattern '*.jsonl' \
   --pattern 'denoize-clap-editor-host-*.txt' \
+  --pattern 'denoize-auv3-auval-*.txt' \
+  --pattern 'denoize-auv3-host-*.txt' \
+  --pattern 'denoize-auv3-host-evidence-*.json' \
   --pattern 'denoize-plugin-editor-evidence-v1.json' \
   --pattern 'denoize-vst3-ardour-*.txt' \
   --pattern 'denoize-vst3-validator-*.txt' \
@@ -288,6 +304,7 @@ gh release download "$tag" \
   --pattern 'denoize-job-status-v1.schema.json' \
   --pattern 'denoize-listening-result-v1.schema.json' \
   --pattern 'denoize-presentation-region-v1.schema.json' \
+  --pattern 'denoize-auv3-host-evidence-v1.schema.json' \
   --pattern 'denoize-plugin-editor-evidence-v1.schema.json' \
   --pattern 'denoize-plugin-host-matrix-v1.schema.json' \
   --pattern 'denoize-project-*.schema.json' \
@@ -367,6 +384,7 @@ for schema in \
   denoize-job-status-v1.schema.json \
   denoize-listening-result-v1.schema.json \
   denoize-presentation-region-v1.schema.json \
+  denoize-auv3-host-evidence-v1.schema.json \
   denoize-plugin-editor-evidence-v1.schema.json \
   denoize-plugin-host-matrix-v1.schema.json \
   denoize-project-batch-v1.schema.json \
@@ -568,6 +586,140 @@ for editor_subject in "$editor_evidence" "$editor_report"; do
     --source-ref "refs/tags/$tag" \
     --signer-workflow "$repo/.github/workflows/release.yml" \
     --deny-self-hosted-runners >/dev/null
+done
+
+for auv3_target in aarch64-apple-darwin x86_64-apple-darwin; do
+  case "$auv3_target" in
+    aarch64-apple-darwin) auv3_architecture=arm64 ;;
+    x86_64-apple-darwin) auv3_architecture=x86_64 ;;
+  esac
+  auv3_evidence="$tmp_dir/denoize-auv3-host-evidence-${tag}-${auv3_target}.json"
+  auv3_auval_report="$tmp_dir/denoize-auv3-auval-${tag}-${auv3_target}.txt"
+  auv3_host_report="$tmp_dir/denoize-auv3-host-${tag}-${auv3_target}.txt"
+  auv3_provenance="$tmp_dir/denoize-auv3-host-evidence-${tag}-${auv3_target}.sigstore.json"
+  auv3_auval_digest=$(sha256sum "$auv3_auval_report" | cut -d' ' -f1)
+  auv3_auval_size=$(wc -c < "$auv3_auval_report")
+  auv3_host_digest=$(sha256sum "$auv3_host_report" | cut -d' ' -f1)
+  auv3_host_size=$(wc -c < "$auv3_host_report")
+  if ! jq -e \
+    --arg tag "$tag" \
+    --arg repository "$repo" \
+    --arg commit "$source_commit" \
+    --arg architecture "$auv3_architecture" \
+    --arg auval_name "$(basename "$auv3_auval_report")" \
+    --arg auval_digest "$auv3_auval_digest" \
+    --argjson auval_size "$auv3_auval_size" \
+    --arg host_name "$(basename "$auv3_host_report")" \
+    --arg host_digest "$auv3_host_digest" \
+    --argjson host_size "$auv3_host_size" '
+    .schema == "denoize-auv3-host-evidence-v1" and
+    .schema_version == 1 and
+    .tag == $tag and
+    .source == {repository: $repository, commit: $commit} and
+    .format == "auv3" and
+    .adapter == {
+      strategy: "signed-embedded-clap-wrapper",
+      clap_wrapper: {
+        version: "0.16.0",
+        commit: "1cca996e96f29ab2be7ae9f8cfe532bbc92e1dd6"
+      },
+      clap_sdk: {
+        version: "1.2.6",
+        commit: "69a69252fdd6ac1d06e246d9a04c0a89d9607a17"
+      }
+    } and
+    .components == [
+      {
+        descriptor_id: "org.penguin425.denoize",
+        name: "denoize",
+        type: "aufx",
+        subtype: "Dn01",
+        manufacturer: "Dnze",
+        parameters: 7
+      },
+      {
+        descriptor_id: "org.penguin425.denoize.neural",
+        name: "denoize Neural",
+        type: "aufx",
+        subtype: "Dn02",
+        manufacturer: "Dnze",
+        parameters: 4
+      }
+    ] and
+    .bundled_model == {
+      name: "gtcrn-dns3",
+      filename: "gtcrn_simple.onnx",
+      size_bytes: 535190,
+      sha256: "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+      authenticated_provenance: true
+    } and
+    .claims == {
+      official_auval: true,
+      avfoundation_real_host: true,
+      app_extension_sandbox: true,
+      self_contained_model: true,
+      embedded_editor: false
+    } and
+    (.limitations | sort) == ([
+      "custom-view-not-exercised",
+      "ios-not-shipped",
+      "macos-only",
+      "proprietary-third-party-hosts-not-exercised",
+      "standalone-opens-standard-component"
+    ] | sort) and
+    (.runs | length) == 2 and
+    .runs[0].host == "auval" and
+    (.runs[0].host_version | test("^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$")) and
+    .runs[0].operating_system == "macos" and
+    .runs[0].architecture == $architecture and
+    .runs[0].evidence_kind == "official-validator" and
+    .runs[0].status == "passed" and
+    .runs[0].components_exercised == 2 and
+    .runs[0].state_round_trip == false and
+    .runs[0].teardown == false and
+    .runs[0].report == {
+      name: $auval_name,
+      size_bytes: $auval_size,
+      sha256: $auval_digest
+    } and
+    .runs[1].host == "AVFoundation" and
+    (.runs[1].host_version | test("^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$")) and
+    .runs[1].operating_system == "macos" and
+    .runs[1].architecture == $architecture and
+    .runs[1].evidence_kind == "real-host-smoke" and
+    .runs[1].status == "passed" and
+    .runs[1].components_exercised == 2 and
+    .runs[1].state_round_trip == true and
+    .runs[1].teardown == true and
+    .runs[1].report == {
+      name: $host_name,
+      size_bytes: $host_size,
+      sha256: $host_digest
+    }
+  ' "$auv3_evidence" >/dev/null; then
+    echo "AUv3 host evidence does not bind the tagged $auv3_target reports" >&2
+    exit 1
+  fi
+  python3 - schemas/denoize-auv3-host-evidence-v1.schema.json "$auv3_evidence" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+document = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+Draft202012Validator(schema).validate(document)
+PY
+  for auv3_subject in "$auv3_evidence" "$auv3_auval_report" "$auv3_host_report"; do
+    gh attestation verify "$auv3_subject" \
+      --repo "$repo" \
+      --bundle "$auv3_provenance" \
+      --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
+      --source-digest "$source_commit" \
+      --source-ref "refs/tags/$tag" \
+      --signer-workflow "$repo/.github/workflows/release.yml" \
+      --deny-self-hosted-runners >/dev/null
+  done
 done
 
 cargo build --locked --no-default-features --bin denoize
@@ -796,6 +948,66 @@ for target in "${cli_targets[@]}"; do
       exit 1
     fi
   done
+done
+
+auv3_notice_files=(
+  "${required_notice_files[@]}"
+  "LICENSES/clap-sdk-1.2.6-MIT.txt"
+  "LICENSES/clap-wrapper-0.16.0-MIT.txt"
+  "LICENSES/fmt-11.1.4-MIT.txt"
+)
+for auv3_target in aarch64-apple-darwin x86_64-apple-darwin; do
+  package="denoize-auv3-${tag}-${auv3_target}"
+  archive="$tmp_dir/$package.tar.gz"
+  while IFS= read -r mode _; do
+    case "${mode:0:1}" in
+      -|d) ;;
+      *)
+        echo "AUv3 archive $(basename "$archive") contains a link or special entry" >&2
+        exit 1
+        ;;
+    esac
+  done < <(tar -tvzf "$archive")
+  for notice in "${auv3_notice_files[@]}"; do
+    if ! archive_contains "$archive" "$package/$notice"; then
+      echo "AUv3 archive $(basename "$archive") is missing $notice" >&2
+      exit 1
+    fi
+  done
+  for documentation in AUV3_PLUGIN.md NEURAL_PLUGIN.md README.md; do
+    if ! archive_contains "$archive" "$package/$documentation"; then
+      echo "AUv3 archive $(basename "$archive") is missing $documentation" >&2
+      exit 1
+    fi
+  done
+  auv3_root="$package/denoize AUv3.app"
+  auv3_appex="$auv3_root/Contents/PlugIns/denoize.appex"
+  auv3_clap="$auv3_appex/Contents/PlugIns/denoize.clap"
+  auv3_model="$auv3_clap/Contents/Resources/denoize-models/gtcrn-dns3/gtcrn_simple.onnx"
+  for auv3_path in \
+    "$auv3_root/Contents/Info.plist" \
+    "$auv3_appex/Contents/Info.plist" \
+    "$auv3_clap/Contents/Info.plist" \
+    "$auv3_clap/Contents/MacOS/denoize" \
+    "$auv3_model"; do
+    if ! archive_contains "$archive" "$auv3_path"; then
+      echo "AUv3 archive $(basename "$archive") is missing $auv3_path" >&2
+      exit 1
+    fi
+  done
+  if [[ $(tar -xOzf "$archive" "$auv3_model" | sha256sum | cut -d' ' -f1) \
+        != b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87 ]]; then
+    echo "AUv3 archive $(basename "$archive") contains the wrong GTCRN model" >&2
+    exit 1
+  fi
+  auv3_provenance_prefix="$auv3_clap/Contents/Resources/denoize-models/gtcrn-dns3/.provenance/"
+  if ! tar -tzf "$archive" | awk -v prefix="$auv3_provenance_prefix" '
+    index($0, prefix) == 1 && $0 ~ /\.json$/ { found = 1 }
+    END { exit !found }
+  '; then
+    echo "AUv3 archive $(basename "$archive") has no authenticated model provenance" >&2
+    exit 1
+  fi
 done
 
 for archive in \

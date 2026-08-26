@@ -905,8 +905,18 @@ tears down both descriptors at 48 kHz. Release evidence includes a signed host
 matrix and both bound logs. See [VST3 plug-in](docs/vst3-plugin.md) for
 installation, reproducible build details, and the explicitly unclaimed f64,
 custom-view, and proprietary-host cases. The v0.79.0 editor evidence is native
-CLAP-only and does not silently widen those VST3 claims. AUv3 and LV2 remain
-separate gates.
+CLAP-only and does not silently widen those VST3 claims.
+
+v0.80.0 adds a macOS AUv3 app extension for both descriptors, with stable
+`aufx/Dn01/Dnze` and `aufx/Dn02/Dnze` identities. The signed containing app
+embeds the sandboxed extension, exact signed CLAP, and verified GTCRN graph plus
+authenticated provenance, so Neural does not depend on a cache hidden by the
+app-extension sandbox. Apple `auval` and an independent AVFoundation
+lifecycle/state host exercise both components on Intel and Apple Silicon; the
+target-qualified evidence and reports are signed. See
+[AUv3 plug-in](docs/auv3-plugin.md) for installation, reproducible builds, and
+the explicit iOS, proprietary-host, and custom-view limits. LV2 remains a
+separate gate.
 
 ## Desktop app
 
@@ -1045,11 +1055,14 @@ prebuilt `full`-feature binaries for:
 - macOS Intel and Apple Silicon
 - Windows x86-64
 
-The same release also includes CLAP and VST3 plug-in archives for those four target
-architectures. Extract the matching `denoize-plugin-<tag>-<target>` archive and
-copy its `denoize.clap` file or macOS bundle into a standard CLAP directory.
-For VST3, extract `denoize-vst3-<tag>-<target>` and copy `denoize.vst3` into the
-platform's standard VST3 directory.
+The same release also includes CLAP and VST3 plug-in archives for those four
+target architectures. Extract the matching `denoize-plugin-<tag>-<target>`
+archive and copy its `denoize.clap` file or macOS bundle into a standard CLAP
+directory. For VST3, extract `denoize-vst3-<tag>-<target>` and copy
+`denoize.vst3` into the platform's standard VST3 directory. macOS releases also
+contain `denoize-auv3-<tag>-<target>` for Intel and Apple Silicon; move its
+`denoize AUv3.app` to `/Applications` and open it once to register the embedded
+extension.
 
 Every archive has a matching `.sha256` checksum file. Releases also publish the
 exact embedded model catalog, its detached signature, the exact embedded model
@@ -1066,9 +1079,10 @@ and a separate update-asset attestation. A bundle contains both the candidate
 and its verified last-known-good installation, so startup-health or explicit
 recovery does not require a network. See [recoverable application updates](docs/updates.md).
 
-Every installable CLI archive, CLAP/VST3 archive, desktop package, crates.io archive,
-and offline model bundle also has a per-artifact CycloneDX SBOM. The release
-evidence archive binds those 22 artifacts and SBOMs to their sizes and SHA-256 digests,
+Every installable CLI archive, CLAP/VST3/AUv3 archive, desktop package,
+crates.io archive, and offline model bundle also has a per-artifact CycloneDX
+SBOM. The release
+evidence archive binds those 24 artifacts and SBOMs to their sizes and SHA-256 digests,
 while companion GitHub Sigstore/SLSA bundles prove the exact tag commit and
 release workflow. See [release evidence and offline verification](docs/release-evidence.md)
 for the trust model and an air-gapped verification procedure.

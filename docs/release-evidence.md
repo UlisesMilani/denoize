@@ -4,7 +4,9 @@ Every tagged release publishes evidence for each installable artifact:
 
 - four full-featured CLI archives;
 - four real-time-safe CLAP plug-in archives;
-- eight signed desktop packages and updater bundles;
+- four VST3 plug-in archives;
+- two macOS AUv3 containing-app archives;
+- eight signed desktop packages;
 - the exact `.crate` archive submitted to crates.io; and
 - the closed-network model bundle.
 
@@ -20,7 +22,7 @@ package even though the package remains listed.
 
 The archive is serialized deterministically from the source commit time. Its
 companion Sigstore bundle authenticates that archive. A second Sigstore bundle
-attests all 22 installable artifacts directly. Those signature bundles and the
+attests all 24 installable artifacts directly. Those signature bundles and the
 trusted-root snapshot are separate because signing timestamps and certificate
 material intentionally change between otherwise identical workflow attempts.
 Release-producing jobs pin Rust to the repository's exact MSRV toolchain and
@@ -42,7 +44,7 @@ rollback SBOM documents referenced by that manifest. A separate
 signature, SBOM copies, and `.dub` transport assets. Each `.dub` independently
 authenticates its embedded candidate, last-known-good artifact, SBOMs, and
 original artifact provenance against the signed manifest; these secondary
-transport assets do not change the 22 primary installable subjects above.
+transport assets do not change the 24 primary installable subjects above.
 
 ## Prepare an offline verification set
 
@@ -74,7 +76,7 @@ bash scripts/verify-release-evidence.sh \
 ```
 
 The verifier first authenticates the evidence archive, then checks its exact
-contents, all 22 artifact digests and sizes, every artifact-to-SBOM binding,
+contents, all 24 artifact digests and sizes, every artifact-to-SBOM binding,
 the `.crate` source commit and version, and the SLSA provenance subject for
 each artifact. It enforces the repository, tag, commit, hosted-runner policy,
 and release-workflow signer entirely from the downloaded Sigstore bundles.

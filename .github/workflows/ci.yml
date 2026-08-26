@@ -107,15 +107,18 @@ jobs:
       - name: Check release scripts
         run: |
           bash -n \
+            scripts/build-auv3-plugin.sh \
             scripts/build-offline-model-bundle.sh \
             scripts/build-vst3-plugin.sh \
             scripts/generate-cli-docs.sh \
+            scripts/package-auv3-plugin.sh \
             scripts/package-clap-plugin.sh \
             scripts/package-vst3-plugin.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
             scripts/test-clap-editor-host.sh \
+            scripts/test-auv3-host.sh \
             scripts/test-evaluation-evidence.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
@@ -123,7 +126,9 @@ jobs:
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \
             scripts/verify-release-version.sh \
+            scripts/validate-auv3-plugin.sh \
             scripts/validate-vst3-plugin.sh
+          python3 -c 'compile(open("scripts/generate-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/generate-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
@@ -138,6 +143,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/test-plugin-editor-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
+          python3 -c 'compile(open("scripts/test-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/test-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
@@ -151,6 +157,7 @@ jobs:
           python3 scripts/test-plugin-editor-evidence.py
           python3 scripts/test-release-updater-metadata.py
           python3 scripts/test-vst3-host-matrix.py
+          python3 scripts/test-auv3-host-evidence.py
           bash scripts/test-release-evidence.sh
 
   clap-plugin:
@@ -430,6 +437,87 @@ jobs:
           test "$archive" = \
             "$output_dir/denoize-vst3-v9.8.7-${{ matrix.target }}.${{ matrix.archive }}"
           test -s "$archive"
+
+  auv3-plugin:
+    name: AUv3 plug-in
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add aarch64-apple-darwin
+
+      - name: Install pinned JSON Schema validator
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/denoize-python"
+          "$RUNNER_TEMP/denoize-python/bin/python" -m pip install \
+            --disable-pip-version-check 'jsonschema==4.25.1'
+          echo "$RUNNER_TEMP/denoize-python/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned neural model
+        shell: bash
+        env:
+          DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-auv3-models-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          cargo run --locked --release --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
+
+      - name: Build signed AUv3 containing app
+        shell: bash
+        env:
+          DENOIZE_MODEL_DIR: ${{ runner.temp }}/denoize-auv3-models-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash scripts/build-auv3-plugin.sh aarch64-apple-darwin
+
+      - name: Validate both Audio Units in official and real hosts
+        shell: bash
+        run: |
+          app=$(find target/auv3-build/aarch64-apple-darwin \
+            -type d -name 'denoize AUv3.app' -print -quit)
+          test -n "$app"
+          report_dir="$RUNNER_TEMP/denoize-auv3-report"
+          mkdir -p "$report_dir"
+          auval_report="$report_dir/denoize-auv3-auval-v9.8.7-aarch64-apple-darwin.txt"
+          host_report="$report_dir/denoize-auv3-host-v9.8.7-aarch64-apple-darwin.txt"
+          evidence="$report_dir/denoize-auv3-host-evidence-v9.8.7-aarch64-apple-darwin.json"
+          bash scripts/validate-auv3-plugin.sh "$app" "$auval_report" >/dev/null
+          bash scripts/test-auv3-host.sh "$app" "$host_report" >/dev/null
+          python3 scripts/generate-auv3-host-evidence.py \
+            --tag v9.8.7 \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --auval-report "$auval_report" \
+            --host-report "$host_report" \
+            --output "$evidence"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-auv3-host-evidence-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
+
+      - name: Test AUv3 release archive layout
+        shell: bash
+        run: |
+          app=$(find target/auv3-build/aarch64-apple-darwin \
+            -type d -name 'denoize AUv3.app' -print -quit)
+          test -n "$app"
+          output_dir=$(mktemp -d "$RUNNER_TEMP/denoize-auv3-package.XXXXXX")
+          archive=$(bash scripts/package-auv3-plugin.sh \
+            aarch64-apple-darwin v9.8.7 "$output_dir" "$app")
+          package=denoize-auv3-v9.8.7-aarch64-apple-darwin
+          tar -tzf "$archive" \
+            | grep -Fx "$package/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/PlugIns/denoize.clap/Contents/Resources/denoize-models/gtcrn-dns3/gtcrn_simple.onnx"
+          tar -tzf "$archive" \
+            | grep -F "$package/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/PlugIns/denoize.clap/Contents/Resources/denoize-models/gtcrn-dns3/.provenance/" >/dev/null
 
   cli-docs:
     name: CLI documentation
