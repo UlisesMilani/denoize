@@ -103,9 +103,8 @@ clone_exact() {
   fi
   git -C "$destination" fetch --depth 1 origin "$revision"
   git -C "$destination" checkout --detach "$revision"
-  if [[ $(git -C "$destination" rev-parse HEAD) != "$revision" || \
-        -n $(git -C "$destination" status --porcelain) ]]; then
-    echo "$name checkout is not the clean pinned revision $revision" >&2
+  if [[ $(git -C "$destination" rev-parse HEAD) != "$revision" ]]; then
+    echo "$name checkout did not resolve to the pinned revision $revision" >&2
     exit 1
   fi
 }
@@ -114,6 +113,27 @@ clap_wrapper_root=$deps_dir/clap-wrapper
 clap_sdk_root=$deps_dir/clap
 clone_exact clap-wrapper "$clap_wrapper_url" "$clap_wrapper_rev" "$clap_wrapper_root"
 clone_exact CLAP "$clap_sdk_url" "$clap_sdk_rev" "$clap_sdk_root"
+
+if [[ -n $(git -C "$clap_sdk_root" status --porcelain) ]]; then
+  echo "CLAP SDK cache is not clean: $clap_sdk_root" >&2
+  exit 1
+fi
+
+auv3_patch=$repo_root/patches/clap-wrapper-v0.16.0-auv3-xcode15.patch
+wrapper_status=$(git -C "$clap_wrapper_root" status --porcelain)
+if [[ -z $wrapper_status ]]; then
+  git -C "$clap_wrapper_root" apply --check "$auv3_patch"
+  git -C "$clap_wrapper_root" apply "$auv3_patch"
+else
+  expected_status=' M src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm'
+  if [[ $wrapper_status != "$expected_status" ]]; then
+    echo "clap-wrapper cache contains changes other than the pinned AUv3 patch" >&2
+    printf '%s\n' "$wrapper_status" >&2
+    exit 1
+  fi
+  git -C "$clap_wrapper_root" apply --reverse --check "$auv3_patch"
+fi
+git -C "$clap_wrapper_root" diff --check
 
 plugin_version=$(sed -n 's/^version = "\([0-9][0-9.]*\)"$/\1/p' \
   plugins/denoize-clap/Cargo.toml | sed -n '1p')
