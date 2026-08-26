@@ -886,7 +886,7 @@ the DAW or run its plug-in rescan. CI and the tagged release workflow verify
 both descriptors with the pinned official CLAP validator 0.4.1: 81 tests, 68
 applicable passes, no failures or warnings, and 13 capability-based skips.
 
-VST3 3.8 bundles are available from v0.78.0. They statically adapt the same two
+VST3 3.8 bundles are available from v0.78.1. They statically adapt the same two
 descriptors through exact pinned CLAP-wrapper, CLAP SDK, and VST3 SDK revisions,
 so they cannot load a same-named external CLAP binary. The official 3.8.1
 validator gate requires 94/94 passes. A pinned Ardour 8.4 headless real-host
