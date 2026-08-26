@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.21)
 
+# Honor CMAKE_MSVC_RUNTIME_LIBRARY for every target, including targets created
+# in this parent directory after clap-wrapper returns from add_subdirectory().
+# Rust's MSVC staticlib uses the dynamic CRT by default, so keep all wrapper and
+# VST3 entry objects on the matching /MD variant.
+cmake_policy(SET CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY
+  "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+
 if(NOT DEFINED DENOIZE_PLUGIN_VERSION)
   message(FATAL_ERROR "DENOIZE_PLUGIN_VERSION is required")
 endif()
