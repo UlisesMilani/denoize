@@ -15,19 +15,19 @@ use clack_plugin::process::audio::{ChannelPair, PairedChannels, SampleType};
 use clack_plugin::stream::{InputStream, OutputStream};
 use crossbeam_queue::ArrayQueue;
 use denoize::{
-    Backend, BackendOptions, ChannelMode, DenoiserConfig, NEURAL_DAW_LATENCY_CHUNKS,
-    NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID,
-    NeuralDawOverloadFallback as OverloadFallback, NeuralDawParameters as NeuralParameters,
-    NeuralDawPortConfiguration as NeuralPortConfiguration,
+    AcceleratorRuntime, Backend, BackendOptions, ChannelMode, DenoiserConfig, GtcrnModel,
+    NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID,
+    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NeuralDawOverloadFallback as OverloadFallback,
+    NeuralDawParameters as NeuralParameters, NeuralDawPortConfiguration as NeuralPortConfiguration,
     NeuralDawSessionState as NeuralSessionState, OnnxModelConfig, StreamingBackendSession,
-    neural_daw_chunk_frames,
+    neural_daw_chunk_frames, select_accelerator_for_options,
 };
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::io::{Read, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -742,6 +742,8 @@ trait BlockProcessor: Send {
 
 struct GtcrnProcessor(StreamingBackendSession);
 
+static GTCRN_MODEL_CACHE: OnceLock<Mutex<Option<GtcrnModel>>> = OnceLock::new();
+
 impl GtcrnProcessor {
     fn new(sample_rate: u32, channels: usize) -> Result<Self, String> {
         let model = gtcrn_model()?;
@@ -761,16 +763,41 @@ impl GtcrnProcessor {
         if channels == 2 {
             options.channel_mode = ChannelMode::StereoLinked;
         }
+        let accelerator = select_accelerator_for_options(Backend::Gtcrn, &options)?;
+        let prepared = prepared_gtcrn_model(
+            options.onnx.as_ref().expect("GTCRN options were populated"),
+            accelerator.effective(),
+        )?;
         let mut denoiser = DenoiserConfig::default(sample_rate);
         denoiser.vad = false;
-        Ok(Self(StreamingBackendSession::new(
-            Backend::Gtcrn,
-            sample_rate,
-            channels,
-            denoiser,
-            options,
-        )?))
+        Ok(Self(
+            StreamingBackendSession::new_gtcrn_with_prepared_model(
+                sample_rate,
+                channels,
+                denoiser,
+                options,
+                &prepared,
+            )?,
+        ))
     }
+}
+
+fn prepared_gtcrn_model(
+    config: &OnnxModelConfig,
+    runtime: AcceleratorRuntime,
+) -> Result<GtcrnModel, String> {
+    let cache = GTCRN_MODEL_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "denoize Neural compiled-model cache lock was poisoned".to_owned())?;
+    if let Some(cached) = cached.as_ref()
+        && cached.runtime() == runtime
+    {
+        return Ok(cached.clone());
+    }
+    let model = GtcrnModel::load_with_accelerator(config, runtime)?;
+    *cached = Some(model.clone());
+    Ok(model)
 }
 
 impl BlockProcessor for GtcrnProcessor {

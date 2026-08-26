@@ -4,10 +4,10 @@
 //! three recurrent state tensors. The tensor layout follows the upstream MIT
 //! implementation in `Xiaobin-Rong/gtcrn`.
 
-use super::tract_runtime::SharedRunnable;
 use super::OnnxModelConfig;
+use super::tract_runtime::SharedRunnable;
 use crate::AcceleratorRuntime;
-use rustfft::{num_complex::Complex32, Fft, FftPlanner};
+use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 use std::sync::Arc;
 use tract_onnx::prelude::*;
 
@@ -80,6 +80,7 @@ fn validate_config(config: &OnnxModelConfig) -> Result<(), String> {
 #[derive(Clone)]
 pub struct GtcrnModel {
     model: SharedRunnable,
+    runtime: AcceleratorRuntime,
 }
 
 impl GtcrnModel {
@@ -95,7 +96,13 @@ impl GtcrnModel {
         validate_config(config)?;
         Ok(Self {
             model: load_model(&config.path, runtime)?,
+            runtime,
         })
+    }
+
+    /// Concrete runtime used to optimize this reusable graph.
+    pub const fn runtime(&self) -> AcceleratorRuntime {
+        self.runtime
     }
 
     pub fn stream(&self) -> Result<GtcrnStream, String> {
@@ -269,13 +276,21 @@ impl StreamingProcessor {
         channels: usize,
         runtime: AcceleratorRuntime,
     ) -> Result<Self, String> {
+        let model = GtcrnModel::load_with_accelerator(config, runtime)?;
+        Self::new_with_model(&model, sample_rate, channels)
+    }
+
+    pub(crate) fn new_with_model(
+        model: &GtcrnModel,
+        sample_rate: u32,
+        channels: usize,
+    ) -> Result<Self, String> {
         if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {
             return Err(format!(
                 "GTCRN streaming channels must be between 1 and {}",
                 crate::config::MAX_STREAM_CHANNELS
             ));
         }
-        let model = GtcrnModel::load_with_accelerator(config, runtime)?;
         let to_model_rate =
             crate::resample::StreamingResampler::new(channels, sample_rate, SAMPLE_RATE)?;
         let from_model_rate =
@@ -675,8 +690,8 @@ mod tests {
     use super::*;
     use prost::Message;
     use tract_onnx::pb::{
-        tensor_proto, tensor_shape_proto, type_proto, GraphProto, ModelProto, NodeProto,
-        OperatorSetIdProto, TensorShapeProto, TypeProto, ValueInfoProto,
+        GraphProto, ModelProto, NodeProto, OperatorSetIdProto, TensorShapeProto, TypeProto,
+        ValueInfoProto, tensor_proto, tensor_shape_proto, type_proto,
     };
 
     #[test]
@@ -713,6 +728,10 @@ mod tests {
             first.process_hop(&input).unwrap(),
             second.process_hop(&input).unwrap()
         );
+
+        let mut streaming = StreamingProcessor::new_with_model(&model, 48_000, 1).unwrap();
+        let ready = streaming.process_block(&[vec![0.1; 480]]).unwrap();
+        assert_eq!(ready.len(), 1);
     }
 
     #[test]
