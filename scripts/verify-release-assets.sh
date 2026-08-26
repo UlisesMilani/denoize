@@ -70,6 +70,13 @@ expected_assets=(
   "denoize-auv3-host-evidence-${tag}-x86_64-apple-darwin.sigstore.json"
   "denoize-auv3-auval-${tag}-x86_64-apple-darwin.txt"
   "denoize-auv3-host-${tag}-x86_64-apple-darwin.txt"
+  "denoize-lv2-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+  "denoize-lv2-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-lv2-host-evidence-v1.json"
+  "denoize-lv2-host-evidence-v1.sigstore.json"
+  "denoize-lv2-validation-${tag}-x86_64-unknown-linux-gnu.txt"
+  "denoize-lv2-jalv-${tag}-x86_64-unknown-linux-gnu.txt"
+  "denoize-lv2-ardour-${tag}-x86_64-unknown-linux-gnu.txt"
   "denoize_${version}_aarch64.app.tar.gz"
   "denoize_${version}_aarch64.app.tar.gz.sig"
   "denoize_${version}_aarch64.dmg"
@@ -115,6 +122,7 @@ expected_assets=(
   "denoize-listening-result-v1.schema.json"
   "denoize-presentation-region-v1.schema.json"
   "denoize-auv3-host-evidence-v1.schema.json"
+  "denoize-lv2-host-evidence-v1.schema.json"
   "denoize-plugin-editor-evidence-v1.schema.json"
   "denoize-plugin-host-matrix-v1.schema.json"
   "denoize-project-batch-v1.schema.json"
@@ -160,7 +168,7 @@ expected_assets=(
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
-update_rollback_versions=(0.76.0 0.77.0)
+update_rollback_versions=(0.79.0 0.80.0)
 update_platforms=(
   "darwin-aarch64-app"
   "darwin-x86_64-app"
@@ -272,6 +280,10 @@ gh release download "$tag" \
   --pattern 'denoize-auv3-auval-*.txt' \
   --pattern 'denoize-auv3-host-*.txt' \
   --pattern 'denoize-auv3-host-evidence-*.json' \
+  --pattern 'denoize-lv2-validation-*.txt' \
+  --pattern 'denoize-lv2-jalv-*.txt' \
+  --pattern 'denoize-lv2-ardour-*.txt' \
+  --pattern 'denoize-lv2-host-evidence-v1.json' \
   --pattern 'denoize-plugin-editor-evidence-v1.json' \
   --pattern 'denoize-vst3-ardour-*.txt' \
   --pattern 'denoize-vst3-validator-*.txt' \
@@ -305,6 +317,7 @@ gh release download "$tag" \
   --pattern 'denoize-listening-result-v1.schema.json' \
   --pattern 'denoize-presentation-region-v1.schema.json' \
   --pattern 'denoize-auv3-host-evidence-v1.schema.json' \
+  --pattern 'denoize-lv2-host-evidence-v1.schema.json' \
   --pattern 'denoize-plugin-editor-evidence-v1.schema.json' \
   --pattern 'denoize-plugin-host-matrix-v1.schema.json' \
   --pattern 'denoize-project-*.schema.json' \
@@ -385,6 +398,7 @@ for schema in \
   denoize-listening-result-v1.schema.json \
   denoize-presentation-region-v1.schema.json \
   denoize-auv3-host-evidence-v1.schema.json \
+  denoize-lv2-host-evidence-v1.schema.json \
   denoize-plugin-editor-evidence-v1.schema.json \
   denoize-plugin-host-matrix-v1.schema.json \
   denoize-project-batch-v1.schema.json \
@@ -508,6 +522,168 @@ for vst3_subject in "$vst3_matrix" "$vst3_report" "$vst3_host_report"; do
   gh attestation verify "$vst3_subject" \
     --repo "$repo" \
     --bundle "$vst3_provenance" \
+    --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
+    --source-digest "$source_commit" \
+    --source-ref "refs/tags/$tag" \
+    --signer-workflow "$repo/.github/workflows/release.yml" \
+    --deny-self-hosted-runners >/dev/null
+done
+
+lv2_evidence="$tmp_dir/denoize-lv2-host-evidence-v1.json"
+lv2_validation_report="$tmp_dir/denoize-lv2-validation-${tag}-x86_64-unknown-linux-gnu.txt"
+lv2_jalv_report="$tmp_dir/denoize-lv2-jalv-${tag}-x86_64-unknown-linux-gnu.txt"
+lv2_ardour_report="$tmp_dir/denoize-lv2-ardour-${tag}-x86_64-unknown-linux-gnu.txt"
+lv2_provenance="$tmp_dir/denoize-lv2-host-evidence-v1.sigstore.json"
+lv2_validation_digest=$(sha256sum "$lv2_validation_report" | cut -d' ' -f1)
+lv2_validation_size=$(wc -c < "$lv2_validation_report")
+lv2_jalv_digest=$(sha256sum "$lv2_jalv_report" | cut -d' ' -f1)
+lv2_jalv_size=$(wc -c < "$lv2_jalv_report")
+lv2_ardour_digest=$(sha256sum "$lv2_ardour_report" | cut -d' ' -f1)
+lv2_ardour_size=$(wc -c < "$lv2_ardour_report")
+if ! jq -e \
+  --arg tag "$tag" \
+  --arg repository "$repo" \
+  --arg commit "$source_commit" \
+  --arg validation_name "$(basename "$lv2_validation_report")" \
+  --arg validation_digest "$lv2_validation_digest" \
+  --argjson validation_size "$lv2_validation_size" \
+  --arg jalv_name "$(basename "$lv2_jalv_report")" \
+  --arg jalv_digest "$lv2_jalv_digest" \
+  --argjson jalv_size "$lv2_jalv_size" \
+  --arg ardour_name "$(basename "$lv2_ardour_report")" \
+  --arg ardour_digest "$lv2_ardour_digest" \
+  --argjson ardour_size "$lv2_ardour_size" '
+  .schema == "denoize-lv2-host-evidence-v1" and
+  .schema_version == 1 and
+  .tag == $tag and
+  .source == {repository: $repository, commit: $commit} and
+  .format == "lv2" and
+  .adapter == {
+    strategy: "direct-rust-lv2",
+    lv2_specification: "1.18.10",
+    rust_lv2_version: "0.6.0",
+    lv2_dev_package: "1.18.10-2build1",
+    lilv_utils_package: "0.24.22-1build1",
+    sordi_package: "0.16.16-2build1",
+    jalv_package: "1.6.8-1build3",
+    jackd2_package: "1.9.21~dfsg-3ubuntu3",
+    ardour_package: "1:8.4.0+ds1-2ubuntu8"
+  } and
+  .descriptors == [
+    {
+      uri: "https://github.com/penguin425/denoize#lv2-dsp",
+      name: "denoize",
+      ports: 13,
+      audio_inputs: 2,
+      audio_outputs: 2,
+      latency_frames_48khz: 480,
+      state_property: "https://github.com/penguin425/denoize#dsp-state",
+      worker_required: false
+    },
+    {
+      uri: "https://github.com/penguin425/denoize#lv2-neural",
+      name: "denoize Neural",
+      ports: 16,
+      audio_inputs: 2,
+      audio_outputs: 2,
+      latency_frames_48khz: 11520,
+      state_property: "https://github.com/penguin425/denoize#neural-state",
+      worker_required: true
+    }
+  ] and
+  .claims == {
+    direct_adapter: true,
+    official_metadata_validation: true,
+    lilv_discovery: true,
+    jalv_real_host: true,
+    ardour_real_host: true,
+    state_roundtrip: true,
+    worker_host: true,
+    sample_accurate_automation: true,
+    single_precision_audio: true,
+    double_precision_audio: false
+  } and
+  .limitations == [
+    "custom-editor-not-present",
+    "double-precision-audio-not-supported",
+    "linux-x86_64-only",
+    "lv2bench-neural-worker-not-supported",
+    "proprietary-hosts-not-exercised"
+  ] and
+  (.runs | length) == 3 and
+  .runs[0] == {
+    host: "LV2 reference tools and Lilv",
+    host_version: "1.18.10",
+    evidence_kind: "official-validation",
+    operating_system: "ubuntu-24.04",
+    architecture: "x86_64",
+    status: "passed",
+    descriptors_exercised: 2,
+    report: {
+      name: $validation_name,
+      size_bytes: $validation_size,
+      sha256: $validation_digest
+    }
+  } and
+  .runs[1] == {
+    host: "Jalv",
+    host_version: "1.6.8-1build3",
+    evidence_kind: "real-host-worker-smoke",
+    operating_system: "ubuntu-24.04",
+    architecture: "x86_64",
+    status: "passed",
+    descriptors_exercised: 2,
+    sample_rate_hz: 48000,
+    block_frames: 480,
+    worker_host: true,
+    teardown: true,
+    report: {
+      name: $jalv_name,
+      size_bytes: $jalv_size,
+      sha256: $jalv_digest
+    }
+  } and
+  .runs[2].host == "Ardour" and
+  .runs[2].host_version == "8.4.0~ds1" and
+  .runs[2].evidence_kind == "real-host-state-smoke" and
+  .runs[2].operating_system == "ubuntu-24.04" and
+  .runs[2].architecture == "x86_64" and
+  .runs[2].status == "passed" and
+  .runs[2].descriptors_exercised == 2 and
+  .runs[2].sample_rate_hz == 48000 and
+  .runs[2].first_pass_frames > 0 and
+  .runs[2].restored_pass_frames > 0 and
+  .runs[2].state_properties == 2 and
+  .runs[2].state_reload == true and
+  .runs[2].state_interface_errors == 0 and
+  .runs[2].teardown == true and
+  .runs[2].report == {
+    name: $ardour_name,
+    size_bytes: $ardour_size,
+    sha256: $ardour_digest
+  }
+' "$lv2_evidence" >/dev/null; then
+  echo "LV2 host evidence does not bind the tagged validation, Jalv, and Ardour reports" >&2
+  exit 1
+fi
+python3 - schemas/denoize-lv2-host-evidence-v1.schema.json "$lv2_evidence" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+document = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+Draft202012Validator(schema).validate(document)
+PY
+for lv2_subject in \
+  "$lv2_evidence" \
+  "$lv2_validation_report" \
+  "$lv2_jalv_report" \
+  "$lv2_ardour_report"; do
+  gh attestation verify "$lv2_subject" \
+    --repo "$repo" \
+    --bundle "$lv2_provenance" \
     --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
     --source-digest "$source_commit" \
     --source-ref "refs/tags/$tag" \
@@ -752,7 +928,7 @@ jq -e \
   .channel == "stable" and
   .version == $version and
   .source_commit == $commit and
-  .compatibility.accepted_from_versions == ["0.76.0", "0.77.0"] and
+  .compatibility.accepted_from_versions == ["0.79.0", "0.80.0"] and
   .rollback_policy.retained_last_known_good == 1 and
   .rollback_policy.manual_recovery == true and
   .rollback_policy.network_required_for_recovery == false and
@@ -778,7 +954,7 @@ jq -e \
     ($platform_row.candidate.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
-    ([$platform_row.rollbacks[].from_version] == ["0.76.0", "0.77.0"]) and
+    ([$platform_row.rollbacks[].from_version] == ["0.79.0", "0.80.0"]) and
     all($platform_row.rollbacks[]; . as $rollback |
       $rollback.payload.activation == $platform_row.candidate.activation and
       (.bundle_url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and

@@ -1,0 +1,389 @@
+@prefix atom:  <http://lv2plug.in/ns/ext/atom#> .
+@prefix doap:  <http://usefulinc.com/ns/doap#> .
+@prefix foaf:  <http://xmlns.com/foaf/0.1/> .
+@prefix lv2:   <http://lv2plug.in/ns/lv2core#> .
+@prefix patch: <http://lv2plug.in/ns/ext/patch#> .
+@prefix pg:    <http://lv2plug.in/ns/ext/port-groups#> .
+@prefix pprop: <http://lv2plug.in/ns/ext/port-props#> .
+@prefix rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs:  <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix rsz:   <http://lv2plug.in/ns/ext/resize-port#> .
+@prefix state: <http://lv2plug.in/ns/ext/state#> .
+@prefix units: <http://lv2plug.in/ns/extensions/units#> .
+@prefix urid:  <http://lv2plug.in/ns/ext/urid#> .
+@prefix work:  <http://lv2plug.in/ns/ext/worker#> .
+@prefix xsd:   <http://www.w3.org/2001/XMLSchema#> .
+@prefix den:   <https://github.com/penguin425/denoize#> .
+
+den:project
+    a doap:Project ;
+    doap:name "denoize" ;
+    doap:homepage <https://github.com/penguin425/denoize> ;
+    doap:license <https://spdx.org/licenses/MIT> ;
+    doap:maintainer [
+        a foaf:Person ;
+        foaf:name "denoize contributors"
+    ] ;
+    doap:release [
+        doap:revision "@DENOIZE_VERSION@" ;
+        doap:created "@DENOIZE_RELEASE_DATE@"^^xsd:date
+    ] .
+
+den:bypass
+    a lv2:Parameter ;
+    rdfs:label "Bypass" ;
+    rdfs:range atom:Bool .
+
+den:amount
+    a lv2:Parameter ;
+    rdfs:label "Amount" ;
+    rdfs:range atom:Float .
+
+den:threshold-dbfs
+    a lv2:Parameter ;
+    rdfs:label "Threshold" ;
+    rdfs:range atom:Float .
+
+den:release-ms
+    a lv2:Parameter ;
+    rdfs:label "Release" ;
+    rdfs:range atom:Float .
+
+den:mix
+    a lv2:Parameter ;
+    rdfs:label "Mix" ;
+    rdfs:range atom:Float .
+
+den:output-gain-db
+    a lv2:Parameter ;
+    rdfs:label "Output Gain" ;
+    rdfs:range atom:Float .
+
+den:stereo-link
+    a lv2:Parameter ;
+    rdfs:label "Stereo Link" ;
+    rdfs:range atom:Bool .
+
+den:overload-fallback
+    a lv2:Parameter ;
+    rdfs:label "Overload Fallback" ;
+    rdfs:range atom:Int .
+
+den:dsp-state
+    a lv2:Parameter ;
+    rdfs:label "denoize DSP portable state" ;
+    rdfs:range atom:String .
+
+den:neural-state
+    a lv2:Parameter ;
+    rdfs:label "denoize Neural portable state" ;
+    rdfs:range atom:String .
+
+den:dsp-main-input
+    a pg:StereoGroup, pg:InputGroup ;
+    lv2:symbol "dsp_main_input" .
+
+den:dsp-main-output
+    a pg:StereoGroup, pg:OutputGroup ;
+    lv2:symbol "dsp_main_output" ;
+    pg:source den:dsp-main-input .
+
+den:neural-main-input
+    a pg:StereoGroup, pg:InputGroup ;
+    lv2:symbol "neural_main_input" .
+
+den:neural-reference
+    a pg:StereoGroup, pg:InputGroup ;
+    lv2:symbol "neural_reference" ;
+    pg:sideChainOf den:neural-main-input .
+
+den:neural-main-output
+    a pg:StereoGroup, pg:OutputGroup ;
+    lv2:symbol "neural_main_output" ;
+    pg:source den:neural-main-input .
+
+den:lv2-dsp
+    a lv2:Plugin, lv2:FilterPlugin ;
+    doap:name "denoize" ;
+    lv2:project den:project ;
+    lv2:requiredFeature urid:map ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:extensionData state:interface ;
+    pg:mainInput den:dsp-main-input ;
+    pg:mainOutput den:dsp-main-output ;
+    patch:writable den:bypass,
+        den:amount,
+        den:threshold-dbfs,
+        den:release-ms,
+        den:mix,
+        den:output-gain-db,
+        den:stereo-link ;
+    lv2:port [
+        a lv2:InputPort, atom:AtomPort ;
+        lv2:index 0 ;
+        lv2:symbol "control" ;
+        lv2:name "Sample-accurate Control" ;
+        lv2:designation lv2:control ;
+        lv2:portProperty lv2:connectionOptional ;
+        atom:bufferType atom:Sequence ;
+        atom:supports patch:Message ;
+        rsz:minimumSize 4096
+    ], [
+        a lv2:InputPort, lv2:AudioPort ;
+        lv2:index 1 ;
+        lv2:symbol "input_left" ;
+        lv2:name "Input Left" ;
+        pg:group den:dsp-main-input ;
+        lv2:designation pg:left
+    ], [
+        a lv2:InputPort, lv2:AudioPort ;
+        lv2:index 2 ;
+        lv2:symbol "input_right" ;
+        lv2:name "Input Right" ;
+        pg:group den:dsp-main-input ;
+        lv2:designation pg:right
+    ], [
+        a lv2:OutputPort, lv2:AudioPort ;
+        lv2:index 3 ;
+        lv2:symbol "output_left" ;
+        lv2:name "Output Left" ;
+        pg:group den:dsp-main-output ;
+        lv2:designation pg:left
+    ], [
+        a lv2:OutputPort, lv2:AudioPort ;
+        lv2:index 4 ;
+        lv2:symbol "output_right" ;
+        lv2:name "Output Right" ;
+        pg:group den:dsp-main-output ;
+        lv2:designation pg:right
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 5 ;
+        lv2:symbol "bypass" ;
+        lv2:name "Bypass" ;
+        lv2:designation den:bypass ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1 ;
+        lv2:portProperty lv2:integer, lv2:toggled
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 6 ;
+        lv2:symbol "amount" ;
+        lv2:name "Amount" ;
+        lv2:designation den:amount ;
+        lv2:default 0.65 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+        units:unit units:coef
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 7 ;
+        lv2:symbol "threshold_dbfs" ;
+        lv2:name "Threshold" ;
+        lv2:designation den:threshold-dbfs ;
+        lv2:default -54.0 ;
+        lv2:minimum -96.0 ;
+        lv2:maximum -18.0 ;
+        units:unit units:db
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 8 ;
+        lv2:symbol "release_ms" ;
+        lv2:name "Release" ;
+        lv2:designation den:release-ms ;
+        lv2:default 160.0 ;
+        lv2:minimum 20.0 ;
+        lv2:maximum 1000.0 ;
+        units:unit units:ms
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 9 ;
+        lv2:symbol "mix" ;
+        lv2:name "Mix" ;
+        lv2:designation den:mix ;
+        lv2:default 1.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+        units:unit units:coef
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 10 ;
+        lv2:symbol "output_gain_db" ;
+        lv2:name "Output Gain" ;
+        lv2:designation den:output-gain-db ;
+        lv2:default 0.0 ;
+        lv2:minimum -24.0 ;
+        lv2:maximum 24.0 ;
+        units:unit units:db
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 11 ;
+        lv2:symbol "stereo_link" ;
+        lv2:name "Stereo Link" ;
+        lv2:designation den:stereo-link ;
+        lv2:default 1 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1 ;
+        lv2:portProperty lv2:integer, lv2:toggled
+    ], [
+        a lv2:OutputPort, lv2:ControlPort ;
+        lv2:index 12 ;
+        lv2:symbol "latency" ;
+        lv2:name "Latency" ;
+        lv2:designation lv2:latency ;
+        lv2:portProperty lv2:integer, lv2:reportsLatency ;
+        units:unit units:frame
+    ] .
+
+den:lv2-neural
+    a lv2:Plugin, lv2:FilterPlugin ;
+    doap:name "denoize Neural" ;
+    lv2:project den:project ;
+    lv2:requiredFeature urid:map, work:schedule ;
+    lv2:optionalFeature lv2:hardRTCapable ;
+    lv2:extensionData work:interface, state:interface ;
+    pg:mainInput den:neural-main-input ;
+    pg:mainOutput den:neural-main-output ;
+    patch:writable den:bypass,
+        den:mix,
+        den:output-gain-db,
+        den:overload-fallback ;
+    lv2:port [
+        a lv2:InputPort, atom:AtomPort ;
+        lv2:index 0 ;
+        lv2:symbol "control" ;
+        lv2:name "Sample-accurate Control" ;
+        lv2:designation lv2:control ;
+        lv2:portProperty lv2:connectionOptional ;
+        atom:bufferType atom:Sequence ;
+        atom:supports patch:Message ;
+        rsz:minimumSize 4096
+    ], [
+        a lv2:InputPort, lv2:AudioPort ;
+        lv2:index 1 ;
+        lv2:symbol "input_left" ;
+        lv2:name "Input Left" ;
+        pg:group den:neural-main-input ;
+        lv2:designation pg:left
+    ], [
+        a lv2:InputPort, lv2:AudioPort ;
+        lv2:index 2 ;
+        lv2:symbol "input_right" ;
+        lv2:name "Input Right" ;
+        pg:group den:neural-main-input ;
+        lv2:designation pg:right
+    ], [
+        a lv2:InputPort, lv2:AudioPort ;
+        lv2:index 3 ;
+        lv2:symbol "reference_left" ;
+        lv2:name "Reserved Reference Left" ;
+        lv2:portProperty lv2:connectionOptional ;
+        pg:group den:neural-reference ;
+        lv2:designation pg:left
+    ], [
+        a lv2:InputPort, lv2:AudioPort ;
+        lv2:index 4 ;
+        lv2:symbol "reference_right" ;
+        lv2:name "Reserved Reference Right" ;
+        lv2:portProperty lv2:connectionOptional ;
+        pg:group den:neural-reference ;
+        lv2:designation pg:right
+    ], [
+        a lv2:OutputPort, lv2:AudioPort ;
+        lv2:index 5 ;
+        lv2:symbol "output_left" ;
+        lv2:name "Output Left" ;
+        pg:group den:neural-main-output ;
+        lv2:designation pg:left
+    ], [
+        a lv2:OutputPort, lv2:AudioPort ;
+        lv2:index 6 ;
+        lv2:symbol "output_right" ;
+        lv2:name "Output Right" ;
+        pg:group den:neural-main-output ;
+        lv2:designation pg:right
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 7 ;
+        lv2:symbol "bypass" ;
+        lv2:name "Bypass" ;
+        lv2:designation den:bypass ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 1 ;
+        lv2:portProperty lv2:integer, lv2:toggled
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 8 ;
+        lv2:symbol "mix" ;
+        lv2:name "Mix" ;
+        lv2:designation den:mix ;
+        lv2:default 1.0 ;
+        lv2:minimum 0.0 ;
+        lv2:maximum 1.0 ;
+        units:unit units:coef
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 9 ;
+        lv2:symbol "output_gain_db" ;
+        lv2:name "Output Gain" ;
+        lv2:designation den:output-gain-db ;
+        lv2:default 0.0 ;
+        lv2:minimum -24.0 ;
+        lv2:maximum 24.0 ;
+        units:unit units:db
+    ], [
+        a lv2:InputPort, lv2:ControlPort ;
+        lv2:index 10 ;
+        lv2:symbol "overload_fallback" ;
+        lv2:name "Overload Fallback" ;
+        lv2:designation den:overload-fallback ;
+        lv2:default 0 ;
+        lv2:minimum 0 ;
+        lv2:maximum 2 ;
+        lv2:portProperty lv2:integer, lv2:enumeration ;
+        lv2:scalePoint [ rdfs:label "Delayed Dry" ; rdf:value 0 ],
+            [ rdfs:label "Last Safe Gain" ; rdf:value 1 ],
+            [ rdfs:label "Silence" ; rdf:value 2 ]
+    ], [
+        a lv2:OutputPort, lv2:ControlPort ;
+        lv2:index 11 ;
+        lv2:symbol "latency" ;
+        lv2:name "Latency" ;
+        lv2:designation lv2:latency ;
+        lv2:portProperty lv2:integer, lv2:reportsLatency ;
+        units:unit units:frame
+    ], [
+        a lv2:OutputPort, lv2:ControlPort ;
+        lv2:index 12 ;
+        lv2:symbol "overload_blocks" ;
+        lv2:name "Overload Blocks" ;
+        lv2:minimum 0 ;
+        lv2:maximum 16777216 ;
+        lv2:portProperty lv2:integer, pprop:notOnGUI
+    ], [
+        a lv2:OutputPort, lv2:ControlPort ;
+        lv2:index 13 ;
+        lv2:symbol "late_blocks" ;
+        lv2:name "Late Blocks" ;
+        lv2:minimum 0 ;
+        lv2:maximum 16777216 ;
+        lv2:portProperty lv2:integer, pprop:notOnGUI
+    ], [
+        a lv2:OutputPort, lv2:ControlPort ;
+        lv2:index 14 ;
+        lv2:symbol "invalid_blocks" ;
+        lv2:name "Invalid Blocks" ;
+        lv2:minimum 0 ;
+        lv2:maximum 16777216 ;
+        lv2:portProperty lv2:integer, pprop:notOnGUI
+    ], [
+        a lv2:OutputPort, lv2:ControlPort ;
+        lv2:index 15 ;
+        lv2:symbol "worker_errors" ;
+        lv2:name "Worker Errors" ;
+        lv2:minimum 0 ;
+        lv2:maximum 16777216 ;
+        lv2:portProperty lv2:integer, pprop:notOnGUI
+    ] .

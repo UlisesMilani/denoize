@@ -1,0 +1,23 @@
+[package]
+name = "denoize-lv2"
+version = "0.81.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+description = "Direct LV2 adapters for denoize DSP and neural effects"
+
+[lib]
+name = "denoize_lv2"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+denoize = { path = "../..", version = "0.81.0", default-features = false, features = ["gtcrn"] }
+lv2 = { version = "0.6.0", default-features = false, features = ["full"] }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
