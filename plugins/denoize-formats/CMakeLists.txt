@@ -6,6 +6,14 @@ endif()
 
 project(denoize_formats VERSION "${DENOIZE_PLUGIN_VERSION}" LANGUAGES C CXX)
 
+# clap-wrapper adds Objective-C and Objective-C++ sources on Apple platforms.
+# Enable those languages before adding the pinned wrapper subdirectory so both
+# Intel and Apple Silicon generators have complete compile rules.
+if(APPLE)
+  enable_language(OBJC)
+  enable_language(OBJCXX)
+endif()
+
 # clap-wrapper uses C++17 library facilities such as std::filesystem.  Do not
 # rely on generator defaults: Xcode 15 otherwise selects C++98, while current
 # Visual Studio rejects the filesystem aliases compiled without /std:c++17.
@@ -72,6 +80,12 @@ target_add_vst3_wrapper(
   BUNDLE_VERSION "${DENOIZE_PLUGIN_VERSION}")
 target_compile_definitions(denoize_vst3-clap-wrapper-vst3-lib
   PRIVATE STATICALLY_LINKED_CLAP_ENTRY=1)
+if(MSVC)
+  # Windows headers define min/max macros unless explicitly suppressed.  They
+  # corrupt std::numeric_limits::max() in the pinned VST3 SDK otherwise.
+  target_compile_definitions(denoize_vst3-clap-wrapper-vst3-lib
+    PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
 
 if(UNIX AND NOT APPLE)
   target_link_options(denoize_vst3 PRIVATE

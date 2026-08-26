@@ -1519,6 +1519,27 @@ mod tests {
         let shared = Box::leak(Box::new(NeuralShared::new()));
         let mut engine = NeuralEngine::new_gtcrn(48_000.0, 1, shared).unwrap();
         let parameters = RuntimeParameters::from(NeuralParameters::default());
+
+        // Tract performs one-time kernel selection and cache population during
+        // the first inference calls.  Hosts activate a prepared plug-in before
+        // recording sustained processing, so exercise that same lifecycle and
+        // exclude only startup work from the deadline counters.
+        let warmup_frames =
+            engine.latency_frames as usize + engine.chunk_frames * (QUEUE_BLOCKS + 8);
+        for frame in 0..warmup_frames {
+            engine.process_frame([0.01, 0.0], parameters);
+            if frame % engine.chunk_frames == 0 {
+                thread::sleep(Duration::from_millis(
+                    u64::from(denoize::NEURAL_DAW_CHUNK_MILLIS) * 2,
+                ));
+            }
+        }
+        assert_eq!(shared.worker_errors.load(Ordering::Relaxed), 0);
+        engine.reset();
+        shared.overload_blocks.store(0, Ordering::Relaxed);
+        shared.late_blocks.store(0, Ordering::Relaxed);
+        shared.invalid_blocks.store(0, Ordering::Relaxed);
+
         let latency = engine.latency_frames as usize;
         let frames = latency + engine.chunk_frames * 100;
         let mut finite = 0usize;
