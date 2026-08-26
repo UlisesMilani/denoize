@@ -68,7 +68,7 @@ stop/rollback conditions behind this order are maintained in
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
 | 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP released in v0.76.0; VST3 in v0.78.1; accessible CLAP editor in v0.79.0; macOS AUv3 implemented for v0.80.0; Linux LV2 implemented for v0.81.0 |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline released in v0.77.0; causal implementation complete for v0.82.0, release pending |
-| 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
+| 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Native file/stream core, signed evidence, schemas, and CLI implemented for v0.83.0; plug-in/live host promotion pending |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
 | 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Planned |
 | 10 | 33 | Stable C ABI, finite/live WASM, mobile SDKs, and optional Web Audio Module packaging after runtime and processing ABI stabilization | Planned |
@@ -223,15 +223,28 @@ release/crates.io asset checks cover causal evidence and reports. This does not
 activate the Stage 28 reference port: each plug-in still needs separate
 enrollment-consent, automation/state, latency, and real-host promotion evidence.
 
-Stage 30 retains a native delay tracker, partitioned frequency-domain adaptive
-filter, double-talk control, and conservative residual suppressor as the safe
-path. A causal neural post-filter may consume aligned microphone/reference,
-linear echo, and error signals only after package-v2 authentication. Release
-evidence covers positive/negative delay, independent clock drift, delay and room
-changes, nonlinear speakers, reference loss, near/far single talk, double talk,
-music, clipping, AECMOS/WAcc/listening, bounded reconvergence, single-thread
-RTF, and no more than 20 ms algorithmic-plus-buffering latency on the named
-reference system. ERLE is reported only in valid far-only regions.
+Stage 30 now has a native `aec` feature, file CLI, and preallocated causal
+stream. The safe path performs explicit constant-clock mapping, normalized FFT
+signed-delay estimation, partitioned frequency-domain NLMS, double-talk
+adaptation freeze, conservative residual suppression, route-generation cold
+reset, and microphone-preserving low-confidence fallback. The complete
+configuration is digest-bound by independently signed evidence before audio is
+opened. Closed evidence/report schemas, release/crates.io asset checks, and
+real-process CLI tests cover exact geometry, privacy, signature tampering, and
+both delay signs. See
+[Acoustic echo cancellation](docs/acoustic-echo-cancellation.md).
+
+The remaining Stage 30 promotion boundary is real host routing: activate the
+reserved typed far-end port only after CLAP/VST3/AUv3/LV2 hosts supply a stable
+reference, route generation, measured capture/playback clock mapping, and
+worst-case callback/worker evidence. A causal neural post-filter may consume
+aligned microphone/reference, linear echo, and error signals only after
+package-v2 authentication. Release evidence covers positive/negative delay,
+independent clock drift, delay and room changes, nonlinear speakers, reference
+loss, near/far single talk, double talk, music, clipping, AECMOS/WAcc/listening,
+bounded reconvergence, single-thread RTF, and no more than 20 ms
+algorithmic-plus-buffering latency on the named reference system. ERLE is
+reported only in valid far-only regions.
 
 Stage 31 accepts array processing only with explicit channel roles and signed or
 typed coordinates; program stereo/surround is never inferred to be an array.

@@ -177,6 +177,16 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes Ed25519-signed offline/causal non-inferiority across all 22 strata,
   recurrent reset/flush, <=100 ms perturbation latency, callback-safety, and
   absent/present/uncertain/late/stale transition evidence.
+- [`denoize-aec-report-v1.schema.json`](../schemas/denoize-aec-report-v1.schema.json)
+  describes an exact-duration, path-free mono AEC render: explicit microphone/
+  reference clock mapping, signed delay and confidence, filter/latency geometry,
+  talk-state, adaptation/reset/clipping counts, valid-region ERLE, and
+  domain-separated microphone/reference/output PCM identities.
+- [`denoize-aec-promotion-evidence-v1.schema.json`](../schemas/denoize-aec-promotion-evidence-v1.schema.json)
+  describes Ed25519-signed implementation/configuration/corpus/result identity,
+  all 17 delay/drift/path/talk/impairment/transition strata, hard fidelity and
+  latency limits, real-device/listening coverage, and the zero-violation paced
+  real-time audit.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -218,8 +228,9 @@ runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
 assessment, deterministic and universal restoration reports and masks,
-universal promotion evidence, and all four target-speaker contracts also reject
-unknown fields so a consumer cannot silently ignore a new safety dimension.
+universal promotion evidence, all four target-speaker contracts, and both AEC
+contracts also reject unknown fields so a consumer cannot silently ignore a
+new safety dimension.
 Signed plug-in editor evidence and host matrices are closed for the same reason.
 
 ## Portable project contracts

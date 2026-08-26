@@ -642,11 +642,35 @@ components can accelerate reconvergence and nonlinear residual suppression
 useful comparisons, but they must not be the only path when the reference drops,
 the route changes, or the room impulse response jumps.
 
+### Implemented native baseline
+
+The v0.83.0 implementation candidate adds an `aec` feature and a dedicated
+typed session rather than routing the reference through ordinary denoising.
+`native-pfdnlms-v1` maps a declared constant clock offset, estimates positive
+or negative bulk delay with normalized FFT cross-correlation, and runs a
+partitioned frequency-domain NLMS filter. Double-talk freezes adaptation;
+residual suppression has a higher near-end-preserving double-talk gain floor;
+and missing or low-confidence reference returns the microphone unchanged.
+Route generation and reference/clock/delay/non-finite discontinuities are cold
+reset boundaries.
+
+The exact closed configuration is SHA-256-bound by domain-separated Ed25519
+promotion evidence before audio is opened. The file CLI preserves exact
+microphone rate and duration and emits a path-free report with three
+domain-separated PCM identities. The public `AecStream` plans both FFTs and
+allocates filter/history/scratch/overlap/error buffers before processing; its
+exact-block method performs no allocation, locks, waits, I/O, network access,
+or logging. A real host must still provide measured capture/playback clock and
+route continuity and clear its own worst-case scheduling gate before the
+reserved DAW reference port is activated. The complete operational contract is
+documented in [Acoustic echo cancellation](acoustic-echo-cancellation.md).
+
 ### Candidate and artifact audit
 
 - The primary implementation is native partitioned-block frequency-domain
-  NLMS/Kalman adaptation. It needs no model or training-data license and can
-  expose the delay, filter energy, double-talk decision, and reset reason.
+  NLMS; a frequency-domain Kalman controller remains a measured comparison. It
+  needs no model or training-data license and exposes delay/confidence,
+  talk-state, adaptation, and reset evidence.
 - [DTLN-AEC](https://github.com/breizhn/DTLN-aec) is a compact causal comparison
   with published TFLite checkpoints and a real-time paper
   ([Westhausen and Meyer, 2021](https://arxiv.org/abs/2010.14337)). The repository

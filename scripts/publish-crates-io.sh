@@ -162,6 +162,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/backend/target_speaker.rs" \
     "denoize-${package_version}/src/causal_target_speaker.rs" \
     "denoize-${package_version}/src/backend/causal_target_speaker.rs" \
+    "denoize-${package_version}/src/acoustic_echo.rs" \
     "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/src/universal_restoration.rs" \
     "denoize-${package_version}/src/project.rs" \
@@ -237,6 +238,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-target-speaker-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-causal-target-speaker-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-aec-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-aec-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-apply-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-bundle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-check-v1.schema.json" \
@@ -256,6 +259,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-universal-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-neural-daw-schemas.py" \
     "denoize-${package_version}/scripts/test-target-speaker-schemas.py" \
+    "denoize-${package_version}/scripts/test-aec-schemas.py" \
     "denoize-${package_version}/scripts/test-runtime-model-package-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do

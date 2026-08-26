@@ -282,6 +282,46 @@ contracts, plus the causal [report](schemas/denoize-causal-target-speaker-report
 and [promotion evidence](schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json)
 contracts.
 
+### Fail-closed acoustic echo cancellation
+
+**denoize aec** cancels one typed mono far-end playback reference from one
+microphone recording through the native `aec` feature:
+
+~~~sh
+denoize aec microphone.wav playback-reference.wav cleaned.wav \
+  --promotion-evidence aec-evidence.json \
+  --promotion-evidence-key evaluator-public-key.json \
+  --aec-config aec-config.json \
+  --reference-clock-ppm -37.5 \
+  --initial-delay-samples -240 \
+  --route-generation 18 \
+  --report aec-report.json --pretty
+~~~
+
+The exact closed configuration and native implementation are bound by
+separately signed promotion evidence before either audio file is opened. The
+safe path uses explicit constant-clock mapping, normalized FFT signed-delay
+estimation, partitioned frequency-domain NLMS, double-talk adaptation freeze,
+and conservative residual suppression. A missing or low-confidence reference
+preserves the microphone. Route, reference, clock, delay, and non-finite-state
+boundaries cold-reset the filter; output retains the exact microphone rate and
+frame count.
+
+`AecStream` plans FFTs and preallocates every filter/history/scratch block on
+the control thread. `AecRealtimeAdapter` adds arbitrary host quanta with one
+fixed AEC-block latency and preallocated typed microphone/reference buffers.
+Processing allocates, locks, waits, logs, and performs I/O zero times. Promotion
+requires the complete 17-stratum
+delay/drift/path/talk/impairment matrix, <=20 ms latency, worst-case RTF <=0.5,
+10,000 paced blocks, real-device and nonlinear cases, AECMOS/WAcc/listening,
+bounded reconvergence, and zero callback/deadline/stale-reset violations. ERLE
+is reported only for far-end-only blocks. See
+[Acoustic echo cancellation](docs/acoustic-echo-cancellation.md), its
+[paper and artifact audit](docs/restoration-research.md#stage-30--acoustic-echo-cancellation),
+and the closed [report](schemas/denoize-aec-report-v1.schema.json) and
+[promotion evidence](schemas/denoize-aec-promotion-evidence-v1.schema.json)
+contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |

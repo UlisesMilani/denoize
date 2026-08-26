@@ -414,6 +414,7 @@ USAGE:
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -6050,6 +6051,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("target-speaker") {
         return run_target_speaker(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("aec") {
+        return run_aec(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("receipts") {
         return run_receipts(&args[1..]);
     }
@@ -8828,6 +8832,184 @@ fn run_universal_audio(_options: UniversalCliOptions) -> Result<(), String> {
     Err("universal audio restoration requires a build with the bsrnn feature".into())
 }
 
+fn aec_usage() -> &'static str {
+    "\
+USAGE:
+    denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize aec evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Cancel a typed mono far-end reference from a mono microphone recording. The
+safe native path uses explicit signed delay (including negative delay), an
+explicit reference clock mapping, partitioned frequency-domain NLMS, frozen
+adaptation during double talk, and conservative residual suppression. The
+exact configuration must be accepted by separately signed promotion evidence.
+A missing or low-confidence reference preserves the microphone; it is never
+treated as evidence that near-end speech should be suppressed.
+
+OPTIONS:
+        --promotion-evidence <PATH>        accepted signed AEC evaluation evidence
+        --promotion-evidence-key <PATH>    trusted Ed25519 evidence public key
+        --aec-config <PATH.json>           closed AEC configuration (default: promoted 48 kHz baseline)
+        --reference-clock-ppm <F>          explicit reference clock offset, -2000..2000 (default: 0)
+        --initial-delay-samples <N>        signed alignment hint within the promoted search range
+        --route-generation <N>             non-negative route identity, reset on every change
+        --report <PATH.json>               atomically write the closed path-free report
+        --max-memory <MB>                  bound decode, alignment, FFT, and output memory
+        --no-metadata                      do not copy microphone metadata to output
+        --replace                          atomically replace output/report destinations
+        --json                             emit compact report JSON
+        --pretty                           emit indented report JSON
+    -h, --help                             show this help
+"
+}
+
+#[cfg(feature = "aec")]
+#[derive(Debug)]
+struct AecCliOptions {
+    microphone: String,
+    reference: String,
+    output: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    config_path: Option<String>,
+    report: Option<String>,
+    reference_clock_ppm: f64,
+    initial_delay_samples: i32,
+    route_generation: u64,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+#[cfg(feature = "aec")]
+fn parse_aec_args(args: &[String]) -> Result<AecCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut promotion_evidence = None;
+    let mut promotion_evidence_key = None;
+    let mut config_path = None;
+    let mut report = None;
+    let mut reference_clock_ppm = 0.0_f64;
+    let mut initial_delay_samples = 0_i32;
+    let mut route_generation = 0_u64;
+    let mut max_memory_mb = None;
+    let mut preserve_metadata = true;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut scalar_options = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--reference-clock-ppm" | "--initial-delay-samples" | "--route-generation"
+        ) && !scalar_options.insert(argument)
+        {
+            return Err(format!("{argument} may be supplied only once"));
+        }
+        match argument {
+            "--promotion-evidence" if promotion_evidence.is_none() => {
+                promotion_evidence = Some(parse_value(args, &mut index, "--promotion-evidence")?);
+            }
+            "--promotion-evidence" => {
+                return Err("--promotion-evidence may be supplied only once".into());
+            }
+            "--promotion-evidence-key" if promotion_evidence_key.is_none() => {
+                promotion_evidence_key =
+                    Some(parse_value(args, &mut index, "--promotion-evidence-key")?);
+            }
+            "--promotion-evidence-key" => {
+                return Err("--promotion-evidence-key may be supplied only once".into());
+            }
+            "--aec-config" if config_path.is_none() => {
+                config_path = Some(parse_value(args, &mut index, "--aec-config")?);
+            }
+            "--aec-config" => return Err("--aec-config may be supplied only once".into()),
+            "--reference-clock-ppm" => {
+                reference_clock_ppm = parse_value(args, &mut index, "--reference-clock-ppm")?;
+            }
+            "--initial-delay-samples" => {
+                initial_delay_samples = parse_value(args, &mut index, "--initial-delay-samples")?;
+            }
+            "--route-generation" => {
+                route_generation = parse_value(args, &mut index, "--route-generation")?;
+            }
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--no-metadata" if preserve_metadata => preserve_metadata = false,
+            "--no-metadata" => return Err("--no-metadata may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("AEC accepts only one of --json or --pretty".into());
+            }
+            "-h" | "--help" => return Err("AEC help requested".into()),
+            "-" => {
+                return Err("AEC requires regular-file paths; stdin/stdout are unsupported".into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown AEC option: {value}"));
+            }
+            value => {
+                if positional.len() == 3 {
+                    return Err(format!("unexpected extra AEC argument: {value}"));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let microphone = positional
+        .first()
+        .cloned()
+        .ok_or("AEC requires MICROPHONE")?;
+    let reference = positional
+        .get(1)
+        .cloned()
+        .ok_or("AEC requires FAR_END_REFERENCE")?;
+    let output = positional.get(2).cloned().ok_or("AEC requires OUTPUT")?;
+    let promotion_evidence = promotion_evidence.ok_or("AEC requires --promotion-evidence")?;
+    let promotion_evidence_key =
+        promotion_evidence_key.ok_or("AEC requires --promotion-evidence-key")?;
+    if !reference_clock_ppm.is_finite() || !(-2_000.0..=2_000.0).contains(&reference_clock_ppm) {
+        return Err("AEC --reference-clock-ppm must be finite and in -2000..=2000".into());
+    }
+    if route_generation > (1_u64 << 53) - 1 {
+        return Err("AEC --route-generation exceeds the JSON safe-integer limit".into());
+    }
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    Ok(AecCliOptions {
+        microphone,
+        reference,
+        output,
+        promotion_evidence,
+        promotion_evidence_key,
+        config_path,
+        report,
+        reference_clock_ppm,
+        initial_delay_samples,
+        route_generation,
+        max_memory_mb,
+        preserve_metadata,
+        commit_mode,
+        print_mode,
+    })
+}
+
 fn target_speaker_usage() -> &'static str {
     "\
 USAGE:
@@ -9425,6 +9607,264 @@ fn validate_causal_target_speaker_publication_paths(
     Ok(())
 }
 
+fn run_aec(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", aec_usage());
+        return Ok(());
+    }
+    #[cfg(feature = "aec")]
+    {
+        if args.first().map(String::as_str) == Some("evidence") {
+            return run_aec_evidence(&args[1..]);
+        }
+        if args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+        {
+            return Err("AEC --help accepts no other arguments".into());
+        }
+        let options = parse_aec_args(args)?;
+        validate_aec_publication_paths(&options)?;
+        run_aec_audio(options)
+    }
+    #[cfg(not(feature = "aec"))]
+    {
+        let _ = args;
+        Err("acoustic echo cancellation requires a build with the aec feature".into())
+    }
+}
+
+#[cfg(feature = "aec")]
+fn run_aec_evidence(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err(
+            "AEC evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]"
+                .into(),
+        );
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("AEC evidence verify accepts only one output mode".into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown AEC evidence option: {value}"));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err("AEC evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into());
+    }
+    let evidence = denoize::SignedAecPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence)
+                .map_err(|error| format!("serialize AEC promotion evidence: {error}"))?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified AEC promotion evidence: implementation={}, strata={}, real_devices={}, nonlinear_devices={}, paced_blocks={}, accepted={}",
+            evidence.payload.implementation,
+            evidence.payload.strata.len(),
+            evidence.payload.real_device_cases,
+            evidence.payload.nonlinear_device_cases,
+            evidence.payload.paced_realtime_blocks,
+            evidence.payload.accepted,
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err("AEC promotion evidence is authentic but does not pass promotion gates".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "aec")]
+fn validate_aec_publication_paths(options: &AecCliOptions) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (options.microphone.as_str(), "AEC microphone"),
+        (options.reference.as_str(), "AEC far-end reference"),
+        (
+            options.promotion_evidence.as_str(),
+            "AEC promotion evidence",
+        ),
+        (
+            options.promotion_evidence_key.as_str(),
+            "AEC promotion evidence key",
+        ),
+    ] {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    if let Some(path) = options.config_path.as_deref() {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve AEC configuration {path}: {error}"))?,
+            "AEC configuration",
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (Some(options.output.as_str()), "AEC audio output"),
+        (options.report.as_deref(), "AEC report"),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace a microphone, reference, configuration, evidence, or key"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "aec")]
+fn run_aec_audio(options: AecCliOptions) -> Result<(), String> {
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let config = options
+        .config_path
+        .as_deref()
+        .map(denoize::AecConfig::from_file)
+        .transpose()?
+        .unwrap_or_default();
+    let evidence = denoize::SignedAecPromotionEvidence::from_file(&options.promotion_evidence)?;
+    let evidence_key = ReceiptPublicKey::from_file(&options.promotion_evidence_key)?;
+    // Authenticate promotion and bind every DSP parameter before either
+    // user-controlled audio source is opened.
+    let session = denoize::AecSession::prepare(&evidence, &evidence_key, config.clone())?;
+    let aec_memory = denoize::estimate_aec_memory_bytes(&config)?;
+    ensure_memory_limit(aec_memory, options.max_memory_mb, "AEC filter working set")?;
+
+    let mut microphone_session = AudioInputSession::open(&options.microphone)?;
+    let mut reference_session = AudioInputSession::open(&options.reference)?;
+    let session_memory = estimate_session_memory_bytes(&microphone_session)
+        .saturating_add(estimate_session_memory_bytes(&reference_session));
+    ensure_memory_limit(
+        aec_memory.saturating_add(session_memory),
+        options.max_memory_mb,
+        "AEC input/filter preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(aec_memory)
+            .saturating_sub(session_memory)
+    });
+    let microphone = read_audio_from_session_with_limits(
+        &mut microphone_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let retained_microphone = denoize::estimate_audio_memory_bytes(&microphone);
+    let reference_maximum = decode_maximum.map(|limit| limit.saturating_sub(retained_microphone));
+    let reference = read_audio_from_session_with_limits(
+        &mut reference_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(reference_maximum),
+            reference_maximum,
+        ),
+    )?;
+    let retained_reference = denoize::estimate_audio_memory_bytes(&reference);
+    let working_set = aec_memory
+        .saturating_add(session_memory)
+        .saturating_add(retained_reference)
+        .saturating_add(retained_microphone.saturating_mul(4));
+    ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "AEC decoded/alignment/output working set",
+    )?;
+    let mapping = denoize::AecClockMapping {
+        microphone_sample_rate: microphone.sample_rate,
+        reference_sample_rate: reference.sample_rate,
+        reference_clock_ppm: options.reference_clock_ppm,
+        initial_delay_samples: options.initial_delay_samples,
+        route_generation: options.route_generation,
+    };
+    let result = session.render(&microphone, &reference, &mapping)?;
+    let mut staged_report = options
+        .report
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.report))
+        .transpose()?;
+    let format = OutputFormat::from_path(std::path::Path::new(&options.output))?;
+    let encode_options = EncodeOptions::default();
+    encode_options.validate_options(format)?;
+    format.validate_config(&result.audio, &encode_options)?;
+    let metadata = if options.preserve_metadata {
+        microphone_session.read_metadata_with_limits(retained_metadata_limits(
+            options.max_memory_mb,
+            working_set,
+        )?)?
+    } else {
+        None
+    };
+    denoize::write_audio_transactional(
+        &options.output,
+        &result.audio,
+        encode_options,
+        metadata,
+        options.commit_mode,
+    )?;
+    if let Some(report) = staged_report.take() {
+        report.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "AEC: delay={} samples confidence={:.3} far-only={} double-talk={} uncertain={} frames={} latency_ms={:.3}",
+            result.report.delay.signed_delay_samples,
+            result.report.delay.confidence,
+            result.report.far_end_only_blocks,
+            result.report.double_talk_blocks,
+            result.report.reference_uncertain_blocks,
+            result.report.output_frames,
+            result.report.algorithmic_plus_buffering_milliseconds,
+        ),
+    }
+    Ok(())
+}
+
 fn run_target_speaker(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("causal") {
         return run_causal_target_speaker(&args[1..]);
@@ -9864,6 +10304,83 @@ fn run_causal_target_speaker_audio(options: CausalTargetSpeakerCliOptions) -> Re
 #[cfg(not(feature = "onnx"))]
 fn run_target_speaker_audio(_options: TargetSpeakerCliOptions) -> Result<(), String> {
     Err("target-speaker extraction requires a build with the onnx feature".into())
+}
+
+#[cfg(all(test, feature = "aec"))]
+mod aec_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parser_requires_both_authenticated_evidence_inputs() {
+        let error = parse_aec_args(&arguments(&["mic.wav", "ref.wav", "out.wav"])).unwrap_err();
+        assert_eq!(error, "AEC requires --promotion-evidence");
+        let parsed = parse_aec_args(&arguments(&[
+            "mic.wav",
+            "ref.wav",
+            "out.wav",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "public.json",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.initial_delay_samples, 0);
+        assert_eq!(parsed.reference_clock_ppm, 0.0);
+        assert_eq!(parsed.commit_mode, CommitMode::NoClobber);
+    }
+
+    #[test]
+    fn parser_accepts_negative_delay_and_clock_mapping() {
+        let parsed = parse_aec_args(&arguments(&[
+            "mic.wav",
+            "ref.wav",
+            "out.wav",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "public.json",
+            "--aec-config",
+            "config.json",
+            "--reference-clock-ppm",
+            "-125.5",
+            "--initial-delay-samples",
+            "-240",
+            "--route-generation",
+            "9",
+            "--replace",
+            "--pretty",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.reference_clock_ppm, -125.5);
+        assert_eq!(parsed.initial_delay_samples, -240);
+        assert_eq!(parsed.route_generation, 9);
+        assert_eq!(parsed.config_path.as_deref(), Some("config.json"));
+        assert_eq!(parsed.commit_mode, CommitMode::Replace);
+        assert_eq!(parsed.print_mode, DiagnosticPrintMode::PrettyJson);
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_and_unsafe_scalar_options() {
+        let base = [
+            "mic.wav",
+            "ref.wav",
+            "out.wav",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "public.json",
+        ];
+        let mut duplicate = base.to_vec();
+        duplicate.extend(["--route-generation", "1", "--route-generation", "2"]);
+        assert!(parse_aec_args(&arguments(&duplicate)).is_err());
+        let mut unsafe_clock = base.to_vec();
+        unsafe_clock.extend(["--reference-clock-ppm", "2000.1"]);
+        assert!(parse_aec_args(&arguments(&unsafe_clock)).is_err());
+    }
 }
 
 #[cfg(test)]

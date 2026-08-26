@@ -105,6 +105,7 @@ default = ["m4a-encode"]
 rnnoise = ["dep:nnnoiseless"]
 deepfilter = ["dep:df", "dep:ndarray"]
 onnx = ["dep:tract-onnx", "dep:crossbeam-queue"]
+aec = ["dep:rustfft"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
@@ -115,7 +116,7 @@ visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
 live = ["dep:cpal"]
 fdk-aac-encoder = ["m4a-encode", "dep:fdk-aac-rust"]
-full = ["rnnoise", "deepfilter", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "m4a-encode", "visqol", "live"]
+full = ["rnnoise", "deepfilter", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "m4a-encode", "visqol", "live"]
 
 [dev-dependencies]
 minisign = "0.9.1"
@@ -132,5 +133,5 @@ strip = true
 opt-level = 1
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
+features = ["rnnoise", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
 rustdoc-args = ["--cfg", "docsrs"]

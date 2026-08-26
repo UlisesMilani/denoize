@@ -86,6 +86,9 @@ jobs:
       - name: Validate target-speaker JSON contracts
         run: python3 scripts/test-target-speaker-schemas.py
 
+      - name: Validate acoustic echo cancellation JSON contracts
+        run: python3 scripts/test-aec-schemas.py
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -136,6 +139,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/test-lv2-host-evidence.py", "exec")'
@@ -1039,6 +1043,8 @@ jobs:
           target_speaker_report_schema="$asset_dir/denoize-target-speaker-report-v1.schema.json"
           causal_target_speaker_promotion_evidence_schema="$asset_dir/denoize-causal-target-speaker-promotion-evidence-v1.schema.json"
           causal_target_speaker_report_schema="$asset_dir/denoize-causal-target-speaker-report-v1.schema.json"
+          aec_promotion_evidence_schema="$asset_dir/denoize-aec-promotion-evidence-v1.schema.json"
+          aec_report_schema="$asset_dir/denoize-aec-report-v1.schema.json"
           watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
           watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
           watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
@@ -1099,6 +1105,8 @@ jobs:
           cp schemas/denoize-target-speaker-report-v1.schema.json "$target_speaker_report_schema"
           cp schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json "$causal_target_speaker_promotion_evidence_schema"
           cp schemas/denoize-causal-target-speaker-report-v1.schema.json "$causal_target_speaker_report_schema"
+          cp schemas/denoize-aec-promotion-evidence-v1.schema.json "$aec_promotion_evidence_schema"
+          cp schemas/denoize-aec-report-v1.schema.json "$aec_report_schema"
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
@@ -1144,6 +1152,7 @@ jobs:
             "$universal_promotion_evidence_schema" \
             "$target_speaker_promotion_evidence_schema" "$target_speaker_report_schema" \
             "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
+            "$aec_promotion_evidence_schema" "$aec_report_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
             "$asset_dir"/denoize-update-*.schema.json \

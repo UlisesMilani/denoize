@@ -153,6 +153,7 @@ windows-sys = { version = "0.61.2", features = [
 default = []
 rnnoise = ["dep:nnnoiseless"]
 onnx = ["dep:tract-onnx", "dep:crossbeam-queue"]
+aec = ["dep:rustfft"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
@@ -161,14 +162,14 @@ gtcrn = ["onnx", "dep:rustfft"]
 accelerators = ["onnx", "dep:tract-metal", "dep:metal", "dep:tract-cuda", "dep:cudarc"]
 visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 live = ["dep:cpal"]
-full = ["rnnoise", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol", "live"]
+full = ["rnnoise", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol", "live"]
 
 [dev-dependencies]
 minisign = "0.9.1"
 prost = "0.14"
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
+features = ["rnnoise", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]

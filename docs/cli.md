@@ -19,6 +19,7 @@ USAGE:
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -287,6 +288,37 @@ CAUSAL OPTIONS:
         --maximum-peak <F>                       absolute candidate peak, 0.5..1 (default: 1)
     The remaining model, probability, energy, accelerator, report, memory,
     metadata, replacement, and JSON options above also apply to causal mode.
+```
+
+## Fail-closed acoustic echo cancellation
+
+```text
+USAGE:
+    denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize aec evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Cancel a typed mono far-end reference from a mono microphone recording. The
+safe native path uses explicit signed delay (including negative delay), an
+explicit reference clock mapping, partitioned frequency-domain NLMS, frozen
+adaptation during double talk, and conservative residual suppression. The
+exact configuration must be accepted by separately signed promotion evidence.
+A missing or low-confidence reference preserves the microphone; it is never
+treated as evidence that near-end speech should be suppressed.
+
+OPTIONS:
+        --promotion-evidence <PATH>        accepted signed AEC evaluation evidence
+        --promotion-evidence-key <PATH>    trusted Ed25519 evidence public key
+        --aec-config <PATH.json>           closed AEC configuration (default: promoted 48 kHz baseline)
+        --reference-clock-ppm <F>          explicit reference clock offset, -2000..2000 (default: 0)
+        --initial-delay-samples <N>        signed alignment hint within the promoted search range
+        --route-generation <N>             non-negative route identity, reset on every change
+        --report <PATH.json>               atomically write the closed path-free report
+        --max-memory <MB>                  bound decode, alignment, FFT, and output memory
+        --no-metadata                      do not copy microphone metadata to output
+        --replace                          atomically replace output/report destinations
+        --json                             emit compact report JSON
+        --pretty                           emit indented report JSON
+    -h, --help                             show this help
 ```
 
 ## Watch-folder automation
