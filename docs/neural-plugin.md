@@ -140,7 +140,7 @@ audio-port, state, parameter, and thread rules.
 
 This release is speech enhancement, not general restoration, target-speaker
 extraction, AEC, or spatial beamforming. It has no custom editor; hosts render
-the four parameters. v0.78.0 adds a statically bound VST3 3.8 adapter with
+the four parameters. v0.78.1 adds a statically bound VST3 3.8 adapter with
 official-validator, pinned Ardour 8.4 processing/state-reload smoke, packaging,
 checksum, SBOM, and signed host-matrix evidence; see
 [VST3 plug-in](vst3-plugin.md). Its matrix intentionally does not claim

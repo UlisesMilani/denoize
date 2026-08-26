@@ -343,6 +343,55 @@ jobs:
             | grep -F 'denoize.vst3/Contents/x86_64-linux/denoize.so' >/dev/null
           unzip -t "$output_dir/denoize-vst3-v9.8.7-x86_64-pc-windows-msvc.zip"
 
+  vst3-cross-platform:
+    name: VST3 cross-platform build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build statically bound VST3 bundle
+        shell: bash
+        run: bash scripts/build-vst3-plugin.sh "${{ matrix.target }}"
+
+      - name: Verify package layout
+        shell: bash
+        run: |
+          bundle=$(find "target/vst3-build/${{ matrix.target }}" \
+            -type d -name denoize.vst3 -print -quit)
+          if [[ -z "$bundle" ]]; then
+            bundle=$(find "target/vst3-build/${{ matrix.target }}" \
+              -type f -name denoize.vst3 -print -quit)
+          fi
+          test -n "$bundle"
+          output_dir="$RUNNER_TEMP/denoize-vst3-package"
+          mkdir -p "$output_dir"
+          archive=$(bash scripts/package-vst3-plugin.sh \
+            "${{ matrix.target }}" v9.8.7 "$output_dir" "$bundle")
+          test "$archive" = \
+            "$output_dir/denoize-vst3-v9.8.7-${{ matrix.target }}.${{ matrix.archive }}"
+          test -s "$archive"
+
   cli-docs:
     name: CLI documentation
     runs-on: ubuntu-latest

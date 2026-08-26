@@ -6,6 +6,13 @@ endif()
 
 project(denoize_formats VERSION "${DENOIZE_PLUGIN_VERSION}" LANGUAGES C CXX)
 
+# clap-wrapper uses C++17 library facilities such as std::filesystem.  Do not
+# rely on generator defaults: Xcode 15 otherwise selects C++98, while current
+# Visual Studio rejects the filesystem aliases compiled without /std:c++17.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 # Every wrapper/support archive is linked into a loadable plug-in bundle.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 

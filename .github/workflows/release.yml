@@ -431,7 +431,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
           - os: macos-15-intel
@@ -1007,7 +1007,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.75.0 0.76.0)
+          rollback_versions=(0.76.0 0.77.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"
