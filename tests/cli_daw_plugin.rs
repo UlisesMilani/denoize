@@ -40,6 +40,115 @@ fn plugin_info_and_latency_are_machine_readable() {
 }
 
 #[test]
+fn neural_plugin_contracts_are_machine_readable_and_fail_closed() {
+    let info = success_json(&[
+        "plugin",
+        "neural",
+        "info",
+        "--sample-rate",
+        "48000",
+        "--json",
+    ]);
+    assert_eq!(info["event"], "plugin-neural-info");
+    assert_eq!(info["plugin_id"], "org.penguin425.denoize.neural");
+    assert_eq!(info["backend"], "gtcrn");
+    assert_eq!(info["model_id"], "gtcrn-dns3");
+    assert_eq!(info["chunk_frames"], 480);
+    assert_eq!(info["latency_frames"], 11_520);
+    assert_eq!(info["realtime_contract"]["allocations"], 0);
+    assert_eq!(info["realtime_contract"]["inference_on_callback"], false);
+
+    for &(rate, chunk, latency) in &[
+        (44_100, 441, 10_584),
+        (48_000, 480, 11_520),
+        (96_000, 960, 23_040),
+    ] {
+        let rate = rate.to_string();
+        let report = success_json(&[
+            "plugin",
+            "neural",
+            "latency",
+            "--sample-rate",
+            &rate,
+            "--json",
+        ]);
+        assert_eq!(report["chunk_frames"], chunk);
+        assert_eq!(report["latency_frames"], latency);
+        assert_eq!(report["measured_latency_frames"], latency);
+        assert_eq!(report["matches_reported"], true);
+        assert_eq!(report["measurement"], "f64-delayed-dry-impulse-v1");
+    }
+
+    let fractional = run(&[
+        "plugin",
+        "neural",
+        "latency",
+        "--sample-rate",
+        "44100.5",
+        "--json",
+    ]);
+    assert!(fractional.status.success());
+    let fractional: serde_json::Value = serde_json::from_slice(&fractional.stdout).unwrap();
+    assert_eq!(fractional["latency_frames"], 10_608);
+    assert_eq!(fractional["measured_latency_frames"], 10_608);
+    assert_eq!(fractional["matches_reported"], true);
+}
+
+#[test]
+fn neural_session_matches_host_state_and_is_no_clobber() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = directory.path().join("neural.json");
+    let path = session.to_str().unwrap();
+    let state = success_json(&[
+        "plugin",
+        "neural",
+        "session",
+        "create",
+        path,
+        "--mono",
+        "--mix",
+        "0.75",
+        "--output-gain-db",
+        "-1.5",
+        "--fallback",
+        "last-safe-gain",
+        "--json",
+    ]);
+    assert_eq!(state["schema"], "denoize-neural-daw-session-v1");
+    assert_eq!(state["plugin_id"], "org.penguin425.denoize.neural");
+    assert_eq!(state["port_configuration"], "mono");
+    assert_eq!(state["parameters"]["mix"], 0.75);
+    assert_eq!(state["parameters"]["overload_fallback"], "last-safe-gain");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&session).unwrap()).unwrap(),
+        state
+    );
+
+    let validation = success_json(&["plugin", "neural", "session", "validate", path, "--json"]);
+    assert_eq!(validation["event"], "plugin-neural-session-validation");
+    assert_eq!(validation["valid"], true);
+    assert_eq!(validation["model_id"], "gtcrn-dns3");
+
+    let before = std::fs::read(&session).unwrap();
+    let duplicate = run(&["plugin", "neural", "session", "create", path, "--stereo"]);
+    assert!(!duplicate.status.success());
+    assert_eq!(std::fs::read(&session).unwrap(), before);
+
+    let ambiguous = directory.path().join("ambiguous.json");
+    let rejected = run(&[
+        "plugin",
+        "neural",
+        "session",
+        "create",
+        ambiguous.to_str().unwrap(),
+        "--mono",
+        "--stereo",
+    ]);
+    assert!(!rejected.status.success());
+    assert!(!ambiguous.exists());
+}
+
+#[test]
 fn preset_and_session_files_are_portable_deterministic_and_no_clobber() {
     let directory = tempfile::tempdir().unwrap();
     let preset = directory.path().join("studio.json");
@@ -165,5 +274,18 @@ fn checked_in_schemas_match_runtime_contracts() {
     assert_eq!(
         session["properties"]["latency_policy"]["const"],
         "fixed-10ms-v1"
+    );
+
+    let neural: serde_json::Value = serde_json::from_str(include_str!(
+        "../schemas/denoize-neural-daw-session-v1.schema.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        neural["properties"]["plugin_id"]["const"],
+        "org.penguin425.denoize.neural"
+    );
+    assert_eq!(
+        neural["properties"]["latency_policy"]["const"],
+        "fixed-24x10ms-worker-v1"
     );
 }

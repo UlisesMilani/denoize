@@ -246,6 +246,24 @@ required `matches_reported: true` result. Preset/session inspect and create
 commands emit their native contracts; validate commands emit the corresponding
 CLI validation event.
 
+`denoize-neural-daw-session-v1` is the separate state document for
+`org.penguin425.denoize.neural`. It binds `gtcrn-dns3`, the exact graph
+SHA-256, `fixed-24x10ms-worker-v1`, mono/stereo layout, bypass, mix, output
+gain, and the explicit overload fallback. Paths, model bytes, audio, worker
+metrics, and enrollment material are not state. The same 64 KiB, closed-field,
+finite-number, regular-file, atomic no-clobber rules apply.
+
+`denoize plugin neural info --json` emits `plugin-neural-info` under
+`denoize-cli-output-v1`: model install status, stable identity, reference-port
+reservation, sample formats, exact scheduler geometry, queue bound, fallbacks,
+and the callback prohibitions. `plugin neural latency --json` emits
+`plugin-neural-latency`; `sample_rate` is a finite JSON number because CLAP's
+ABI permits fractional rates, while frame counts remain integers. It contains
+an independent delayed-dry f64 impulse measurement and requires
+`matches_reported: true`. Neural session validation emits
+`plugin-neural-session-validation`; inspect/create emit the native state
+contract.
+
 ## Local IPC contracts
 
 IPC v1 uses length-prefixed JSON over a loopback-only TCP endpoint. The

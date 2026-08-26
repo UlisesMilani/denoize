@@ -66,7 +66,7 @@ stop/rollback conditions behind this order are maintained in
 | 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
-| 5 | 28 | Neural CLAP processing, VST3, custom editor, sidechain foundation, off-callback inference, host latency, automation, overload fallback, then AUv3 and LV2 | Planned |
+| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and format-parity gates | CLAP foundation released in v0.76.0; format expansion planned |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Planned |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
@@ -127,6 +127,39 @@ content/speaker/quality/output/performance metrics per stratum, and human
 listening evidence. No URGENT or UniPASE checkpoint is bundled until the full
 artifact-level training-data redistribution chain is resolved. See
 [Fail-closed universal speech restoration](docs/universal-restoration.md).
+
+Stage 28 first establishes one measurable deployment reference rather than
+claiming several wrappers at once. The v0.76.0 bundle exposes
+`org.penguin425.denoize.neural` beside the unchanged DSP effect, verifies the
+exact managed `gtcrn-dns3` graph before activation, and prepares/runs it on one
+permanent worker. The host callback owns only a preallocated 40-block pool,
+bounded 16-block lock-free queues, delayed-dry/last-safe-gain/silence fallback,
+and sample-accurate bypass/mix/gain selection. Its public latency is twenty-four
+ceil-rounded 10 ms chunks for every finite CLAP rate, including fractional
+rates. Absolute frame identity and reset generation reject late cross-session
+audio. Mono/stereo and a reserved independent reference input form the routing
+foundation; the reference is not consumed until Stage 29 or 30 defines it.
+
+The portable neural session is closed, 64 KiB bounded, path-free, atomically
+no-clobber, and binds the exact plugin/model/digest/scheduler/ports/parameters.
+CLI and Desktop report the independent identity and measured latency. CI runs
+100 real-time-paced blocks through the release-profile pinned graph and requires
+zero deadline misses, overload fallbacks, invalid blocks, or worker errors. It
+also runs allocation/stall/reset/automation/state tests, JSON schemas, and both
+descriptors through the pinned official validator (81 total, 68 success, 13
+capability skip, zero failure/warning). See
+[Neural DAW plug-in](docs/neural-plugin.md).
+
+Format work remains split into explicit parity gates so the v0.76.0 status does
+not imply untested host support:
+
+| Substage | Scope | Status |
+|---|---|---|
+| 28a | CLAP neural reference, shared scheduler/state/sidechain foundation | Released in v0.76.0 |
+| 28b | VST3 3.8 component/controller, buses, automation, latency restart, validator, packaging, and signed host matrix | Planned |
+| 28c | Accessible custom editor with generic-host fallback and UI-thread/lifecycle tests | Planned |
+| 28d | AUv3 sandbox/lifecycle/state/render parity and signed Apple host matrix | Planned |
+| 28e | LV2 worker/atom/state parity, validation, packaging, and Linux host matrix | Planned |
 
 Stages 28–31 depend on the v2 runtime contract. The audio callback may not
 allocate, block, load a model, perform filesystem or network I/O, or wait on

@@ -263,6 +263,14 @@ type DawPluginInfo = {
   measuredLatencyFrames: number; matchesReported: boolean;
   portConfigurations: string[]; sampleFormats: string[]; realtimeAllocations: number;
 };
+type NeuralDawPluginInfo = {
+  pluginId: string; version: string; format: "CLAP"; backend: "gtcrn";
+  modelId: string; modelSha256: string; modelInstalled: boolean; latencyPolicy: string;
+  sampleRate: number; chunkFrames: number; latencyFrames: number; latencyMillis: number;
+  measuredLatencyFrames: number; matchesReported: boolean;
+  portConfigurations: string[]; referencePort: string; sampleFormats: string[];
+  queueBlocks: number; blockPool: number; overloadFallbacks: string[]; realtimeAllocations: number;
+};
 type ExecutionPlan = {
   schema: string; schema_version: number; denoize_version: string; kind: "file" | "batch" | "stream";
   deterministic: boolean; metadata_policy: string; items: Array<Record<string, unknown>>;
@@ -634,10 +642,19 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
             <article class="card">
               <div class="card-heading"><div><span class="step">CLAP</span><h2>プラグイン契約</h2></div><span class="hint">RT SAFE · FIXED LATENCY</span></div>
               <p class="section-copy">DAW が補正できる固定レイテンシと、オーディオコールバック内のゼロ allocation 契約を表示します。</p>
-              <div class="form-grid two"><label>サンプルレート Hz<input id="daw-sample-rate" type="number" value="48000" min="1" max="768000" step="1" inputmode="decimal"></label><label>プラグイン ID<input id="daw-plugin-id" type="text" value="org.penguin425.denoize" readonly></label></div>
+              <div class="form-grid two"><label>サンプルレート Hz<input id="daw-sample-rate" type="number" value="48000" min="1" max="768000" step="any" inputmode="decimal"></label><label>プラグイン ID<input id="daw-plugin-id" type="text" value="org.penguin425.denoize" readonly></label></div>
               <div class="metric-pair"><div><span>報告レイテンシ</span><b id="daw-latency-frames">480 frames</b></div><div><span>測定レイテンシ</span><b id="daw-latency-ms">480 frames · 10.000 ms</b></div></div>
               <p id="daw-plugin-status" class="field-hint" role="status" aria-live="polite">CLAP 契約を確認しています。</p>
               <button type="button" class="secondary" id="refresh-daw-plugin">レイテンシを再計測</button>
+            </article>
+
+            <article class="card">
+              <div class="card-heading"><div><span class="step">NEURAL</span><h2>ニューラル契約</h2></div><span class="hint">OFF-CALLBACK · PINNED</span></div>
+              <p class="section-copy">固定 GTCRN モデル、worker スケジューラ、遅延整合、過負荷 fallback を既存 DSP とは別のプラグイン ID で確認します。</p>
+              <div class="form-grid two"><label>ニューラル ID<input id="neural-daw-plugin-id" type="text" value="org.penguin425.denoize.neural" readonly></label><label>モデル ID<input id="neural-daw-model-id" type="text" value="gtcrn-dns3" readonly></label></div>
+              <div class="metric-pair"><div><span>報告レイテンシ</span><b id="neural-daw-latency-frames">11520 frames</b></div><div><span>測定レイテンシ</span><b id="neural-daw-latency-ms">11520 frames · 240.000 ms</b></div></div>
+              <p id="neural-daw-plugin-status" class="field-hint" role="status" aria-live="polite">ニューラル CLAP 契約を確認しています。</p>
+              <button type="button" class="secondary" id="refresh-neural-daw-plugin">ニューラル遅延を再計測</button>
             </article>
 
             <article class="card">
@@ -1653,6 +1670,25 @@ async function refreshDawPluginInfo() {
   );
 }
 
+async function refreshNeuralDawPluginInfo() {
+  const sampleRate = Number($<HTMLInputElement>("#daw-sample-rate").value);
+  if (!Number.isFinite(sampleRate) || sampleRate < 1 || sampleRate > 768000) {
+    throw new Error(tr(
+      "サンプルレートは 1 以上 768000 以下の有限値で指定してください",
+      "Sample rate must be a finite value from 1 through 768000",
+    ));
+  }
+  const info = await invoke<NeuralDawPluginInfo>("neural_daw_plugin_info", { sampleRate });
+  $<HTMLInputElement>("#neural-daw-plugin-id").value = info.pluginId;
+  $<HTMLInputElement>("#neural-daw-model-id").value = info.modelId;
+  $("#neural-daw-latency-frames").textContent = `${info.latencyFrames} frames`;
+  $("#neural-daw-latency-ms").textContent = `${info.measuredLatencyFrames} frames · ${info.latencyMillis.toFixed(3)} ms`;
+  $("#neural-daw-plugin-status").textContent = tr(
+    `${info.format} v${info.version} · ${info.backend}/${info.modelId} ${info.modelInstalled ? "検証済み" : "未導入"} · ${info.queueBlocks} block queue · fallback ${info.overloadFallbacks.join("/")} · RT allocation ${info.realtimeAllocations}`,
+    `${info.format} v${info.version} · ${info.backend}/${info.modelId} ${info.modelInstalled ? "verified" : "not installed"} · ${info.queueBlocks}-block queue · fallback ${info.overloadFallbacks.join("/")} · RT allocations ${info.realtimeAllocations}`,
+  );
+}
+
 async function loadDawFactoryPreset() {
   const factory = $<HTMLSelectElement>("#daw-factory").value;
   const preset = await invoke<DawPreset>("daw_factory_preset", { factory });
@@ -1662,7 +1698,7 @@ async function loadDawFactoryPreset() {
 
 async function initializeDawPlugin() {
   renderDawPreset(dawPreset, false);
-  await Promise.all([refreshDawPluginInfo(), (async () => {
+  await Promise.all([refreshDawPluginInfo(), refreshNeuralDawPluginInfo(), (async () => {
     const preset = await invoke<DawPreset>("daw_factory_preset", { factory: "speech" });
     renderDawPreset(preset, false);
   })()]);
@@ -1678,6 +1714,9 @@ for (const selector of [
 
 $("#refresh-daw-plugin").addEventListener("click", () => {
   void refreshDawPluginInfo().catch((error) => showToast(errorText(error), true));
+});
+$("#refresh-neural-daw-plugin").addEventListener("click", () => {
+  void refreshNeuralDawPluginInfo().catch((error) => showToast(errorText(error), true));
 });
 $("#load-daw-factory").addEventListener("click", () => {
   void loadDawFactoryPreset().catch((error) => showToast(errorText(error), true));

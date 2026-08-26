@@ -10,6 +10,9 @@
     { "$ref": "#/$defs/liveStatus" },
     { "$ref": "#/$defs/pluginInfo" },
     { "$ref": "#/$defs/pluginLatency" },
+    { "$ref": "#/$defs/pluginNeuralInfo" },
+    { "$ref": "#/$defs/pluginNeuralLatency" },
+    { "$ref": "#/$defs/pluginNeuralSessionValidation" },
     { "$ref": "#/$defs/pluginPresetValidation" },
     { "$ref": "#/$defs/pluginSessionValidation" }
   ],
@@ -229,6 +232,106 @@
         "measured_latency_frames": { "type": "integer", "minimum": 1 },
         "matches_reported": { "const": true },
         "measurement": { "const": "f64-bypass-impulse-v1" }
+      },
+      "additionalProperties": false
+    },
+    "pluginNeuralInfo": {
+      "type": "object",
+      "required": [
+        "schema", "schema_version", "event", "plugin_id", "name", "version",
+        "format", "backend", "model_id", "model_sha256", "model_installed",
+        "port_configurations", "reference_port", "sample_formats", "sample_rate",
+        "chunk_frames", "latency_policy", "latency_frames", "latency_millis",
+        "queue_blocks", "overload_fallbacks", "realtime_contract"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-neural-info" },
+        "plugin_id": { "const": "org.penguin425.denoize.neural" },
+        "name": { "const": "denoize Neural" },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+        "format": { "const": "CLAP" },
+        "backend": { "const": "gtcrn" },
+        "model_id": { "const": "gtcrn-dns3" },
+        "model_sha256": {
+          "const": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+        },
+        "model_installed": { "type": "boolean" },
+        "port_configurations": { "const": ["mono", "stereo"] },
+        "reference_port": { "const": "reserved-independent-input" },
+        "sample_formats": { "const": ["f32", "f64"] },
+        "sample_rate": { "type": "number", "minimum": 1, "maximum": 768000 },
+        "chunk_frames": { "type": "integer", "minimum": 1 },
+        "latency_policy": { "const": "fixed-24x10ms-worker-v1" },
+        "latency_frames": { "type": "integer", "minimum": 1 },
+        "latency_millis": { "type": "number", "exclusiveMinimum": 0 },
+        "queue_blocks": { "const": 16 },
+        "overload_fallbacks": {
+          "const": ["delayed-dry", "last-safe-gain", "silence"]
+        },
+        "realtime_contract": {
+          "type": "object",
+          "required": [
+            "allocations", "locks", "file_io", "network_io", "logging",
+            "worker_waits", "inference_on_callback"
+          ],
+          "properties": {
+            "allocations": { "const": 0 },
+            "locks": { "const": 0 },
+            "file_io": { "const": false },
+            "network_io": { "const": false },
+            "logging": { "const": false },
+            "worker_waits": { "const": false },
+            "inference_on_callback": { "const": false }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "pluginNeuralLatency": {
+      "type": "object",
+      "required": [
+        "schema", "schema_version", "event", "plugin_id", "latency_policy",
+        "sample_rate", "chunk_frames", "latency_frames", "latency_millis",
+        "measured_latency_frames", "matches_reported", "measurement"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-neural-latency" },
+        "plugin_id": { "const": "org.penguin425.denoize.neural" },
+        "latency_policy": { "const": "fixed-24x10ms-worker-v1" },
+        "sample_rate": { "type": "number", "minimum": 1, "maximum": 768000 },
+        "chunk_frames": { "type": "integer", "minimum": 1 },
+        "latency_frames": { "type": "integer", "minimum": 1 },
+        "latency_millis": { "type": "number", "exclusiveMinimum": 0 },
+        "measured_latency_frames": { "type": "integer", "minimum": 1 },
+        "matches_reported": { "const": true },
+        "measurement": { "const": "f64-delayed-dry-impulse-v1" }
+      },
+      "additionalProperties": false
+    },
+    "pluginNeuralSessionValidation": {
+      "type": "object",
+      "required": [
+        "schema", "schema_version", "event", "valid", "path", "plugin_id",
+        "model_id", "model_sha256", "port_configuration", "latency_policy"
+      ],
+      "properties": {
+        "schema": { "const": "denoize-cli-output-v1" },
+        "schema_version": { "const": 1 },
+        "event": { "const": "plugin-neural-session-validation" },
+        "valid": { "const": true },
+        "path": { "type": "string", "minLength": 1 },
+        "plugin_id": { "const": "org.penguin425.denoize.neural" },
+        "model_id": { "const": "gtcrn-dns3" },
+        "model_sha256": {
+          "const": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+        },
+        "port_configuration": { "enum": ["mono", "stereo"] },
+        "latency_policy": { "const": "fixed-24x10ms-worker-v1" }
       },
       "additionalProperties": false
     },

@@ -18,7 +18,7 @@ pub const DAW_SESSION_SCHEMA: &str = "denoize-daw-session-v1";
 pub const DAW_SESSION_SCHEMA_VERSION: u32 = 1;
 pub const DAW_LATENCY_POLICY: &str = "fixed-10ms-v1";
 pub const DAW_FIXED_LATENCY_MILLIS: f64 = 10.0;
-const MAX_DAW_DOCUMENT_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_DAW_DOCUMENT_BYTES: u64 = 64 * 1024;
 const MAX_PRESET_NAME_CHARS: usize = 80;
 
 /// Stable, host-independent plug-in parameters.
@@ -252,7 +252,7 @@ fn ensure_input_size(bytes: &[u8], label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn serialize_bounded<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn serialize_bounded<T: Serialize>(value: &T, label: &str) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec(value).map_err(|error| format!("serialize {label}: {error}"))?;
     ensure_input_size(&bytes, label)?;
     Ok(bytes)
@@ -292,7 +292,12 @@ pub fn write_daw_session(
     )
 }
 
-fn write_document(path: &Path, bytes: &[u8], mode: CommitMode, label: &str) -> Result<(), String> {
+pub(crate) fn write_document(
+    path: &Path,
+    bytes: &[u8],
+    mode: CommitMode,
+    label: &str,
+) -> Result<(), String> {
     let mut output = AtomicOutput::new(path)?;
     output
         .file_mut()
@@ -301,7 +306,7 @@ fn write_document(path: &Path, bytes: &[u8], mode: CommitMode, label: &str) -> R
     output.commit(mode)
 }
 
-fn read_bounded_regular_file(path: &Path, label: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded_regular_file(path: &Path, label: &str) -> Result<Vec<u8>, String> {
     let path_metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
     if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {

@@ -1,6 +1,6 @@
 [package]
 name = "denoize-clap"
-version = "0.75.0"
+version = "0.76.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -12,7 +12,7 @@ name = "denoize_clap"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-denoize = { path = "../..", version = "0.75.0", default-features = false }
+denoize = { path = "../..", version = "0.76.0", default-features = false, features = ["gtcrn"] }
 clack-plugin = "0.1.1"
 clack-extensions = { version = "0.1.1", features = [
     "audio-ports",
@@ -22,6 +22,8 @@ clack-extensions = { version = "0.1.1", features = [
     "params",
     "state",
 ] }
+crossbeam-queue = "0.3.12"
+serde_json = "1.0"
 
 [lints.rust]
 unsafe_code = "deny"

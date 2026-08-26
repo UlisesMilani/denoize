@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::config::{ConfigError, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS};
 use crate::{
-    select_accelerator_for_options, AcceleratorSelection, DenoiserConfig, StreamingDenoiser,
+    AcceleratorSelection, DenoiserConfig, StreamingDenoiser, select_accelerator_for_options,
 };
 
 #[cfg(feature = "rnnoise")]
@@ -89,9 +89,62 @@ impl StreamingBackendSession {
         backend: Backend,
         sample_rate: u32,
         channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+        accelerator: AcceleratorSelection,
+    ) -> Result<Self, String> {
+        Self::new_with_accelerator_inner(
+            backend,
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            accelerator,
+            #[cfg(feature = "gtcrn")]
+            None,
+        )
+    }
+
+    /// Create a GTCRN stream from an already authenticated and optimized graph.
+    ///
+    /// The options still undergo the ordinary deterministic/runtime validation;
+    /// callers must prepare `model` for the resulting effective runtime.
+    #[cfg(feature = "gtcrn")]
+    pub fn new_gtcrn_with_prepared_model(
+        sample_rate: u32,
+        channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+        model: &super::gtcrn::GtcrnModel,
+    ) -> Result<Self, String> {
+        let backend = Backend::Gtcrn;
+        let accelerator = select_accelerator_for_options(backend, &backend_options)?;
+        if model.runtime() != accelerator.effective() {
+            return Err(format!(
+                "prepared GTCRN graph uses {}, but the effective stream runtime is {}",
+                model.runtime().name(),
+                accelerator.effective().name()
+            ));
+        }
+        Self::new_with_accelerator_inner(
+            backend,
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            accelerator,
+            Some(model),
+        )
+    }
+
+    fn new_with_accelerator_inner(
+        backend: Backend,
+        sample_rate: u32,
+        channels: usize,
         mut denoiser: DenoiserConfig,
         backend_options: BackendOptions,
         accelerator: AcceleratorSelection,
+        #[cfg(feature = "gtcrn")] prepared_gtcrn: Option<&super::gtcrn::GtcrnModel>,
     ) -> Result<Self, String> {
         if channels == 0 || channels > MAX_STREAM_CHANNELS {
             return Err(format!(
@@ -140,6 +193,8 @@ impl StreamingBackendSession {
             &processor_denoiser,
             &backend_options,
             accelerator,
+            #[cfg(feature = "gtcrn")]
+            prepared_gtcrn,
         )?;
         Ok(Self {
             backend,
@@ -357,6 +412,7 @@ impl StreamingBackendSession {
         denoiser: &DenoiserConfig,
         backend_options: &BackendOptions,
         accelerator: AcceleratorSelection,
+        #[cfg(feature = "gtcrn")] prepared_gtcrn: Option<&super::gtcrn::GtcrnModel>,
     ) -> Result<StreamingBackend, String> {
         let _ = (sample_rate, backend_options, accelerator);
         match backend {
@@ -392,14 +448,21 @@ impl StreamingBackendSession {
                     .onnx
                     .as_ref()
                     .ok_or_else(|| "GTCRN streaming requires the managed ONNX model".to_string())?;
-                Ok(StreamingBackend::Gtcrn(Box::new(
+                let processor = if let Some(prepared) = prepared_gtcrn {
+                    super::gtcrn::StreamingProcessor::new_with_model(
+                        prepared,
+                        sample_rate,
+                        channels,
+                    )?
+                } else {
                     super::gtcrn::StreamingProcessor::new_with_accelerator(
                         model,
                         sample_rate,
                         channels,
                         accelerator.effective(),
-                    )?,
-                )))
+                    )?
+                };
+                Ok(StreamingBackend::Gtcrn(Box::new(processor)))
             }
             #[allow(unreachable_patterns)]
             _ => Err("selected backend does not support stateful streaming".into()),

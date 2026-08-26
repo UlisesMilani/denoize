@@ -157,6 +157,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/model_package/testdata/minisign.pub" \
     "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
+    "denoize-${package_version}/src/neural_daw.rs" \
     "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/src/universal_restoration.rs" \
     "denoize-${package_version}/src/project.rs" \
@@ -168,6 +169,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/json.md" \
     "denoize-${package_version}/docs/evaluation.md" \
     "denoize-${package_version}/docs/diagnostics.md" \
+    "denoize-${package_version}/docs/neural-plugin.md" \
     "denoize-${package_version}/docs/projects.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/docs/restoration-research.md" \
@@ -179,6 +181,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-daw-preset-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-daw-session-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-neural-daw-session-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-diagnostic-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-execution-plan-v2.schema.json" \
@@ -242,6 +245,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-project-schemas.py" \
     "denoize-${package_version}/scripts/test-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-universal-restoration-schemas.py" \
+    "denoize-${package_version}/scripts/test-neural-daw-schemas.py" \
     "denoize-${package_version}/scripts/test-runtime-model-package-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
