@@ -1321,7 +1321,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.79.0 0.80.0)
+          rollback_versions=(0.80.0 0.81.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"
