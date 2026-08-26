@@ -876,7 +876,7 @@ and scheduler policy. It is also path-free, closed, bounded, non-symlink, and
 atomically no-clobber. See [Neural DAW plug-in](docs/neural-plugin.md) for the
 scheduler, model trust boundary, state contract, evidence, and limitations.
 
-From a repository checkout, build a local plug-in with
+From a repository checkout, build a local CLAP plug-in with
 `cargo build --release -p denoize-clap`. On Linux,
 copy `target/release/libdenoize_clap.so` to `~/.clap/denoize.clap`. Tagged
 releases provide ready-to-copy archives for Linux x86-64, macOS Intel and Apple
@@ -885,8 +885,16 @@ Silicon, and Windows x86-64. macOS archives contain a complete
 the DAW or run its plug-in rescan. CI and the tagged release workflow verify
 both descriptors with the pinned official CLAP validator 0.4.1: 81 tests, 68
 applicable passes, no failures or warnings, and 13 capability-based skips.
-v0.76 uses host-rendered parameter controls; it does not claim a custom in-host
-editor or VST3/AUv3/LV2 support.
+
+VST3 3.8 bundles are available from v0.78.0. They statically adapt the same two
+descriptors through exact pinned CLAP-wrapper, CLAP SDK, and VST3 SDK revisions,
+so they cannot load a same-named external CLAP binary. The official 3.8.1
+validator gate requires 94/94 passes. A pinned Ardour 8.4 headless real-host
+gate also discovers, inserts, processes, saves, reloads in a fresh process, and
+tears down both descriptors at 48 kHz. Release evidence includes a signed host
+matrix and both bound logs. See [VST3 plug-in](docs/vst3-plugin.md) for
+installation, reproducible build details, and the explicitly unclaimed f64,
+custom-editor, and proprietary-host cases. AUv3 and LV2 remain separate gates.
 
 ## Desktop app
 
@@ -1025,9 +1033,11 @@ prebuilt `full`-feature binaries for:
 - macOS Intel and Apple Silicon
 - Windows x86-64
 
-The same release also includes CLAP plug-in archives for those four target
+The same release also includes CLAP and VST3 plug-in archives for those four target
 architectures. Extract the matching `denoize-plugin-<tag>-<target>` archive and
 copy its `denoize.clap` file or macOS bundle into a standard CLAP directory.
+For VST3, extract `denoize-vst3-<tag>-<target>` and copy `denoize.vst3` into the
+platform's standard VST3 directory.
 
 Every archive has a matching `.sha256` checksum file. Releases also publish the
 exact embedded model catalog, its detached signature, the exact embedded model
@@ -1044,9 +1054,9 @@ and a separate update-asset attestation. A bundle contains both the candidate
 and its verified last-known-good installation, so startup-health or explicit
 recovery does not require a network. See [recoverable application updates](docs/updates.md).
 
-Every installable CLI archive, CLAP archive, desktop package, crates.io archive,
+Every installable CLI archive, CLAP/VST3 archive, desktop package, crates.io archive,
 and offline model bundle also has a per-artifact CycloneDX SBOM. The release
-evidence archive binds those 18 artifacts and SBOMs to their sizes and SHA-256 digests,
+evidence archive binds those 22 artifacts and SBOMs to their sizes and SHA-256 digests,
 while companion GitHub Sigstore/SLSA bundles prove the exact tag commit and
 release workflow. See [release evidence and offline verification](docs/release-evidence.md)
 for the trust model and an air-gapped verification procedure.
@@ -1078,7 +1088,7 @@ git push origin v0.1.0
 
 The `GitHub Release` workflow verifies that the tag is on the default branch and
 matches every release version field, runs the full test suite, and builds all
-CLI, CLAP, and desktop targets before publishing the crates.io package. It then checks
+CLI, CLAP, VST3, and desktop targets before publishing the crates.io package. It then checks
 all archives, checksums, signatures, per-artifact SBOMs, build provenance,
 recoverable update bundles, and updater metadata before publishing the draft release and generated notes. The
 exact `.crate` archive is attested before publication and its checksum must

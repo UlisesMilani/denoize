@@ -66,7 +66,7 @@ stop/rollback conditions behind this order are maintained in
 | 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
-| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP foundation released in v0.76.0; format expansion planned |
+| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP released in v0.76.0; VST3 reference gate implemented for v0.78.0; editor/AUv3/LV2 planned |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline implementation complete; v0.77.0 release pending; causal substage planned |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
@@ -166,7 +166,7 @@ not imply untested host support:
 | Substage | Scope | Status |
 |---|---|---|
 | 28a | CLAP neural reference, shared scheduler/state/sidechain foundation | Released in v0.76.0 |
-| 28b | VST3 3.8 component/controller, buses, automation, latency restart, validator, packaging, and signed host matrix; compare a pinned CLAP wrapper with the official VST3 C API | Planned |
+| 28b | VST3 3.8 component/controller, buses, automation, latency restart, validator, packaging, and signed host matrix; compare a pinned CLAP wrapper with the official VST3 C API | Implemented for v0.78.0 with a statically bound wrapper, 94/94 official validation, pinned Ardour 8.4 discovery/processing/state-reload/teardown smoke, four target bundles, and signed evidence; proprietary hosts remain explicitly unclaimed |
 | 28c | Accessible custom editor with generic-host fallback and UI-thread/lifecycle tests | Planned |
 | 28d | AUv3 sandbox/lifecycle/state/render parity and signed Apple host matrix | Planned |
 | 28e | LV2 worker/atom/state parity, validation, packaging, and Linux host matrix | Planned |

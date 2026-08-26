@@ -19,6 +19,24 @@ The complete selected license texts are included at
 [`LICENSES/clack-0.1.1-MIT.txt`](LICENSES/clack-0.1.1-MIT.txt) and
 [`LICENSES/clap-sys-0.5.0-MIT.txt`](LICENSES/clap-sys-0.5.0-MIT.txt).
 
+## CLAP wrapper 0.16.0, CLAP SDK 1.2.6, and VST3 SDK 3.8.1
+
+The VST3 bundle statically links the MIT-licensed CLAP wrapper revision
+`1cca996e96f29ab2be7ae9f8cfe532bbc92e1dd6`, CLAP SDK revision
+`69a69252fdd6ac1d06e246d9a04c0a89d9607a17`, and Steinberg VST3 SDK revision
+`3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96`. The VST3 `base`, `cmake`,
+`pluginterfaces`, and `public.sdk` submodules are also pinned and verified by
+the release build. denoize applies only the two reviewed compatibility and
+static-entry patches stored under `patches/`; the wrapper cannot search host or
+user CLAP paths for a same-named binary.
+
+The wrapper embeds fmt 11.1.4 by Victor Zverovich. Complete selected notices
+are included at
+[`LICENSES/clap-wrapper-0.16.0-MIT.txt`](LICENSES/clap-wrapper-0.16.0-MIT.txt),
+[`LICENSES/clap-sdk-1.2.6-MIT.txt`](LICENSES/clap-sdk-1.2.6-MIT.txt),
+[`LICENSES/vst3-sdk-3.8.1-MIT.txt`](LICENSES/vst3-sdk-3.8.1-MIT.txt), and
+[`LICENSES/fmt-11.1.4-MIT.txt`](LICENSES/fmt-11.1.4-MIT.txt).
+
 ## GTCRN DNS3 model
 
 The signed offline model release bundle contains the official causal GTCRN

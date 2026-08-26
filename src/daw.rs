@@ -18,6 +18,10 @@ pub const DAW_SESSION_SCHEMA: &str = "denoize-daw-session-v1";
 pub const DAW_SESSION_SCHEMA_VERSION: u32 = 1;
 pub const DAW_LATENCY_POLICY: &str = "fixed-10ms-v1";
 pub const DAW_FIXED_LATENCY_MILLIS: f64 = 10.0;
+/// Host-facing ceiling, including the official VST3 validator's 1,234,567.8 Hz case.
+/// File decoding, encoding, and offline restoration retain their separate
+/// 768 kHz resource boundary.
+pub const DAW_MAX_SAMPLE_RATE: u32 = crate::config::MAX_HOST_SAMPLE_RATE;
 pub(crate) const MAX_DAW_DOCUMENT_BYTES: u64 = 64 * 1024;
 const MAX_PRESET_NAME_CHARS: usize = 80;
 
@@ -399,9 +403,12 @@ pub struct DawRealtimeProcessor {
 
 impl DawRealtimeProcessor {
     pub fn new(sample_rate: f64, channels: usize) -> Result<Self, String> {
-        if !sample_rate.is_finite() || sample_rate <= 0.0 || sample_rate > 768_000.0 {
+        if !sample_rate.is_finite()
+            || sample_rate <= 0.0
+            || sample_rate > f64::from(DAW_MAX_SAMPLE_RATE)
+        {
             return Err(format!(
-                "DAW sample rate must be finite and within (0, 768000], got {sample_rate}"
+                "DAW sample rate must be finite and within (0, {DAW_MAX_SAMPLE_RATE}], got {sample_rate}"
             ));
         }
         if !(1..=2).contains(&channels) {
@@ -703,6 +710,13 @@ mod tests {
             }
             assert_eq!(nonzero, vec![(expected, 1.0)]);
         }
+    }
+
+    #[test]
+    fn host_rate_contract_covers_the_official_vst3_validator_boundary() {
+        let processor = DawRealtimeProcessor::new(1_234_567.8, 2).unwrap();
+        assert_eq!(processor.latency_frames(), 12_346);
+        assert!(DawRealtimeProcessor::new(f64::from(DAW_MAX_SAMPLE_RATE) + 0.1, 2).is_err());
     }
 
     #[test]

@@ -771,7 +771,7 @@ impl GtcrnProcessor {
         let mut denoiser = DenoiserConfig::default(sample_rate);
         denoiser.vad = false;
         Ok(Self(
-            StreamingBackendSession::new_gtcrn_with_prepared_model(
+            StreamingBackendSession::new_gtcrn_for_daw_with_prepared_model(
                 sample_rate,
                 channels,
                 denoiser,

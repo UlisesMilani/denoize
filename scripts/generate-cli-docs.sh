@@ -215,7 +215,8 @@ capabilities, factory presets, fixed latency policy, and zero-allocation audio
 callback contract. `plugin latency` sends an f64 bypass impulse through the
 same processor, reports both the host frame count and measured first-output
 frame, and fails if they differ. It accepts every finite sample rate supported
-by CLAP validation up to 768 kHz.
+by the CLAP and VST3 host contracts through 1,234,568 Hz. File decoding and
+offline restoration retain their separate 768 kHz resource ceiling.
 
 Preset and session creation is no-clobber by default; `--replace` is explicit.
 Both readers accept only bounded regular non-symlink JSON files. Preset v1

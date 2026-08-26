@@ -40,6 +40,11 @@ the integer-rate audio backend receives the nearest rate only for its internal
 resampling ratio. Ordinary DAW rates are therefore exact, while validator and
 specialized-host rates remain ABI-compatible and keep a correct reported delay.
 
+The host-facing plug-in contract accepts finite rates through 1,234,568 Hz so
+the official VST3 3.8.1 validator's 1,234,567.8 Hz boundary is exercised
+without a format-specific clamp. This does not widen denoize's file decoding,
+encoding, or offline-restoration ceiling of 768 kHz.
+
 That is 10,584 frames at 44.1 kHz, 11,520 at 48 kHz, and 23,040 at
 96 kHz—240 ms at those rates. The policy name is
 `fixed-24x10ms-worker-v1`. The fixed budget deliberately includes model and
@@ -135,7 +140,9 @@ audio-port, state, parameter, and thread rules.
 
 This release is speech enhancement, not general restoration, target-speaker
 extraction, AEC, or spatial beamforming. It has no custom editor; hosts render
-the four parameters. VST3 3.8 is now MIT-licensed, but VST3, AUv3, and LV2 are
-separate release gates because each needs equivalent state, sidechain, latency,
-validator, packaging, signing, and host-smoke evidence. The generic CLAP effect
-remains the deployment reference until those matrices pass.
+the four parameters. v0.78.0 adds a statically bound VST3 3.8 adapter with
+official-validator, pinned Ardour 8.4 processing/state-reload smoke, packaging,
+checksum, SBOM, and signed host-matrix evidence; see
+[VST3 plug-in](vst3-plugin.md). Its matrix intentionally does not claim
+double-precision VST3 audio or compatibility with untested proprietary hosts.
+AUv3 and LV2 remain separate release gates.
