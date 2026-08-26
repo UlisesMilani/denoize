@@ -167,6 +167,8 @@ jobs:
 
       - name: Validate with the pinned official CLAP validator
         shell: bash
+        env:
+          DENOIZE_MODEL_DIR: /tmp/denoize-clap-models-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           validator_dir=$(mktemp -d /tmp/denoize-clap-validator.XXXXXX)
           validator_zip="$validator_dir/clap-validator.zip"
