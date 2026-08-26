@@ -67,6 +67,7 @@ pub mod ipc;
 pub mod live;
 pub mod loudness;
 pub mod metadata;
+pub mod microphone_array;
 pub mod model_package;
 pub mod models;
 pub mod neural_daw;
@@ -201,6 +202,15 @@ pub use hardware::{
 };
 pub use input::AudioInputSession;
 pub use input::StreamSpoolLimits;
+pub use microphone_array::{
+    estimate_microphone_array_memory_bytes, sign_microphone_array_promotion_evidence,
+    ArrayCoordinateUnit, ArrayHandedness, ArrayInputSemantics, MicrophoneArrayConfig,
+    MicrophoneArrayEvidenceStratum, MicrophoneArrayGeometry,
+    MicrophoneArrayPromotionEvidencePayload, MicrophoneArrayReport, MicrophoneArrayResult,
+    MicrophoneArraySession, MicrophonePosition, SignedMicrophoneArrayPromotionEvidence,
+    MICROPHONE_ARRAY_EVIDENCE_SCHEMA, MICROPHONE_ARRAY_REPORT_SCHEMA,
+    MICROPHONE_ARRAY_SCHEMA_VERSION,
+};
 pub use model_package::{
     build_runtime_model_package, build_runtime_model_package_v2, inspect_runtime_model_package,
     RuntimeModelAxisContractV2, RuntimeModelChannelContractV2, RuntimeModelChannelRoleContractV2,

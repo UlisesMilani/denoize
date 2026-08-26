@@ -187,6 +187,15 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   all 17 delay/drift/path/talk/impairment/transition strata, hard fidelity and
   latency limits, real-device/listening coverage, and the zero-violation paced
   real-time audit.
+- [`denoize-microphone-array-report-v1.schema.json`](../schemas/denoize-microphone-array-report-v1.schema.json)
+  describes a path-free, exact-duration microphone-array render with canonical
+  channel identities, authenticated geometry/configuration, active/inactive
+  channels, STFT latency, complete solved/fallback bin decisions, clipping, and
+  domain-separated input/output PCM identities.
+- [`denoize-microphone-array-promotion-evidence-v1.schema.json`](../schemas/denoize-microphone-array-promotion-evidence-v1.schema.json)
+  describes Ed25519-signed implementation/configuration/corpus/result identity,
+  the exact 12-stratum geometry/noise/meeting/program-stereo matrix, fidelity,
+  leakage, DOA, ASR, listening, and zero-violation paced evidence gates.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -228,9 +237,9 @@ runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
 assessment, deterministic and universal restoration reports and masks,
-universal promotion evidence, all four target-speaker contracts, and both AEC
-contracts also reject unknown fields so a consumer cannot silently ignore a
-new safety dimension.
+universal promotion evidence, all four target-speaker contracts, both AEC
+contracts, and both microphone-array contracts also reject unknown fields so a
+consumer cannot silently ignore a new safety dimension.
 Signed plug-in editor evidence and host matrices are closed for the same reason.
 
 ## Portable project contracts

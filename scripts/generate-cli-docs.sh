@@ -73,6 +73,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" aec --help
   echo '```'
   echo
+  echo '## Explicit-geometry microphone-array enhancement'
+  echo
+  echo '```text'
+  "$binary" array --help
+  echo '```'
+  echo
   echo '## Watch-folder automation'
   echo
   echo '```text'
