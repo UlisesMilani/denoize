@@ -220,6 +220,42 @@ and the closed [report](schemas/denoize-universal-restoration-report-v1.schema.j
 [promotion evidence](schemas/denoize-universal-promotion-evidence-v1.schema.json)
 contracts.
 
+### Fail-closed target-speaker extraction
+
+**denoize target-speaker** extracts one enrolled speaker from a mixture through
+a dedicated signed package v2 graph. It is offline and mono in Stage 29:
+
+~~~sh
+denoize target-speaker meeting.wav enrollment.wav target.wav \
+  --model-package target-speaker.dmp \
+  --model-package-key publisher.pub \
+  --promotion-evidence promotion.json \
+  --promotion-evidence-key evaluator-public-key.json \
+  --report target-speaker-report.json \
+  --max-memory 4096 --pretty
+~~~
+
+The graph must expose exactly one mixture input, one enrollment input, one
+same-length audio output, and calibrated `absent`/`uncertain`/`present`
+probabilities. Package components, provenance, graph names/shapes, numerical
+vectors, and separately signed REAL-T/TS-SUPERB/absence promotion evidence are
+verified before either audio file is decoded.
+
+Only a confidently present target whose candidate passes geometry, finite,
+energy, peak, clipping, presence, and evidence gates creates an audio file.
+Absent, uncertain, and unsafe candidates create no audio and never fall back to
+the mixture, silence, or an unverified voice. Enrollment working buffers are
+zeroized immediately after inference; reports contain no enrollment samples,
+embedding, digest, or path.
+
+No checkpoint is bundled because the audited WeSep/REAL-TSE/MeanFlow candidates
+do not yet provide a complete artifact-level redistribution and protected-
+stratum evidence chain. See [Target-speaker extraction](docs/target-speaker.md),
+the [paper and artifact audit](docs/restoration-research.md#stage-29--target-speaker-extraction),
+and the closed [report](schemas/denoize-target-speaker-report-v1.schema.json)
+and [promotion evidence](schemas/denoize-target-speaker-promotion-evidence-v1.schema.json)
+contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |

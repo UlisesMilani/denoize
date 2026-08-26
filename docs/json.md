@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes sixty-three versioned JSON contracts for local automation. Their
+denoize publishes sixty-six versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -152,6 +152,16 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   demographic, material, and degradation strata, nine fidelity/quality/output/
   performance metrics per stratum, and a mechanically consistent listening
   and promotion decision.
+- [`denoize-target-speaker-report-v1.schema.json`](../schemas/denoize-target-speaker-report-v1.schema.json)
+  describes a fail-closed offline target-speaker decision, authenticated model
+  and promotion identity, path-free enrollment geometry, calibrated presence,
+  signal gates, and accepted input/output PCM bindings. Withheld candidates
+  have no output or candidate digest.
+- [`denoize-target-speaker-promotion-evidence-v1.schema.json`](../schemas/denoize-target-speaker-promotion-evidence-v1.schema.json)
+  describes Ed25519-signed package/source/checkpoint/corpus/REAL-T/TS-SUPERB
+  identity, 22 target-present/absent strata, content, extraction, identity,
+  leakage, presence, output and quality limits, calibration, and listening
+  evidence.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -192,9 +202,9 @@ keys, policies, verification reports, presentation regions, project documents,
 runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
-assessment, deterministic and universal restoration reports and masks, and
-universal promotion evidence also reject unknown fields so a consumer cannot
-silently ignore a new safety dimension.
+assessment, deterministic and universal restoration reports and masks,
+universal promotion evidence, and both target-speaker contracts also reject
+unknown fields so a consumer cannot silently ignore a new safety dimension.
 
 ## Portable project contracts
 

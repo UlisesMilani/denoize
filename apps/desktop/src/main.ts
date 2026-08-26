@@ -331,6 +331,10 @@ type DesktopUniversalRestorationResult = {
   report: Record<string, unknown> & { decision?: string; candidate_accepted?: boolean };
   mask: Record<string, unknown>;
 };
+type DesktopTargetSpeakerResult = {
+  output: string | null;
+  report: Record<string, unknown> & { decision?: string; presence?: { state?: string }; output_published?: boolean };
+};
 type WatchCycleReport = {
   observed: number; pending: number; attempted: number; succeeded: number;
   retrying: number; quarantined: number; superseded: number; scan_errors: number;
@@ -799,6 +803,36 @@ document.querySelector<HTMLDivElement>("#app")!.innerHTML = `
               </div>
               <button class="primary wide" id="run-universal">汎用復元を実行</button>
               <p class="field-hint">Clean入力は推論を迂回します。信号ゲートは単語・音素・話者同一性を証明しないため、生成型はPrimaryへ昇格できません。</p>
+            </article>
+            <article class="card">
+              <div class="card-heading"><div><span class="step">TARGET</span><h2>対象話者抽出</h2></div><span class="hint">SIGNED · PRIVATE · FAIL-CLOSED</span></div>
+              <p class="section-copy">登録音声で指定した一人を混合音声から抽出します。対象不在、判定不確実、安全ゲート失敗では音声を一切保存せず、混合音声や別話者へフォールバックしません。</p>
+              <div class="file-row"><div><label>混合音声</label><div id="target-speaker-mixture-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-mixture">選択</button></div>
+              <div class="file-row"><div><label>対象話者の登録音声</label><div id="target-speaker-enrollment-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-enrollment">選択</button></div>
+              <div class="file-row"><div><label>抽出音声の保存先</label><div id="target-speaker-output-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-output">保存先</button></div>
+              <div class="file-row"><div><label>署名付き対象話者 package v2</label><div id="target-speaker-package-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-package">選択</button></div>
+              <div class="file-row"><div><label>package の Minisign 公開鍵</label><div id="target-speaker-package-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-package-key">選択</button></div>
+              <div class="file-row"><div><label>署名付き promotion evidence</label><div id="target-speaker-evidence-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-evidence">選択</button></div>
+              <div class="file-row"><div><label>evidence の Ed25519 公開鍵</label><div id="target-speaker-evidence-key-display" class="path empty">選択されていません</div></div><button class="secondary" id="choose-target-speaker-evidence-key">選択</button></div>
+              <input type="hidden" id="target-speaker-mixture-path"><input type="hidden" id="target-speaker-enrollment-path"><input type="hidden" id="target-speaker-output-path"><input type="hidden" id="target-speaker-package-path"><input type="hidden" id="target-speaker-package-key-path"><input type="hidden" id="target-speaker-evidence-path"><input type="hidden" id="target-speaker-evidence-key-path">
+              <div class="form-grid three">
+                <label>アクセラレータ<select id="target-speaker-accelerator"><option value="cpu" selected>CPU</option><option value="auto">Auto</option><option value="gpu">GPU</option><option value="metal">Metal</option><option value="cuda">CUDA</option></select></label>
+              </div>
+              <details class="watch-advanced"><summary>高度な対象話者ゲート</summary>
+                <div class="form-grid three">
+                  <label>最小 present 確率<input id="target-speaker-minimum-present" type="number" value="0.9" min="0.5" max="1" step="0.01"></label>
+                  <label>最小 absent 確率<input id="target-speaker-minimum-absent" type="number" value="0.9" min="0.5" max="1" step="0.01"></label>
+                  <label>最大energy増加 dB<input id="target-speaker-maximum-energy" type="number" value="3" min="0" max="12" step="0.1"></label>
+                  <label>最大peak増加 dB<input id="target-speaker-maximum-peak" type="number" value="3" min="0" max="12" step="0.1"></label>
+                  <label>最大新規clipping率<input id="target-speaker-maximum-clipping" type="number" value="0.0001" min="0" max="0.01" step="0.0001"></label>
+                </div>
+              </details>
+              <div class="toggle-grid">
+                <label class="toggle"><input id="target-speaker-preserve-metadata" type="checkbox" checked><span></span><div><b>メタデータ保持</b><small>採用時だけ混合音声からコピー</small></div></label>
+                <label class="toggle"><input id="target-speaker-replace" type="checkbox"><span></span><div><b>既存を上書き</b><small>未選択時は no-clobber</small></div></label>
+              </div>
+              <button class="primary wide" id="run-target-speaker">対象話者を抽出</button>
+              <p class="field-hint">登録音声は生体情報です。推論直後に作業バッファをゼロ化し、PCM、埋め込み、digest、pathをレポートへ残しません。</p>
             </article>
             <article class="card">
               <div class="card-heading"><div><span class="step">RESTORE</span><h2>決定的音声修復</h2></div><span class="hint">LOCAL · INSPECTABLE</span></div>
@@ -3013,6 +3047,81 @@ $("#run-universal").addEventListener("click", async () => {
   finally { setEvaluationBusy(false); }
 });
 
+for (const [button, input, display] of [
+  ["#choose-target-speaker-mixture", "#target-speaker-mixture-path", "#target-speaker-mixture-display"],
+  ["#choose-target-speaker-enrollment", "#target-speaker-enrollment-path", "#target-speaker-enrollment-display"],
+] as const) {
+  $(button).addEventListener("click", async () => {
+    const path = await open({ multiple: false, filters: audioFilters });
+    if (typeof path === "string") setPath(input, display, path);
+  });
+}
+
+$("#choose-target-speaker-output").addEventListener("click", async () => {
+  const path = await save({ defaultPath: "target-speaker.wav", filters: audioFilters });
+  if (path) setPath("#target-speaker-output-path", "#target-speaker-output-display", path);
+});
+
+$("#choose-target-speaker-package").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "denoize runtime model package", extensions: ["dmp"] }] });
+  if (typeof path === "string") setPath("#target-speaker-package-path", "#target-speaker-package-display", path);
+});
+
+$("#choose-target-speaker-package-key").addEventListener("click", async () => {
+  const path = await open({ multiple: false, filters: [{ name: "Minisign public key", extensions: ["pub"] }] });
+  if (typeof path === "string") setPath("#target-speaker-package-key-path", "#target-speaker-package-key-display", path);
+});
+
+for (const [button, input, display] of [
+  ["#choose-target-speaker-evidence", "#target-speaker-evidence-path", "#target-speaker-evidence-display"],
+  ["#choose-target-speaker-evidence-key", "#target-speaker-evidence-key-path", "#target-speaker-evidence-key-display"],
+] as const) {
+  $(button).addEventListener("click", async () => {
+    const path = await open({ multiple: false, filters: jsonFilters });
+    if (typeof path === "string") setPath(input, display, path);
+  });
+}
+
+$("#run-target-speaker").addEventListener("click", async () => {
+  if (evaluationRunning) return;
+  if (watchRunning || activeJob !== null || pendingJobKind !== null || previewJob !== null || pendingPreview || recommendationRunning
+    || !$("#stop-live").classList.contains("hidden")) {
+    return showToast(tr("別の処理が実行中です", "Another job is running"), true);
+  }
+  setEvaluationBusy(true);
+  try {
+    const memoryRaw = $<HTMLInputElement>("#resource-process-memory").value;
+    const result = await invoke<DesktopTargetSpeakerResult>("extract_target_speaker_audio", { request: {
+      mixture: evaluationPath("#target-speaker-mixture-path", tr("混合音声を選択してください", "Select a mixture audio file")),
+      enrollment: evaluationPath("#target-speaker-enrollment-path", tr("対象話者の登録音声を選択してください", "Select target-speaker enrollment audio")),
+      output: evaluationPath("#target-speaker-output-path", tr("抽出音声の保存先を選択してください", "Select an extracted-audio destination")),
+      modelPackage: evaluationPath("#target-speaker-package-path", tr("署名付き対象話者 package v2を選択してください", "Select a signed target-speaker package v2")),
+      modelPackageKey: evaluationPath("#target-speaker-package-key-path", tr("package の Minisign 公開鍵を選択してください", "Select the package Minisign public key")),
+      promotionEvidence: evaluationPath("#target-speaker-evidence-path", tr("署名付き promotion evidenceを選択してください", "Select signed promotion evidence")),
+      promotionEvidenceKey: evaluationPath("#target-speaker-evidence-key-path", tr("evidence の Ed25519 公開鍵を選択してください", "Select the evidence Ed25519 public key")),
+      minimumPresentProbability: universalGateValue("#target-speaker-minimum-present", 0.5, 1, tr("最小 present 確率", "Minimum present probability")),
+      minimumAbsentProbability: universalGateValue("#target-speaker-minimum-absent", 0.5, 1, tr("最小 absent 確率", "Minimum absent probability")),
+      maximumEnergyGainDb: universalGateValue("#target-speaker-maximum-energy", 0, 12, tr("最大energy増加", "Maximum energy gain")),
+      maximumPeakGainDb: universalGateValue("#target-speaker-maximum-peak", 0, 12, tr("最大peak増加", "Maximum peak gain")),
+      maximumNewClippingRatio: universalGateValue("#target-speaker-maximum-clipping", 0, 0.01, tr("最大新規clipping率", "Maximum new clipping ratio")),
+      accelerator: $<HTMLSelectElement>("#target-speaker-accelerator").value,
+      maxMemoryMb: memoryRaw ? Number(memoryRaw) : null,
+      preserveMetadata: $<HTMLInputElement>("#target-speaker-preserve-metadata").checked,
+      replace: $<HTMLInputElement>("#target-speaker-replace").checked,
+    } });
+    renderEvaluationResult(result);
+    const decision = result.report.decision;
+    showToast(result.output
+      ? tr("対象話者音声を安全ゲート通過後に保存しました", "The target-speaker audio passed all gates and was saved")
+      : decision === "withheld-absent"
+        ? tr("対象話者が不在のため音声を保存しませんでした", "No audio was saved because the target speaker was absent")
+        : decision === "withheld-uncertain"
+          ? tr("対象話者判定が不確実なため音声を保存しませんでした", "No audio was saved because target presence was uncertain")
+          : tr("候補が安全ゲートに失敗したため音声を保存しませんでした", "No audio was saved because the candidate failed a safety gate"));
+  } catch (error) { showToast(errorText(error), true); }
+  finally { setEvaluationBusy(false); }
+});
+
 $("#choose-restoration-input").addEventListener("click", async () => {
   const path = await open({ multiple: false, filters: audioFilters });
   if (typeof path === "string") setPath("#restoration-input-path", "#restoration-input-display", path);
@@ -3146,7 +3255,7 @@ function renderEvaluationResult(value: unknown) {
 
 function setEvaluationBusy(running: boolean) {
   evaluationRunning = running;
-  for (const selector of ["#run-universal", "#run-restoration", "#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
+  for (const selector of ["#run-universal", "#run-target-speaker", "#run-restoration", "#run-diagnostic", "#run-assessment", "#validate-evaluation", "#run-evaluation", "#verify-evaluation", "#compare-evaluation"]) {
     $<HTMLButtonElement>(selector).disabled = running;
   }
 }

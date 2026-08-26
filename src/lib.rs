@@ -79,6 +79,7 @@ pub mod service;
 pub mod stft;
 mod stoi_resample;
 pub mod stream;
+pub mod target_speaker;
 pub mod universal_restoration;
 pub mod update;
 pub mod vad;
@@ -234,6 +235,21 @@ pub use restoration::{
     RestorationReport, RestorationResult, RestorationStatus, WindPlosiveConfig, WpeChannelMode,
     WpeConfig, MAX_RESTORATION_CHANNELS, MAX_RESTORATION_MASK_RUNS, MAX_RESTORATION_OPERATIONS,
     RESTORATION_MASK_SCHEMA, RESTORATION_REPORT_SCHEMA, RESTORATION_SCHEMA_VERSION,
+};
+#[cfg(feature = "onnx")]
+pub use target_speaker::TargetSpeakerSession;
+pub use target_speaker::{
+    estimate_target_speaker_memory_bytes, sign_target_speaker_promotion_evidence,
+    SignedTargetSpeakerPromotionEvidence, TargetSpeakerDecision, TargetSpeakerEnrollmentSummary,
+    TargetSpeakerEvidenceIdentity, TargetSpeakerExtractionConfig, TargetSpeakerExtractionReport,
+    TargetSpeakerExtractionResult, TargetSpeakerMetricOperator, TargetSpeakerMetricOutcome,
+    TargetSpeakerModelIdentity, TargetSpeakerPresence, TargetSpeakerPresenceAssessment,
+    TargetSpeakerPromotionEvidencePayload, TargetSpeakerSafetyGate, TargetSpeakerSafetyGateKind,
+    TargetSpeakerSafetyMeasurements, TargetSpeakerStratumEvidence, TargetSpeakerStratumKind,
+    MAX_TARGET_SPEAKER_ENROLLMENT_MILLIS, MAX_TARGET_SPEAKER_EVIDENCE_METRICS,
+    MAX_TARGET_SPEAKER_EVIDENCE_STRATA, MAX_TARGET_SPEAKER_MIXTURE_SECONDS,
+    MIN_TARGET_SPEAKER_ENROLLMENT_MILLIS, TARGET_SPEAKER_PROMOTION_EVIDENCE_SCHEMA,
+    TARGET_SPEAKER_REPORT_SCHEMA, TARGET_SPEAKER_SCHEMA_VERSION,
 };
 #[cfg(feature = "bsrnn")]
 pub use universal_restoration::restore_universal_audio;
