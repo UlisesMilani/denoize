@@ -163,7 +163,10 @@ jobs:
       - name: Install embedded-editor host dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends dbus-x11 libxtst6 xvfb
+          sudo apt-get install --no-install-recommends dbus-x11 libxtst6 python3-pip xvfb
+          python3 -m pip install --user --disable-pip-version-check \
+            'jsonschema==4.25.1'
+          python3 -c 'from jsonschema import Draft202012Validator'
 
       - name: Select minimum supported Rust
         run: |
