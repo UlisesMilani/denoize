@@ -1,0 +1,136 @@
+name: Resume v0.78.2 publication
+
+on:
+  workflow_dispatch:
+
+permissions:
+  attestations: read
+  contents: write
+
+concurrency:
+  group: release-v0.78.2
+  cancel-in-progress: false
+
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  GH_REPO: ${{ github.repository }}
+  RELEASE_COMMIT: 671469eae1ddf4da111ceb344780a532f95a9d75
+  RELEASE_TAG: v0.78.2
+
+jobs:
+  resume:
+    name: Verify and resume immutable release
+    environment: crates-io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the immutable release tag
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          ref: refs/tags/v0.78.2
+
+      - name: Verify the fixed tag and default-branch ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_commit=$(git rev-parse HEAD)
+          tag_commit=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
+          if [[ "$actual_commit" != "$RELEASE_COMMIT" || "$tag_commit" != "$RELEASE_COMMIT" ]]; then
+            echo "immutable release identity mismatch" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.event.repository.default_branch }}:refs/remotes/origin/${{ github.event.repository.default_branch }}"
+          if ! git merge-base --is-ancestor \
+            "$RELEASE_COMMIT" "refs/remotes/origin/${{ github.event.repository.default_branch }}"; then
+            echo "$RELEASE_TAG is not on the default branch" >&2
+            exit 1
+          fi
+
+      - name: Select release Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Apply the verifier-only download fix
+        shell: bash
+        run: |
+          git apply <<'PATCH'
+          diff --git a/scripts/verify-release-assets.sh b/scripts/verify-release-assets.sh
+          index 50dfabd..ab0af38 100755
+          --- a/scripts/verify-release-assets.sh
+          +++ b/scripts/verify-release-assets.sh
+          @@ -244,6 +244,7 @@ gh release download "$tag" \
+             --pattern '*.crate' \
+             --pattern '*.sigstore.json' \
+             --pattern '*.jsonl' \
+          +  --pattern 'denoize-vst3-host-matrix-v1.json' \
+             --pattern 'denoize-vst3-ardour-*.txt' \
+             --pattern 'denoize-vst3-validator-*.txt' \
+             --pattern 'denoize-model-catalog-v1.json' \
+          PATCH
+          git diff --check
+          test "$(git diff --numstat -- scripts/verify-release-assets.sh)" = $'1\t0\tscripts/verify-release-assets.sh'
+
+      - name: Verify every release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/verify-release-assets.sh "$RELEASE_TAG"
+
+      - name: Restore the exact tagged source
+        run: |
+          git restore --source=HEAD -- scripts/verify-release-assets.sh
+          git diff --exit-code
+
+      - name: Publish the evidence-bound crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          package="$RUNNER_TEMP/denoize-${version}.crate"
+          gh release download "$RELEASE_TAG" \
+            --pattern "$(basename "$package")" \
+            --dir "$RUNNER_TEMP"
+          expected_checksum=$(sha256sum "$package" | awk '{print $1}')
+          response=$(curl --fail --silent --show-error \
+            --user-agent "denoize-release-recovery ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)" \
+            "https://crates.io/api/v1/crates/denoize" || true)
+          if jq -e --arg version "$version" \
+            '.versions[]? | select(.num == $version)' <<<"$response" >/dev/null; then
+            echo "denoize $version is already published; checking its checksum."
+          else
+            if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+              echo "CRATES_IO_TOKEN is not configured in the crates-io environment." >&2
+              exit 1
+            fi
+            bash scripts/publish-crates-io.sh --expected-package "$package"
+          fi
+          published_checksum=""
+          for attempt in $(seq 1 30); do
+            response=$(curl --fail --silent --show-error \
+              --user-agent "denoize-release-recovery ($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)" \
+              "https://crates.io/api/v1/crates/denoize" || true)
+            published_checksum=$(jq -r --arg version "$version" \
+              '.versions[]? | select(.num == $version) | .checksum' <<<"$response" | head -n 1)
+            if [[ -n "$published_checksum" ]]; then
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$published_checksum" != "$expected_checksum" ]]; then
+            echo "crates.io checksum mismatch: expected $expected_checksum, got ${published_checksum:-<missing>}" >&2
+            exit 1
+          fi
+          echo "crates.io denoize $version matches $expected_checksum"
+
+      - name: Publish the verified GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --draft=false
