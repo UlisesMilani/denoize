@@ -1009,15 +1009,16 @@ contracts, publish all SDK archives and schemas, and bind them into the same
 SBOM/provenance evidence set as the applications. These virtual-device gates do
 not substitute for named physical-device latency evidence.
 
-## Research watchlist, not committed implementation stages
+## Post-roadmap implementation and research watchlist
 
-These capabilities have product value, but the evidence does not yet justify
-placing them ahead of Stages 25–33. They are deliberately excluded from the
-current implementation commitment until the stated promotion condition holds.
+Stage 34 now has a bounded product contract while its concrete neural artifacts
+remain gated. The later capabilities have product value, but are deliberately
+excluded from the current implementation commitment until their stated
+promotion conditions hold.
 
 | Candidate order | Capability | Current decision | Promotion condition |
 |---:|---|---|---|
-| 34 | Meeting speaker tracks | Strongest new post-roadmap feature; design after Stages 29, 31, and 32 | Licensed real-meeting evidence, stable speaker-count/overlap uncertainty, bounded track count, and no retained biometric embeddings |
+| 34 | Meeting speaker tracks | Implemented as the v0.87.0 bounded anonymous baseline after Stages 29, 31, and 32 | Any concrete checkpoint still requires licensed real-meeting evidence, stable speaker-count/overlap uncertainty, and its complete redistribution chain |
 | 35 | Music/general-audio restoration | Add mixture-preserving repair first; keep dry-stem estimation opt-in | Redistributable exact checkpoint/data chain plus stereo, transient, timbre, genre, and listening gates |
 | watch | Semantic target-sound extraction | Research adapter only | Closed query semantics, target-absence calibration, residual conservation, distributable weights/data, and real-time evidence |
 | watch | Audio-visual target extraction | Do not schedule yet | Explicit camera/face consent, sync, occlusion/spoofing, biometric retention, and audio-only failure policy |
@@ -1056,6 +1057,29 @@ named identity, and default reports retain no speaker embedding. Promotion
 stops on unstable speaker count, forced assignment of unknown speech, track
 swaps hidden by aggregate SI-SDR, retained biometrics, or ASR gains caused by
 deleting difficult words.
+
+### Implemented Stage 34 boundary
+
+v0.87.0 turns that research decision into a dedicated runtime package v2
+adapter rather than accepting an arbitrary waveform graph. One fixed mono or
+authenticated fixed-array window produces at most eight anonymous audio tracks,
+per-track inactive/uncertain/active probabilities, and global no-speech/
+assigned/unknown probabilities. Exact bounded assignment joins window-local
+tracks only when overlap correlation and the runner-up margin both pass;
+otherwise the window is reported as unknown. Activity, uncertainty, overlap,
+and unknown ranges use presentation samples.
+
+The published tracks are accompanied by `unassigned = mono reference - sum of
+published tracks`, and the operation fails if their recombination error exceeds
+`1e-12`, duration changes, samples become non-finite, or configured peaks are
+exceeded. Optional names are not inferred: a label requires hashes for explicit
+consent and an accepted Stage 29 report, and the label document must state that
+neither enrollment audio nor a speaker embedding was retained. Promotion
+evidence binds the exact package/configuration plus corpus and corpus-license
+manifests and enforces the twelve stratified audio, diarization, overlap,
+speaker-count, tcpWER, listening, and privacy gates. No checkpoint or meeting
+corpus is bundled; an operator-supplied graph remains blocked until that exact
+artifact clears the signed evidence contract.
 
 ### Music and general-audio restoration
 

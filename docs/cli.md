@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.86.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.87.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -19,6 +19,7 @@ USAGE:
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config CONFIG --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
@@ -292,6 +293,45 @@ CAUSAL OPTIONS:
     metadata, replacement, and JSON options above also apply to causal mode.
 ```
 
+## Anonymous meeting speaker tracks
+
+```text
+USAGE:
+    denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize meeting-speakers evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Separate a mono meeting or an explicitly fixed microphone array into at most
+eight anonymous speaker channels plus one final unassigned-residual channel.
+The signed package must expose fixed-window separated audio, per-track
+inactive/uncertain/active probabilities, and global no-speech/assigned/unknown
+probabilities. The residual is required and exactly recombines with every
+published track to the arithmetic-mean reference. Unknown speech is never
+forced into an identity. The output is WAV only; the report maps its first N
+channels to speaker-NNN and its final channel to unassigned.
+
+OPTIONS:
+        --model-package <PATH>                    required signed runtime package v2
+        --model-package-key <PATH>                trusted Minisign public key
+        --promotion-evidence <PATH>               accepted signed meeting evaluation evidence
+        --promotion-evidence-key <PATH>           trusted Ed25519 evidence public key
+        --track-labels <PATH.json>                optional Stage 29 consent-bound labels
+        --minimum-active-probability <F>          active threshold, 0.5..1 (default: 0.8)
+        --minimum-inactive-probability <F>        inactive threshold, 0.5..1 (default: 0.8)
+        --minimum-unknown-probability <F>         unknown threshold, 0.5..1 (default: 0.8)
+        --minimum-active-frames <N>               consecutive frames needed to publish, 1..100 (default: 2)
+        --permutation-minimum-correlation <F>     window stitch threshold, 0..1 (default: 0.2)
+        --permutation-minimum-margin <F>          best/runner-up stitch margin, 0..1 (default: 0.05)
+        --maximum-track-peak <F>                  absolute track peak, 0.5..1 (default: 1)
+        --maximum-residual-peak <F>               absolute residual peak, 0.5..1 (default: 1)
+        --accelerator <NAME>                      cpu|auto|gpu|metal|cuda (default: cpu)
+        --report <PATH.json>                      atomically write the closed path-free report
+        --max-memory <MB>                         bound decode, model, tracks, and residual memory
+        --replace                                 atomically replace output/report destinations
+        --json                                    emit compact report JSON
+        --pretty                                  emit indented report JSON
+    -h, --help                                    show this help
+```
+
 ## Fail-closed acoustic echo cancellation
 
 ```text
@@ -354,7 +394,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.86.0 watch-folder automation
+denoize 0.87.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

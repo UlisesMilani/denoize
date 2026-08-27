@@ -352,6 +352,31 @@ and the closed [report](schemas/denoize-microphone-array-report-v1.schema.json)
 and [promotion evidence](schemas/denoize-microphone-array-promotion-evidence-v1.schema.json)
 contracts.
 
+### Anonymous meeting speaker tracks
+
+Stage 34 separates a meeting into at most eight anonymous speaker channels and
+one mandatory unassigned-residual channel:
+
+```bash
+denoize meeting-speakers meeting.wav tracks.wav \
+  --model-package meeting-css.dmp \
+  --model-package-key operator-model.pub \
+  --promotion-evidence meeting-evidence.json \
+  --promotion-evidence-key evaluator.pub.json \
+  --report meeting-report.json
+```
+
+The dedicated package-v2 adapter requires fixed audio, per-track activity, and
+global unknown heads. Window permutations need both a correlation threshold
+and a runner-up margin; ambiguous stitches and unassigned speech remain
+explicit. The final residual exactly recombines with the published tracks to
+the mono reference. Optional labels require Stage 29 consent/report hashes and
+reject retained enrollment or embeddings. No CSS checkpoint or meeting corpus
+is bundled. See [Anonymous meeting speaker tracks](docs/meeting-speakers.md) and
+the closed [report](schemas/denoize-meeting-speaker-report-v1.schema.json),
+[promotion evidence](schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json),
+and [label](schemas/denoize-meeting-track-labels-v1.schema.json) contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -1901,7 +1926,9 @@ resource-accounting scope, corpus-promotion rule, and debug-only fault protocol.
 
 ## Embedding SDKs
 
-v0.86.0 adds a stable C ABI v1, scalar finite/incremental WASM, a bounded
+v0.87.0 adds bounded anonymous meeting speaker tracks, explicit overlap and
+unknown regions, consent-bound optional labels, and an exact reconstruction
+residual. v0.86.0 adds a stable C ABI v1, scalar finite/incremental WASM, a bounded
 Worker/AudioWorklet transport, and Android/iOS worker wrappers over the same C
 core. SDK calls never download models or silently substitute unsupported
 backends. The CLI exposes the exact machine-readable contracts:

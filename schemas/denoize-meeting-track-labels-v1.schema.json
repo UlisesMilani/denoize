@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-meeting-track-labels-v1.schema.json",
+  "title": "denoize consent-bound meeting track labels v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "labels"],
+  "properties": {
+    "schema": { "const": "denoize-meeting-track-labels-v1" },
+    "schema_version": { "const": 1 },
+    "labels": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/label" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "label": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "track_id",
+        "label",
+        "consent_record_sha256",
+        "target_speaker_report_sha256",
+        "raw_enrollment_retained",
+        "speaker_embedding_retained"
+      ],
+      "properties": {
+        "track_id": { "type": "string", "pattern": "^speaker-00[1-8]$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$" },
+        "consent_record_sha256": { "$ref": "#/$defs/sha256" },
+        "target_speaker_report_sha256": { "$ref": "#/$defs/sha256" },
+        "raw_enrollment_retained": { "const": false },
+        "speaker_embedding_retained": { "const": false }
+      }
+    }
+  }
+}
