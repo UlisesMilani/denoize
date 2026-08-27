@@ -799,9 +799,9 @@ jobs:
           releaseName: denoize ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
-          uploadUpdaterJson: true
-          # Matrix jobs upload target-local updater JSON under one shared name.
-          # updater-metadata replaces the last writer only after all four finish.
+          # A single updater-metadata job assembles latest.json after all four
+          # platform jobs finish. Matrix jobs must not race on that shared name.
+          uploadUpdaterJson: false
           updaterJsonPreferNsis: true
           retryAttempts: 3
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
