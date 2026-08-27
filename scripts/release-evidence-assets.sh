@@ -29,6 +29,8 @@ denoize_release_primary_assets() {
     plugin x86_64-apple-darwin "denoize-vst3-${tag}-x86_64-apple-darwin.tar.gz" \
     plugin x86_64-pc-windows-msvc "denoize-vst3-${tag}-x86_64-pc-windows-msvc.zip" \
     plugin x86_64-unknown-linux-gnu "denoize-vst3-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+    plugin aarch64-apple-darwin "denoize-auv3-${tag}-aarch64-apple-darwin.tar.gz" \
+    plugin x86_64-apple-darwin "denoize-auv3-${tag}-x86_64-apple-darwin.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.app.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.dmg" \
     desktop x86_64-apple-darwin "denoize_${version}_x64.app.tar.gz" \

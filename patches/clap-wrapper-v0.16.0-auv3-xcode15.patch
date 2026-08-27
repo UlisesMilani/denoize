@@ -1,0 +1,57 @@
+diff --git a/cmake/shared_prologue.cmake b/cmake/shared_prologue.cmake
+--- a/cmake/shared_prologue.cmake
++++ b/cmake/shared_prologue.cmake
+@@ -306,11 +306,10 @@ function(macos_include_clap_in_bundle)
+ 
+     if (NOT ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} STREQUAL "")
+         message(STATUS "clap-wrapper: including embedded clap in target ${MBC_TARGET}")
+         add_custom_command(TARGET ${MBC_TARGET} PRE_BUILD
+-                WORKING_DIRECTORY $<TARGET_PROPERTY:${MBC_TARGET},LIBRARY_OUTPUT_DIRECTORY>
+-                COMMAND ${CMAKE_COMMAND} -E echo "Installing ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} in $<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.$<TARGET_PROPERTY:${MBC_TARGET},BUNDLE_EXTENSION>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
+-                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.$<TARGET_PROPERTY:${MBC_TARGET},BUNDLE_EXTENSION>/Contents/PlugIns"
+-                COMMAND ${CMAKE_COMMAND} -E copy_directory ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} "$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.$<TARGET_PROPERTY:${MBC_TARGET},BUNDLE_EXTENSION>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
++                COMMAND ${CMAKE_COMMAND} -E echo "Installing ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} in $<TARGET_BUNDLE_DIR:${MBC_TARGET}>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
++                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:${MBC_TARGET}>/Contents/PlugIns"
++                COMMAND ${CMAKE_COMMAND} -E copy_directory "${MBC_MACOS_EMBEDDED_CLAP_LOCATION}" "$<TARGET_BUNDLE_DIR:${MBC_TARGET}>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
+                 )
+     endif ()
+ endfunction(macos_include_clap_in_bundle)
+
+diff --git a/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm b/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm
+index 6581e27..95f5ae1 100644
+--- a/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm
++++ b/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm
+@@ -240,6 +240,6 @@ fourCCFromString(const char *str)
+   switch ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio])
+   {
+-    case AVAuthorizationStatusNotDetermined:
++    case AVAuthorizationStatusNotDetermined: {
+       [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
+                                completionHandler:^(BOOL granted) {
+                                  if (!granted) return;
+@@ -255,5 +255,6 @@ fourCCFromString(const char *str)
+                                }];
+       break;
++    }
+     default:
+       break;
+   }
+@@ -284,15 +285,15 @@ fourCCFromString(const char *str)
+     std::cout << "[auv3-standalone] Found registered AudioComponent: "
+               << (compName ? [(__bridge NSString *)compName UTF8String] : "?") << std::endl;
+     if (compName) CFRelease(compName);
+ 
+-    __weak typeof(self) weakSelf = self;
++    __weak __typeof__(self) weakSelf = self;
+     [AVAudioUnit instantiateWithComponentDescription:desc
+                                              options:kAudioComponentInstantiation_LoadInProcess
+                                    completionHandler:^(AVAudioUnit *_Nullable audioUnit,
+                                                        NSError *_Nullable error) {
+                                      dispatch_async(dispatch_get_main_queue(), ^{
+-                                       __strong typeof(weakSelf) self = weakSelf;
+-                                       if (self) [self finishSetupWithAudioUnit:audioUnit error:error];
++                                       __strong __typeof__(weakSelf) strongSelf = weakSelf;
++                                       if (strongSelf) [strongSelf finishSetupWithAudioUnit:audioUnit error:error];
+                                      });
+                                    }];
+     return;

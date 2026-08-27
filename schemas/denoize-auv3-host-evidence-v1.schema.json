@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-auv3-host-evidence-v1.schema.json",
+  "title": "denoize AUv3 host evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "tag",
+    "source",
+    "format",
+    "adapter",
+    "components",
+    "bundled_model",
+    "runs",
+    "claims",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-auv3-host-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "tag": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "format": { "const": "auv3" },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "clap_wrapper", "clap_sdk"],
+      "properties": {
+        "strategy": { "const": "signed-embedded-clap-wrapper" },
+        "clap_wrapper": { "$ref": "#/$defs/dependency" },
+        "clap_sdk": { "$ref": "#/$defs/dependency" }
+      }
+    },
+    "components": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        { "$ref": "#/$defs/standardComponent" },
+        { "$ref": "#/$defs/neuralComponent" }
+      ],
+      "items": false
+    },
+    "bundled_model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "filename", "size_bytes", "sha256", "authenticated_provenance"],
+      "properties": {
+        "name": { "const": "gtcrn-dns3" },
+        "filename": { "const": "gtcrn_simple.onnx" },
+        "size_bytes": { "const": 535190 },
+        "sha256": {
+          "const": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+        },
+        "authenticated_provenance": { "const": true }
+      }
+    },
+    "runs": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        { "$ref": "#/$defs/auvalRun" },
+        { "$ref": "#/$defs/hostRun" }
+      ],
+      "items": false
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "official_auval",
+        "avfoundation_real_host",
+        "app_extension_sandbox",
+        "self_contained_model",
+        "embedded_editor"
+      ],
+      "properties": {
+        "official_auval": { "const": true },
+        "avfoundation_real_host": { "const": true },
+        "app_extension_sandbox": { "const": true },
+        "self_contained_model": { "const": true },
+        "embedded_editor": { "const": false }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "custom-view-not-exercised",
+          "ios-not-shipped",
+          "macos-only",
+          "proprietary-third-party-hosts-not-exercised",
+          "standalone-opens-standard-component"
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "commit"],
+      "properties": {
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "componentBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["descriptor_id", "name", "type", "subtype", "manufacturer", "parameters"],
+      "properties": {
+        "descriptor_id": {
+          "enum": ["org.penguin425.denoize", "org.penguin425.denoize.neural"]
+        },
+        "name": { "enum": ["denoize", "denoize Neural"] },
+        "type": { "const": "aufx" },
+        "subtype": { "enum": ["Dn01", "Dn02"] },
+        "manufacturer": { "const": "Dnze" },
+        "parameters": { "enum": [4, 7] }
+      }
+    },
+    "standardComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/componentBase" },
+        {
+          "properties": {
+            "descriptor_id": { "const": "org.penguin425.denoize" },
+            "name": { "const": "denoize" },
+            "subtype": { "const": "Dn01" },
+            "parameters": { "const": 7 }
+          }
+        }
+      ]
+    },
+    "neuralComponent": {
+      "allOf": [
+        { "$ref": "#/$defs/componentBase" },
+        {
+          "properties": {
+            "descriptor_id": { "const": "org.penguin425.denoize.neural" },
+            "name": { "const": "denoize Neural" },
+            "subtype": { "const": "Dn02" },
+            "parameters": { "const": 4 }
+          }
+        }
+      ]
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "runBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host",
+        "host_version",
+        "operating_system",
+        "architecture",
+        "evidence_kind",
+        "status",
+        "components_exercised",
+        "state_round_trip",
+        "teardown",
+        "report"
+      ],
+      "properties": {
+        "host": { "enum": ["auval", "AVFoundation"] },
+        "host_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+(?:\\.[0-9]+)?$"
+        },
+        "operating_system": { "const": "macos" },
+        "architecture": { "enum": ["arm64", "x86_64"] },
+        "evidence_kind": { "enum": ["official-validator", "real-host-smoke"] },
+        "status": { "const": "passed" },
+        "components_exercised": { "const": 2 },
+        "state_round_trip": { "type": "boolean" },
+        "teardown": { "type": "boolean" },
+        "report": { "$ref": "#/$defs/file" }
+      }
+    },
+    "auvalRun": {
+      "allOf": [
+        { "$ref": "#/$defs/runBase" },
+        {
+          "properties": {
+            "host": { "const": "auval" },
+            "evidence_kind": { "const": "official-validator" },
+            "state_round_trip": { "const": false },
+            "teardown": { "const": false }
+          }
+        }
+      ]
+    },
+    "hostRun": {
+      "allOf": [
+        { "$ref": "#/$defs/runBase" },
+        {
+          "properties": {
+            "host": { "const": "AVFoundation" },
+            "evidence_kind": { "const": "real-host-smoke" },
+            "state_round_trip": { "const": true },
+            "teardown": { "const": true }
+          }
+        }
+      ]
+    }
+  }
+}

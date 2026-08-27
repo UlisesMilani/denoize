@@ -1,5 +1,6 @@
 //! CLAP adapter for the allocation-free denoize DAW processing core.
 
+mod apple_factory;
 mod gui_contract;
 mod neural;
 
@@ -1067,17 +1068,21 @@ fn write_channel<S: AudioSample>(channel: &mut ChannelPair<'_, S>, frame: usize,
 
 struct DenoizeEntry {
     plugin_factory: PluginFactoryWrapper<DenoizeFactory>,
+    audio_unit_factory: apple_factory::DenoizeAudioUnitFactory,
 }
 
 impl Entry for DenoizeEntry {
     fn new(_plugin_path: Option<&CStr>) -> Result<Self, EntryLoadError> {
         Ok(Self {
             plugin_factory: PluginFactoryWrapper::new(DenoizeFactory::new()),
+            audio_unit_factory: apple_factory::DenoizeAudioUnitFactory::new(),
         })
     }
 
     fn declare_factories<'a>(&'a self, builder: &mut EntryFactories<'a>) {
-        builder.register_factory(&self.plugin_factory);
+        builder
+            .register_factory(&self.plugin_factory)
+            .register_factory(&self.audio_unit_factory);
     }
 }
 

@@ -82,8 +82,8 @@ def read_asset_specs(path: Path) -> list[dict[str, str]]:
             raise EvidenceError(f"unsafe artifact target on line {line_number}: {target}")
         seen.add(name)
         specs.append({"kind": kind, "target": target, "name": name})
-    if len(specs) != 22:
-        raise EvidenceError(f"expected 22 installable release artifacts, found {len(specs)}")
+    if len(specs) != 24:
+        raise EvidenceError(f"expected 24 installable release artifacts, found {len(specs)}")
     return specs
 
 

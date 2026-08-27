@@ -418,15 +418,110 @@ fn path_for_spec(model: &ModelSpec<'_>) -> Result<PathBuf, String> {
     Ok(cache_dir()?.join(model.name).join(model.filename))
 }
 
+fn bundled_path_for_spec(model: &ModelSpec<'_>) -> Option<PathBuf> {
+    // An explicit directory is an operator override and must never be
+    // shadowed by a model carried inside a plug-in bundle.
+    if std::env::var_os("DENOIZE_MODEL_DIR").is_some() {
+        return None;
+    }
+    bundled_model_root().map(|root| root.join(model.name).join(model.filename))
+}
+
+#[cfg(target_os = "macos")]
+fn bundled_model_root() -> Option<PathBuf> {
+    let module = current_module_path()?;
+    let root = bundled_model_root_from_module_path(&module)?;
+    root.is_dir().then_some(root)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn bundled_model_root() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn bundled_model_root_from_module_path(module: &Path) -> Option<PathBuf> {
+    let bundle = module.ancestors().find(|ancestor| {
+        matches!(
+            ancestor
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("clap" | "appex")
+        ) && module.starts_with(ancestor.join("Contents").join("MacOS"))
+    })?;
+    Some(
+        bundle
+            .join("Contents")
+            .join("Resources")
+            .join("denoize-models"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+#[allow(
+    unsafe_code,
+    reason = "dladdr is the platform API for resolving the loaded plug-in bundle"
+)]
+#[inline(never)]
+fn current_module_path() -> Option<PathBuf> {
+    use std::ffi::{c_void, CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    let address = current_module_path as *const () as *const c_void;
+    // SAFETY: info points to writable storage and address names this loaded
+    // function. A successful dladdr call initializes the full Dl_info value.
+    if unsafe { libc::dladdr(address, info.as_mut_ptr()) } == 0 {
+        return None;
+    }
+    // SAFETY: dladdr returned success, so info is initialized.
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return None;
+    }
+    // SAFETY: a successful dladdr call returns a process-lifetime NUL-
+    // terminated image path in dli_fname.
+    let bytes = unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes();
+    Some(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+fn verify_runtime_spec(model: &ModelSpec<'_>) -> Result<PathBuf, String> {
+    if let Some(destination) = bundled_path_for_spec(model) {
+        return verify_bundled_spec_at(model, &destination).map_err(|error| {
+            format!(
+                "bundled model validation failed at {}: {error}",
+                destination.display()
+            )
+        });
+    }
+    verify_spec_at(model, &path_for_spec(model)?)
+}
+
+fn verify_bundled_spec_at(model: &ModelSpec<'_>, destination: &Path) -> Result<PathBuf, String> {
+    validate_model_storage_path(destination)?;
+    let verified = verify_bytes_at(model, destination)?;
+    if model.catalog.is_some() {
+        let path = provenance_path(model, destination)?;
+        let provenance = read_provenance(&path)?.ok_or_else(|| {
+            format!(
+                "authenticated bundled-model provenance is missing: {}",
+                path.display()
+            )
+        })?;
+        validate_provenance(model, &provenance)?;
+    }
+    Ok(verified)
+}
+
 pub fn verify(model: &ModelInfo) -> Result<PathBuf, String> {
     let model = ModelSpec::legacy(model);
-    verify_spec_at(&model, &path_for_spec(&model)?)
+    verify_runtime_spec(&model)
 }
 
 /// Verify an installed catalog package and its authenticated provenance.
 pub fn verify_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
     let model = ModelSpec::catalog(model);
-    verify_spec_at(&model, &path_for_spec(&model)?)
+    verify_runtime_spec(&model)
 }
 
 /// Verify an installed catalog artifact without creating or migrating its
@@ -437,6 +532,9 @@ pub fn verify_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
 /// authenticated provenance requirements remain unchanged.
 pub(crate) fn verify_catalog_model_read_only(model: &CatalogModel) -> Result<PathBuf, String> {
     let model = ModelSpec::catalog(model);
+    if let Some(destination) = bundled_path_for_spec(&model) {
+        return verify_bundled_spec_at(&model, &destination);
+    }
     let destination = path_for_spec(&model)?;
     validate_model_storage_path(&destination)?;
     let verified = verify_bytes_at(&model, &destination)?;
