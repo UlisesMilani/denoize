@@ -364,6 +364,16 @@ keyboard navigation, scaling and accessible names, bound persisted UI state,
 and fall back completely to a host generic editor. No editor failure may affect
 activation, processing, state recovery, or automation.
 
+Stage 28c implements that boundary for both native CLAP descriptors in
+v0.79.0. A deterministic software-rendered X11/Win32/Cocoa child exposes the
+same stable parameters through AccessKit, keyboard and pointer input. Atomics,
+a fixed 128-entry queue, a 63-bit final-value overflow mask, and a resumable
+Begin/Value/End state machine prevent UI work and host backpressure from
+crossing the audio callback. Unsupported Wayland/floating configurations and
+any editor creation failure leave generic host parameters intact. Unit,
+cross-target, official-validator, and signed X11 real-host evidence form the
+promotion gate; VST3 custom-view and proprietary-host claims remain separate.
+
 Release stops if any descriptor fails the official validator; activation or
 reset touches the network; the post-activation callback allocates, locks,
 performs I/O/logging/inference, or waits; an injected worker stall lengthens the
@@ -371,8 +381,9 @@ callback path; the impulse differs from reported latency; reset permits stale
 audio; queue exhaustion lacks the selected fallback; state accepts unknown or
 mismatched model identity; the pinned real graph smoke test fails; or a release
 artifact cannot reproduce the exact model, state schema, validator report, and
-source revision. VST3/editor/AUv3/LV2 claims stay out of release status until
-their own equivalent matrices pass.
+source revision. VST3, editor, AUv3, and LV2 claims stay out of release status
+until their own equivalent evidence passes; Stage 28b and the native CLAP
+portion of 28c now satisfy their separately documented gates.
 
 ## Stage 29 — target-speaker extraction
 

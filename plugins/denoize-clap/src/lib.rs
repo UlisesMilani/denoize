@@ -1,24 +1,34 @@
 //! CLAP adapter for the allocation-free denoize DAW processing core.
 
+mod gui_contract;
 mod neural;
 
 use clack_extensions::audio_ports::*;
 use clack_extensions::audio_ports_config::*;
+use clack_extensions::gui::*;
 use clack_extensions::latency::{PluginLatency, PluginLatencyImpl};
 use clack_extensions::params::*;
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_plugin::entry::prelude::*;
+use clack_plugin::events::event_types::{
+    ParamGestureBeginEvent, ParamGestureEndEvent, ParamValueEvent,
+};
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
 use clack_plugin::process::audio::{ChannelPair, PairedChannels, SampleType};
 use clack_plugin::stream::{InputStream, OutputStream};
+use clack_plugin::utils::Cookie;
 use denoize::{
     DAW_PLUGIN_ID, DawParameters, DawPortConfiguration, DawPreset, DawRealtimeProcessor,
     DawSessionState,
 };
+use denoize_plugin_editor::{
+    AutomationGesture, ControlKind, DisplayUnit, EditorModel, ParameterSpec, PluginEditor,
+};
 use std::ffi::CStr;
 use std::fmt::Write as _;
 use std::io::{Read, Write as _};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const STATE_LIMIT_BYTES: u64 = 64 * 1024;
@@ -36,6 +46,88 @@ const PARAM_OUTPUT_GAIN: ClapId = ClapId::new(5);
 const PARAM_STEREO_LINK: ClapId = ClapId::new(6);
 const PARAMETER_COUNT: u32 = 7;
 
+const EDITOR_PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec {
+        id: 0,
+        name: "Bypass",
+        minimum: 0.0,
+        maximum: 1.0,
+        default: 0.0,
+        step: 1.0,
+        page_step: 1.0,
+        kind: ControlKind::Toggle,
+        unit: DisplayUnit::Plain,
+    },
+    ParameterSpec {
+        id: 1,
+        name: "Amount",
+        minimum: 0.0,
+        maximum: 1.0,
+        // The DSP parameter is stored as `f32`; keep the advertised editor
+        // default bit-identical to the value exposed through CLAP.
+        default: 0.65_f32 as f64,
+        step: 0.01,
+        page_step: 0.1,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Percent,
+    },
+    ParameterSpec {
+        id: 2,
+        name: "Threshold",
+        minimum: -96.0,
+        maximum: -18.0,
+        default: -54.0,
+        step: 0.5,
+        page_step: 6.0,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Decibels,
+    },
+    ParameterSpec {
+        id: 3,
+        name: "Release",
+        minimum: 20.0,
+        maximum: 1_000.0,
+        default: 160.0,
+        step: 5.0,
+        page_step: 50.0,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Milliseconds,
+    },
+    ParameterSpec {
+        id: 4,
+        name: "Mix",
+        minimum: 0.0,
+        maximum: 1.0,
+        default: 1.0,
+        step: 0.01,
+        page_step: 0.1,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Percent,
+    },
+    ParameterSpec {
+        id: 5,
+        name: "Output Gain",
+        minimum: -24.0,
+        maximum: 24.0,
+        default: 0.0,
+        step: 0.5,
+        page_step: 3.0,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Decibels,
+    },
+    ParameterSpec {
+        id: 6,
+        name: "Stereo Link",
+        minimum: 0.0,
+        maximum: 1.0,
+        default: 1.0,
+        step: 1.0,
+        page_step: 1.0,
+        kind: ControlKind::Toggle,
+        unit: DisplayUnit::Plain,
+    },
+];
+
 pub struct DenoizePlugin;
 
 impl Plugin for DenoizePlugin {
@@ -51,6 +143,7 @@ impl Plugin for DenoizePlugin {
             .register::<PluginAudioPorts>()
             .register::<PluginAudioPortsConfig>()
             .register::<PluginAudioPortsConfigInfo>()
+            .register::<gui_contract::DenoizePluginGui>()
             .register::<PluginParams>()
             .register::<PluginState>()
             .register::<PluginLatency>();
@@ -70,16 +163,20 @@ impl DefaultPluginFactory for DenoizePlugin {
     }
 
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {
-        Ok(DenoizeShared::new())
+        DenoizeShared::new()
     }
 
     fn new_main_thread<'a>(
         host: HostMainThreadHandle<'a>,
         shared: &'a Self::Shared<'a>,
     ) -> Result<Self::MainThread<'a>, PluginError> {
+        let host_gui = host.get_extension::<HostGui>();
         Ok(DenoizeMainThread {
             host,
             shared,
+            host_gui,
+            editor: None,
+            pending_automation: None,
             port_configuration: DawPortConfiguration::Stereo,
             latency_frames: 0,
             preset_name: "Session".to_owned(),
@@ -93,11 +190,11 @@ pub struct DenoizeShared {
 }
 
 impl DenoizeShared {
-    fn new() -> Self {
-        Self {
-            parameters: SharedParameters::new(DawParameters::default()),
+    fn new() -> Result<Self, PluginError> {
+        Ok(Self {
+            parameters: SharedParameters::new(DawParameters::default())?,
             reset_generation: AtomicU32::new(0),
-        }
+        })
     }
 
     fn restore(&self, parameters: DawParameters) {
@@ -111,12 +208,110 @@ impl PluginShared<'_> for DenoizeShared {}
 pub struct DenoizeMainThread<'a> {
     host: HostMainThreadHandle<'a>,
     shared: &'a DenoizeShared,
+    host_gui: Option<HostGui>,
+    editor: Option<PluginEditor>,
+    pending_automation: Option<PendingAutomation>,
     port_configuration: DawPortConfiguration,
     latency_frames: u32,
     preset_name: String,
 }
 
-impl<'a> PluginMainThread<'a, DenoizeShared> for DenoizeMainThread<'a> {}
+impl<'a> PluginMainThread<'a, DenoizeShared> for DenoizeMainThread<'a> {
+    fn on_main_thread(&mut self) {
+        if let Some(editor) = &self.editor {
+            editor.host_main_thread_callback();
+        }
+    }
+}
+
+impl PluginGuiImpl for DenoizeMainThread<'_> {
+    fn is_api_supported(&mut self, configuration: GuiConfiguration<'_>) -> bool {
+        PluginEditor::supports(configuration)
+    }
+
+    fn get_preferred_api(&mut self) -> Option<GuiConfiguration<'_>> {
+        PluginEditor::preferred_configuration()
+    }
+
+    fn create(&mut self, configuration: GuiConfiguration<'_>) -> Result<(), PluginError> {
+        if self.editor.is_some() {
+            return Err(PluginError::Message("denoize editor is already created"));
+        }
+        self.editor = Some(PluginEditor::create(
+            &self.host,
+            self.host_gui,
+            Arc::clone(&self.shared.parameters.editor),
+            configuration,
+        )?);
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.editor.take();
+    }
+
+    fn set_scale(&mut self, scale: f64) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize editor is not created"))?
+            .set_scale(scale)
+    }
+
+    fn get_size(&mut self) -> Option<GuiSize> {
+        self.editor.as_ref().map(PluginEditor::size)
+    }
+
+    fn can_resize(&mut self) -> bool {
+        self.editor.as_ref().is_some_and(PluginEditor::can_resize)
+    }
+
+    fn get_resize_hints(&mut self) -> Option<GuiResizeHints> {
+        self.editor.as_ref().map(PluginEditor::resize_hints)
+    }
+
+    fn adjust_size(&mut self, size: GuiSize) -> Option<GuiSize> {
+        self.editor
+            .as_ref()
+            .and_then(|editor| editor.adjust_size(size))
+    }
+
+    fn set_size(&mut self, size: GuiSize) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize editor is not created"))?
+            .set_size(size)
+    }
+
+    fn set_parent(&mut self, window: clack_extensions::gui::Window<'_>) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize editor is not created"))?
+            .set_parent(window)
+    }
+
+    fn set_transient(
+        &mut self,
+        _window: clack_extensions::gui::Window<'_>,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::Message(
+            "denoize editor does not support floating windows",
+        ))
+    }
+
+    fn show(&mut self) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize editor is not created"))?
+            .show()
+    }
+
+    fn hide(&mut self) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize editor is not created"))?
+            .hide()
+    }
+}
 
 impl PluginAudioPortsImpl for DenoizeMainThread<'_> {
     fn count(&mut self, _is_input: bool) -> u32 {
@@ -281,6 +476,7 @@ fn invalid_state(message: String) -> PluginError {
 }
 
 struct SharedParameters {
+    editor: Arc<EditorModel>,
     bypass: AtomicF32,
     amount: AtomicF32,
     threshold_dbfs: AtomicF32,
@@ -291,8 +487,23 @@ struct SharedParameters {
 }
 
 impl SharedParameters {
-    fn new(parameters: DawParameters) -> Self {
-        Self {
+    fn new(parameters: DawParameters) -> Result<Self, PluginError> {
+        let editor = EditorModel::new(
+            "denoize",
+            EDITOR_PARAMETERS,
+            &[
+                f64::from(bool_value(parameters.bypass)),
+                f64::from(parameters.amount),
+                f64::from(parameters.threshold_dbfs),
+                f64::from(parameters.release_ms),
+                f64::from(parameters.mix),
+                f64::from(parameters.output_gain_db),
+                f64::from(bool_value(parameters.stereo_link)),
+            ],
+        )
+        .map_err(PluginError::from)?;
+        Ok(Self {
+            editor,
             bypass: AtomicF32::new(bool_value(parameters.bypass)),
             amount: AtomicF32::new(parameters.amount),
             threshold_dbfs: AtomicF32::new(parameters.threshold_dbfs),
@@ -300,7 +511,7 @@ impl SharedParameters {
             mix: AtomicF32::new(parameters.mix),
             output_gain_db: AtomicF32::new(parameters.output_gain_db),
             stereo_link: AtomicF32::new(bool_value(parameters.stereo_link)),
-        }
+        })
     }
 
     fn snapshot(&self) -> DawParameters {
@@ -323,6 +534,24 @@ impl SharedParameters {
         self.mix.store(parameters.mix);
         self.output_gain_db.store(parameters.output_gain_db);
         self.stereo_link.store(bool_value(parameters.stereo_link));
+        self.editor
+            .set_host_value(PARAM_BYPASS.get(), f64::from(bool_value(parameters.bypass)));
+        self.editor
+            .set_host_value(PARAM_AMOUNT.get(), f64::from(parameters.amount));
+        self.editor
+            .set_host_value(PARAM_THRESHOLD.get(), f64::from(parameters.threshold_dbfs));
+        self.editor
+            .set_host_value(PARAM_RELEASE.get(), f64::from(parameters.release_ms));
+        self.editor
+            .set_host_value(PARAM_MIX.get(), f64::from(parameters.mix));
+        self.editor.set_host_value(
+            PARAM_OUTPUT_GAIN.get(),
+            f64::from(parameters.output_gain_db),
+        );
+        self.editor.set_host_value(
+            PARAM_STEREO_LINK.get(),
+            f64::from(bool_value(parameters.stereo_link)),
+        );
     }
 
     fn value(&self, id: ClapId) -> Option<f64> {
@@ -369,6 +598,7 @@ impl SharedParameters {
             return false;
         };
         target.0.store(target.1);
+        self.editor.set_host_value(id.get(), f64::from(target.1));
         true
     }
 
@@ -401,6 +631,105 @@ impl AtomicF32 {
     fn store(&self, value: f32) {
         self.0.store(value.to_bits(), Ordering::Relaxed);
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutomationStage {
+    Begin,
+    Value,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingAutomation {
+    gesture: AutomationGesture,
+    stage: AutomationStage,
+}
+
+fn continue_editor_gesture(
+    output: &mut OutputEvents<'_>,
+    pending: &mut Option<PendingAutomation>,
+) -> bool {
+    while let Some(current) = *pending {
+        let Some(parameter_id) = ClapId::from_raw(current.gesture.parameter_id) else {
+            *pending = None;
+            return true;
+        };
+        let pushed = match current.stage {
+            AutomationStage::Begin => output.try_push(ParamGestureBeginEvent::new(0, parameter_id)),
+            AutomationStage::Value => output.try_push(ParamValueEvent::new(
+                0,
+                parameter_id,
+                Pckn::match_all(),
+                current.gesture.value,
+                Cookie::empty(),
+            )),
+            AutomationStage::End => output.try_push(ParamGestureEndEvent::new(0, parameter_id)),
+        };
+        if pushed.is_err() {
+            return false;
+        }
+        *pending = match current.stage {
+            AutomationStage::Begin => Some(PendingAutomation {
+                stage: AutomationStage::Value,
+                ..current
+            }),
+            AutomationStage::Value => Some(PendingAutomation {
+                stage: AutomationStage::End,
+                ..current
+            }),
+            AutomationStage::End => None,
+        };
+    }
+    true
+}
+
+fn drain_editor_automation(
+    model: &EditorModel,
+    output: &mut OutputEvents<'_>,
+    pending: &mut Option<PendingAutomation>,
+    mut apply: impl FnMut(ClapId, f64),
+) -> bool {
+    if !continue_editor_gesture(output, pending) {
+        return true;
+    }
+
+    while let Some(gesture) = model.pop_gesture() {
+        let Some(parameter_id) = ClapId::from_raw(gesture.parameter_id) else {
+            continue;
+        };
+        apply(parameter_id, gesture.value);
+        *pending = Some(PendingAutomation {
+            gesture,
+            stage: AutomationStage::Begin,
+        });
+        if !continue_editor_gesture(output, pending) {
+            return true;
+        }
+    }
+
+    let mut overflow = model.take_overflow_mask();
+    while overflow != 0 {
+        let index = overflow.trailing_zeros() as usize;
+        let bit = 1_u64 << index;
+        overflow &= !bit;
+        let Some(gesture) = model.overflow_gesture(index) else {
+            continue;
+        };
+        let Some(parameter_id) = ClapId::from_raw(gesture.parameter_id) else {
+            continue;
+        };
+        apply(parameter_id, gesture.value);
+        *pending = Some(PendingAutomation {
+            gesture,
+            stage: AutomationStage::Begin,
+        });
+        if !continue_editor_gesture(output, pending) {
+            model.restore_overflow_mask(overflow);
+            return true;
+        }
+    }
+    false
 }
 
 impl PluginMainThreadParams for DenoizeMainThread<'_> {
@@ -465,9 +794,20 @@ impl PluginMainThreadParams for DenoizeMainThread<'_> {
         }
     }
 
-    fn flush(&mut self, input: &InputEvents, _output: &mut OutputEvents) {
+    fn flush(&mut self, input: &InputEvents, output: &mut OutputEvents) {
         for event in input {
             self.shared.parameters.handle_event(event);
+        }
+        let retry = drain_editor_automation(
+            &self.shared.parameters.editor,
+            output,
+            &mut self.pending_automation,
+            |parameter_id, value| {
+                self.shared.parameters.set_value(parameter_id, value);
+            },
+        );
+        if retry && let Some(params) = self.host.get_extension::<HostParams>() {
+            params.request_flush(&self.host.shared());
         }
     }
 }
@@ -798,6 +1138,33 @@ clack_plugin::clack_export_entry!(DenoizeEntry);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clack_plugin::events::UnknownEvent;
+    use clack_plugin::events::io::{EventBuffer, OutputEventBuffer, OutputEvents, TryPushError};
+
+    struct LimitedOutput {
+        accepted: EventBuffer,
+        remaining: usize,
+    }
+
+    impl LimitedOutput {
+        fn one() -> Self {
+            Self {
+                accepted: EventBuffer::with_capacity(1),
+                remaining: 1,
+            }
+        }
+    }
+
+    impl OutputEventBuffer for LimitedOutput {
+        fn try_push(&mut self, event: &UnknownEvent) -> Result<(), TryPushError> {
+            if self.remaining == 0 {
+                return Err(TryPushError::new());
+            }
+            self.remaining -= 1;
+            self.accepted.push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn parameter_ids_and_ranges_are_stable() {
@@ -813,8 +1180,130 @@ mod tests {
     }
 
     #[test]
+    fn accessible_editor_specs_match_every_host_parameter() {
+        assert_eq!(EDITOR_PARAMETERS.len(), PARAMETER_COUNT as usize);
+        for (index, editor) in EDITOR_PARAMETERS.iter().enumerate() {
+            let info = parameter_info(index as u32).unwrap();
+            assert_eq!(editor.id, info.id.get());
+            assert_eq!(editor.name.as_bytes(), info.name);
+            assert_eq!(editor.minimum, info.min_value);
+            assert_eq!(editor.maximum, info.max_value);
+            assert_eq!(editor.default, info.default_value);
+        }
+    }
+
+    #[test]
+    fn editor_change_emits_one_complete_host_automation_gesture() {
+        let defaults = DawParameters::default();
+        let model = EditorModel::new(
+            "denoize",
+            EDITOR_PARAMETERS,
+            &[
+                f64::from(bool_value(defaults.bypass)),
+                f64::from(defaults.amount),
+                f64::from(defaults.threshold_dbfs),
+                f64::from(defaults.release_ms),
+                f64::from(defaults.mix),
+                f64::from(defaults.output_gain_db),
+                f64::from(bool_value(defaults.stereo_link)),
+            ],
+        )
+        .unwrap();
+        model.set_editor_value(4, 0.42).unwrap();
+        let mut buffer = EventBuffer::with_capacity(3);
+        let mut applied = None;
+        let retry =
+            drain_editor_automation(&model, &mut buffer.as_output(), &mut None, |id, value| {
+                applied = Some((id, value));
+            });
+        assert!(!retry);
+        let (id, value) = applied.unwrap();
+        assert_eq!(id, PARAM_MIX);
+        assert!((value - 0.42).abs() < 1.0e-6);
+        assert_eq!(buffer.len(), 3);
+        assert!(matches!(
+            buffer[0].as_event::<ParamGestureBeginEvent>(),
+            Some(_)
+        ));
+        assert!(matches!(
+            buffer[1].as_core_event(),
+            Some(CoreEventSpace::ParamValue(_))
+        ));
+        assert!(matches!(
+            buffer[2].as_event::<ParamGestureEndEvent>(),
+            Some(_)
+        ));
+    }
+
+    #[test]
+    fn host_capacity_retries_resume_without_duplicate_begin_or_parameter_apply() {
+        let defaults = DawParameters::default();
+        let model = EditorModel::new(
+            "denoize",
+            EDITOR_PARAMETERS,
+            &[
+                f64::from(bool_value(defaults.bypass)),
+                f64::from(defaults.amount),
+                f64::from(defaults.threshold_dbfs),
+                f64::from(defaults.release_ms),
+                f64::from(defaults.mix),
+                f64::from(defaults.output_gain_db),
+                f64::from(bool_value(defaults.stereo_link)),
+            ],
+        )
+        .unwrap();
+        model.set_editor_value(4, 0.42).unwrap();
+
+        let mut pending = None;
+        let mut apply_count = 0;
+        let mut first = LimitedOutput::one();
+        let retry = drain_editor_automation(
+            &model,
+            &mut OutputEvents::from(&mut first),
+            &mut pending,
+            |_, _| apply_count += 1,
+        );
+        assert!(retry);
+        assert_eq!(apply_count, 1);
+        assert!(
+            first.accepted[0]
+                .as_event::<ParamGestureBeginEvent>()
+                .is_some()
+        );
+        assert_eq!(pending.unwrap().stage, AutomationStage::Value);
+
+        let mut second = LimitedOutput::one();
+        let retry = drain_editor_automation(
+            &model,
+            &mut OutputEvents::from(&mut second),
+            &mut pending,
+            |_, _| apply_count += 1,
+        );
+        assert!(retry);
+        assert_eq!(apply_count, 1);
+        assert!(second.accepted[0].as_event::<ParamValueEvent>().is_some());
+        assert_eq!(pending.unwrap().stage, AutomationStage::End);
+
+        let mut third = LimitedOutput::one();
+        let retry = drain_editor_automation(
+            &model,
+            &mut OutputEvents::from(&mut third),
+            &mut pending,
+            |_, _| apply_count += 1,
+        );
+        assert!(!retry);
+        assert_eq!(apply_count, 1);
+        assert!(
+            third.accepted[0]
+                .as_event::<ParamGestureEndEvent>()
+                .is_some()
+        );
+        assert_eq!(pending, None);
+    }
+
+    #[test]
     fn snapshots_round_trip_all_parameters() {
-        let shared = DenoizeShared::new();
+        let shared = DenoizeShared::new().unwrap();
         let expected = DawParameters {
             bypass: true,
             amount: 0.91,

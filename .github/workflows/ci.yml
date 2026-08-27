@@ -115,6 +115,7 @@ jobs:
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
+            scripts/test-clap-editor-host.sh \
             scripts/test-evaluation-evidence.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
@@ -133,6 +134,8 @@ jobs:
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/generate-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/generate-plugin-editor-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/test-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/test-plugin-editor-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
@@ -145,6 +148,7 @@ jobs:
       - name: Test release evidence generation and offline verification
         run: |
           python3 scripts/test-application-update-manifest.py
+          python3 scripts/test-plugin-editor-evidence.py
           python3 scripts/test-release-updater-metadata.py
           python3 scripts/test-vst3-host-matrix.py
           bash scripts/test-release-evidence.sh
@@ -155,6 +159,14 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+
+      - name: Install embedded-editor host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends dbus-x11 libxtst6 python3-pip xvfb
+          python3 -m pip install --user --disable-pip-version-check \
+            'jsonschema==4.25.1'
+          python3 -c 'from jsonschema import Draft202012Validator'
 
       - name: Select minimum supported Rust
         run: |
@@ -175,6 +187,32 @@ jobs:
 
       - name: Build release plug-in
         run: cargo build --locked --release -p denoize-clap
+
+      - name: Exercise both embedded editors in a real CLAP host
+        shell: bash
+        run: |
+          report_dir=$(mktemp -d /tmp/denoize-clap-editor-report.XXXXXX)
+          report="$report_dir/denoize-clap-editor-host-v9.8.7-x86_64-unknown-linux-gnu.txt"
+          evidence="$report_dir/denoize-plugin-editor-evidence-v1.json"
+          bash scripts/test-clap-editor-host.sh \
+            target/release/libdenoize_clap.so "$report" >/dev/null
+          python3 scripts/generate-plugin-editor-evidence.py \
+            --tag v9.8.7 \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --operating-system ubuntu-22.04 \
+            --architecture x86_64 \
+            --report "$report" \
+            --output "$evidence"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-plugin-editor-evidence-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
 
       - name: Validate with the pinned official CLAP validator
         shell: bash

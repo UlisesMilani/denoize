@@ -6,6 +6,7 @@
 
 use clack_extensions::audio_ports::*;
 use clack_extensions::audio_ports_config::*;
+use clack_extensions::gui::*;
 use clack_extensions::latency::{PluginLatency, PluginLatencyImpl};
 use clack_extensions::params::*;
 use clack_extensions::state::{PluginState, PluginStateImpl};
@@ -22,6 +23,7 @@ use denoize::{
     NeuralDawSessionState as NeuralSessionState, OnnxModelConfig, StreamingBackendSession,
     neural_daw_chunk_frames, select_accelerator_for_options,
 };
+use denoize_plugin_editor::{ControlKind, DisplayUnit, EditorModel, ParameterSpec, PluginEditor};
 use std::collections::VecDeque;
 use std::ffi::CStr;
 use std::fmt::Write as _;
@@ -53,6 +55,54 @@ const PARAM_OUTPUT_GAIN: ClapId = ClapId::new(2);
 const PARAM_FALLBACK: ClapId = ClapId::new(3);
 const PARAMETER_COUNT: u32 = 4;
 
+const FALLBACK_LABELS: &[&str] = &["Delayed Dry", "Last Safe Gain", "Silence"];
+const EDITOR_PARAMETERS: &[ParameterSpec] = &[
+    ParameterSpec {
+        id: 0,
+        name: "Bypass",
+        minimum: 0.0,
+        maximum: 1.0,
+        default: 0.0,
+        step: 1.0,
+        page_step: 1.0,
+        kind: ControlKind::Toggle,
+        unit: DisplayUnit::Plain,
+    },
+    ParameterSpec {
+        id: 1,
+        name: "Mix",
+        minimum: 0.0,
+        maximum: 1.0,
+        default: 1.0,
+        step: 0.01,
+        page_step: 0.1,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Percent,
+    },
+    ParameterSpec {
+        id: 2,
+        name: "Output Gain",
+        minimum: -24.0,
+        maximum: 24.0,
+        default: 0.0,
+        step: 0.5,
+        page_step: 3.0,
+        kind: ControlKind::Continuous,
+        unit: DisplayUnit::Decibels,
+    },
+    ParameterSpec {
+        id: 3,
+        name: "Overload Fallback",
+        minimum: 0.0,
+        maximum: 2.0,
+        default: 0.0,
+        step: 1.0,
+        page_step: 1.0,
+        kind: ControlKind::Choice(FALLBACK_LABELS),
+        unit: DisplayUnit::Plain,
+    },
+];
+
 pub(crate) struct NeuralPlugin;
 
 impl Plugin for NeuralPlugin {
@@ -68,6 +118,7 @@ impl Plugin for NeuralPlugin {
             .register::<PluginAudioPorts>()
             .register::<PluginAudioPortsConfig>()
             .register::<PluginAudioPortsConfigInfo>()
+            .register::<super::gui_contract::DenoizePluginGui>()
             .register::<PluginParams>()
             .register::<PluginState>()
             .register::<PluginLatency>();
@@ -87,16 +138,20 @@ impl DefaultPluginFactory for NeuralPlugin {
     }
 
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {
-        Ok(NeuralShared::new())
+        NeuralShared::new()
     }
 
     fn new_main_thread<'a>(
         host: HostMainThreadHandle<'a>,
         shared: &'a Self::Shared<'a>,
     ) -> Result<Self::MainThread<'a>, PluginError> {
+        let host_gui = host.get_extension::<HostGui>();
         Ok(NeuralMainThread {
             host,
             shared,
+            host_gui,
+            editor: None,
+            pending_automation: None,
             port_configuration: NeuralPortConfiguration::Stereo,
             latency_frames: 0,
         })
@@ -113,15 +168,15 @@ pub(crate) struct NeuralShared {
 }
 
 impl NeuralShared {
-    fn new() -> Self {
-        Self {
-            parameters: SharedParameters::new(NeuralParameters::default()),
+    fn new() -> Result<Self, PluginError> {
+        Ok(Self {
+            parameters: SharedParameters::new(NeuralParameters::default())?,
             reset_generation: AtomicU64::new(1),
             overload_blocks: AtomicU64::new(0),
             late_blocks: AtomicU64::new(0),
             invalid_blocks: AtomicU64::new(0),
             worker_errors: Arc::new(AtomicU64::new(0)),
-        }
+        })
     }
 
     fn restore(&self, parameters: NeuralParameters) {
@@ -135,11 +190,111 @@ impl PluginShared<'_> for NeuralShared {}
 pub(crate) struct NeuralMainThread<'a> {
     host: HostMainThreadHandle<'a>,
     shared: &'a NeuralShared,
+    host_gui: Option<HostGui>,
+    editor: Option<PluginEditor>,
+    pending_automation: Option<super::PendingAutomation>,
     port_configuration: NeuralPortConfiguration,
     latency_frames: u32,
 }
 
-impl<'a> PluginMainThread<'a, NeuralShared> for NeuralMainThread<'a> {}
+impl<'a> PluginMainThread<'a, NeuralShared> for NeuralMainThread<'a> {
+    fn on_main_thread(&mut self) {
+        if let Some(editor) = &self.editor {
+            editor.host_main_thread_callback();
+        }
+    }
+}
+
+impl PluginGuiImpl for NeuralMainThread<'_> {
+    fn is_api_supported(&mut self, configuration: GuiConfiguration<'_>) -> bool {
+        PluginEditor::supports(configuration)
+    }
+
+    fn get_preferred_api(&mut self) -> Option<GuiConfiguration<'_>> {
+        PluginEditor::preferred_configuration()
+    }
+
+    fn create(&mut self, configuration: GuiConfiguration<'_>) -> Result<(), PluginError> {
+        if self.editor.is_some() {
+            return Err(PluginError::Message(
+                "denoize Neural editor is already created",
+            ));
+        }
+        self.editor = Some(PluginEditor::create(
+            &self.host,
+            self.host_gui,
+            Arc::clone(&self.shared.parameters.editor),
+            configuration,
+        )?);
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.editor.take();
+    }
+
+    fn set_scale(&mut self, scale: f64) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize Neural editor is not created"))?
+            .set_scale(scale)
+    }
+
+    fn get_size(&mut self) -> Option<GuiSize> {
+        self.editor.as_ref().map(PluginEditor::size)
+    }
+
+    fn can_resize(&mut self) -> bool {
+        self.editor.as_ref().is_some_and(PluginEditor::can_resize)
+    }
+
+    fn get_resize_hints(&mut self) -> Option<GuiResizeHints> {
+        self.editor.as_ref().map(PluginEditor::resize_hints)
+    }
+
+    fn adjust_size(&mut self, size: GuiSize) -> Option<GuiSize> {
+        self.editor
+            .as_ref()
+            .and_then(|editor| editor.adjust_size(size))
+    }
+
+    fn set_size(&mut self, size: GuiSize) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize Neural editor is not created"))?
+            .set_size(size)
+    }
+
+    fn set_parent(&mut self, window: clack_extensions::gui::Window<'_>) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize Neural editor is not created"))?
+            .set_parent(window)
+    }
+
+    fn set_transient(
+        &mut self,
+        _window: clack_extensions::gui::Window<'_>,
+    ) -> Result<(), PluginError> {
+        Err(PluginError::Message(
+            "denoize Neural editor does not support floating windows",
+        ))
+    }
+
+    fn show(&mut self) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize Neural editor is not created"))?
+            .show()
+    }
+
+    fn hide(&mut self) -> Result<(), PluginError> {
+        self.editor
+            .as_ref()
+            .ok_or(PluginError::Message("denoize Neural editor is not created"))?
+            .hide()
+    }
+}
 
 impl PluginAudioPortsImpl for NeuralMainThread<'_> {
     fn count(&mut self, is_input: bool) -> u32 {
@@ -311,6 +466,7 @@ fn invalid_state(message: String) -> PluginError {
 }
 
 struct SharedParameters {
+    editor: Arc<EditorModel>,
     bypass: AtomicU32,
     mix: AtomicU32,
     output_gain_db: AtomicU32,
@@ -318,13 +474,25 @@ struct SharedParameters {
 }
 
 impl SharedParameters {
-    fn new(parameters: NeuralParameters) -> Self {
-        Self {
+    fn new(parameters: NeuralParameters) -> Result<Self, PluginError> {
+        let editor = EditorModel::new(
+            "denoize Neural",
+            EDITOR_PARAMETERS,
+            &[
+                f64::from(bool_value(parameters.bypass)),
+                f64::from(parameters.mix),
+                f64::from(parameters.output_gain_db),
+                f64::from(parameters.overload_fallback.index()),
+            ],
+        )
+        .map_err(PluginError::from)?;
+        Ok(Self {
+            editor,
             bypass: AtomicU32::new(bool_value(parameters.bypass).to_bits()),
             mix: AtomicU32::new(parameters.mix.to_bits()),
             output_gain_db: AtomicU32::new(parameters.output_gain_db.to_bits()),
             overload_fallback: AtomicU32::new(parameters.overload_fallback.index()),
-        }
+        })
     }
 
     fn snapshot(&self) -> NeuralParameters {
@@ -346,6 +514,18 @@ impl SharedParameters {
             .store(parameters.output_gain_db.to_bits(), Ordering::Relaxed);
         self.overload_fallback
             .store(parameters.overload_fallback.index(), Ordering::Relaxed);
+        self.editor
+            .set_host_value(PARAM_BYPASS.get(), f64::from(bool_value(parameters.bypass)));
+        self.editor
+            .set_host_value(PARAM_MIX.get(), f64::from(parameters.mix));
+        self.editor.set_host_value(
+            PARAM_OUTPUT_GAIN.get(),
+            f64::from(parameters.output_gain_db),
+        );
+        self.editor.set_host_value(
+            PARAM_FALLBACK.get(),
+            f64::from(parameters.overload_fallback.index()),
+        );
     }
 
     fn value(&self, id: ClapId) -> Option<f64> {
@@ -389,6 +569,7 @@ impl SharedParameters {
         } else {
             return false;
         }
+        self.editor.set_host_value(id.get(), value);
         true
     }
 
@@ -473,9 +654,20 @@ impl PluginMainThreadParams for NeuralMainThread<'_> {
         }
     }
 
-    fn flush(&mut self, input: &InputEvents, _output: &mut OutputEvents) {
+    fn flush(&mut self, input: &InputEvents, output: &mut OutputEvents) {
         for event in input {
             self.shared.parameters.handle_event(event);
+        }
+        let retry = super::drain_editor_automation(
+            &self.shared.parameters.editor,
+            output,
+            &mut self.pending_automation,
+            |parameter_id, value| {
+                self.shared.parameters.set_value(parameter_id, value);
+            },
+        );
+        if retry && let Some(params) = self.host.get_extension::<HostParams>() {
+            params.request_flush(&self.host.shared());
         }
     }
 }
@@ -764,10 +956,10 @@ impl GtcrnProcessor {
             options.channel_mode = ChannelMode::StereoLinked;
         }
         let accelerator = select_accelerator_for_options(Backend::Gtcrn, &options)?;
-        let prepared = prepared_gtcrn_model(
-            options.onnx.as_ref().expect("GTCRN options were populated"),
-            accelerator.effective(),
-        )?;
+        let Some(model_config) = options.onnx.as_ref() else {
+            return Err("internal GTCRN model options are unavailable".to_owned());
+        };
+        let prepared = prepared_gtcrn_model(model_config, accelerator.effective())?;
         let mut denoiser = DenoiserConfig::default(sample_rate);
         denoiser.vad = false;
         Ok(Self(
@@ -1400,7 +1592,7 @@ mod tests {
     where
         F: FnOnce() -> Result<Box<dyn BlockProcessor>, String> + Send + 'static,
     {
-        let shared = Box::leak(Box::new(NeuralShared::new()));
+        let shared = Box::leak(Box::new(NeuralShared::new().unwrap()));
         NeuralEngine::new_with_factory(48_000.0, channels, shared, factory).unwrap()
     }
 
@@ -1492,9 +1684,16 @@ mod tests {
 
     #[test]
     fn parameters_and_port_contracts_are_stable() {
+        assert_eq!(EDITOR_PARAMETERS.len(), PARAMETER_COUNT as usize);
         for index in 0..PARAMETER_COUNT {
             let info = parameter_info(index).unwrap();
+            let editor = &EDITOR_PARAMETERS[index as usize];
             assert_eq!(info.id.get(), index);
+            assert_eq!(editor.id, info.id.get());
+            assert_eq!(editor.name.as_bytes(), info.name);
+            assert_eq!(editor.minimum, info.min_value);
+            assert_eq!(editor.maximum, info.max_value);
+            assert_eq!(editor.default, info.default_value);
             assert!(info.min_value <= info.default_value);
             assert!(info.default_value <= info.max_value);
         }
@@ -1516,7 +1715,7 @@ mod tests {
             !cfg!(debug_assertions),
             "the sustained GTCRN deadline gate must exercise the release profile"
         );
-        let shared = Box::leak(Box::new(NeuralShared::new()));
+        let shared = Box::leak(Box::new(NeuralShared::new().unwrap()));
         let mut engine = NeuralEngine::new_gtcrn(48_000.0, 1, shared).unwrap();
         let parameters = RuntimeParameters::from(NeuralParameters::default());
 

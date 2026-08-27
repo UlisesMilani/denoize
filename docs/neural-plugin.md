@@ -139,10 +139,13 @@ still require direct measurement. The audio callback boundary follows the
 audio-port, state, parameter, and thread rules.
 
 This release is speech enhancement, not general restoration, target-speaker
-extraction, AEC, or spatial beamforming. It has no custom editor; hosts render
-the four parameters. v0.78.1 adds a statically bound VST3 3.8 adapter with
+extraction, AEC, or spatial beamforming. v0.79.0 adds the same accessible native
+CLAP editor used by the DSP descriptor; hosts retain generic rendering of all
+four parameters when the custom API is unsupported or creation fails. See
+[Accessible plug-in editor](plugin-editor.md). v0.78.1 added a statically bound
+VST3 3.8 adapter with
 official-validator, pinned Ardour 8.4 processing/state-reload smoke, packaging,
 checksum, SBOM, and signed host-matrix evidence; see
 [VST3 plug-in](vst3-plugin.md). Its matrix intentionally does not claim
-double-precision VST3 audio or compatibility with untested proprietary hosts.
-AUv3 and LV2 remain separate release gates.
+double-precision VST3 audio, a VST3 custom view, or compatibility with untested
+proprietary hosts. AUv3 and LV2 remain separate release gates.

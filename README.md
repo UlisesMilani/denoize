@@ -886,6 +886,16 @@ the DAW or run its plug-in rescan. CI and the tagged release workflow verify
 both descriptors with the pinned official CLAP validator 0.4.1: 81 tests, 68
 applicable passes, no failures or warnings, and 13 capability-based skips.
 
+v0.79.0 adds one accessible native embedded editor for both CLAP descriptors.
+Every visible control remains a host parameter, with keyboard navigation,
+visible focus, deterministic software rendering, native AccessKit adapters,
+bounded lock-free UI automation, and complete generic-host fallback when the
+custom window API is unsupported or creation fails. The signed Linux X11 gate
+opens and renders both editors in a real host, injects a bypass click, verifies
+the exact three-event automation gesture, and exercises resize and lifecycle
+rejection paths. See [Accessible plug-in editor](docs/plugin-editor.md) for the
+supported window APIs, accessibility contract, evidence, and explicit limits.
+
 VST3 3.8 bundles are available from v0.78.1. They statically adapt the same two
 descriptors through exact pinned CLAP-wrapper, CLAP SDK, and VST3 SDK revisions,
 so they cannot load a same-named external CLAP binary. The official 3.8.1
@@ -894,7 +904,9 @@ gate also discovers, inserts, processes, saves, reloads in a fresh process, and
 tears down both descriptors at 48 kHz. Release evidence includes a signed host
 matrix and both bound logs. See [VST3 plug-in](docs/vst3-plugin.md) for
 installation, reproducible build details, and the explicitly unclaimed f64,
-custom-editor, and proprietary-host cases. AUv3 and LV2 remain separate gates.
+custom-view, and proprietary-host cases. The v0.79.0 editor evidence is native
+CLAP-only and does not silently widen those VST3 claims. AUv3 and LV2 remain
+separate gates.
 
 ## Desktop app
 

@@ -43,6 +43,9 @@ expected_assets=(
   "denoize-plugin-${tag}-x86_64-pc-windows-msvc.zip.sha256"
   "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz"
   "denoize-plugin-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-plugin-editor-evidence-v1.json"
+  "denoize-plugin-editor-evidence-v1.sigstore.json"
+  "denoize-clap-editor-host-${tag}-x86_64-unknown-linux-gnu.txt"
   "denoize-vst3-${tag}-aarch64-apple-darwin.tar.gz"
   "denoize-vst3-${tag}-aarch64-apple-darwin.tar.gz.sha256"
   "denoize-vst3-${tag}-x86_64-apple-darwin.tar.gz"
@@ -99,6 +102,7 @@ expected_assets=(
   "denoize-job-status-v1.schema.json"
   "denoize-listening-result-v1.schema.json"
   "denoize-presentation-region-v1.schema.json"
+  "denoize-plugin-editor-evidence-v1.schema.json"
   "denoize-plugin-host-matrix-v1.schema.json"
   "denoize-project-batch-v1.schema.json"
   "denoize-project-bundle-import-v1.schema.json"
@@ -251,6 +255,8 @@ gh release download "$tag" \
   --pattern '*.crate' \
   --pattern '*.sigstore.json' \
   --pattern '*.jsonl' \
+  --pattern 'denoize-clap-editor-host-*.txt' \
+  --pattern 'denoize-plugin-editor-evidence-v1.json' \
   --pattern 'denoize-vst3-host-matrix-v1.json' \
   --pattern 'denoize-vst3-ardour-*.txt' \
   --pattern 'denoize-vst3-validator-*.txt' \
@@ -283,6 +289,7 @@ gh release download "$tag" \
   --pattern 'denoize-job-status-v1.schema.json' \
   --pattern 'denoize-listening-result-v1.schema.json' \
   --pattern 'denoize-presentation-region-v1.schema.json' \
+  --pattern 'denoize-plugin-editor-evidence-v1.schema.json' \
   --pattern 'denoize-plugin-host-matrix-v1.schema.json' \
   --pattern 'denoize-project-*.schema.json' \
   --pattern 'denoize-receipt-public-key-v1.schema.json' \
@@ -361,6 +368,7 @@ for schema in \
   denoize-job-status-v1.schema.json \
   denoize-listening-result-v1.schema.json \
   denoize-presentation-region-v1.schema.json \
+  denoize-plugin-editor-evidence-v1.schema.json \
   denoize-plugin-host-matrix-v1.schema.json \
   denoize-project-batch-v1.schema.json \
   denoize-project-bundle-import-v1.schema.json \
@@ -483,6 +491,79 @@ for vst3_subject in "$vst3_matrix" "$vst3_report" "$vst3_host_report"; do
   gh attestation verify "$vst3_subject" \
     --repo "$repo" \
     --bundle "$vst3_provenance" \
+    --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
+    --source-digest "$source_commit" \
+    --source-ref "refs/tags/$tag" \
+    --signer-workflow "$repo/.github/workflows/release.yml" \
+    --deny-self-hosted-runners >/dev/null
+done
+
+editor_evidence="$tmp_dir/denoize-plugin-editor-evidence-v1.json"
+editor_report="$tmp_dir/denoize-clap-editor-host-${tag}-x86_64-unknown-linux-gnu.txt"
+editor_provenance="$tmp_dir/denoize-plugin-editor-evidence-v1.sigstore.json"
+editor_report_digest=$(sha256sum "$editor_report" | cut -d' ' -f1)
+editor_report_size=$(wc -c < "$editor_report")
+if ! jq -e \
+  --arg tag "$tag" \
+  --arg repository "$repo" \
+  --arg commit "$source_commit" \
+  --arg report_name "$(basename "$editor_report")" \
+  --arg report_digest "$editor_report_digest" \
+  --argjson report_size "$editor_report_size" '
+  .schema == "denoize-plugin-editor-evidence-v1" and
+  .schema_version == 1 and
+  .tag == $tag and
+  .source.repository == $repository and
+  .source.commit == $commit and
+  .editor.format == "clap" and
+  .editor.embedding == "native-child-window" and
+  .editor.window_api == "x11" and
+  .claims.custom_editor == true and
+  .claims.native_embedded == true and
+  .claims.host_parameter_automation == true and
+  .claims.generic_parameter_fallback == true and
+  .claims.lifecycle_contract == true and
+  .claims.resize_contract == true and
+  (.descriptors | length) == 2 and
+  [.descriptors[].id] == [
+    "org.penguin425.denoize",
+    "org.penguin425.denoize.neural"
+  ] and
+  all(.descriptors[];
+    .rendered_colors >= 4 and
+    .automation_events == 3 and
+    .bypass_value == 1.0 and
+    .lifecycle == true and
+    .resize_contract == true
+  ) and
+  .run.host == "clack-host" and
+  .run.host_version == "0.1.1" and
+  .run.operating_system == "ubuntu-24.04" and
+  .run.architecture == "x86_64" and
+  .run.display == "Xvfb/X11" and
+  .run.descriptors_exercised == 2 and
+  .run.status == "passed" and
+  .run.report.name == $report_name and
+  .run.report.sha256 == $report_digest and
+  .run.report.size_bytes == $report_size
+' "$editor_evidence" >/dev/null; then
+  echo "plug-in editor evidence does not bind the tagged real-host report" >&2
+  exit 1
+fi
+python3 - schemas/denoize-plugin-editor-evidence-v1.schema.json "$editor_evidence" <<'PY'
+import json
+from pathlib import Path
+import sys
+from jsonschema import Draft202012Validator
+
+schema = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+document = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+Draft202012Validator(schema).validate(document)
+PY
+for editor_subject in "$editor_evidence" "$editor_report"; do
+  gh attestation verify "$editor_subject" \
+    --repo "$repo" \
+    --bundle "$editor_provenance" \
     --custom-trusted-root "$tmp_dir/denoize-sigstore-trusted-root.jsonl" \
     --source-digest "$source_commit" \
     --source-ref "refs/tags/$tag" \

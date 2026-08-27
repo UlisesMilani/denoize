@@ -1,0 +1,52 @@
+[package]
+name = "denoize-plugin-editor"
+version = "0.79.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+description = "Bounded, accessible embedded editor for denoize audio plug-ins"
+
+[dependencies]
+accesskit = "0.24.1"
+baseview = { git = "https://github.com/RustAudio/baseview", rev = "aba6ad070828ba31174ae1e60c9b20d90d699e87" }
+clack-extensions = { version = "0.1.1", features = [
+    "clack-plugin",
+    "gui",
+    "params",
+    "raw-window-handle_06",
+] }
+clack-plugin = "0.1.1"
+crossbeam-queue = "0.3.12"
+font8x8 = "0.3.1"
+keyboard-types = "0.8.3"
+raw-window-handle = "0.6.2"
+softbuffer = "0.4.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+accesskit_unix = "0.22.1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+clack-host = "0.1.1"
+clack-extensions = { version = "0.1.1", features = [
+    "clack-host",
+    "gui",
+    "params",
+    "raw-window-handle_06",
+] }
+x11-dl = "2.21.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+accesskit_windows = "0.34.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accesskit_macos = "0.26.3"
+
+[lints.rust]
+# The only unsafe operations are the narrowly documented host/window lifetime
+# bridges required by the CLAP and native accessibility APIs.
+unsafe_code = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

@@ -1,6 +1,6 @@
 [package]
 name = "denoize-desktop"
-version = "0.78.2"
+version = "0.79.0"
 description = "Desktop interface for denoize"
 authors = ["denoize"]
 edition = "2021"
