@@ -111,10 +111,14 @@ jobs:
             scripts/build-auv3-plugin.sh \
             scripts/build-lv2-plugin.sh \
             scripts/build-vst3-plugin.sh \
+            scripts/package-android-sdk.sh \
             scripts/package-auv3-plugin.sh \
+            scripts/package-c-sdk.sh \
             scripts/package-clap-plugin.sh \
+            scripts/package-ios-sdk.sh \
             scripts/package-lv2-plugin.sh \
             scripts/package-vst3-plugin.sh \
+            scripts/package-web-sdk.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
@@ -123,7 +127,9 @@ jobs:
             scripts/test-lv2-jalv-host.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
+            scripts/test-c-sdk.sh \
             scripts/test-auv3-host.sh \
+            scripts/test-wasm-sdk.sh \
             scripts/test-vst3-ardour-host.sh \
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \
@@ -150,6 +156,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/test-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
+          python3 -c 'compile(open("scripts/test-sdk-contracts.py", encoding="utf-8").read(), "scripts/test-sdk-contracts.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
               "$schema" >/dev/null
@@ -159,6 +166,7 @@ jobs:
           python3 scripts/test-vst3-host-matrix.py
           python3 scripts/test-lv2-host-evidence.py
           python3 scripts/test-auv3-host-evidence.py
+          python3 scripts/test-sdk-contracts.py
           DENOIZE_BIN=target/debug/denoize bash scripts/test-evaluation-evidence.sh
           bash scripts/test-release-evidence.sh
 
@@ -265,6 +273,10 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --features full
 
+      - name: Build and package stable C SDK
+        shell: bash
+        run: bash scripts/package-c-sdk.sh "${{ matrix.target }}" .
+
       - name: Package Unix binary
         if: runner.os != 'Windows'
         shell: bash
@@ -300,6 +312,155 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" \
             denoize-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }} \
             denoize-${GITHUB_REF_NAME}-${{ matrix.target }}.${{ matrix.archive }}.sha256 \
+            denoize-c-sdk-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz \
+            denoize-c-sdk-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz.sha256 \
+            --clobber
+
+  sdk-web-build:
+    name: Web and WASM SDK
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust and WASM target
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --locked --version 0.2.126
+
+      - name: Install pinned browser matrix
+        run: |
+          npm --prefix sdk/web ci
+          npm --prefix sdk/web exec -- playwright install --with-deps chromium firefox webkit
+
+      - name: Test and package Web SDK
+        run: |
+          bash scripts/test-wasm-sdk.sh
+          bash scripts/test-browser-sdk.sh
+          bash scripts/package-web-sdk.sh "$RUNNER_TEMP"
+
+      - name: Upload Web SDK assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/denoize-web-sdk-${GITHUB_REF_NAME}.tar.gz" \
+            "$RUNNER_TEMP/denoize-web-sdk-${GITHUB_REF_NAME}.tar.gz.sha256" \
+            --clobber
+
+  sdk-android-build:
+    name: Android SDK
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Select Java 17
+        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android command-line tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
+
+      - name: Install pinned Android platform and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-37" \
+            "build-tools;37.0.0" \
+            "cmake;3.22.1" \
+            "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Select Gradle 9.5
+        uses: gradle/actions/setup-gradle@4733eaac7c1b0da527e4206b7671e0061de1ce37
+        with:
+          gradle-version: "9.5.0"
+
+      - name: Permit the emulator to use KVM
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Test and package Android SDK on an x86_64 emulator
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-boot-timeout: 900
+          script: DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$RUNNER_TEMP"
+
+      - name: Upload Android SDK assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/denoize-android-sdk-${GITHUB_REF_NAME}.tar.gz" \
+            "$RUNNER_TEMP/denoize-android-sdk-${GITHUB_REF_NAME}.tar.gz.sha256" \
+            --clobber
+
+  sdk-abi-sanitizer-build:
+    name: C SDK AddressSanitizer fuzz regression
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Install pinned nightly Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-08-20 --profile minimal --no-self-update
+          cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Replay bounded ABI and lifecycle mutations under AddressSanitizer
+        run: >-
+          cargo +nightly-2026-08-20 fuzz run sdk_abi fuzz/corpus/sdk_abi --
+          -runs=4096
+          -max_len=4096
+          -rss_limit_mb=768
+          -timeout=10
+
+  sdk-ios-build:
+    name: iOS SDK
+    needs: prepare
+    runs-on: macos-14
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Build and test iOS SDK
+        shell: bash
+        run: DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$RUNNER_TEMP"
+
+      - name: Upload iOS SDK assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/denoize-ios-sdk-${GITHUB_REF_NAME}.tar.gz" \
+            "$RUNNER_TEMP/denoize-ios-sdk-${GITHUB_REF_NAME}.tar.gz.sha256" \
             --clobber
 
   plugin-build:
@@ -924,9 +1085,9 @@ jobs:
           releaseName: denoize ${{ github.ref_name }}
           releaseDraft: true
           prerelease: false
-          uploadUpdaterJson: true
-          # Matrix jobs upload target-local updater JSON under one shared name.
-          # updater-metadata replaces the last writer only after all four finish.
+          # A single updater-metadata job assembles latest.json after all four
+          # platform jobs finish. Matrix jobs must not race on that shared name.
+          uploadUpdaterJson: false
           updaterJsonPreferNsis: true
           retryAttempts: 3
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
@@ -1051,6 +1212,10 @@ jobs:
           aec_report_schema="$asset_dir/denoize-aec-report-v1.schema.json"
           microphone_array_promotion_evidence_schema="$asset_dir/denoize-microphone-array-promotion-evidence-v1.schema.json"
           microphone_array_report_schema="$asset_dir/denoize-microphone-array-report-v1.schema.json"
+          sdk_abi_schema="$asset_dir/denoize-sdk-abi-v1.schema.json"
+          sdk_capabilities_schema="$asset_dir/denoize-sdk-capabilities-v1.schema.json"
+          mobile_lifecycle_schema="$asset_dir/denoize-mobile-lifecycle-v1.schema.json"
+          wasm_capabilities_schema="$asset_dir/denoize-wasm-capabilities-v1.schema.json"
           watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
           watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
           watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
@@ -1115,6 +1280,10 @@ jobs:
           cp schemas/denoize-aec-report-v1.schema.json "$aec_report_schema"
           cp schemas/denoize-microphone-array-promotion-evidence-v1.schema.json "$microphone_array_promotion_evidence_schema"
           cp schemas/denoize-microphone-array-report-v1.schema.json "$microphone_array_report_schema"
+          cp schemas/denoize-sdk-abi-v1.schema.json "$sdk_abi_schema"
+          cp schemas/denoize-sdk-capabilities-v1.schema.json "$sdk_capabilities_schema"
+          cp schemas/denoize-mobile-lifecycle-v1.schema.json "$mobile_lifecycle_schema"
+          cp schemas/denoize-wasm-capabilities-v1.schema.json "$wasm_capabilities_schema"
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
@@ -1162,6 +1331,8 @@ jobs:
             "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
             "$aec_promotion_evidence_schema" "$aec_report_schema" \
             "$microphone_array_promotion_evidence_schema" "$microphone_array_report_schema" \
+            "$sdk_abi_schema" "$sdk_capabilities_schema" \
+            "$mobile_lifecycle_schema" "$wasm_capabilities_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
             "$asset_dir"/denoize-update-*.schema.json \
@@ -1169,7 +1340,7 @@ jobs:
 
   release-evidence:
     name: Generate release SBOMs and provenance
-    needs: [build, plugin-build, vst3-build, lv2-build, auv3-build, desktop-build, model-catalog, updater-metadata]
+    needs: [build, sdk-web-build, sdk-android-build, sdk-abi-sanitizer-build, sdk-ios-build, plugin-build, vst3-build, lv2-build, auv3-build, desktop-build, model-catalog, updater-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1339,7 +1510,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.83.0 0.84.0)
+          rollback_versions=(0.84.0 0.85.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

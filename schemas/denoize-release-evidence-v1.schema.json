@@ -80,8 +80,8 @@
     },
     "artifacts": {
       "type": "array",
-      "minItems": 25,
-      "maxItems": 25,
+      "minItems": 32,
+      "maxItems": 32,
       "items": {
         "$ref": "#/$defs/artifact"
       }
@@ -123,7 +123,7 @@
       "required": ["kind", "target", "name", "size_bytes", "sha256", "sbom"],
       "properties": {
         "kind": {
-          "enum": ["cli", "plugin", "desktop", "crate", "model-bundle"]
+          "enum": ["cli", "plugin", "desktop", "sdk", "crate", "model-bundle"]
         },
         "target": {
           "type": "string",

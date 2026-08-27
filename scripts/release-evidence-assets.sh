@@ -32,6 +32,13 @@ denoize_release_primary_assets() {
     plugin aarch64-apple-darwin "denoize-auv3-${tag}-aarch64-apple-darwin.tar.gz" \
     plugin x86_64-apple-darwin "denoize-auv3-${tag}-x86_64-apple-darwin.tar.gz" \
     plugin x86_64-unknown-linux-gnu "denoize-lv2-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+    sdk aarch64-apple-darwin "denoize-c-sdk-${tag}-aarch64-apple-darwin.tar.gz" \
+    sdk x86_64-apple-darwin "denoize-c-sdk-${tag}-x86_64-apple-darwin.tar.gz" \
+    sdk x86_64-pc-windows-msvc "denoize-c-sdk-${tag}-x86_64-pc-windows-msvc.tar.gz" \
+    sdk x86_64-unknown-linux-gnu "denoize-c-sdk-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+    sdk wasm32-unknown-unknown "denoize-web-sdk-${tag}.tar.gz" \
+    sdk android-arm64-v8a+x86_64 "denoize-android-sdk-${tag}.tar.gz" \
+    sdk ios-arm64+simulator+macos "denoize-ios-sdk-${tag}.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.app.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.dmg" \
     desktop x86_64-apple-darwin "denoize_${version}_x64.app.tar.gz" \

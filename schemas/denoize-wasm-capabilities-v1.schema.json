@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-wasm-capabilities-v1.schema.json",
+  "title": "denoize WASM capabilities v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "library_version",
+    "backend",
+    "finite",
+    "incremental",
+    "cancellation",
+    "filesystem",
+    "implicit_model_downloads",
+    "simd_required",
+    "default_render_quantum",
+    "observed_render_quantum_required",
+    "execution_thread",
+    "audio_worklet",
+    "limits"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-wasm-capabilities-v1" },
+    "schema_version": { "const": 1 },
+    "library_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "backend": { "const": "classical-scalar" },
+    "finite": { "const": true },
+    "incremental": { "const": true },
+    "cancellation": { "const": "between-bounded-calls" },
+    "filesystem": { "const": false },
+    "implicit_model_downloads": { "const": false },
+    "simd_required": { "const": false },
+    "default_render_quantum": { "type": "null" },
+    "observed_render_quantum_required": { "const": true },
+    "execution_thread": { "const": "worker" },
+    "audio_worklet": { "const": "preallocated-shared-ring-only" },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_channels",
+        "max_frames_per_call",
+        "max_buffered_frames",
+        "max_render_quantum"
+      ],
+      "properties": {
+        "max_channels": { "const": 32 },
+        "max_frames_per_call": { "const": 1048576 },
+        "max_buffered_frames": { "const": 4194304 },
+        "max_render_quantum": { "const": 32768 }
+      }
+    }
+  }
+}

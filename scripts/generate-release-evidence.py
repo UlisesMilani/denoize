@@ -25,7 +25,7 @@ TAG_RE = re.compile(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PORTABLE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$")
-KINDS = {"cli", "plugin", "desktop", "crate", "model-bundle"}
+KINDS = {"cli", "plugin", "desktop", "sdk", "crate", "model-bundle"}
 
 
 class EvidenceError(RuntimeError):
@@ -82,8 +82,8 @@ def read_asset_specs(path: Path) -> list[dict[str, str]]:
             raise EvidenceError(f"unsafe artifact target on line {line_number}: {target}")
         seen.add(name)
         specs.append({"kind": kind, "target": target, "name": name})
-    if len(specs) != 25:
-        raise EvidenceError(f"expected 25 installable release artifacts, found {len(specs)}")
+    if len(specs) != 32:
+        raise EvidenceError(f"expected 32 installable release artifacts, found {len(specs)}")
     return specs
 
 
@@ -276,6 +276,7 @@ def artifact_sbom(
         "cli": "application",
         "plugin": "application",
         "desktop": "application",
+        "sdk": "library",
         "crate": "library",
         "model-bundle": "machine-learning-model",
     }[spec["kind"]]
@@ -353,6 +354,7 @@ def generate(args: argparse.Namespace) -> None:
         (repository_root / "Cargo.lock", "root Cargo.lock"),
         (repository_root / "apps/desktop/src-tauri/Cargo.lock", "desktop Cargo.lock"),
         (repository_root / "apps/desktop/package-lock.json", "desktop package-lock.json"),
+        (repository_root / "sdk/web/package-lock.json", "Web SDK package-lock.json"),
         (args.model_catalog.resolve(), "model catalog"),
         (syft, "Syft executable"),
     ):
@@ -391,6 +393,14 @@ def generate(args: argparse.Namespace) -> None:
             ),
             "desktop-package-lock",
         )
+        web_lock = normalized_inventory(
+            syft_scan(
+                syft,
+                f"file:{repository_root / 'sdk/web/package-lock.json'}",
+                temporary / "web-sdk-npm.json",
+            ),
+            "web-sdk-package-lock",
+        )
         models = model_inventory(args.model_catalog.resolve())
 
         crate_spec = next(spec for spec in specs if spec["kind"] == "crate")
@@ -418,6 +428,7 @@ def generate(args: argparse.Namespace) -> None:
             ("root Cargo.lock", root_lock),
             ("desktop Cargo.lock", desktop_lock),
             ("desktop package-lock.json", frontend_lock),
+            ("Web SDK package-lock.json", web_lock),
             ("packaged crates.io Cargo.lock", crate_lock),
             ("model catalog", models),
         ):
@@ -435,7 +446,10 @@ def generate(args: argparse.Namespace) -> None:
             if size <= 0:
                 raise EvidenceError(f"release artifact is empty: {spec['name']}")
             digest = sha256_file(artifact)
-            if spec["kind"] in {"cli", "plugin"}:
+            if spec["kind"] == "sdk" and spec["target"] == "wasm32-unknown-unknown":
+                inventory = combine_inventories([root_lock, web_lock])
+                dependency_basis = "tagged-root-cargo-and-web-sdk-npm-locks"
+            elif spec["kind"] in {"cli", "plugin", "sdk"}:
                 inventory = root_lock
                 dependency_basis = "tagged-root-cargo-lock"
             elif spec["kind"] == "desktop":

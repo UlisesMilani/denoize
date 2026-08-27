@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>denoize Web Audio browser smoke</title>
+  </head>
+  <body>
+    <button id="start" type="button">Run smoke</button>
+    <script type="module">
+      import { DenoizeWebAudioSession } from "../src/index.js";
+
+      globalThis.denoizeBrowserResult = { state: "idle" };
+
+      async function waitForQuantum(session) {
+        for (let attempt = 0; attempt < 300; attempt += 1) {
+          const status = session.status();
+          if (status.renderQuantum > 0) {
+            return status;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error("AudioWorklet did not report a render quantum");
+      }
+
+      document.querySelector("#start").addEventListener("click", () => {
+        globalThis.denoizeBrowserResult = { state: "starting" };
+        void (async () => {
+          if (!globalThis.crossOriginIsolated || typeof SharedArrayBuffer !== "function") {
+            throw new Error("browser fixture is not cross-origin isolated");
+          }
+          const context = new AudioContext({ sampleRate: 48_000 });
+          globalThis.denoizeBrowserResult = { state: "context-created" };
+          const session = new DenoizeWebAudioSession({
+            context,
+            workletUrl: new URL("../src/denoize-worklet.js", import.meta.url),
+            workerUrl: new URL("../src/denoize-worker.js", import.meta.url),
+            wasmUrl: new URL("../../denoize-wasm/pkg/denoize_wasm_bg.wasm", import.meta.url),
+          });
+          try {
+            globalThis.denoizeBrowserResult = { state: "initializing" };
+            const node = await session.initialize({
+              channels: 1,
+              capacityFrames: 16_384,
+              maxBlockFrames: 2_048,
+              frameSize: 512,
+            });
+            globalThis.denoizeBrowserResult = { state: "initialized" };
+            const shouldRender = new URL(location.href).searchParams.get("render") === "1";
+            if (!shouldRender) {
+              const running = session.status();
+              await session.cancel();
+              const stopped = session.status();
+              return {
+                state: stopped.state,
+                mode: "initialize-cancel",
+                generation: running.generation,
+                renderQuantum: stopped.renderQuantum,
+                errorCode: stopped.errorCode,
+              };
+            }
+            await context.resume();
+            globalThis.denoizeBrowserResult = { state: "context-running" };
+            const oscillator = new OscillatorNode(context, {
+              frequency: 440,
+              type: "sine",
+            });
+            const gain = new GainNode(context, { gain: 0.01 });
+            oscillator.connect(gain).connect(node).connect(context.destination);
+            oscillator.start();
+            const running = await waitForQuantum(session);
+            oscillator.stop();
+            oscillator.disconnect();
+            gain.disconnect();
+            await session.finish();
+            const stopped = session.status();
+            if (stopped.state !== "stopped" || stopped.errorCode !== 0) {
+              throw new Error(`unexpected terminal status: ${JSON.stringify(stopped)}`);
+            }
+            return {
+              state: stopped.state,
+              mode: "render-finish",
+              generation: stopped.generation,
+              renderQuantum: running.renderQuantum,
+              errorCode: stopped.errorCode,
+            };
+          } finally {
+            session.close();
+            await context.close();
+          }
+        })().then(
+          (result) => {
+            globalThis.denoizeBrowserResult = result;
+          },
+          (error) => {
+            globalThis.denoizeBrowserResult = {
+              state: "failed",
+              error: String(error?.stack || error),
+            };
+          },
+        );
+      }, { once: true });
+    </script>
+  </body>
+</html>

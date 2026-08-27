@@ -560,10 +560,8 @@ fn metadata_copies_across_wav_flac_and_mp3() {
         let output = workspace.file(&format!("tagged.{extension}"));
         write_audio(&output, &audio, EncodeOptions::default())
             .unwrap_or_else(|error| panic!("write {codec}: {error}"));
-        assert!(
-            metadata::copy(&input, &output)
-                .unwrap_or_else(|error| panic!("copy metadata to {codec}: {error}"))
-        );
+        assert!(metadata::copy(&input, &output)
+            .unwrap_or_else(|error| panic!("copy metadata to {codec}: {error}")));
         assert_tag(&output);
     }
 }

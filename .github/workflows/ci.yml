@@ -122,9 +122,13 @@ jobs:
             scripts/build-vst3-plugin.sh \
             scripts/generate-cli-docs.sh \
             scripts/package-auv3-plugin.sh \
+            scripts/package-android-sdk.sh \
+            scripts/package-c-sdk.sh \
+            scripts/package-ios-sdk.sh \
             scripts/package-clap-plugin.sh \
             scripts/package-lv2-plugin.sh \
             scripts/package-vst3-plugin.sh \
+            scripts/package-web-sdk.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
@@ -135,6 +139,8 @@ jobs:
             scripts/test-lv2-jalv-host.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
+            scripts/test-c-sdk.sh \
+            scripts/test-wasm-sdk.sh \
             scripts/test-vst3-ardour-host.sh \
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \
@@ -163,6 +169,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/test-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-sdk-contracts.py", encoding="utf-8").read(), "scripts/test-sdk-contracts.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
           for schema in schemas/*.schema.json; do
             jq -e '."$schema" == "https://json-schema.org/draft/2020-12/schema"' \
@@ -617,6 +624,177 @@ jobs:
             | grep -Fx "$package/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/PlugIns/denoize.clap/Contents/Resources/denoize-models/gtcrn-dns3/gtcrn_simple.onnx"
           tar -tzf "$archive" \
             | grep -F "$package/denoize AUv3.app/Contents/PlugIns/denoize.appex/Contents/PlugIns/denoize.clap/Contents/Resources/denoize-models/gtcrn-dns3/.provenance/" >/dev/null
+
+  sdk-native:
+    name: Native C SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Install SDK contract dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends python3-jsonschema
+
+      - name: Test frozen ABI and old-header compatibility
+        run: |
+          cargo test --locked -p denoize-c
+          cargo clippy --locked -p denoize-c --all-targets --no-deps -- -D warnings
+          bash scripts/test-c-sdk.sh
+          c++ -std=c++17 -Wall -Wextra -Werror -pedantic \
+            -I sdk/denoize-c/include -fsyntax-only \
+            sdk/denoize-c/tests/current_header_compile.cpp
+
+      - name: Test native SDK release archive
+        run: |
+          output_dir=$(mktemp -d /tmp/denoize-c-sdk-package.XXXXXX)
+          archive=$(bash scripts/package-c-sdk.sh \
+            x86_64-unknown-linux-gnu "$output_dir")
+          package="denoize-c-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)-x86_64-unknown-linux-gnu"
+          tar -tzf "$archive" | grep -Fx "$package/include/denoize.h"
+          tar -tzf "$archive" | grep -Fx "$package/lib/libdenoize_c.so"
+          tar -tzf "$archive" | grep -Fx "$package/lib/libdenoize_c.a"
+
+  sdk-web:
+    name: WASM and Web Audio SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust and WASM target
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --locked --version 0.2.126
+
+      - name: Install pinned browser matrix
+        run: |
+          npm --prefix sdk/web ci
+          npm --prefix sdk/web exec -- playwright install --with-deps chromium firefox webkit
+
+      - name: Test scalar WASM and non-blocking Web Audio transport
+        run: |
+          cargo test --locked -p denoize-wasm
+          cargo clippy --locked -p denoize-wasm --lib --no-deps -- -D warnings
+          bash scripts/test-wasm-sdk.sh
+          bash scripts/test-browser-sdk.sh
+
+      - name: Test Web SDK release archive
+        run: |
+          output_dir=$(mktemp -d /tmp/denoize-web-sdk-package.XXXXXX)
+          archive=$(bash scripts/package-web-sdk.sh "$output_dir")
+          package="denoize-web-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          tar -tzf "$archive" | grep -Fx "$package/denoize-wasm/pkg/denoize_wasm_bg.wasm"
+          tar -tzf "$archive" | grep -Fx "$package/web/src/denoize-worklet.js"
+          tar -tzf "$archive" | grep -Fx "$package/web/src/denoize-worker.js"
+
+  sdk-abi-sanitizer:
+    name: C SDK AddressSanitizer fuzz regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install pinned nightly Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly-2026-08-20 --profile minimal --no-self-update
+          cargo install cargo-fuzz --locked --version 0.13.2
+
+      - name: Replay bounded ABI and lifecycle mutations under AddressSanitizer
+        run: >-
+          cargo +nightly-2026-08-20 fuzz run sdk_abi fuzz/corpus/sdk_abi --
+          -runs=4096
+          -max_len=4096
+          -rss_limit_mb=768
+          -timeout=10
+
+  sdk-android:
+    name: Android SDK (arm64-v8a and x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Select Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android command-line tools
+        uses: android-actions/setup-android@v4
+
+      - name: Install pinned Android platform and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platforms;android-37" \
+            "build-tools;37.0.0" \
+            "cmake;3.22.1" \
+            "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - name: Select Gradle 9.5
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "9.5.0"
+
+      - name: Permit the emulator to use KVM
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Test on an Android x86_64 emulator and inspect the AAR
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6
+          disable-animations: true
+          emulator-boot-timeout: 900
+          script: |
+            output_dir=$(mktemp -d /tmp/denoize-android-sdk-package.XXXXXX)
+            archive=$(DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$output_dir")
+            package="denoize-android-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+            tar -tzf "$archive" | grep -F "$package/denoize-sdk-" >/dev/null
+
+  sdk-ios:
+    name: iOS SDK (device and simulator)
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Build and test Swift package and XCFramework
+        shell: bash
+        run: |
+          output_dir=$(mktemp -d "$RUNNER_TEMP/denoize-ios-sdk-package.XXXXXX")
+          archive=$(DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$output_dir")
+          package="denoize-ios-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          tar -tzf "$archive" | grep -F "$package/DenoizeC.xcframework/" >/dev/null
+          tar -tzf "$archive" | grep -Fx "$package/Package.swift"
 
   cli-docs:
     name: CLI documentation

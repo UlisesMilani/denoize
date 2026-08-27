@@ -1,0 +1,4 @@
+module CDenoize {
+  header "CDenoize.h"
+  export *
+}

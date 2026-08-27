@@ -918,8 +918,8 @@ read-only/loss reports before any project mutation.
 ### Delivery order and ABI contract
 
 Freeze a small C ABI before language wrappers: opaque handles; fixed-width
-integers; caller-owned input and explicit allocator/free pairs for returned
-memory; length-delimited UTF-8; versioned option/result structs with `size` and
+integers; caller-owned input/output buffers so no allocator crosses the ABI;
+length-delimited UTF-8; versioned option/result structs with `size` and
 `abi_version`; stable numeric error codes plus copied diagnostic text; no Rust
 enum/layout/panic across the boundary; and documented thread ownership and
 cancellation. ABI symbol/layout checks and old-header/new-library tests run for
@@ -933,9 +933,9 @@ mobile is reported as unsupported rather than replaced by a different recipe.
 
 WASM exposes finite, incremental, and cancellation APIs without filesystem
 assumptions. Browser live processing uses AudioWorklet on the rendering thread.
-Web Audio 1.1 defines a default quantum of 128 frames but also exposes the
-actual `renderQuantumSize`; denoize therefore negotiates and tests the reported
-size instead of baking 128 into its ABI
+Web Audio 1.1 defines a default quantum of 128 frames, while each worklet
+callback exposes the actual output-buffer length; denoize therefore observes
+and tests that length instead of baking 128 into its ABI
 ([W3C Web Audio 1.1](https://www.w3.org/TR/webaudio-1.1/)). Heavy inference runs in
 a Worker with preallocated shared-memory rings where isolation permits; the
 worklet never waits. SIMD is an optional detected profile based on the official
@@ -975,6 +975,39 @@ if a worklet waits for a Worker; if a browser quantum is assumed rather than
 observed; if background/route change resumes stale state; if an SDK downloads a
 model implicitly; or if old headers cannot drive the new library within their
 declared compatibility range.
+
+### Implemented Stage 33 boundary
+
+The v0.86.0 implementation freezes ABI v1 as fixed-width, sized/versioned C
+structures, opaque creator-thread processor handles, caller-owned interleaved
+`float32` buffers, stable numeric status codes, copied diagnostics, unwind
+containment, and a separately synchronized atomic cancellation token. Frozen
+header compilation, C and C++ consumers, old-header/new-library execution, and
+layout/schema checks run in CI. Four native target archives contain both the
+exact header and the matching static/shared library.
+
+The scalar WASM crate includes the canonical native DSP source modules rather
+than forking the algorithm. It exposes finite/incremental processing,
+cooperative cancellation, bounded call and buffered-frame limits, and exact
+finish accounting. The Web Audio host waits for Worker readiness and moves PCM
+through fixed shared rings; the worklet observes each actual render quantum,
+performs no DSP or waits, and drains a finish tail before stopping. This
+transport requires cross-origin isolation and makes no universal browser/device
+deadline claim. The WAM descriptor is packaged but remains explicitly
+host-matrix-gated.
+
+Android and iOS packages wrap the same C core on application-owned worker
+threads. Their shared closed lifecycle contract destroys device-bound state on
+interrupt, background, memory pressure, or route changes, increments a checked
+route generation, and rebuilds from a freshly supplied sample rate, buffer
+size, and channel count. Neither wrapper opens devices, requests permissions,
+or downloads models. Release jobs build both Android 64-bit ABIs and an iOS
+XCFramework, replay bounded C-ABI mutations under AddressSanitizer-backed
+libFuzzer, execute the Kotlin/core contract on an Android x86-64 emulator, run
+Swift/core tests on macOS and an iPhone simulator, inspect the AAR/XCFramework
+contracts, publish all SDK archives and schemas, and bind them into the same
+SBOM/provenance evidence set as the applications. These virtual-device gates do
+not substitute for named physical-device latency evidence.
 
 ## Research watchlist, not committed implementation stages
 

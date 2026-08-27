@@ -1,0 +1,21 @@
+{
+  "name": "@denoize/web-sdk",
+  "version": "0.86.0",
+  "private": true,
+  "type": "module",
+  "description": "AudioWorklet and Worker transport for the denoize scalar WASM SDK",
+  "exports": {
+    ".": "./src/index.js",
+    "./ring": "./src/ring-protocol.js",
+    "./worklet": "./src/denoize-worklet.js",
+    "./worker": "./src/denoize-worker.js"
+  },
+  "scripts": {
+    "test": "node --test test/ring.test.mjs",
+    "test:browser": "playwright test --config=playwright.config.mjs",
+    "check": "node --check src/ring-protocol.js && node --check src/denoize-worklet.js && node --check src/denoize-worker.js && node --check src/index.js && node --check test/browser-server.mjs && node --check test/browser.test.mjs && node --check playwright.config.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1"
+  }
+}

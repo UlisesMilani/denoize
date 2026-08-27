@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-sdk-abi-v1.schema.json",
+  "title": "denoize SDK ABI manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "library_version",
+    "abi_version",
+    "library",
+    "supported_architectures",
+    "build_profile",
+    "panic_strategy",
+    "backend",
+    "threading",
+    "limits",
+    "status_codes",
+    "structs_64_bit",
+    "symbols"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-sdk-abi-v1" },
+    "schema_version": { "const": 1 },
+    "library_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "abi_version": { "const": 1 },
+    "library": { "const": "denoize_c" },
+    "supported_architectures": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "aarch64" },
+        { "const": "x86_64" }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "build_profile": { "const": "ffi-release" },
+    "panic_strategy": { "const": "unwind-contained" },
+    "backend": { "const": "classical-scalar" },
+    "threading": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["processor", "cancel_token"],
+      "properties": {
+        "processor": { "const": "creator-thread-owned" },
+        "cancel_token": { "const": "cross-thread-atomic" }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_channels", "max_frames_per_call", "max_buffered_frames"],
+      "properties": {
+        "max_channels": { "const": 32 },
+        "max_frames_per_call": { "const": 1048576 },
+        "max_buffered_frames": { "const": 4194304 }
+      }
+    },
+    "status_codes": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 9 },
+      "minProperties": 10,
+      "maxProperties": 10,
+      "required": [
+        "ok",
+        "invalid_argument",
+        "unsupported",
+        "out_of_memory",
+        "invalid_state",
+        "cancelled",
+        "buffer_too_small",
+        "wrong_thread",
+        "panic_contained",
+        "internal"
+      ]
+    },
+    "structs_64_bit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["denoize_options_v1", "denoize_process_result_v1", "denoize_diagnostic_v1"],
+      "properties": {
+        "denoize_options_v1": { "$ref": "#/$defs/layout96" },
+        "denoize_process_result_v1": { "$ref": "#/$defs/layout88" },
+        "denoize_diagnostic_v1": { "$ref": "#/$defs/layout72" }
+      }
+    },
+    "symbols": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^denoize_[a-z0-9_]+$" },
+      "minItems": 13,
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "layout96": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size", "alignment"],
+      "properties": {
+        "size": { "const": 96 },
+        "alignment": { "const": 8 }
+      }
+    },
+    "layout88": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size", "alignment"],
+      "properties": {
+        "size": { "const": 88 },
+        "alignment": { "const": 8 }
+      }
+    },
+    "layout72": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size", "alignment"],
+      "properties": {
+        "size": { "const": 72 },
+        "alignment": { "const": 8 }
+      }
+    }
+  }
+}

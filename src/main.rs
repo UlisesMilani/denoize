@@ -427,6 +427,7 @@ USAGE:
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
     denoize update <COMMAND> [OPTIONS]  (run `denoize update --help`)
     denoize project <COMMAND> [OPTIONS]  (run `denoize project --help`)
+    denoize sdk <COMMAND> [OPTIONS]  (run `denoize sdk --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -6704,6 +6705,165 @@ fn run_project_relocate(args: &[String]) -> Result<(), String> {
     print_project_document(&relocated, pretty)
 }
 
+fn sdk_usage() -> &'static str {
+    "\
+USAGE:
+    denoize sdk capabilities [--json|--pretty]
+    denoize sdk lifecycle [--json|--pretty]
+
+COMMANDS:
+    capabilities    print the frozen Stage 33 SDK feature matrix
+    lifecycle       print the mobile route/lifecycle state-machine contract
+
+The SDK never downloads a model implicitly. Unsupported backends and host
+profiles remain explicit in the capability matrix."
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SdkOutputMode {
+    Human,
+    Json,
+    PrettyJson,
+}
+
+fn parse_sdk_output_mode(args: &[String], command: &str) -> Result<SdkOutputMode, String> {
+    match args {
+        [] => Ok(SdkOutputMode::Human),
+        [flag] if flag == "--json" => Ok(SdkOutputMode::Json),
+        [flag] if flag == "--pretty" => Ok(SdkOutputMode::PrettyJson),
+        _ => Err(format!(
+            "sdk {command} accepts at most one of --json or --pretty"
+        )),
+    }
+}
+
+fn parse_sdk_document(source: &str, name: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(source).map_err(|error| format!("parse embedded {name}: {error}"))
+}
+
+fn print_sdk_document(document: &serde_json::Value, mode: SdkOutputMode) -> Result<(), String> {
+    match mode {
+        SdkOutputMode::Human => Ok(()),
+        SdkOutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(document)
+                    .map_err(|error| format!("serialize SDK document: {error}"))?
+            );
+            Ok(())
+        }
+        SdkOutputMode::PrettyJson => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(document)
+                    .map_err(|error| format!("serialize SDK document: {error}"))?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn run_sdk(args: &[String]) -> Result<(), String> {
+    if args.is_empty()
+        || args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "-h" | "--help" | "help"))
+    {
+        print!("{}", sdk_usage());
+        return Ok(());
+    }
+    let command = args[0].as_str();
+    let mode = parse_sdk_output_mode(&args[1..], command)?;
+    match command {
+        "capabilities" => {
+            let source = denoize::sdk::sdk_capabilities_json();
+            let document = parse_sdk_document(source, "SDK capability matrix")?;
+            let library_version = document
+                .get("library_version")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("embedded SDK capability matrix has no library_version")?;
+            if library_version != VERSION {
+                return Err(format!(
+                    "SDK capability version {library_version} does not match binary version {VERSION}"
+                ));
+            }
+            if mode != SdkOutputMode::Human {
+                return print_sdk_document(&document, mode);
+            }
+            println!("SDK capabilities: v{library_version} (Stage 33)");
+            println!("C ABI: stable ABI v1, classical scalar backend");
+            println!("WASM: finite and incremental scalar processing");
+            println!("Web Audio: Worker DSP with a non-blocking shared ring");
+            println!("Android/iOS: worker wrappers with route-generation rebuilds");
+            println!("WAM: optional and host-matrix gated");
+            println!("No SDK call downloads or installs a model implicitly.");
+            Ok(())
+        }
+        "lifecycle" => {
+            let source = denoize::sdk::mobile_lifecycle_json();
+            let document = parse_sdk_document(source, "mobile lifecycle contract")?;
+            if mode != SdkOutputMode::Human {
+                return print_sdk_document(&document, mode);
+            }
+            let state_count = document
+                .get("states")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .ok_or("embedded mobile lifecycle contract has no states")?;
+            let transition_count = document
+                .get("transitions")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .ok_or("embedded mobile lifecycle contract has no transitions")?;
+            println!("Mobile lifecycle: denoize-mobile-lifecycle-v1");
+            println!("States: {state_count}; transitions: {transition_count}");
+            println!(
+                "Route, interruption, background, and memory events invalidate stale processors."
+            );
+            println!("Resume requires an explicit current route and creates a new generation.");
+            Ok(())
+        }
+        value => Err(format!("unknown sdk command: {value}")),
+    }
+}
+
+#[cfg(test)]
+mod sdk_cli_tests {
+    use super::*;
+
+    #[test]
+    fn sdk_output_mode_is_closed_and_unambiguous() {
+        assert_eq!(
+            parse_sdk_output_mode(&[], "capabilities").unwrap(),
+            SdkOutputMode::Human
+        );
+        assert_eq!(
+            parse_sdk_output_mode(&["--json".into()], "capabilities").unwrap(),
+            SdkOutputMode::Json
+        );
+        assert!(
+            parse_sdk_output_mode(&["--json".into(), "--pretty".into()], "capabilities").is_err()
+        );
+        assert!(parse_sdk_output_mode(&["--yaml".into()], "capabilities").is_err());
+    }
+
+    #[test]
+    fn embedded_sdk_documents_are_valid_and_version_bound() {
+        let capabilities = parse_sdk_document(
+            denoize::sdk::sdk_capabilities_json(),
+            "SDK capability matrix",
+        )
+        .unwrap();
+        assert_eq!(capabilities["library_version"].as_str(), Some(VERSION));
+        let lifecycle = parse_sdk_document(
+            denoize::sdk::mobile_lifecycle_json(),
+            "mobile lifecycle contract",
+        )
+        .unwrap();
+        assert_eq!(lifecycle["transitions"].as_array().unwrap().len(), 8);
+    }
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     #[cfg(windows)]
     wait_for_isolation_gate()?;
@@ -6772,6 +6932,9 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("project") {
         return run_project(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("sdk") {
+        return run_sdk(&args[1..]);
     }
     let (input, output, ov) = parse_args(args)?;
     if ov.resume && !ov.batch && !ov.stream {
@@ -15218,7 +15381,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "af8186b247f73a5f0be66e675a91374863927479926ea5cf06485e946a9186d7";
+        "6bd6f98f52e0f234eb64093590560121d3af59acd029bfe8173df9989eafcc08";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {
