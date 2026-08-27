@@ -32,7 +32,10 @@ cleanup() {
   rm -f "$entitlements" "$temporary"
 }
 trap cleanup EXIT
-codesign -d --entitlements :- "$appex" > "$entitlements" 2>/dev/null
+# Current codesign versions can display DER entitlements in a human-readable
+# form by default. Force an XML property list before asking plutil to inspect
+# the entitlement embedded in the actual signature.
+codesign --display --entitlements - --xml "$appex" > "$entitlements" 2>/dev/null
 if ! plutil -extract com.apple.security.app-sandbox raw -o - "$entitlements" \
   | grep -Fx true >/dev/null; then
   echo "AUv3 appex is missing the app-sandbox entitlement" >&2
