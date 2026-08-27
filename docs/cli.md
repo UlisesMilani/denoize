@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.83.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.84.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -20,6 +20,7 @@ USAGE:
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config CONFIG --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -321,10 +322,38 @@ OPTIONS:
     -h, --help                             show this help
 ```
 
+## Explicit-geometry microphone-array enhancement
+
+```text
+USAGE:
+    denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config <CONFIG.json> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize array evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Enhance a declared two-to-four-channel microphone array to a mono reference
+image. The input is accepted only when the closed configuration explicitly
+binds every channel ID, right-handed x-forward/y-left/z-up coordinate,
+sample-skew and gain/phase calibration, and the reference microphone. Ordinary
+program stereo or surround is never inferred to be an array. Authenticated
+promotion evidence must bind the exact WPE plus conditioned mask-MVDR
+configuration before the input audio is opened.
+
+OPTIONS:
+        --array-config <PATH.json>         required closed geometry and DSP configuration
+        --promotion-evidence <PATH>        accepted signed array evaluation evidence
+        --promotion-evidence-key <PATH>    trusted Ed25519 evidence public key
+        --report <PATH.json>               atomically write the closed path-free report
+        --max-memory <MB>                  bound decode, WPE, STFT, covariance, and output memory
+        --no-metadata                      do not copy input metadata to output
+        --replace                          atomically replace output/report destinations
+        --json                             emit compact report JSON
+        --pretty                           emit indented report JSON
+    -h, --help                             show this help
+```
+
 ## Watch-folder automation
 
 ```text
-denoize 0.83.0 watch-folder automation
+denoize 0.84.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

@@ -415,6 +415,7 @@ USAGE:
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config CONFIG --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
     denoize watch <INPUT_DIR> <OUTPUT_DIR> [OPTIONS]  (run `denoize watch --help`)
     denoize receipts <COMMAND> [OPTIONS]  (run `denoize receipts --help`)
@@ -6054,6 +6055,12 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("aec") {
         return run_aec(&args[1..]);
     }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("array" | "array-enhance")
+    ) {
+        return run_microphone_array(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("receipts") {
         return run_receipts(&args[1..]);
     }
@@ -8832,6 +8839,386 @@ fn run_universal_audio(_options: UniversalCliOptions) -> Result<(), String> {
     Err("universal audio restoration requires a build with the bsrnn feature".into())
 }
 
+fn microphone_array_usage() -> &'static str {
+    "\
+USAGE:
+    denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config <CONFIG.json> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize array evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Enhance a declared two-to-four-channel microphone array to a mono reference
+image. The input is accepted only when the closed configuration explicitly
+binds every channel ID, right-handed x-forward/y-left/z-up coordinate,
+sample-skew and gain/phase calibration, and the reference microphone. Ordinary
+program stereo or surround is never inferred to be an array. Authenticated
+promotion evidence must bind the exact WPE plus conditioned mask-MVDR
+configuration before the input audio is opened.
+
+OPTIONS:
+        --array-config <PATH.json>         required closed geometry and DSP configuration
+        --promotion-evidence <PATH>        accepted signed array evaluation evidence
+        --promotion-evidence-key <PATH>    trusted Ed25519 evidence public key
+        --report <PATH.json>               atomically write the closed path-free report
+        --max-memory <MB>                  bound decode, WPE, STFT, covariance, and output memory
+        --no-metadata                      do not copy input metadata to output
+        --replace                          atomically replace output/report destinations
+        --json                             emit compact report JSON
+        --pretty                           emit indented report JSON
+    -h, --help                             show this help
+"
+}
+
+#[derive(Debug)]
+struct MicrophoneArrayCliOptions {
+    input: String,
+    output: String,
+    config_path: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    report: Option<String>,
+    max_memory_mb: Option<usize>,
+    preserve_metadata: bool,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_microphone_array_args(args: &[String]) -> Result<MicrophoneArrayCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut config_path = None;
+    let mut promotion_evidence = None;
+    let mut promotion_evidence_key = None;
+    let mut report = None;
+    let mut max_memory_mb = None;
+    let mut preserve_metadata = true;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--array-config" if config_path.is_none() => {
+                config_path = Some(parse_value(args, &mut index, "--array-config")?);
+            }
+            "--array-config" => return Err("--array-config may be supplied only once".into()),
+            "--promotion-evidence" if promotion_evidence.is_none() => {
+                promotion_evidence = Some(parse_value(args, &mut index, "--promotion-evidence")?);
+            }
+            "--promotion-evidence" => {
+                return Err("--promotion-evidence may be supplied only once".into());
+            }
+            "--promotion-evidence-key" if promotion_evidence_key.is_none() => {
+                promotion_evidence_key =
+                    Some(parse_value(args, &mut index, "--promotion-evidence-key")?);
+            }
+            "--promotion-evidence-key" => {
+                return Err("--promotion-evidence-key may be supplied only once".into());
+            }
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--no-metadata" if preserve_metadata => preserve_metadata = false,
+            "--no-metadata" => return Err("--no-metadata may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err(
+                    "microphone-array enhancement accepts only one of --json or --pretty".into(),
+                );
+            }
+            "-h" | "--help" => return Err("microphone-array help requested".into()),
+            "-" => {
+                return Err(
+                    "microphone-array enhancement requires regular-file paths; stdin/stdout are unsupported"
+                        .into(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown microphone-array option: {value}"));
+            }
+            value => {
+                if positional.len() == 2 {
+                    return Err(format!(
+                        "unexpected extra microphone-array argument: {value}"
+                    ));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let input = positional
+        .first()
+        .cloned()
+        .ok_or("microphone-array enhancement requires MICROPHONE_ARRAY")?;
+    let output = positional
+        .get(1)
+        .cloned()
+        .ok_or("microphone-array enhancement requires OUTPUT")?;
+    let config_path = config_path.ok_or("microphone-array enhancement requires --array-config")?;
+    let promotion_evidence =
+        promotion_evidence.ok_or("microphone-array enhancement requires --promotion-evidence")?;
+    let promotion_evidence_key = promotion_evidence_key
+        .ok_or("microphone-array enhancement requires --promotion-evidence-key")?;
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    Ok(MicrophoneArrayCliOptions {
+        input,
+        output,
+        config_path,
+        promotion_evidence,
+        promotion_evidence_key,
+        report,
+        max_memory_mb,
+        preserve_metadata,
+        commit_mode,
+        print_mode,
+    })
+}
+
+fn run_microphone_array(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", microphone_array_usage());
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("evidence") {
+        return run_microphone_array_evidence(&args[1..]);
+    }
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        return Err("microphone-array --help accepts no other arguments".into());
+    }
+    let options = parse_microphone_array_args(args)?;
+    validate_microphone_array_publication_paths(&options)?;
+    run_microphone_array_audio(options)
+}
+
+fn run_microphone_array_evidence(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err(
+            "microphone-array evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]"
+                .into(),
+        );
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("microphone-array evidence verify accepts only one output mode".into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown microphone-array evidence option: {value}"));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(
+            "microphone-array evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into(),
+        );
+    }
+    let evidence = denoize::SignedMicrophoneArrayPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence).map_err(|error| {
+                format!("serialize microphone-array promotion evidence: {error}")
+            })?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified microphone-array promotion evidence: implementation={}, strata={}, real_meetings={}, unseen_geometries={}, permutations={}, accepted={}",
+            evidence.payload.implementation,
+            evidence.payload.strata.len(),
+            evidence.payload.real_meeting_cases,
+            evidence.payload.unseen_geometry_cases,
+            evidence.payload.permutation_cases,
+            evidence.payload.accepted,
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err(
+            "microphone-array promotion evidence is authentic but does not pass promotion gates"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_microphone_array_publication_paths(
+    options: &MicrophoneArrayCliOptions,
+) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (options.input.as_str(), "microphone-array input"),
+        (
+            options.config_path.as_str(),
+            "microphone-array configuration",
+        ),
+        (
+            options.promotion_evidence.as_str(),
+            "microphone-array promotion evidence",
+        ),
+        (
+            options.promotion_evidence_key.as_str(),
+            "microphone-array promotion evidence key",
+        ),
+    ] {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (
+            Some(options.output.as_str()),
+            "microphone-array audio output",
+        ),
+        (options.report.as_deref(), "microphone-array report"),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace an input, configuration, evidence, or key"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+fn run_microphone_array_audio(options: MicrophoneArrayCliOptions) -> Result<(), String> {
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let config = denoize::MicrophoneArrayConfig::from_file(&options.config_path)?;
+    let evidence =
+        denoize::SignedMicrophoneArrayPromotionEvidence::from_file(&options.promotion_evidence)?;
+    let evidence_key = ReceiptPublicKey::from_file(&options.promotion_evidence_key)?;
+    // Authenticate the exact geometry and DSP configuration before opening
+    // user-controlled audio.
+    let session =
+        denoize::MicrophoneArraySession::prepare(&evidence, &evidence_key, config.clone())?;
+    let fixed_memory = denoize::estimate_microphone_array_memory_bytes(&config, 0)?;
+    ensure_memory_limit(
+        fixed_memory,
+        options.max_memory_mb,
+        "microphone-array fixed working set",
+    )?;
+
+    let mut input_session = AudioInputSession::open(&options.input)?;
+    let session_memory = estimate_session_memory_bytes(&input_session);
+    ensure_memory_limit(
+        fixed_memory.saturating_add(session_memory),
+        options.max_memory_mb,
+        "microphone-array input preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(fixed_memory)
+            .saturating_sub(session_memory)
+    });
+    let input = read_audio_from_session_with_limits(
+        &mut input_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let array_memory =
+        denoize::estimate_microphone_array_memory_bytes(session.config(), input.frames())?;
+    let working_set = array_memory.saturating_add(session_memory);
+    ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "microphone-array decoded/WPE/MVDR/output working set",
+    )?;
+    let result = session.enhance(&input)?;
+    let mut staged_report = options
+        .report
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.report))
+        .transpose()?;
+    let format = OutputFormat::from_path(std::path::Path::new(&options.output))?;
+    let encode_options = EncodeOptions::default();
+    encode_options.validate_options(format)?;
+    format.validate_config(&result.audio, &encode_options)?;
+    let metadata = if options.preserve_metadata {
+        input_session.read_metadata_with_limits(retained_metadata_limits(
+            options.max_memory_mb,
+            working_set,
+        )?)?
+    } else {
+        None
+    };
+    denoize::write_audio_transactional(
+        &options.output,
+        &result.audio,
+        encode_options,
+        metadata,
+        options.commit_mode,
+    )?;
+    if let Some(report) = staged_report.take() {
+        report.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "microphone array: input_channels={} active={} solved_bins={} fallback_bins={} frames={} latency_ms={:.3}",
+            result.report.input_channels,
+            result.report.active_microphones,
+            result.report.solved_frequency_bins,
+            result.report.fallback_frequency_bins,
+            result.report.output_frames,
+            result.report.algorithmic_latency_milliseconds,
+        ),
+    }
+    Ok(())
+}
+
 fn aec_usage() -> &'static str {
     "\
 USAGE:
@@ -10304,6 +10691,78 @@ fn run_causal_target_speaker_audio(options: CausalTargetSpeakerCliOptions) -> Re
 #[cfg(not(feature = "onnx"))]
 fn run_target_speaker_audio(_options: TargetSpeakerCliOptions) -> Result<(), String> {
     Err("target-speaker extraction requires a build with the onnx feature".into())
+}
+
+#[cfg(test)]
+mod microphone_array_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn array_parser_requires_explicit_geometry_and_evidence() {
+        let error = parse_microphone_array_args(&arguments(&["array.wav", "out.wav"])).unwrap_err();
+        assert_eq!(
+            error,
+            "microphone-array enhancement requires --array-config"
+        );
+    }
+
+    #[test]
+    fn array_parser_accepts_closed_publication_options() {
+        let parsed = parse_microphone_array_args(&arguments(&[
+            "array.wav",
+            "out.flac",
+            "--array-config",
+            "geometry.json",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "key.json",
+            "--report",
+            "report.json",
+            "--max-memory",
+            "512",
+            "--no-metadata",
+            "--replace",
+            "--pretty",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.input, "array.wav");
+        assert_eq!(parsed.output, "out.flac");
+        assert_eq!(parsed.config_path, "geometry.json");
+        assert_eq!(parsed.max_memory_mb, Some(512));
+        assert!(!parsed.preserve_metadata);
+        assert_eq!(parsed.commit_mode, CommitMode::Replace);
+        assert_eq!(parsed.print_mode, DiagnosticPrintMode::PrettyJson);
+    }
+
+    #[test]
+    fn array_parser_rejects_ambiguous_or_streaming_inputs() {
+        let base = [
+            "array.wav",
+            "out.wav",
+            "--array-config",
+            "geometry.json",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "key.json",
+        ];
+        let mut duplicate = base.to_vec();
+        duplicate.extend(["--array-config", "other.json"]);
+        assert!(parse_microphone_array_args(&arguments(&duplicate)).is_err());
+
+        let mut modes = base.to_vec();
+        modes.extend(["--json", "--pretty"]);
+        assert!(parse_microphone_array_args(&arguments(&modes)).is_err());
+
+        let mut streaming = base.to_vec();
+        streaming[0] = "-";
+        assert!(parse_microphone_array_args(&arguments(&streaming)).is_err());
+    }
 }
 
 #[cfg(all(test, feature = "aec"))]
@@ -14080,7 +14539,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "33c028439a092f8b697e9b13cf199e287c1fce69b14adc13f7c43343ca0ef971";
+        "7120b9f84090e815069c6e5199dec158d2a2ad322374dc62474e20f11d8306b7";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

@@ -322,6 +322,36 @@ and the closed [report](schemas/denoize-aec-report-v1.schema.json) and
 [promotion evidence](schemas/denoize-aec-promotion-evidence-v1.schema.json)
 contracts.
 
+### Explicit-geometry microphone-array enhancement
+
+**denoize array** enhances a declared two-to-four-channel microphone array to
+mono without ever inferring that ordinary program stereo is an array:
+
+~~~sh
+denoize array meeting-array.wav enhanced.wav \
+  --array-config array-config.json \
+  --promotion-evidence array-evidence.json \
+  --promotion-evidence-key evaluator-public-key.json \
+  --report array-report.json --max-memory 1024 --pretty
+~~~
+
+The closed configuration binds channel IDs, unique right-handed coordinates,
+sample-skew and gain/phase calibration, the reference microphone, and every DSP
+parameter. Signed promotion evidence authenticates that exact configuration
+before audio is opened. The native baseline applies multichannel WPE followed
+by conditioned mask-MVDR; singular bins and arrays with too few active channels
+use the declared reference, while an inactive reference fails closed. Channel
+plus geometry permutations render equivalently, output is finite mono PCM of
+exact duration, and reports record no paths.
+
+No neural spatial checkpoint is bundled or promoted; streaming and moving-
+source neural claims remain behind the package-v2 and real-device evidence
+gates. See [Microphone-array enhancement](docs/microphone-array.md), the
+[paper and artifact audit](docs/restoration-research.md#stage-31--microphone-array-enhancement),
+and the closed [report](schemas/denoize-microphone-array-report-v1.schema.json)
+and [promotion evidence](schemas/denoize-microphone-array-promotion-evidence-v1.schema.json)
+contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |

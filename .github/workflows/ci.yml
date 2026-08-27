@@ -91,6 +91,9 @@ jobs:
       - name: Validate acoustic echo cancellation JSON contracts
         run: python3 scripts/test-aec-schemas.py
 
+      - name: Validate microphone-array JSON contracts
+        run: python3 scripts/test-microphone-array-schemas.py
+
       - name: Run bounded deterministic resilience matrix
         env:
           DENOIZE_RESILIENCE_FEATURES: full
@@ -151,6 +154,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/generate-plugin-editor-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/generate-lv2-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/test-plugin-editor-evidence.py", "exec")'

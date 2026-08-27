@@ -725,6 +725,15 @@ worst-case paced blocks.
 
 ## Stage 31 — microphone-array enhancement
 
+The v0.84.0 implementation candidate adds a closed explicit-geometry
+configuration, authenticated promotion evidence, a path-free report, Rust
+session API, and `denoize array` CLI. Its native offline baseline performs
+calibrated multichannel WPE followed by conditioned mask-estimated MVDR with
+per-bin reference fallback. Canonical ID ordering makes matching channel plus
+geometry permutations equivalent; an inactive reference, malformed geometry,
+non-finite input, or evidence/configuration mismatch fails before publication.
+No neural checkpoint or streaming neural claim is included in this candidate.
+
 ### Geometry boundary and deterministic baseline
 
 Program stereo/surround is never assumed to be a microphone array. Array mode

@@ -10127,7 +10127,7 @@ mod tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "33c028439a092f8b697e9b13cf199e287c1fce69b14adc13f7c43343ca0ef971";
+        "7120b9f84090e815069c6e5199dec158d2a2ad322374dc62474e20f11d8306b7";
 
     #[test]
     fn desktop_errors_have_stable_codes_and_camel_case_wire_fields() {

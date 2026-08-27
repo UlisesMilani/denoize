@@ -89,6 +89,9 @@ jobs:
       - name: Validate acoustic echo cancellation JSON contracts
         run: python3 scripts/test-aec-schemas.py
 
+      - name: Validate microphone-array JSON contracts
+        run: python3 scripts/test-microphone-array-schemas.py
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -140,6 +143,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/test-lv2-host-evidence.py", "exec")'
@@ -1043,6 +1047,8 @@ jobs:
           causal_target_speaker_report_schema="$asset_dir/denoize-causal-target-speaker-report-v1.schema.json"
           aec_promotion_evidence_schema="$asset_dir/denoize-aec-promotion-evidence-v1.schema.json"
           aec_report_schema="$asset_dir/denoize-aec-report-v1.schema.json"
+          microphone_array_promotion_evidence_schema="$asset_dir/denoize-microphone-array-promotion-evidence-v1.schema.json"
+          microphone_array_report_schema="$asset_dir/denoize-microphone-array-report-v1.schema.json"
           watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
           watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
           watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
@@ -1105,6 +1111,8 @@ jobs:
           cp schemas/denoize-causal-target-speaker-report-v1.schema.json "$causal_target_speaker_report_schema"
           cp schemas/denoize-aec-promotion-evidence-v1.schema.json "$aec_promotion_evidence_schema"
           cp schemas/denoize-aec-report-v1.schema.json "$aec_report_schema"
+          cp schemas/denoize-microphone-array-promotion-evidence-v1.schema.json "$microphone_array_promotion_evidence_schema"
+          cp schemas/denoize-microphone-array-report-v1.schema.json "$microphone_array_report_schema"
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
@@ -1151,6 +1159,7 @@ jobs:
             "$target_speaker_promotion_evidence_schema" "$target_speaker_report_schema" \
             "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
             "$aec_promotion_evidence_schema" "$aec_report_schema" \
+            "$microphone_array_promotion_evidence_schema" "$microphone_array_report_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
             "$asset_dir"/denoize-update-*.schema.json \
@@ -1328,7 +1337,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.81.0 0.82.0)
+          rollback_versions=(0.82.0 0.83.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"
