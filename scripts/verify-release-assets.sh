@@ -257,6 +257,7 @@ gh release download "$tag" \
   --pattern '*.jsonl' \
   --pattern 'denoize-clap-editor-host-*.txt' \
   --pattern 'denoize-plugin-editor-evidence-v1.json' \
+  --pattern 'denoize-vst3-host-matrix-v1.json' \
   --pattern 'denoize-vst3-ardour-*.txt' \
   --pattern 'denoize-vst3-validator-*.txt' \
   --pattern 'denoize-model-catalog-v1.json' \
