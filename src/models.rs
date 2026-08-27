@@ -518,6 +518,24 @@ pub fn verify(model: &ModelInfo) -> Result<PathBuf, String> {
     verify_runtime_spec(&model)
 }
 
+/// Verify an authenticated model carried by a caller-owned plug-in bundle.
+///
+/// `model_root` is the directory that directly contains catalog package
+/// directories (for example, `denoize-models` in an LV2 bundle). Unlike
+/// [`verify`], this function never consults the process environment or user
+/// cache, so a plug-in can bind activation to the exact resources discovered
+/// from its host-provided bundle path.
+pub fn verify_bundled(model: &ModelInfo, model_root: &Path) -> Result<PathBuf, String> {
+    let model = ModelSpec::legacy(model);
+    let destination = model_root.join(model.name).join(model.filename);
+    verify_bundled_spec_at(&model, &destination).map_err(|error| {
+        format!(
+            "bundled model validation failed at {}: {error}",
+            destination.display()
+        )
+    })
+}
+
 /// Verify an installed catalog package and its authenticated provenance.
 pub fn verify_catalog_model(model: &CatalogModel) -> Result<PathBuf, String> {
     let model = ModelSpec::catalog(model);

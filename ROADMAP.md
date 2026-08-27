@@ -66,7 +66,7 @@ stop/rollback conditions behind this order are maintained in
 | 2 | 25 | Runtime model package v2 with named multi-input/output tensors, recurrent state, channel roles/geometry, latency/context, resources, precision profiles, license provenance, and numerical vectors | Released in v0.73.0 |
 | 3 | 26 | Deterministic restoration: de-hum, de-click/crackle, de-clip, WPE de-reverb, wind/plosive repair, masks, and non-destructive reports | Released in v0.74.0 |
 | 4 | 27 | Universal speech restoration for noise, reverb, clipping, bandwidth, codec, packet loss, and wind, with safe discriminative default and independently gated UniPASE/generative comparisons | Released in v0.75.0 |
-| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP released in v0.76.0; VST3 in v0.78.1; accessible CLAP editor in v0.79.0; macOS AUv3 implemented for v0.80.0; LV2 planned |
+| 5 | 28 | Neural DAW foundation: independent CLAP effect, pinned worker inference, reserved typed sidechain, fixed host latency, automation, overload fallback, portable state, and measured VST3/editor/AUv3/LV2 parity gates | CLAP released in v0.76.0; VST3 in v0.78.1; accessible CLAP editor in v0.79.0; macOS AUv3 implemented for v0.80.0; Linux LV2 implemented for v0.81.0 |
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline released in v0.77.0; causal substage planned |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Planned |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Planned |
@@ -169,7 +169,21 @@ not imply untested host support:
 | 28b | VST3 3.8 component/controller, buses, automation, latency restart, validator, packaging, and signed host matrix; compare a pinned CLAP wrapper with the official VST3 C API | Implemented for v0.78.1 with a statically bound wrapper, 94/94 official validation, pinned Ardour 8.4 discovery/processing/state-reload/teardown smoke, four target bundles, and signed evidence; proprietary hosts remain explicitly unclaimed |
 | 28c | Accessible custom editor with generic-host fallback and UI-thread/lifecycle tests | Implemented for v0.79.0: both CLAP descriptors, native embedded X11/Win32/Cocoa APIs, keyboard and AccessKit semantics, bounded resumable host automation, deterministic rendering, lifecycle/resize failure isolation, cross-target checks, and signed X11 real-host evidence; Wayland/floating/VST3 custom-view and proprietary-host claims remain explicit limits |
 | 28d | AUv3 sandbox/lifecycle/state/render parity and signed Apple host matrix | Implemented for v0.80.0 on macOS Intel and Apple Silicon: stable dual-component identities, signed app/appex/embedded-CLAP chain, bundled verified GTCRN provenance, `auval` plus AVFoundation lifecycle/state gates, target-qualified signed evidence; iOS, proprietary DAWs, and automated AU custom-view interaction remain explicit limits |
-| 28e | LV2 worker/atom/state parity, validation, packaging, and Linux host matrix | Planned |
+| 28e | LV2 worker/atom/state parity, validation, packaging, and Linux host matrix | Implemented for v0.81.0 on Linux x86-64: direct Rust LV2 descriptors, host-owned Worker inference, bounded Atom/Patch automation, portable State, in-place-safe audio buffers, official metadata/Lilv validation, Jalv worker smoke, Ardour save/reload smoke, packaging, and signed evidence; custom editor, f64 audio, non-Linux targets, and proprietary hosts remain explicit limits |
+
+Stage 28e keeps LV2 as a direct adapter rather than projecting the CLAP ABI.
+The DSP and Neural URIs expose 13 and 16 ports respectively, including fixed
+10 ms and 240 ms latency outputs. Neural schedules every inference block only
+through the host-provided Worker extension; it creates no private thread. A
+bounded Atom Sequence accepts at most 256 timestamped Patch updates per
+callback, while ordinary control ports remain the block-rate fallback. The
+State interface stores the same closed, path-free DSP and neural JSON and is
+tested with the zero caller flags used by Ardour. Raw audio-port handling also
+supports hosts that alias input and output buffers without constructing
+overlapping Rust references. Promotion requires official Turtle validation,
+Lilv discovery/offline processing, a real Jalv Worker run, two-process Ardour
+state restoration, ELF hardening, archive layout checks, and one signed JSON
+record binding all three host reports. See [LV2 plug-in](docs/lv2-plugin.md).
 
 Stage 29 now has a released finite package-v2 adapter in v0.77.0. The graph
 must expose exactly one mixture input, one enrollment input,

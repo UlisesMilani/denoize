@@ -64,6 +64,9 @@ jobs:
       - name: Test all features
         run: cargo test --locked --all-targets --features full
 
+      - name: Check feature-unified workspace
+        run: cargo check --locked --workspace --all-features
+
       - name: Validate project JSON contracts
         run: python3 scripts/test-project-schemas.py --denoize target/debug/denoize
 
@@ -108,11 +111,13 @@ jobs:
         run: |
           bash -n \
             scripts/build-auv3-plugin.sh \
+            scripts/build-lv2-plugin.sh \
             scripts/build-offline-model-bundle.sh \
             scripts/build-vst3-plugin.sh \
             scripts/generate-cli-docs.sh \
             scripts/package-auv3-plugin.sh \
             scripts/package-clap-plugin.sh \
+            scripts/package-lv2-plugin.sh \
             scripts/package-vst3-plugin.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
@@ -120,6 +125,8 @@ jobs:
             scripts/test-clap-editor-host.sh \
             scripts/test-auv3-host.sh \
             scripts/test-evaluation-evidence.sh \
+            scripts/test-lv2-ardour-host.sh \
+            scripts/test-lv2-jalv-host.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
             scripts/test-vst3-ardour-host.sh \
@@ -127,6 +134,7 @@ jobs:
             scripts/verify-release-evidence.sh \
             scripts/verify-release-version.sh \
             scripts/validate-auv3-plugin.sh \
+            scripts/validate-lv2-plugin.sh \
             scripts/validate-vst3-plugin.sh
           python3 -c 'compile(open("scripts/generate-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/generate-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
@@ -140,7 +148,9 @@ jobs:
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/generate-plugin-editor-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/generate-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/generate-lv2-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/test-plugin-editor-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/test-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/test-lv2-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/test-auv3-host-evidence.py", "exec")'
@@ -155,6 +165,7 @@ jobs:
         run: |
           python3 scripts/test-application-update-manifest.py
           python3 scripts/test-plugin-editor-evidence.py
+          python3 scripts/test-lv2-host-evidence.py
           python3 scripts/test-release-updater-metadata.py
           python3 scripts/test-vst3-host-matrix.py
           python3 scripts/test-auv3-host-evidence.py
@@ -439,6 +450,86 @@ jobs:
           test "$archive" = \
             "$output_dir/denoize-vst3-v9.8.7-${{ matrix.target }}.${{ matrix.archive }}"
           test -s "$archive"
+
+  lv2-plugin:
+    name: LV2 plug-in
+    runs-on: ubuntu-24.04
+    env:
+      DENOIZE_MODEL_DIR: /tmp/denoize-lv2-models-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Select minimum supported Rust
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+
+      - name: Install pinned LV2 validation and host dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            ardour=1:8.4.0+ds1-2ubuntu8 \
+            jackd2=1.9.21~dfsg-3ubuntu3 \
+            jalv=1.6.8-1build3 \
+            libasound2-dev \
+            lilv-utils=0.24.22-1build1 \
+            lv2-dev=1.18.10-2build1 \
+            python3-jsonschema \
+            sordi=0.16.16-2build1
+
+      - name: Install pinned neural model
+        run: |
+          cargo run --locked --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
+
+      - name: Test direct LV2 adapter contracts
+        run: cargo test --locked -p denoize-lv2 --lib
+
+      - name: Build hardened LV2 bundle
+        run: bash scripts/build-lv2-plugin.sh x86_64-unknown-linux-gnu
+
+      - name: Validate and exercise Jalv and Ardour
+        run: |
+          report_dir=$(mktemp -d /tmp/denoize-lv2-report.XXXXXX)
+          bundle=target/lv2-build/x86_64-unknown-linux-gnu/denoize.lv2
+          validation="$report_dir/denoize-lv2-validation-v9.8.7-x86_64-unknown-linux-gnu.txt"
+          jalv="$report_dir/denoize-lv2-jalv-v9.8.7-x86_64-unknown-linux-gnu.txt"
+          ardour="$report_dir/denoize-lv2-ardour-v9.8.7-x86_64-unknown-linux-gnu.txt"
+          evidence="$report_dir/denoize-lv2-host-evidence-v1.json"
+          bash scripts/validate-lv2-plugin.sh "$bundle" "$validation" >/dev/null
+          bash scripts/test-lv2-jalv-host.sh "$bundle" "$jalv" >/dev/null
+          bash scripts/test-lv2-ardour-host.sh "$bundle" "$ardour" >/dev/null
+          python3 scripts/generate-lv2-host-evidence.py \
+            --tag v9.8.7 \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --validation-report "$validation" \
+            --jalv-report "$jalv" \
+            --ardour-report "$ardour" \
+            --output "$evidence"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-lv2-host-evidence-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
+
+      - name: Test LV2 release archive layout
+        run: |
+          output_dir=$(mktemp -d /tmp/denoize-lv2-package.XXXXXX)
+          bash scripts/package-lv2-plugin.sh \
+            x86_64-unknown-linux-gnu v9.8.7 "$output_dir"
+          archive="$output_dir/denoize-lv2-v9.8.7-x86_64-unknown-linux-gnu.tar.gz"
+          tar -tzf "$archive" \
+            | grep -F 'denoize.lv2/denoize.so' >/dev/null
+          tar -tzf "$archive" \
+            | grep -F 'denoize.lv2/denoize-models/gtcrn-dns3/gtcrn_simple.onnx' >/dev/null
 
   auv3-plugin:
     name: AUv3 plug-in

@@ -915,8 +915,18 @@ app-extension sandbox. Apple `auval` and an independent AVFoundation
 lifecycle/state host exercise both components on Intel and Apple Silicon; the
 target-qualified evidence and reports are signed. See
 [AUv3 plug-in](docs/auv3-plugin.md) for installation, reproducible builds, and
-the explicit iOS, proprietary-host, and custom-view limits. LV2 remains a
-separate gate.
+the explicit iOS, proprietary-host, and custom-view limits.
+
+v0.81.0 adds direct Linux x86-64 LV2 adapters for both descriptors. Neural
+uses the host-owned LV2 Worker instead of a private inference thread; bounded
+Atom/Patch events provide sample-accurate automation, and the State interface
+round-trips the same closed portable JSON used by the shared engine. The
+release gate combines official LV2 metadata validation and Lilv discovery with
+real Jalv Worker processing and a two-process Ardour save/reload test. One
+signed evidence record binds the exact descriptor URIs, port counts, fixed
+latencies, package versions, source commit, and three raw reports. See
+[LV2 plug-in](docs/lv2-plugin.md) for installation and the explicit Linux-only,
+f32-only, generic-editor, and untested-host limits.
 
 ## Desktop app
 

@@ -373,6 +373,42 @@ state round-trip, and teardown on both macOS architectures. iOS provisioning,
 mobile hosts, proprietary DAWs, and automated AU custom-view interaction stay
 outside the claim until their own evidence exists.
 
+Stage 28e implements the Linux LV2 branch in v0.81.0 as a direct Rust adapter.
+LV2 deliberately separates executable code from Turtle metadata and permits a
+host to inspect a bundle without loading it
+([LV2 core](https://lv2plug.in/ns/lv2core)). That makes metadata validation and
+runtime processing distinct release gates. The DSP and Neural descriptors
+reuse shared denoize engines but own their URIs, ports, URID map, and extension
+lifecycle. Audio is f32 as required by the core AudioPort contract, and raw
+buffer traversal permits input/output aliasing without overlapping Rust
+references.
+
+Neural inference is delegated only through the host-provided
+[Worker extension](https://lv2plug.in/ns/ext/worker), whose contract moves
+non-real-time-safe work off the audio thread and returns responses in the run
+context while retaining synchronous offline-render compatibility. A bounded
+[Atom Sequence](https://lv2plug.in/ns/ext/atom) carries frame-timestamped
+[Patch Set](https://lv2plug.in/ns/ext/patch) messages for sample-accurate
+automation; the adapter caps admission at 256 events, stable-orders timestamps,
+and ignores unknown, non-finite, or out-of-block values. The
+[State interface](https://lv2plug.in/ns/ext/state) stores closed, path-free JSON
+as portable POD data. Its adapter accepts host caller preference flags such as
+Ardour's zero value while independently marking each stored property POD and
+portable, matching the specification's separation of method-call preferences
+from per-property flags.
+
+The promotion matrix first uses the official validation tools and Lilv for
+Turtle restrictions, discovery, offline DSP processing, and binary hardening
+([LV2 data validation](https://lv2plug.in/pages/validating-lv2-data.html)). It
+then runs both descriptors in Jalv with a dummy JACK graph, which proves that a
+real host supplies Worker scheduling, and creates plus restores an Ardour 8.4
+session in separate processes, which proves state-property persistence,
+fixed-latency reporting, processing, and teardown. The release JSON binds all
+three raw report digests, exact Ubuntu package versions, descriptor URIs, port
+counts, source commit, and known limits. Non-Linux architectures, f64 audio,
+custom UI, `lv2bench` Worker support, and proprietary hosts are not inferred
+from these results.
+
 A custom editor is also independent of the audio engine. It must stay on the
 host-approved UI thread, expose every control through host parameters, support
 keyboard navigation, scaling and accessible names, bound persisted UI state,
@@ -398,8 +434,8 @@ mismatched model identity; the pinned real graph smoke test fails; or a release
 artifact cannot reproduce the exact model, state schema, validator report, and
 source revision. VST3, editor, AUv3, and LV2 claims stay out of release status
 until their own equivalent evidence passes; Stage 28b, the native CLAP portion
-of 28c, and the macOS portion of 28d now satisfy their separately documented
-gates.
+of 28c, the macOS portion of 28d, and the Linux portion of 28e now satisfy their
+separately documented gates.
 
 ## Stage 29 — target-speaker extraction
 

@@ -103,14 +103,18 @@ jobs:
         run: |
           bash -n \
             scripts/build-auv3-plugin.sh \
+            scripts/build-lv2-plugin.sh \
             scripts/build-vst3-plugin.sh \
             scripts/package-auv3-plugin.sh \
             scripts/package-clap-plugin.sh \
+            scripts/package-lv2-plugin.sh \
             scripts/package-vst3-plugin.sh \
             scripts/package-release-evidence.sh \
             scripts/publish-crates-io.sh \
             scripts/release-evidence-assets.sh \
             scripts/test-evaluation-evidence.sh \
+            scripts/test-lv2-ardour-host.sh \
+            scripts/test-lv2-jalv-host.sh \
             scripts/test-resilience.sh \
             scripts/test-release-evidence.sh \
             scripts/test-auv3-host.sh \
@@ -118,8 +122,10 @@ jobs:
             scripts/verify-release-assets.sh \
             scripts/verify-release-evidence.sh \
             scripts/validate-auv3-plugin.sh \
+            scripts/validate-lv2-plugin.sh \
             scripts/validate-vst3-plugin.sh
           python3 -c 'compile(open("scripts/generate-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/generate-auv3-host-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/generate-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/generate-lv2-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-release-evidence.py", encoding="utf-8").read(), "scripts/generate-release-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-release-updater-metadata.py", encoding="utf-8").read(), "scripts/assemble-release-updater-metadata.py", "exec")'
           python3 -c 'compile(open("scripts/assemble-application-update.py", encoding="utf-8").read(), "scripts/assemble-application-update.py", "exec")'
@@ -132,6 +138,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
+          python3 -c 'compile(open("scripts/test-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/test-lv2-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-auv3-host-evidence.py", encoding="utf-8").read(), "scripts/test-auv3-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-runtime-model-package-schemas.py", encoding="utf-8").read(), "scripts/test-runtime-model-package-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-release-updater-metadata.py", encoding="utf-8").read(), "scripts/test-release-updater-metadata.py", "exec")'
@@ -142,6 +149,7 @@ jobs:
           python3 scripts/test-release-updater-metadata.py
           python3 scripts/test-application-update-manifest.py
           python3 scripts/test-vst3-host-matrix.py
+          python3 scripts/test-lv2-host-evidence.py
           python3 scripts/test-auv3-host-evidence.py
           DENOIZE_BIN=target/debug/denoize bash scripts/test-evaluation-evidence.sh
           bash scripts/test-release-evidence.sh
@@ -627,6 +635,115 @@ jobs:
             "$provenance" \
             --clobber
 
+  lv2-build:
+    name: LV2 x86_64-unknown-linux-gnu
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      DENOIZE_MODEL_DIR: /tmp/denoize-lv2-models-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out tagged source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select release Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Install pinned LV2 validation and host dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends \
+            ardour=1:8.4.0+ds1-2ubuntu8 \
+            jackd2=1.9.21~dfsg-3ubuntu3 \
+            jalv=1.6.8-1build3 \
+            libasound2-dev \
+            lilv-utils=0.24.22-1build1 \
+            lv2-dev=1.18.10-2build1 \
+            python3-jsonschema \
+            sordi=0.16.16-2build1
+
+      - name: Install pinned neural model
+        run: |
+          cargo run --locked --release --no-default-features --features gtcrn --bin denoize -- \
+            models install gtcrn
+
+      - name: Test and build direct LV2 adapters
+        run: |
+          cargo test --locked -p denoize-lv2 --lib
+          bash scripts/build-lv2-plugin.sh x86_64-unknown-linux-gnu
+
+      - name: Validate and bind LV2 host evidence
+        run: |
+          bundle=target/lv2-build/x86_64-unknown-linux-gnu/denoize.lv2
+          validation="$RUNNER_TEMP/denoize-lv2-validation-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.txt"
+          jalv="$RUNNER_TEMP/denoize-lv2-jalv-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.txt"
+          ardour="$RUNNER_TEMP/denoize-lv2-ardour-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.txt"
+          evidence="$RUNNER_TEMP/denoize-lv2-host-evidence-v1.json"
+          bash scripts/validate-lv2-plugin.sh "$bundle" "$validation" >/dev/null
+          bash scripts/test-lv2-jalv-host.sh "$bundle" "$jalv" >/dev/null
+          bash scripts/test-lv2-ardour-host.sh "$bundle" "$ardour" >/dev/null
+          python3 scripts/generate-lv2-host-evidence.py \
+            --tag "$GITHUB_REF_NAME" \
+            --commit "$(git rev-parse HEAD)" \
+            --repository "$GITHUB_REPOSITORY" \
+            --validation-report "$validation" \
+            --jalv-report "$jalv" \
+            --ardour-report "$ardour" \
+            --output "$evidence"
+          python3 - "$evidence" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          from jsonschema import Draft202012Validator
+          schema = json.loads(Path("schemas/denoize-lv2-host-evidence-v1.schema.json").read_text())
+          document = json.loads(Path(sys.argv[1]).read_text())
+          Draft202012Validator(schema).validate(document)
+          PY
+
+      - name: Attest LV2 host evidence and reports
+        id: attest-lv2-host-evidence
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            ${{ runner.temp }}/denoize-lv2-host-evidence-v1.json
+            ${{ runner.temp }}/denoize-lv2-validation-${{ github.ref_name }}-x86_64-unknown-linux-gnu.txt
+            ${{ runner.temp }}/denoize-lv2-jalv-${{ github.ref_name }}-x86_64-unknown-linux-gnu.txt
+            ${{ runner.temp }}/denoize-lv2-ardour-${{ github.ref_name }}-x86_64-unknown-linux-gnu.txt
+
+      - name: Package LV2 plug-in
+        run: |
+          bash scripts/package-lv2-plugin.sh \
+            x86_64-unknown-linux-gnu "$GITHUB_REF_NAME" .
+          archive="denoize-lv2-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Upload LV2 release assets and signed host evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="denoize-lv2-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          provenance="$RUNNER_TEMP/denoize-lv2-host-evidence-v1.sigstore.json"
+          cp "${{ steps.attest-lv2-host-evidence.outputs.bundle-path }}" "$provenance"
+          gh release upload "$GITHUB_REF_NAME" \
+            "$archive" "$archive.sha256" \
+            "$RUNNER_TEMP/denoize-lv2-host-evidence-v1.json" \
+            "$RUNNER_TEMP/denoize-lv2-validation-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.txt" \
+            "$RUNNER_TEMP/denoize-lv2-jalv-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.txt" \
+            "$RUNNER_TEMP/denoize-lv2-ardour-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.txt" \
+            "$provenance" \
+            --clobber
+
   auv3-build:
     name: AUv3 ${{ matrix.target }}
     needs: prepare
@@ -889,6 +1006,7 @@ jobs:
           listening_result_schema="$asset_dir/denoize-listening-result-v1.schema.json"
           presentation_region_schema="$asset_dir/denoize-presentation-region-v1.schema.json"
           auv3_host_evidence_schema="$asset_dir/denoize-auv3-host-evidence-v1.schema.json"
+          lv2_host_evidence_schema="$asset_dir/denoize-lv2-host-evidence-v1.schema.json"
           plugin_editor_evidence_schema="$asset_dir/denoize-plugin-editor-evidence-v1.schema.json"
           plugin_host_matrix_schema="$asset_dir/denoize-plugin-host-matrix-v1.schema.json"
           recommendation_schema="$asset_dir/denoize-recommendation-v1.schema.json"
@@ -943,6 +1061,7 @@ jobs:
           cp schemas/denoize-listening-result-v1.schema.json "$listening_result_schema"
           cp schemas/denoize-presentation-region-v1.schema.json "$presentation_region_schema"
           cp schemas/denoize-auv3-host-evidence-v1.schema.json "$auv3_host_evidence_schema"
+          cp schemas/denoize-lv2-host-evidence-v1.schema.json "$lv2_host_evidence_schema"
           cp schemas/denoize-plugin-editor-evidence-v1.schema.json "$plugin_editor_evidence_schema"
           cp schemas/denoize-plugin-host-matrix-v1.schema.json "$plugin_host_matrix_schema"
           for project_schema in schemas/denoize-project-*.schema.json; do
@@ -1000,6 +1119,7 @@ jobs:
             "$listening_result_schema" \
             "$presentation_region_schema" \
             "$auv3_host_evidence_schema" \
+            "$lv2_host_evidence_schema" \
             "$plugin_editor_evidence_schema" "$plugin_host_matrix_schema" \
             "$asset_dir"/denoize-project-*.schema.json \
             "$recommendation_schema" "$release_evidence_schema" \
@@ -1024,7 +1144,7 @@ jobs:
 
   release-evidence:
     name: Generate release SBOMs and provenance
-    needs: [build, plugin-build, vst3-build, auv3-build, desktop-build, model-catalog, updater-metadata]
+    needs: [build, plugin-build, vst3-build, lv2-build, auv3-build, desktop-build, model-catalog, updater-metadata]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1194,7 +1314,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.76.0 0.77.0)
+          rollback_versions=(0.79.0 0.80.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

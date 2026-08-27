@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-lv2-host-evidence-v1.schema.json",
+  "title": "denoize LV2 host evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "tag",
+    "source",
+    "format",
+    "adapter",
+    "descriptors",
+    "runs",
+    "claims",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-lv2-host-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "tag": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "format": { "const": "lv2" },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "strategy",
+        "lv2_specification",
+        "rust_lv2_version",
+        "lv2_dev_package",
+        "lilv_utils_package",
+        "sordi_package",
+        "jalv_package",
+        "jackd2_package",
+        "ardour_package"
+      ],
+      "properties": {
+        "strategy": { "const": "direct-rust-lv2" },
+        "lv2_specification": { "const": "1.18.10" },
+        "rust_lv2_version": { "const": "0.6.0" },
+        "lv2_dev_package": { "const": "1.18.10-2build1" },
+        "lilv_utils_package": { "const": "0.24.22-1build1" },
+        "sordi_package": { "const": "0.16.16-2build1" },
+        "jalv_package": { "const": "1.6.8-1build3" },
+        "jackd2_package": { "const": "1.9.21~dfsg-3ubuntu3" },
+        "ardour_package": { "const": "1:8.4.0+ds1-2ubuntu8" }
+      }
+    },
+    "descriptors": {
+      "type": "array",
+      "prefixItems": [
+        { "$ref": "#/$defs/dspDescriptor" },
+        { "$ref": "#/$defs/neuralDescriptor" }
+      ],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "runs": {
+      "type": "array",
+      "prefixItems": [
+        { "$ref": "#/$defs/validationRun" },
+        { "$ref": "#/$defs/jalvRun" },
+        { "$ref": "#/$defs/ardourRun" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "claims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "direct_adapter",
+        "official_metadata_validation",
+        "lilv_discovery",
+        "jalv_real_host",
+        "ardour_real_host",
+        "state_roundtrip",
+        "worker_host",
+        "sample_accurate_automation",
+        "single_precision_audio",
+        "double_precision_audio"
+      ],
+      "properties": {
+        "direct_adapter": { "const": true },
+        "official_metadata_validation": { "const": true },
+        "lilv_discovery": { "const": true },
+        "jalv_real_host": { "const": true },
+        "ardour_real_host": { "const": true },
+        "state_roundtrip": { "const": true },
+        "worker_host": { "const": true },
+        "sample_accurate_automation": { "const": true },
+        "single_precision_audio": { "const": true },
+        "double_precision_audio": { "const": false }
+      }
+    },
+    "limitations": {
+      "const": [
+        "custom-editor-not-present",
+        "double-precision-audio-not-supported",
+        "linux-x86_64-only",
+        "lv2bench-neural-worker-not-supported",
+        "proprietary-hosts-not-exercised"
+      ]
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 4194304 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "descriptorBase": {
+      "type": "object",
+      "required": [
+        "uri",
+        "name",
+        "ports",
+        "audio_inputs",
+        "audio_outputs",
+        "latency_frames_48khz",
+        "state_property",
+        "worker_required"
+      ]
+    },
+    "dspDescriptor": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/descriptorBase" },
+        {
+          "properties": {
+            "uri": { "const": "https://github.com/penguin425/denoize#lv2-dsp" },
+            "name": { "const": "denoize" },
+            "ports": { "const": 13 },
+            "audio_inputs": { "const": 2 },
+            "audio_outputs": { "const": 2 },
+            "latency_frames_48khz": { "const": 480 },
+            "state_property": {
+              "const": "https://github.com/penguin425/denoize#dsp-state"
+            },
+            "worker_required": { "const": false }
+          }
+        }
+      ]
+    },
+    "neuralDescriptor": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/descriptorBase" },
+        {
+          "properties": {
+            "uri": { "const": "https://github.com/penguin425/denoize#lv2-neural" },
+            "name": { "const": "denoize Neural" },
+            "ports": { "const": 16 },
+            "audio_inputs": { "const": 2 },
+            "audio_outputs": { "const": 2 },
+            "latency_frames_48khz": { "const": 11520 },
+            "state_property": {
+              "const": "https://github.com/penguin425/denoize#neural-state"
+            },
+            "worker_required": { "const": true }
+          }
+        }
+      ]
+    },
+    "runBase": {
+      "type": "object",
+      "required": [
+        "host",
+        "host_version",
+        "evidence_kind",
+        "operating_system",
+        "architecture",
+        "status",
+        "descriptors_exercised",
+        "report"
+      ]
+    },
+    "validationRun": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/runBase" },
+        {
+          "properties": {
+            "host": { "const": "LV2 reference tools and Lilv" },
+            "host_version": { "const": "1.18.10" },
+            "evidence_kind": { "const": "official-validation" },
+            "operating_system": { "const": "ubuntu-24.04" },
+            "architecture": { "const": "x86_64" },
+            "status": { "const": "passed" },
+            "descriptors_exercised": { "const": 2 },
+            "report": { "$ref": "#/$defs/file" }
+          }
+        }
+      ]
+    },
+    "jalvRun": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/runBase" },
+        {
+          "required": ["sample_rate_hz", "block_frames", "worker_host", "teardown"],
+          "properties": {
+            "host": { "const": "Jalv" },
+            "host_version": { "const": "1.6.8-1build3" },
+            "evidence_kind": { "const": "real-host-worker-smoke" },
+            "operating_system": { "const": "ubuntu-24.04" },
+            "architecture": { "const": "x86_64" },
+            "status": { "const": "passed" },
+            "descriptors_exercised": { "const": 2 },
+            "sample_rate_hz": { "const": 48000 },
+            "block_frames": { "const": 480 },
+            "worker_host": { "const": true },
+            "teardown": { "const": true },
+            "report": { "$ref": "#/$defs/file" }
+          }
+        }
+      ]
+    },
+    "ardourRun": {
+      "unevaluatedProperties": false,
+      "allOf": [
+        { "$ref": "#/$defs/runBase" },
+        {
+          "required": [
+            "sample_rate_hz",
+            "first_pass_frames",
+            "restored_pass_frames",
+            "state_properties",
+            "state_reload",
+            "state_interface_errors",
+            "teardown"
+          ],
+          "properties": {
+            "host": { "const": "Ardour" },
+            "host_version": { "const": "8.4.0~ds1" },
+            "evidence_kind": { "const": "real-host-state-smoke" },
+            "operating_system": { "const": "ubuntu-24.04" },
+            "architecture": { "const": "x86_64" },
+            "status": { "const": "passed" },
+            "descriptors_exercised": { "const": 2 },
+            "sample_rate_hz": { "const": 48000 },
+            "first_pass_frames": { "type": "integer", "minimum": 1 },
+            "restored_pass_frames": { "type": "integer", "minimum": 1 },
+            "state_properties": { "const": 2 },
+            "state_reload": { "const": true },
+            "state_interface_errors": { "const": 0 },
+            "teardown": { "const": true },
+            "report": { "$ref": "#/$defs/file" }
+          }
+        }
+      ]
+    }
+  }
+}

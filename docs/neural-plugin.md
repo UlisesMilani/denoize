@@ -150,5 +150,8 @@ checksum, SBOM, and signed host-matrix evidence; see
 double-precision VST3 audio, a VST3 custom view, or compatibility with untested
 proprietary hosts. v0.80.0 adds the macOS AUv3 gate with a sandbox-visible
 verified copy of the pinned graph, Apple `auval`, and independent AVFoundation
-lifecycle/state evidence; see [AUv3 plug-in](auv3-plugin.md). iOS and LV2 remain
-separate release gates.
+lifecycle/state evidence; see [AUv3 plug-in](auv3-plugin.md). v0.81.0 adds a
+direct Linux LV2 adapter whose inference is delegated to the host Worker and
+whose Atom/Patch automation and portable State are exercised in Jalv and
+Ardour; see [LV2 plug-in](lv2-plugin.md). iOS and untested proprietary hosts
+remain separate release gates.
