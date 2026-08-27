@@ -18,7 +18,7 @@ if [[ ! -d $appex || ! -f $plist ]]; then
   echo "AUv3 app does not contain denoize.appex: $app" >&2
   exit 1
 fi
-for command in auval codesign plutil pluginkit sw_vers; do
+for command in auval codesign plutil pluginkit python3 sw_vers; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "$command is required to validate AUv3" >&2
     exit 1
@@ -33,11 +33,17 @@ cleanup() {
 }
 trap cleanup EXIT
 # Current codesign versions can display DER entitlements in a human-readable
-# form by default. Force an XML property list before asking plutil to inspect
-# the entitlement embedded in the actual signature.
-codesign --display --entitlements - --xml "$appex" > "$entitlements" 2>/dev/null
-if ! plutil -extract com.apple.security.app-sandbox raw -o - "$entitlements" \
-  | grep -Fx true >/dev/null; then
+# form by default. Force XML and normalize it before inspecting the entitlement
+# embedded in the actual signature.
+codesign --display --entitlements - --xml "$appex" 2>/dev/null \
+  | plutil -convert xml1 -o "$entitlements" -
+if ! python3 -c '
+import plistlib
+import sys
+
+entitlements = plistlib.loads(sys.stdin.buffer.read())
+raise SystemExit(entitlements.get("com.apple.security.app-sandbox") is not True)
+' < "$entitlements"; then
   echo "AUv3 appex is missing the app-sandbox entitlement" >&2
   exit 1
 fi

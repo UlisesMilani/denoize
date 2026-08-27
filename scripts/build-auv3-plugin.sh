@@ -196,6 +196,14 @@ if [[ $(shasum -a 256 "$embedded_model" | awk '{print $1}') != "$model_sha" ]]; 
   echo "embedded AUv3 model digest changed during assembly" >&2
   exit 1
 fi
+appex_entitlements=$clap_wrapper_root/src/detail/auv3/auv3.entitlements
+if [[ ! -f $appex_entitlements || -L $appex_entitlements ]]; then
+  echo "pinned AUv3 entitlements are missing or are a symbolic link" >&2
+  exit 1
+fi
+plutil -lint "$appex_entitlements" >/dev/null
+codesign --force --sign - --timestamp=none \
+  --entitlements "$appex_entitlements" "$appex"
 codesign --force --sign - --timestamp=none "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 printf '%s\n' "$app"
