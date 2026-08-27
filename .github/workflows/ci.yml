@@ -479,9 +479,8 @@ jobs:
       - name: Validate both Audio Units in official and real hosts
         shell: bash
         run: |
-          app=$(find target/auv3-build/aarch64-apple-darwin \
-            -type d -name 'denoize AUv3.app' -print -quit)
-          test -n "$app"
+          app='target/auv3-build/aarch64-apple-darwin/Release/denoize AUv3.app'
+          test -d "$app"
           report_dir="$RUNNER_TEMP/denoize-auv3-report"
           mkdir -p "$report_dir"
           auval_report="$report_dir/denoize-auv3-auval-v9.8.7-aarch64-apple-darwin.txt"
@@ -509,9 +508,8 @@ jobs:
       - name: Test AUv3 release archive layout
         shell: bash
         run: |
-          app=$(find target/auv3-build/aarch64-apple-darwin \
-            -type d -name 'denoize AUv3.app' -print -quit)
-          test -n "$app"
+          app='target/auv3-build/aarch64-apple-darwin/Release/denoize AUv3.app'
+          test -d "$app"
           output_dir=$(mktemp -d "$RUNNER_TEMP/denoize-auv3-package.XXXXXX")
           archive=$(bash scripts/package-auv3-plugin.sh \
             aarch64-apple-darwin v9.8.7 "$output_dir" "$app")

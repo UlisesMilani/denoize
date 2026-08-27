@@ -680,9 +680,8 @@ jobs:
       - name: Validate and bind AUv3 host evidence
         shell: bash
         run: |
-          app=$(find "target/auv3-build/${{ matrix.target }}" \
-            -type d -name 'denoize AUv3.app' -print -quit)
-          test -n "$app"
+          app='target/auv3-build/${{ matrix.target }}/Release/denoize AUv3.app'
+          test -d "$app"
           auval_report="$RUNNER_TEMP/denoize-auv3-auval-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
           host_report="$RUNNER_TEMP/denoize-auv3-host-${GITHUB_REF_NAME}-${{ matrix.target }}.txt"
           evidence="$RUNNER_TEMP/denoize-auv3-host-evidence-${GITHUB_REF_NAME}-${{ matrix.target }}.json"
@@ -718,9 +717,8 @@ jobs:
       - name: Package AUv3 plug-in
         shell: bash
         run: |
-          app=$(find "target/auv3-build/${{ matrix.target }}" \
-            -type d -name 'denoize AUv3.app' -print -quit)
-          test -n "$app"
+          app='target/auv3-build/${{ matrix.target }}/Release/denoize AUv3.app'
+          test -d "$app"
           bash scripts/package-auv3-plugin.sh \
             "${{ matrix.target }}" "$GITHUB_REF_NAME" . "$app"
           archive="denoize-auv3-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
