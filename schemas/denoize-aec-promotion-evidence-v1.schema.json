@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-aec-promotion-evidence-v1.schema.json",
+  "title": "denoize signed acoustic echo cancellation promotion evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "payload", "signature"],
+  "properties": {
+    "schema": { "const": "denoize-aec-promotion-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "payload": { "$ref": "#/$defs/payload" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9._+:/-]{1,256}$" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completed_at_unix_seconds",
+        "implementation",
+        "implementation_source_revision",
+        "implementation_source_sha256",
+        "configuration_sha256",
+        "corpus_manifest_sha256",
+        "evaluation_result_sha256",
+        "listening_result_sha256",
+        "sample_rate",
+        "block_size_samples",
+        "tail_samples",
+        "maximum_delay_samples",
+        "strata",
+        "real_device_cases",
+        "nonlinear_device_cases",
+        "delay_transition_cases",
+        "paced_realtime_blocks",
+        "worst_case_realtime_factor",
+        "callback_allocations",
+        "callback_locks",
+        "callback_waits",
+        "callback_io_operations",
+        "callback_log_operations",
+        "deadline_misses",
+        "stale_frames_after_reset",
+        "minimum_listeners",
+        "listener_count",
+        "listener_preference",
+        "listener_preference_limit",
+        "accepted"
+      ],
+      "properties": {
+        "completed_at_unix_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "implementation": { "const": "native-pfdnlms-v1" },
+        "implementation_source_revision": { "$ref": "#/$defs/id" },
+        "implementation_source_sha256": { "$ref": "#/$defs/sha256" },
+        "configuration_sha256": { "$ref": "#/$defs/sha256" },
+        "corpus_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "listening_result_sha256": { "$ref": "#/$defs/sha256" },
+        "sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+        "block_size_samples": { "type": "integer", "minimum": 64, "maximum": 4096 },
+        "tail_samples": { "type": "integer", "minimum": 64, "maximum": 384000 },
+        "maximum_delay_samples": { "type": "integer", "minimum": 0, "maximum": 384000 },
+        "strata": {
+          "type": "array",
+          "minItems": 17,
+          "maxItems": 17,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/stratum" }
+        },
+        "real_device_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "nonlinear_device_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "delay_transition_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "paced_realtime_blocks": { "type": "integer", "minimum": 10000, "maximum": 9007199254740991 },
+        "worst_case_realtime_factor": { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "callback_allocations": { "const": 0 },
+        "callback_locks": { "const": 0 },
+        "callback_waits": { "const": 0 },
+        "callback_io_operations": { "const": 0 },
+        "callback_log_operations": { "const": 0 },
+        "deadline_misses": { "const": 0 },
+        "stale_frames_after_reset": { "const": 0 },
+        "minimum_listeners": { "type": "integer", "minimum": 20, "maximum": 100000 },
+        "listener_count": { "type": "integer", "minimum": 20, "maximum": 100000 },
+        "listener_preference": { "type": "number", "minimum": 0, "maximum": 1 },
+        "listener_preference_limit": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "stratum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "cases", "metrics"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["far-end-only", "near-end-only", "double-talk", "transition", "impairment"] },
+        "cases": { "type": "integer", "minimum": 10, "maximum": 1000000 },
+        "metrics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/metric" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "value", "operator", "limit", "passed"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/id" },
+        "value": { "type": "number" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "limit": { "type": "number" },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "key_id": { "$ref": "#/$defs/sha256" },
+        "value_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
+        }
+      }
+    }
+  }
+}

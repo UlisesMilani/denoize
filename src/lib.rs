@@ -27,6 +27,7 @@
 //! - `deepfilter` feature: DeepFilterNet v3 via tract ONNX
 //! - `onnx` feature: user-supplied waveform ONNX models via tract
 //!   (including a reusable, contract-checked loaded-model API)
+//! - `aec` feature: typed far-end-reference partitioned frequency-domain AEC
 //! - `mpsenet` feature: MP-SENet compressed-magnitude/phase ONNX adapter
 //! - `bsrnn` feature: ESPnet BSRNN spectral ONNX adapter
 //! - `mossformer2` feature: ClearerVoice MossFormer2 48 kHz ONNX adapter
@@ -34,6 +35,8 @@
 //!
 //! Build with all backends: `cargo build --release --features full`
 
+#[cfg(feature = "aec")]
+pub mod acoustic_echo;
 pub mod atomic_output;
 pub mod audio;
 pub mod automation;
@@ -88,6 +91,15 @@ pub mod vad;
 pub mod watch;
 pub mod window;
 
+#[cfg(feature = "aec")]
+pub use acoustic_echo::{
+    estimate_aec_memory_bytes, sign_aec_promotion_evidence, AecBlockDiagnostics, AecClockMapping,
+    AecConfig, AecDelayEstimate, AecEvidenceMetric, AecEvidenceMetricOperator, AecEvidenceStratum,
+    AecEvidenceStratumKind, AecPromotionEvidencePayload, AecRealtimeAdapter,
+    AecRealtimeDiagnostics, AecRenderReport, AecRenderResult, AecResetCounts, AecResetReason,
+    AecSession, AecStream, AecTalkState, SignedAecPromotionEvidence, AEC_PROMOTION_EVIDENCE_SCHEMA,
+    AEC_REPORT_SCHEMA, AEC_SCHEMA_VERSION,
+};
 pub use atomic_output::{AtomicOutput, CommitMode};
 pub use audio::{
     ensure_memory_limit, estimate_audio_memory_bytes, estimate_audio_working_set_bytes,

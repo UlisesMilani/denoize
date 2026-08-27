@@ -67,6 +67,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" target-speaker --help
   echo '```'
   echo
+  echo '## Fail-closed acoustic echo cancellation'
+  echo
+  echo '```text'
+  "$binary" aec --help
+  echo '```'
+  echo
   echo '## Watch-folder automation'
   echo
   echo '```text'

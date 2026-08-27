@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-aec-report-v1.schema.json",
+  "title": "denoize acoustic echo cancellation report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "implementation",
+    "configuration_sha256",
+    "evidence_signing_key_id",
+    "evidence_evaluation_result_sha256",
+    "microphone_pcm_sha256",
+    "reference_pcm_sha256",
+    "output_pcm_sha256",
+    "microphone_frames",
+    "reference_frames",
+    "output_frames",
+    "microphone_sample_rate",
+    "reference_sample_rate",
+    "reference_clock_ppm",
+    "route_generation",
+    "delay",
+    "block_size_samples",
+    "tail_samples",
+    "maximum_delay_samples",
+    "algorithmic_plus_buffering_milliseconds",
+    "silence_blocks",
+    "far_end_only_blocks",
+    "near_end_only_blocks",
+    "double_talk_blocks",
+    "reference_uncertain_blocks",
+    "adaptation_blocks",
+    "reset_count",
+    "reset_reasons",
+    "clipped_samples",
+    "non_finite_output_samples",
+    "far_end_erle_db",
+    "exact_output_duration",
+    "paths_recorded",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-aec-report-v1" },
+    "schema_version": { "const": 1 },
+    "implementation": { "const": "native-pfdnlms-v1" },
+    "configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "evidence_signing_key_id": { "$ref": "#/$defs/sha256" },
+    "evidence_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+    "microphone_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "reference_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "output_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "microphone_frames": { "type": "integer", "minimum": 1, "maximum": 691200000 },
+    "reference_frames": { "type": "integer", "minimum": 0, "maximum": 691200000 },
+    "output_frames": { "type": "integer", "minimum": 1, "maximum": 691200000 },
+    "microphone_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "reference_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "reference_clock_ppm": { "type": "number", "minimum": -2000, "maximum": 2000 },
+    "route_generation": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "delay": { "$ref": "#/$defs/delay" },
+    "block_size_samples": { "type": "integer", "minimum": 64, "maximum": 4096 },
+    "tail_samples": { "type": "integer", "minimum": 64, "maximum": 384000 },
+    "maximum_delay_samples": { "type": "integer", "minimum": 0, "maximum": 384000 },
+    "algorithmic_plus_buffering_milliseconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 20 },
+    "silence_blocks": { "$ref": "#/$defs/count" },
+    "far_end_only_blocks": { "$ref": "#/$defs/count" },
+    "near_end_only_blocks": { "$ref": "#/$defs/count" },
+    "double_talk_blocks": { "$ref": "#/$defs/count" },
+    "reference_uncertain_blocks": { "$ref": "#/$defs/count" },
+    "adaptation_blocks": { "$ref": "#/$defs/count" },
+    "reset_count": { "$ref": "#/$defs/count" },
+    "reset_reasons": { "$ref": "#/$defs/reset_reasons" },
+    "clipped_samples": { "$ref": "#/$defs/count" },
+    "non_finite_output_samples": { "const": 0 },
+    "far_end_erle_db": {
+      "oneOf": [
+        { "type": "number", "minimum": -240, "maximum": 240 },
+        { "type": "null" }
+      ]
+    },
+    "exact_output_duration": { "const": true },
+    "paths_recorded": { "const": 0 },
+    "limitations": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "reset_reasons": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initial", "route_change", "reference_discontinuity", "clock_jump", "delay_jump", "non_finite_state"],
+      "properties": {
+        "initial": { "$ref": "#/$defs/count" },
+        "route_change": { "$ref": "#/$defs/count" },
+        "reference_discontinuity": { "$ref": "#/$defs/count" },
+        "clock_jump": { "$ref": "#/$defs/count" },
+        "delay_jump": { "$ref": "#/$defs/count" },
+        "non_finite_state": { "$ref": "#/$defs/count" }
+      }
+    },
+    "delay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signed_delay_samples", "confidence", "polarity_inverted", "analyzed_samples"],
+      "properties": {
+        "signed_delay_samples": { "type": "integer", "minimum": -384000, "maximum": 384000 },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "polarity_inverted": { "type": "boolean" },
+        "analyzed_samples": { "type": "integer", "minimum": 0, "maximum": 1920000 }
+      }
+    }
+  }
+}
