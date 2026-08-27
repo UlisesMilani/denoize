@@ -1,3 +1,22 @@
+diff --git a/cmake/shared_prologue.cmake b/cmake/shared_prologue.cmake
+--- a/cmake/shared_prologue.cmake
++++ b/cmake/shared_prologue.cmake
+@@ -306,11 +306,10 @@ function(macos_include_clap_in_bundle)
+ 
+     if (NOT ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} STREQUAL "")
+         message(STATUS "clap-wrapper: including embedded clap in target ${MBC_TARGET}")
+         add_custom_command(TARGET ${MBC_TARGET} PRE_BUILD
+-                WORKING_DIRECTORY $<TARGET_PROPERTY:${MBC_TARGET},LIBRARY_OUTPUT_DIRECTORY>
+-                COMMAND ${CMAKE_COMMAND} -E echo "Installing ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} in $<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.$<TARGET_PROPERTY:${MBC_TARGET},BUNDLE_EXTENSION>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
+-                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.$<TARGET_PROPERTY:${MBC_TARGET},BUNDLE_EXTENSION>/Contents/PlugIns"
+-                COMMAND ${CMAKE_COMMAND} -E copy_directory ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} "$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.$<TARGET_PROPERTY:${MBC_TARGET},BUNDLE_EXTENSION>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
++                COMMAND ${CMAKE_COMMAND} -E echo "Installing ${MBC_MACOS_EMBEDDED_CLAP_LOCATION} in $<TARGET_BUNDLE_DIR:${MBC_TARGET}>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
++                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:${MBC_TARGET}>/Contents/PlugIns"
++                COMMAND ${CMAKE_COMMAND} -E copy_directory "${MBC_MACOS_EMBEDDED_CLAP_LOCATION}" "$<TARGET_BUNDLE_DIR:${MBC_TARGET}>/Contents/PlugIns/$<TARGET_PROPERTY:${MBC_TARGET},MACOSX_BUNDLE_BUNDLE_NAME>.clap"
+                 )
+     endif ()
+ endfunction(macos_include_clap_in_bundle)
+
 diff --git a/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm b/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm
 index 6581e27..95f5ae1 100644
 --- a/src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm
