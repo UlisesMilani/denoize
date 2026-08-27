@@ -1,6 +1,6 @@
 # Restoration platform research review
 
-Research cut-off: 2026-08-26. This review turns papers and format specifications
+Research cut-off: 2026-08-27. This review turns papers and format specifications
 into denoize implementation decisions. A paper result is evidence for a
 candidate, not permission to distribute its code, checkpoint, or training
 material; all three license layers are audited independently before a managed
@@ -19,6 +19,8 @@ model can ship.
 | 31 | Spatial | WPE + mask-estimated MVDR baseline, then geometry-aware streaming neural model | Geometry errors and ordinary stereo must be distinguishable before neural beamforming | Array permutation/geometry mismatch, moving source, diffuse noise, stereo bypass |
 | 32 | Project v2 | Immutable source graph, rational timeline, tracks/buses/effects/automation, content-addressed render cache | Processing semantics should stabilize before becoming durable project data | Deterministic render, portable relink, crash recovery, undo/redo property tests |
 | 33 | SDKs | Versioned C ABI first, then finite WASM, AudioWorklet, mobile wrappers, and optional Web Audio Module packaging | ABI stability depends on the runtime, timeline, and error model above | ABI checker, ownership/thread rules, negotiated browser render-quantum deadline, mobile lifecycle |
+| 34 | Meeting speaker tracks | Bounded anonymous CSS/diarization with an explicit residual | Builds on consent, array, timeline, and SDK contracts without conflating audio tracks with transcription or identity | Unknown/overlap/speaker-count calibration, permutation continuity, privacy, licensed real-meeting evidence |
+| 35 | Music/general-audio restoration | Finished-mixture codec repair and bandwidth extension before dry-stem estimation | Music needs phase, transient, stereo, instrument, genre, and mastering-intent protections that speech gates omit | Exact model/data/license BOM, clean bypass, full-song and professional-listening evidence |
 
 The key product decision is to separate “sounds better” from “faithfully
 restored.” Deterministic repair and discriminative neural output are defaults.
@@ -1011,15 +1013,15 @@ not substitute for named physical-device latency evidence.
 
 ## Post-roadmap implementation and research watchlist
 
-Stage 34 now has a bounded product contract while its concrete neural artifacts
-remain gated. The later capabilities have product value, but are deliberately
-excluded from the current implementation commitment until their stated
+Stages 34 and 35 now have bounded product contracts while concrete neural
+artifacts remain gated. Later capabilities have product value, but are
+deliberately excluded from the implementation commitment until their stated
 promotion conditions hold.
 
 | Candidate order | Capability | Current decision | Promotion condition |
 |---:|---|---|---|
 | 34 | Meeting speaker tracks | Implemented as the v0.87.0 bounded anonymous baseline after Stages 29, 31, and 32 | Any concrete checkpoint still requires licensed real-meeting evidence, stable speaker-count/overlap uncertainty, and its complete redistribution chain |
-| 35 | Music/general-audio restoration | Add mixture-preserving repair first; keep dry-stem estimation opt-in | Redistributable exact checkpoint/data chain plus stereo, transient, timbre, genre, and listening gates |
+| 35 | Music/general-audio restoration | Implemented for v0.88.0 as task-bound finished-mixture codec/bandwidth candidate rendering; dry stems remain separate and opt-in | Any concrete checkpoint still requires a redistributable exact dependency/data chain plus phase, stereo, transient, clean-bypass, full-song, instrument, genre, and listening evidence |
 | watch | Semantic target-sound extraction | Research adapter only | Closed query semantics, target-absence calibration, residual conservation, distributable weights/data, and real-time evidence |
 | watch | Audio-visual target extraction | Do not schedule yet | Explicit camera/face consent, sync, occlusion/spoofing, biometric retention, and audio-only failure policy |
 
@@ -1081,42 +1083,90 @@ speaker-count, tcpWER, listening, and privacy gates. No checkpoint or meeting
 corpus is bundled; an operator-supplied graph remains blocked until that exact
 artifact clears the signed evidence contract.
 
-### Music and general-audio restoration
+### Stage 35 — music and general-audio restoration
 
-This is the clearest post-roadmap candidate. Speech restoration metrics do not
-cover timbre, stereo image, percussion, or mastering intent. The inaugural
-Music Source Restoration task formalizes recovery of dry instrument stems from
-mixtures affected by EQ, compression, distortion, reverb, and codecs, and its
-2026 challenge reports large per-instrument differences and a subjective test
-alongside Multi-Mel-SNR, Zimtohrli, and FAD-CLAP
-([task paper](https://arxiv.org/abs/2505.21827),
-[challenge summary](https://arxiv.org/abs/2601.04343)). A future track should
-first offer mixture-preserving codec/bandwidth repair, then explicitly requested
-stem restoration; it must never represent an estimated dry stem as recovered
-ground truth.
+#### Evidence from papers and benchmarks
 
-The 2026 winner used sequential BS-RoFormer separation, dereverberation, and
-denoising and led both objective and subjective rankings
-([challenge results](https://msrchallenge.com/),
-[system paper](https://arxiv.org/abs/2602.09042)). Its
-[implementation](https://github.com/ModistAndrew/xlance-msr) is MIT-licensed and
-publishes checkpoint links, making it the first candidate to audit. It is not
-yet a shippable denoize package: inherited separation checkpoints and every
-MoisesDB/RawStems training item still need an artifact-level redistribution
-chain, and source-code MIT metadata alone does not settle those layers.
+Speech restoration metrics do not protect timbre, stereo image, percussion, or
+mastering intent. The inaugural
+[Music Source Restoration paper](https://arxiv.org/abs/2505.21827) introduces
+RawStems with 578 songs and 354.13 hours across eight primary and seventeen
+secondary instrument groups, and models EQ, dynamics compression, distortion,
+reverberation, and lossy codecs. Its dry-stem objective is broader than the
+first safe denoize operation; an estimated stem must never be represented as
+recovered ground truth.
 
-Apollo is a practical band-split reference for compressed 44.1 kHz music
-([Li and Luo, ICASSP 2025](https://arxiv.org/abs/2409.08514)). A2SB demonstrates
-long-form bandwidth extension and inpainting, but its code and weights are
-non-commercial and therefore cannot ship in denoize
-([official repository](https://github.com/NVIDIA/diffusion-audio-restoration)).
-SonicMaster adds prompt-controlled all-in-one restoration/mastering and an
-Apache-2.0 code repository, but it is generative and restoration intent is
-entangled with creative mastering
-([official repository](https://github.com/AMAAI-Lab/SonicMaster)). Promotion
-requires redistributable exact weights and datasets, stereo/full-song tests,
-clean-bypass and transient/timbre gates, and blinded evaluation by instrument
-and genre.
+The [2026 challenge summary](https://arxiv.org/abs/2601.04343) describes an
+eight-stem task and MSRBench: 2,000 stereo, 48 kHz, ten-second clips across
+thirteen degradation conditions, assessed with Multi-Mel-SNR, Zimtohrli,
+FAD-CLAP, and professional-engineer MOS. The winning system reached 4.46 dB
+overall Multi-Mel-SNR and 3.47 MOS, but instrument results varied sharply: its
+reported bass average was 4.59 dB while percussion was 0.29 dB. Aggregate
+improvement therefore cannot stand in for per-instrument/transient gates. The
+[MSRBench metric analysis](https://arxiv.org/abs/2510.10995) further finds that
+phase errors can make SI-SNR misleading and argues for phase-aware,
+instrument-specific evaluation.
+
+The winning pipeline applies BS-RoFormer separation, denoising, and
+dereverberation sequentially
+([system paper](https://arxiv.org/abs/2602.09042)). That result supports a
+modular comparison, but it does not establish that every inherited checkpoint
+or training item can be redistributed. Data quality and stem alignment are
+also material variables rather than implementation details.
+
+#### Immutable artifact and license audit
+
+The audit below separates repository code, published checkpoints, inherited
+dependencies, and training/evaluation data. “Not bundled” is a product decision,
+not a claim that upstream use under its own terms is improper.
+
+| Candidate | Audited identity | Technical value | Distribution decision |
+|---|---|---|---|
+| [Official MSR baseline](https://github.com/yongyizang/music-source-restoration) | source `ff5facb6bfb5e897e29afda985d9fcdfd33ecb3c`; Apache-2.0 repository; published baseline card revision `e3d2e56b96ff861468492a0eac1b7694edb83a9d` also declares Apache-2.0 | Reproducible task baseline and degradation/evaluation reference; upstream explicitly does not present it as production restoration | Useful evaluator/reference only; checkpoint and every training-data term remain separately operator-audited |
+| [MSRKit](https://github.com/yongyizang/MSRKit) | source `70b715d9f543993d458a6f5fa1600c8b9b2b1c35`; MIT | Official-style metric/degradation tooling | Tooling reference; MSRBench revision `1b7087548d99cda8cec39be8525532bf67cce2af` and the challenge test set are CC-BY-NC-4.0 and cannot become redistributable commercial training assets |
+| [X-LANCE MSR winner](https://github.com/ModistAndrew/xlance-msr) | source `7f55df1f84b127aaa27f57f9436538529ad09643`; MIT; checkpoint-card revision `c275b1fda995b98fc061ce571327f91b2ca666a2` declares MIT | Best reported challenge pipeline and a strong modular comparison | Do not bundle: the system card identifies inherited gated BS-RoFormer assets, a GPL-3.0 dereverberation dependency, additional pretrained checkpoints, MoisesDB, and RawStems; a top-level MIT label does not close that combined chain |
+| [Apollo](https://github.com/JusperLee/Apollo) | source `e84bcacc59d5455f05d86a5c97dd4aeb3c14dbb6`; GitHub reports no SPDX license while the README states CC-BY-SA-4.0 | Band-split, high-frequency-aware 44.1 kHz codec restoration ([paper](https://arxiv.org/abs/2409.08514)) | Architecture reference only; weight rights and the MUSDB/Moises training chain are not closed for a denoize release package |
+| [A2SB](https://github.com/NVIDIA/diffusion-audio-restoration) | source `02ddff01c4dbbe20839e13e09da1988db7dd4be9`; custom NVIDIA source/model terms are non-commercial | 44.1 kHz mono long-form bandwidth extension and inpainting ([paper](https://arxiv.org/abs/2501.11311)) | Explicitly not shippable in a commercial-capable denoize release; stereo is also listed as future work |
+| [SonicMaster](https://github.com/AMAAI-Lab/SonicMaster) | source `c4c0869c14bada6c5cb7d3decbcdc00e6a3050f5`; Apache-2.0 code; model-card revision `9e2721cd1b71dd56fd8c016e8a6f4cb6d34861b1` declares Apache-2.0; published dataset declares CC-BY-2.0 | Prompt-controlled generative restoration/mastering ([paper](https://arxiv.org/abs/2508.03448)) | Keep outside automatic restoration: inference inherits the Stability AI Community License through `stable-audio-open-1.0`, and restoration is entangled with creative mastering |
+
+Shortened revisions above are human-readable summaries; any promotion evidence
+must record complete immutable revisions and SHA-256 identities. Mutable model
+cards or repository license badges are never the release authority.
+
+#### Implemented v0.88.0 boundary
+
+The first operation preserves one complete mono or stereo mixture and supports
+only `codec-repair` or `bandwidth-extension`. A dedicated finite package-v2
+adapter accepts `[1,C,W]` audio and returns same-geometry candidate audio plus
+ordered `bypass`/`uncertain`/`apply` probabilities. Fixed dimensions, channel
+roles, sample/window/hop/state clocks, graph and vectors, resource profile,
+full package/source/checkpoint/training-data BOM, licenses, and accelerator are
+authenticated before program audio is opened.
+
+Only consecutive high-confidence apply frames receive the model delta. Clean
+and uncertain frames get zero correction. The source-rate result must preserve
+duration/channels/rate, finite values, peak and correction ceilings, stereo
+correlation, and Mid/Side energy ratio. The API returns a correction residual
+and verifies exact in-memory recombination; the CLI requires candidate WAV,
+correction WAV, and a path-free report, stages all three, and publishes the
+candidate last. The report explicitly states candidate-only, no recovered
+ground-truth claim, no dry stems, no creative mastering, and no network access.
+
+Signed promotion evidence fixes twelve strata: AAC/MP3 64 kb/s, neural and
+unseen codecs, clean bypass, wideband reference, mono, stereo image,
+phase-critical audio, percussion transients, long form, and unseen genre.
+Stratum gates cover Multi-Mel-SNR, Zimtohrli, FAD-CLAP, low-band SNR, transient
+loss, stereo correlation, phase, duration, clipping, and finite output. Global
+coverage requires 1,000 paired clips, 50 full songs, eight instruments, eight
+genres, clean/mono/stereo coverage, 20 listeners, exact license manifests, and
+zero redistributed restricted artifacts.
+
+No audited candidate above clears that complete combined boundary, so v0.88.0
+bundles no weights and makes no upstream quality claim. Dry-stem restoration
+remains a separately named, opt-in future operation requiring residual/
+conservation semantics, alignment checks, phase-aware and per-instrument gates,
+and its own redistributable dependency and dataset chain. See
+[the product contract](music-restoration.md).
 
 ### Semantic target-sound extraction
 

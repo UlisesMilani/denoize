@@ -95,6 +95,9 @@ jobs:
       - name: Validate meeting speaker-track JSON contracts
         run: python3 scripts/test-meeting-speaker-schemas.py
 
+      - name: Validate music-restoration JSON contracts
+        run: python3 scripts/test-music-restoration-schemas.py
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -154,6 +157,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-meeting-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-meeting-speaker-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-music-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-music-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/test-lv2-host-evidence.py", "exec")'
@@ -1219,6 +1223,8 @@ jobs:
           meeting_speaker_promotion_evidence_schema="$asset_dir/denoize-meeting-speaker-promotion-evidence-v1.schema.json"
           meeting_speaker_report_schema="$asset_dir/denoize-meeting-speaker-report-v1.schema.json"
           meeting_track_labels_schema="$asset_dir/denoize-meeting-track-labels-v1.schema.json"
+          music_restoration_promotion_evidence_schema="$asset_dir/denoize-music-restoration-promotion-evidence-v1.schema.json"
+          music_restoration_report_schema="$asset_dir/denoize-music-restoration-report-v1.schema.json"
           sdk_abi_schema="$asset_dir/denoize-sdk-abi-v1.schema.json"
           sdk_capabilities_schema="$asset_dir/denoize-sdk-capabilities-v1.schema.json"
           mobile_lifecycle_schema="$asset_dir/denoize-mobile-lifecycle-v1.schema.json"
@@ -1290,6 +1296,8 @@ jobs:
           cp schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json "$meeting_speaker_promotion_evidence_schema"
           cp schemas/denoize-meeting-speaker-report-v1.schema.json "$meeting_speaker_report_schema"
           cp schemas/denoize-meeting-track-labels-v1.schema.json "$meeting_track_labels_schema"
+          cp schemas/denoize-music-restoration-promotion-evidence-v1.schema.json "$music_restoration_promotion_evidence_schema"
+          cp schemas/denoize-music-restoration-report-v1.schema.json "$music_restoration_report_schema"
           cp schemas/denoize-sdk-abi-v1.schema.json "$sdk_abi_schema"
           cp schemas/denoize-sdk-capabilities-v1.schema.json "$sdk_capabilities_schema"
           cp schemas/denoize-mobile-lifecycle-v1.schema.json "$mobile_lifecycle_schema"
@@ -1522,7 +1530,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.85.0 0.86.0)
+          rollback_versions=(0.86.0 0.87.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

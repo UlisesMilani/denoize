@@ -190,7 +190,7 @@ class ApplicationUpdateManifestTests(unittest.TestCase):
 
         update = job_block("application-update")
         self.assertIn("needs: release-evidence", update)
-        self.assertIn("rollback_versions=(0.85.0 0.86.0)", update)
+        self.assertIn("rollback_versions=(0.86.0 0.87.0)", update)
         self.assertIn("assemble-application-update.py", update)
         self.assertIn("denoize update bundle build", update)
         self.assertIn("subject-checksums:", update)

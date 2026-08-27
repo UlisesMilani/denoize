@@ -415,6 +415,7 @@ USAGE:
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction CORRECTION.wav --report REPORT.json --task TASK --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config CONFIG --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
@@ -6895,6 +6896,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("meeting-speakers") {
         return run_meeting_speakers(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("music-restore") {
+        return run_music_restoration(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("aec") {
         return run_aec(&args[1..]);
     }
@@ -10251,6 +10255,579 @@ mod meeting_speaker_cli_tests {
         let mut lossy = base.to_vec();
         lossy[1] = "tracks.mp3";
         assert!(parse_meeting_speaker_args(&arguments(&lossy)).is_err());
+    }
+}
+
+fn music_restoration_usage() -> &'static str {
+    "\
+USAGE:
+    denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction <CORRECTION.wav> --report <REPORT.json> --task <codec-repair|bandwidth-extension> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize music-restore evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Render a bounded restoration candidate for one complete mono or stereo music
+mixture. This operation repairs codec damage or extends bandwidth; it never
+claims recovered ground truth, estimates dry stems, or applies creative
+mastering. Confidently clean and uncertain frames remain unchanged. The
+candidate, exact in-memory correction residual, and path-free audit report are
+all required publication artifacts. Only authenticated package-v2 models with
+accepted, task-matched promotion evidence may process audio.
+
+OPTIONS:
+        --correction <PATH.wav>                    required float32 correction residual
+        --report <PATH.json>                       required closed path-free audit report
+        --task <NAME>                              codec-repair|bandwidth-extension (required)
+        --model-package <PATH>                     required signed runtime package v2
+        --model-package-key <PATH>                 trusted Minisign public key
+        --promotion-evidence <PATH>                accepted signed restoration evidence
+        --promotion-evidence-key <PATH>            trusted Ed25519 evidence public key
+        --minimum-apply-probability <F>            apply threshold, 0.5..1 (default: 0.8)
+        --minimum-bypass-probability <F>           clean-bypass threshold, 0.5..1 (default: 0.8)
+        --minimum-apply-frames <N>                 consecutive frames needed to apply, 1..100 (default: 2)
+        --maximum-output-peak <F>                  candidate absolute peak, 0.5..1 (default: 1)
+        --maximum-absolute-correction <F>          per-sample correction limit, 0.01..1 (default: 0.5)
+        --maximum-stereo-correlation-delta <F>     stereo correlation change, 0..0.25 (default: 0.05)
+        --maximum-mid-side-ratio-delta-db <F>      mid/side energy change, 0..6 dB (default: 1.5)
+        --accelerator <NAME>                       cpu|auto|gpu|metal|cuda (default: cpu)
+        --max-memory <MB>                          bound decode, model, candidate, and residual memory
+        --replace                                  atomically replace all three destinations
+        --json                                     emit compact report JSON
+        --pretty                                   emit indented report JSON
+    -h, --help                                     show this help
+"
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+#[derive(Debug)]
+struct MusicRestorationCliOptions {
+    input: String,
+    output: String,
+    correction: String,
+    report: String,
+    package: String,
+    package_key: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    config: denoize::MusicRestorationConfig,
+    accelerator: AcceleratorPreference,
+    max_memory_mb: Option<usize>,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_music_restoration_task(value: &str) -> Result<denoize::MusicRestorationTask, String> {
+    match value {
+        "codec-repair" => Ok(denoize::MusicRestorationTask::CodecRepair),
+        "bandwidth-extension" => Ok(denoize::MusicRestorationTask::BandwidthExtension),
+        _ => Err(format!(
+            "unknown music-restoration task: {value} (expected codec-repair or bandwidth-extension)"
+        )),
+    }
+}
+
+fn parse_music_restoration_args(args: &[String]) -> Result<MusicRestorationCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut correction = None;
+    let mut report = None;
+    let mut task = None;
+    let mut package = None;
+    let mut package_key = None;
+    let mut promotion_evidence = None;
+    let mut promotion_evidence_key = None;
+    let mut config = denoize::MusicRestorationConfig::default();
+    let mut accelerator = AcceleratorPreference::Cpu;
+    let mut accelerator_seen = false;
+    let mut max_memory_mb = None;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut scalar_options = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--minimum-apply-probability"
+                | "--minimum-bypass-probability"
+                | "--minimum-apply-frames"
+                | "--maximum-output-peak"
+                | "--maximum-absolute-correction"
+                | "--maximum-stereo-correlation-delta"
+                | "--maximum-mid-side-ratio-delta-db"
+        ) && !scalar_options.insert(argument)
+        {
+            return Err(format!("{argument} may be supplied only once"));
+        }
+        match argument {
+            "--correction" if correction.is_none() => {
+                correction = Some(parse_value(args, &mut index, "--correction")?);
+            }
+            "--correction" => return Err("--correction may be supplied only once".into()),
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--task" if task.is_none() => {
+                let value: String = parse_value(args, &mut index, "--task")?;
+                task = Some(parse_music_restoration_task(&value)?);
+            }
+            "--task" => return Err("--task may be supplied only once".into()),
+            "--model-package" if package.is_none() => {
+                package = Some(parse_value(args, &mut index, "--model-package")?);
+            }
+            "--model-package" => return Err("--model-package may be supplied only once".into()),
+            "--model-package-key" if package_key.is_none() => {
+                package_key = Some(parse_value(args, &mut index, "--model-package-key")?);
+            }
+            "--model-package-key" => {
+                return Err("--model-package-key may be supplied only once".into());
+            }
+            "--promotion-evidence" if promotion_evidence.is_none() => {
+                promotion_evidence = Some(parse_value(args, &mut index, "--promotion-evidence")?);
+            }
+            "--promotion-evidence" => {
+                return Err("--promotion-evidence may be supplied only once".into());
+            }
+            "--promotion-evidence-key" if promotion_evidence_key.is_none() => {
+                promotion_evidence_key =
+                    Some(parse_value(args, &mut index, "--promotion-evidence-key")?);
+            }
+            "--promotion-evidence-key" => {
+                return Err("--promotion-evidence-key may be supplied only once".into());
+            }
+            "--minimum-apply-probability" => {
+                config.minimum_apply_probability =
+                    parse_value(args, &mut index, "--minimum-apply-probability")?;
+            }
+            "--minimum-bypass-probability" => {
+                config.minimum_bypass_probability =
+                    parse_value(args, &mut index, "--minimum-bypass-probability")?;
+            }
+            "--minimum-apply-frames" => {
+                config.minimum_apply_frames =
+                    parse_value(args, &mut index, "--minimum-apply-frames")?;
+            }
+            "--maximum-output-peak" => {
+                config.maximum_output_peak =
+                    parse_value(args, &mut index, "--maximum-output-peak")?;
+            }
+            "--maximum-absolute-correction" => {
+                config.maximum_absolute_correction =
+                    parse_value(args, &mut index, "--maximum-absolute-correction")?;
+            }
+            "--maximum-stereo-correlation-delta" => {
+                config.maximum_stereo_correlation_delta =
+                    parse_value(args, &mut index, "--maximum-stereo-correlation-delta")?;
+            }
+            "--maximum-mid-side-ratio-delta-db" => {
+                config.maximum_mid_side_energy_ratio_delta_db =
+                    parse_value(args, &mut index, "--maximum-mid-side-ratio-delta-db")?;
+            }
+            "--accelerator" if !accelerator_seen => {
+                accelerator_seen = true;
+                let value: String = parse_value(args, &mut index, "--accelerator")?;
+                accelerator = AcceleratorPreference::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown music-restoration accelerator: {value} (expected cpu, auto, gpu, metal, or cuda)"
+                    )
+                })?;
+            }
+            "--accelerator" => return Err("--accelerator may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("music-restore accepts only one of --json or --pretty".into());
+            }
+            "-h" | "--help" => return Err("music-restore help requested".into()),
+            "-" => {
+                return Err(
+                    "music-restore requires regular-file paths; stdin/stdout are unsupported"
+                        .into(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown music-restore option: {value}"));
+            }
+            value => {
+                if positional.len() == 2 {
+                    return Err(format!("unexpected extra music-restore argument: {value}"));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let input = positional
+        .first()
+        .cloned()
+        .ok_or("music-restore requires PROGRAM")?;
+    let output = positional
+        .get(1)
+        .cloned()
+        .ok_or("music-restore requires CANDIDATE.wav")?;
+    let correction = correction.ok_or("music-restore requires --correction")?;
+    let report = report.ok_or("music-restore requires --report")?;
+    let task = task.ok_or("music-restore requires --task")?;
+    for (path, context) in [(&output, "candidate"), (&correction, "correction residual")] {
+        if OutputFormat::from_path(std::path::Path::new(path))? != OutputFormat::Wav {
+            return Err(format!(
+                "music-restore {context} output must be WAV to avoid lossy encoding"
+            ));
+        }
+    }
+    if std::path::Path::new(&report)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        != Some("json")
+    {
+        return Err("music-restore report must use a .json extension".into());
+    }
+    config.task = task;
+    let package = package.ok_or("music-restore requires --model-package")?;
+    let package_key = package_key.ok_or("music-restore requires --model-package-key")?;
+    let promotion_evidence =
+        promotion_evidence.ok_or("music-restore requires --promotion-evidence")?;
+    let promotion_evidence_key =
+        promotion_evidence_key.ok_or("music-restore requires --promotion-evidence-key")?;
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    config.validate()?;
+    Ok(MusicRestorationCliOptions {
+        input,
+        output,
+        correction,
+        report,
+        package,
+        package_key,
+        promotion_evidence,
+        promotion_evidence_key,
+        config,
+        accelerator,
+        max_memory_mb,
+        commit_mode,
+        print_mode,
+    })
+}
+
+fn run_music_restoration(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", music_restoration_usage());
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("evidence") {
+        return run_music_restoration_evidence(&args[1..]);
+    }
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        return Err("music-restore --help accepts no other arguments".into());
+    }
+    let options = parse_music_restoration_args(args)?;
+    validate_music_restoration_publication_paths(&options)?;
+    run_music_restoration_audio(options)
+}
+
+fn run_music_restoration_evidence(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err(
+            "music-restoration evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]"
+                .into(),
+        );
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err(
+                    "music-restoration evidence verify accepts only one output mode".into(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!(
+                    "unknown music-restoration evidence option: {value}"
+                ));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(
+            "music-restoration evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into(),
+        );
+    }
+    let evidence = denoize::SignedMusicRestorationPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence)
+                .map_err(|error| format!("serialize music-restoration evidence: {error}"))?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified music-restoration evidence: task={:?} strata={} paired_clips={} full_tracks={} listeners={} restricted_artifacts={} accepted={}",
+            evidence.payload.task,
+            evidence.payload.strata.len(),
+            evidence.payload.paired_clips,
+            evidence.payload.full_length_tracks,
+            evidence.payload.listener_count,
+            evidence.payload.redistributed_restricted_artifacts,
+            evidence.payload.accepted,
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err(
+            "music-restoration evidence is authentic but does not pass promotion gates".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_music_restoration_publication_paths(
+    options: &MusicRestorationCliOptions,
+) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (options.input.as_str(), "music-restoration input"),
+        (options.package.as_str(), "music-restoration package"),
+        (
+            options.package_key.as_str(),
+            "music-restoration package key",
+        ),
+        (
+            options.promotion_evidence.as_str(),
+            "music-restoration evidence",
+        ),
+        (
+            options.promotion_evidence_key.as_str(),
+            "music-restoration evidence key",
+        ),
+    ] {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (options.output.as_str(), "music-restoration candidate"),
+        (
+            options.correction.as_str(),
+            "music-restoration correction residual",
+        ),
+        (options.report.as_str(), "music-restoration report"),
+    ] {
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace an input, package, key, or evidence document"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "onnx")]
+fn run_music_restoration_audio(options: MusicRestorationCliOptions) -> Result<(), String> {
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let evidence =
+        denoize::SignedMusicRestorationPromotionEvidence::from_file(&options.promotion_evidence)?;
+    let evidence_key = ReceiptPublicKey::from_file(&options.promotion_evidence_key)?;
+    let package = RuntimeModelPackage::open(&options.package, &options.package_key)?;
+    // Authenticate the package, graph, numerical vectors, evaluation evidence,
+    // task, configuration, and accelerator before opening user-controlled audio.
+    let session = denoize::MusicRestorationSession::prepare(
+        package,
+        &evidence,
+        &evidence_key,
+        &options.config,
+        options.accelerator,
+    )?;
+    let model_working_set = session.model_working_set_bytes()?;
+    ensure_memory_limit(
+        model_working_set,
+        options.max_memory_mb,
+        "music-restoration model working set",
+    )?;
+    let mut input_session = AudioInputSession::open(&options.input)?;
+    let session_memory = estimate_session_memory_bytes(&input_session);
+    ensure_memory_limit(
+        model_working_set.saturating_add(session_memory),
+        options.max_memory_mb,
+        "music-restoration input/model preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(model_working_set)
+            .saturating_sub(session_memory)
+    });
+    let input = read_audio_from_session_with_limits(
+        &mut input_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let working_set = session
+        .processing_working_set_bytes(&input)?
+        .saturating_add(model_working_set)
+        .saturating_add(session_memory);
+    ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "music-restoration decoded/model/candidate/residual working set",
+    )?;
+    let result = session.restore(&input, &options.config)?;
+    let encode_options = EncodeOptions::default();
+    OutputFormat::Wav.validate_config(&result.output, &encode_options)?;
+    OutputFormat::Wav.validate_config(&result.correction, &encode_options)?;
+
+    // Finish every potentially fallible encode before publishing any artifact.
+    let mut staged_candidate = AtomicOutput::new(&options.output)?;
+    denoize::encode::write_audio_to_file(
+        staged_candidate.file_mut(),
+        OutputFormat::Wav,
+        &result.output,
+        encode_options,
+    )?;
+    let mut staged_correction = AtomicOutput::new(&options.correction)?;
+    denoize::encode::write_audio_to_file(
+        staged_correction.file_mut(),
+        OutputFormat::Wav,
+        &result.correction,
+        encode_options,
+    )?;
+    let staged_report = stage_restoration_json(&options.report, &result.report)?;
+
+    // Publish the candidate last: a partial multi-file commit may leave audit
+    // artifacts, but never an unaudited candidate without its residual/report.
+    staged_correction.commit(options.commit_mode)?;
+    staged_report.commit(options.commit_mode)?;
+    staged_candidate.commit(options.commit_mode)?;
+
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "music restoration: task={:?} channels={} frames={} applied_frames={} uncertain_frames={} changed_samples={} maximum_correction={:.6} package={}",
+            result.report.task,
+            result.report.source_channels,
+            result.report.source_frames,
+            result.report.applied_decision_frames,
+            result.report.uncertain_decision_frames,
+            result.report.changed_samples,
+            result.report.maximum_absolute_correction,
+            result.report.model.package_sha256,
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "onnx"))]
+fn run_music_restoration_audio(_options: MusicRestorationCliOptions) -> Result<(), String> {
+    Err("music restoration requires a build with the onnx feature".into())
+}
+
+#[cfg(test)]
+mod music_restoration_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn valid_arguments() -> Vec<String> {
+        arguments(&[
+            "program.wav",
+            "candidate.wav",
+            "--correction",
+            "correction.wav",
+            "--report",
+            "report.json",
+            "--task",
+            "codec-repair",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "evidence.pub.json",
+        ])
+    }
+
+    #[test]
+    fn parser_requires_every_audit_artifact_and_explicit_task() {
+        let error = parse_music_restoration_args(&arguments(&["program.wav", "candidate.wav"]))
+            .unwrap_err();
+        assert_eq!(error, "music-restore requires --correction");
+        let parsed = parse_music_restoration_args(&valid_arguments()).unwrap();
+        assert_eq!(
+            parsed.config.task,
+            denoize::MusicRestorationTask::CodecRepair
+        );
+        assert_eq!(parsed.config.minimum_apply_probability, 0.8);
+        assert_eq!(parsed.commit_mode, CommitMode::NoClobber);
+    }
+
+    #[test]
+    fn parser_rejects_lossy_residual_and_duplicate_thresholds() {
+        let mut lossy = valid_arguments();
+        let correction = lossy
+            .iter()
+            .position(|argument| argument == "correction.wav")
+            .unwrap();
+        lossy[correction] = "correction.mp3".into();
+        assert!(parse_music_restoration_args(&lossy).is_err());
+
+        let mut duplicate = valid_arguments();
+        duplicate.extend([
+            "--minimum-apply-probability".into(),
+            "0.8".into(),
+            "--minimum-apply-probability".into(),
+            "0.9".into(),
+        ]);
+        assert!(parse_music_restoration_args(&duplicate).is_err());
     }
 }
 
@@ -15954,7 +16531,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "71e6b2f5ed99ba7f2b26a02adbbf82ba596d4465eae0417c48885d655b8f26a9";
+        "8ec41a1a59650358841b18a8998ce7ef2789e15123a131c6d4bcfd7af0c0834d";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

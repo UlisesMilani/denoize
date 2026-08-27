@@ -245,6 +245,16 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   optionally binds an anonymous track to explicit consent and an accepted
   Stage 29 report while requiring that enrollment audio and speaker embeddings
   were not retained.
+- [`denoize-music-restoration-report-v1.schema.json`](../schemas/denoize-music-restoration-report-v1.schema.json)
+  describes a deterministic, path-free, candidate-only mono/stereo codec or
+  bandwidth repair with exact source/output clocks, decision regions, full
+  model/data/license BOM, correction identity, peak and stereo preservation
+  measurements, and explicit no-stem/no-mastering declarations.
+- [`denoize-music-restoration-promotion-evidence-v1.schema.json`](../schemas/denoize-music-restoration-promotion-evidence-v1.schema.json)
+  authenticates the task, exact package/configuration and artifact BOM,
+  training/evaluation license manifests, twelve codec/clean/phase/transient/
+  stereo/genre strata, full-song coverage, listening evidence, and zero
+  redistribution of restricted artifacts.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.

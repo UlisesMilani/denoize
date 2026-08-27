@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-music-restoration-report-v1.schema.json",
+  "title": "denoize bounded music-restoration candidate report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "task",
+    "configuration_sha256",
+    "network_accessed",
+    "deterministic",
+    "candidate_render",
+    "recovered_ground_truth_claimed",
+    "dry_stems_produced",
+    "creative_mastering_applied",
+    "model",
+    "promotion_evidence",
+    "source_sample_rate",
+    "source_channels",
+    "source_frames",
+    "output_sample_rate",
+    "output_channels",
+    "output_frames",
+    "model_sample_rate",
+    "model_channels",
+    "model_window_samples",
+    "model_hop_samples",
+    "model_state_frames_per_window",
+    "model_windows",
+    "decision_frames",
+    "applied_decision_frames",
+    "bypassed_decision_frames",
+    "uncertain_decision_frames",
+    "applied_source_samples",
+    "changed_samples",
+    "regions",
+    "input_pcm_sha256",
+    "output_pcm_sha256",
+    "correction_pcm_sha256",
+    "correction_recombination_maximum_absolute_error",
+    "maximum_absolute_correction",
+    "maximum_output_peak",
+    "input_stereo_correlation",
+    "output_stereo_correlation",
+    "stereo_correlation_delta",
+    "input_mid_side_energy_ratio_db",
+    "output_mid_side_energy_ratio_db",
+    "mid_side_energy_ratio_delta_db",
+    "exact_output_geometry",
+    "path_fields_recorded",
+    "limitations"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-music-restoration-report-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "task": { "$ref": "#/$defs/task" },
+    "configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "network_accessed": { "const": false },
+    "deterministic": { "const": true },
+    "candidate_render": { "const": true },
+    "recovered_ground_truth_claimed": { "const": false },
+    "dry_stems_produced": { "const": false },
+    "creative_mastering_applied": { "const": false },
+    "model": { "$ref": "#/$defs/model" },
+    "promotion_evidence": { "$ref": "#/$defs/evidence" },
+    "source_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "source_channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "source_frames": { "type": "integer", "minimum": 1, "maximum": 4147200000 },
+    "output_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "output_channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "output_frames": { "type": "integer", "minimum": 1, "maximum": 4147200000 },
+    "model_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "model_channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "model_window_samples": { "type": "integer", "minimum": 256, "maximum": 16777216 },
+    "model_hop_samples": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+    "model_state_frames_per_window": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+    "model_windows": { "type": "integer", "minimum": 1, "maximum": 500000 },
+    "decision_frames": { "$ref": "#/$defs/count" },
+    "applied_decision_frames": { "$ref": "#/$defs/count" },
+    "bypassed_decision_frames": { "$ref": "#/$defs/count" },
+    "uncertain_decision_frames": { "$ref": "#/$defs/count" },
+    "applied_source_samples": { "$ref": "#/$defs/count" },
+    "changed_samples": { "$ref": "#/$defs/count" },
+    "regions": {
+      "type": "array",
+      "maxItems": 500000,
+      "items": { "$ref": "#/$defs/region" }
+    },
+    "input_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "output_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "correction_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "correction_recombination_maximum_absolute_error": { "type": "number", "minimum": 0, "maximum": 1e-12 },
+    "maximum_absolute_correction": { "type": "number", "minimum": 0, "maximum": 1 },
+    "maximum_output_peak": { "type": "number", "minimum": 0, "maximum": 1 },
+    "input_stereo_correlation": { "$ref": "#/$defs/nullable_correlation" },
+    "output_stereo_correlation": { "$ref": "#/$defs/nullable_correlation" },
+    "stereo_correlation_delta": { "$ref": "#/$defs/nullable_correlation_delta" },
+    "input_mid_side_energy_ratio_db": { "$ref": "#/$defs/nullable_ratio" },
+    "output_mid_side_energy_ratio_db": { "$ref": "#/$defs/nullable_ratio" },
+    "mid_side_energy_ratio_delta_db": { "$ref": "#/$defs/nullable_ratio_delta" },
+    "exact_output_geometry": { "const": true },
+    "path_fields_recorded": { "const": 0 },
+    "limitations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/text512" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "task": { "enum": ["codec-repair", "bandwidth-extension"] },
+    "text256": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$" },
+    "text512": { "type": "string", "minLength": 1, "maxLength": 512, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$" },
+    "nullable_correlation": {
+      "anyOf": [
+        { "type": "number", "minimum": -1, "maximum": 1 },
+        { "type": "null" }
+      ]
+    },
+    "nullable_correlation_delta": {
+      "anyOf": [
+        { "type": "number", "minimum": 0, "maximum": 2 },
+        { "type": "null" }
+      ]
+    },
+    "nullable_ratio": {
+      "anyOf": [
+        { "type": "number", "minimum": -240, "maximum": 240 },
+        { "type": "null" }
+      ]
+    },
+    "nullable_ratio_delta": {
+      "anyOf": [
+        { "type": "number", "minimum": 0, "maximum": 480 },
+        { "type": "null" }
+      ]
+    },
+    "training_dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "sha256", "license_spdx"],
+      "properties": {
+        "id": { "$ref": "#/$defs/text256" },
+        "revision": { "$ref": "#/$defs/text512" },
+        "sha256": {
+          "anyOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+        },
+        "license_spdx": { "$ref": "#/$defs/text512" }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_sha256",
+        "public_key_sha256",
+        "package_id",
+        "package_revision",
+        "precision_profile",
+        "package_license_spdx",
+        "source_revision",
+        "source_sha256",
+        "source_license_spdx",
+        "checkpoint_sha256",
+        "checkpoint_license_spdx",
+        "training_datasets",
+        "accelerator"
+      ],
+      "properties": {
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "public_key_sha256": { "$ref": "#/$defs/sha256" },
+        "package_id": { "$ref": "#/$defs/text256" },
+        "package_revision": { "$ref": "#/$defs/text256" },
+        "precision_profile": { "$ref": "#/$defs/text256" },
+        "package_license_spdx": { "$ref": "#/$defs/text512" },
+        "source_revision": { "$ref": "#/$defs/text512" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_license_spdx": { "$ref": "#/$defs/text512" },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_license_spdx": { "$ref": "#/$defs/text512" },
+        "training_datasets": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/training_dataset" }
+        },
+        "accelerator": { "enum": ["cpu", "metal", "cuda"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signing_key_id",
+        "artifact_bom_sha256",
+        "training_dataset_license_manifest_sha256",
+        "evaluation_corpus_manifest_sha256",
+        "evaluation_corpus_license_manifest_sha256",
+        "evaluation_result_sha256",
+        "listening_result_sha256",
+        "paired_clips",
+        "full_length_tracks",
+        "listener_count",
+        "accepted"
+      ],
+      "properties": {
+        "signing_key_id": { "$ref": "#/$defs/sha256" },
+        "artifact_bom_sha256": { "$ref": "#/$defs/sha256" },
+        "training_dataset_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "listening_result_sha256": { "$ref": "#/$defs/sha256" },
+        "paired_clips": { "type": "integer", "minimum": 1000, "maximum": 10000000 },
+        "full_length_tracks": { "type": "integer", "minimum": 50, "maximum": 1000000 },
+        "listener_count": { "type": "integer", "minimum": 20, "maximum": 100000 },
+        "accepted": { "const": true }
+      }
+    },
+    "region": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_sample", "end_sample", "decision", "confidence"],
+      "properties": {
+        "start_sample": { "$ref": "#/$defs/count" },
+        "end_sample": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "decision": { "enum": ["apply", "uncertain"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "denoize-lv2"
-version = "0.87.0"
+version = "0.88.0"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -12,7 +12,7 @@ name = "denoize_lv2"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-denoize = { path = "../..", version = "0.87.0", default-features = false, features = ["gtcrn"] }
+denoize = { path = "../..", version = "0.88.0", default-features = false, features = ["gtcrn"] }
 lv2 = { version = "0.6.0", default-features = false, features = ["full"] }
 
 [lints.rust]
