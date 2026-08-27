@@ -1,8 +1,12 @@
 //! Optional AI denoising backends (feature-gated).
 
+#[cfg(feature = "onnx")]
+pub(crate) mod causal_target_speaker;
 mod classical;
 mod session;
 mod stream;
+#[cfg(feature = "onnx")]
+pub(crate) mod target_speaker;
 #[cfg(any(
     feature = "onnx",
     feature = "mpsenet",
@@ -12,8 +16,6 @@ mod stream;
     feature = "gtcrn"
 ))]
 mod tract_runtime;
-#[cfg(feature = "onnx")]
-pub(crate) mod target_speaker;
 
 use std::path::PathBuf;
 

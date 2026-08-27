@@ -1035,6 +1035,8 @@ jobs:
           universal_promotion_evidence_schema="$asset_dir/denoize-universal-promotion-evidence-v1.schema.json"
           target_speaker_promotion_evidence_schema="$asset_dir/denoize-target-speaker-promotion-evidence-v1.schema.json"
           target_speaker_report_schema="$asset_dir/denoize-target-speaker-report-v1.schema.json"
+          causal_target_speaker_promotion_evidence_schema="$asset_dir/denoize-causal-target-speaker-promotion-evidence-v1.schema.json"
+          causal_target_speaker_report_schema="$asset_dir/denoize-causal-target-speaker-report-v1.schema.json"
           watch_cycle_schema="$asset_dir/denoize-watch-cycle-v1.schema.json"
           watch_quarantine_schema="$asset_dir/denoize-watch-quarantine-v1.schema.json"
           watch_state_schema="$asset_dir/denoize-watch-state-v1.schema.json"
@@ -1093,6 +1095,8 @@ jobs:
           cp schemas/denoize-universal-promotion-evidence-v1.schema.json "$universal_promotion_evidence_schema"
           cp schemas/denoize-target-speaker-promotion-evidence-v1.schema.json "$target_speaker_promotion_evidence_schema"
           cp schemas/denoize-target-speaker-report-v1.schema.json "$target_speaker_report_schema"
+          cp schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json "$causal_target_speaker_promotion_evidence_schema"
+          cp schemas/denoize-causal-target-speaker-report-v1.schema.json "$causal_target_speaker_report_schema"
           cp schemas/denoize-watch-cycle-v1.schema.json "$watch_cycle_schema"
           cp schemas/denoize-watch-quarantine-v1.schema.json "$watch_quarantine_schema"
           cp schemas/denoize-watch-state-v1.schema.json "$watch_state_schema"
@@ -1137,6 +1141,7 @@ jobs:
             "$universal_restoration_mask_schema" "$universal_restoration_report_schema" \
             "$universal_promotion_evidence_schema" \
             "$target_speaker_promotion_evidence_schema" "$target_speaker_report_schema" \
+            "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
             "$watch_state_schema" \
             "$asset_dir"/denoize-update-*.schema.json \
@@ -1314,7 +1319,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.79.0 0.80.0)
+          rollback_versions=(0.80.0 0.81.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.81.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.82.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -247,6 +247,8 @@ OPTIONS:
 USAGE:
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
     denoize target-speaker evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+    denoize target-speaker causal <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package <PACKAGE.dmp> --model-package-key <KEY> --offline-promotion-evidence <EVIDENCE.json> --offline-promotion-evidence-key <PUBLIC-KEY.json> --causal-promotion-evidence <EVIDENCE.json> --causal-promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-speaker causal evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
 
 Run offline target-speaker extraction through a signed package v2 graph with
 mixture and enrollment inputs, extracted-audio output, and calibrated
@@ -275,12 +277,22 @@ OPTIONS:
         --json                             emit compact report JSON
         --pretty                           emit indented report JSON
     -h, --help                             show this help
+
+CAUSAL OPTIONS:
+        --offline-promotion-evidence <PATH>      accepted signed offline evidence
+        --offline-promotion-evidence-key <PATH> trusted offline evidence public key
+        --causal-promotion-evidence <PATH>       accepted signed causal evidence
+        --causal-promotion-evidence-key <PATH>  trusted causal evidence public key
+        --present-hold-blocks <N>                consecutive present blocks, 1..100 (default: 3)
+        --maximum-peak <F>                       absolute candidate peak, 0.5..1 (default: 1)
+    The remaining model, probability, energy, accelerator, report, memory,
+    metadata, replacement, and JSON options above also apply to causal mode.
 ```
 
 ## Watch-folder automation
 
 ```text
-denoize 0.81.0 watch-folder automation
+denoize 0.82.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

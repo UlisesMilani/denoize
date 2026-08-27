@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json",
+  "title": "denoize signed causal target-speaker promotion evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "payload", "signature"],
+  "properties": {
+    "schema": { "const": "denoize-causal-target-speaker-promotion-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "payload": { "$ref": "#/$defs/payload" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[a-z0-9._+-]{1,256}$" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completed_at_unix_seconds",
+        "model_package_sha256",
+        "source_revision",
+        "source_sha256",
+        "checkpoint_sha256",
+        "offline_evaluation_result_sha256",
+        "causal_evaluation_result_sha256",
+        "state_reset_flush_result_sha256",
+        "latency_result_sha256",
+        "realtime_callback_result_sha256",
+        "transition_result_sha256",
+        "strata",
+        "model_sample_rate_hz",
+        "frame_samples",
+        "algorithmic_latency_samples",
+        "flush_samples",
+        "perturbation_latency_cases",
+        "effective_latency_milliseconds",
+        "effective_latency_limit_milliseconds",
+        "realtime",
+        "transitions",
+        "accepted"
+      ],
+      "properties": {
+        "completed_at_unix_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "model_package_sha256": { "$ref": "#/$defs/sha256" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "offline_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "state_reset_flush_result_sha256": { "$ref": "#/$defs/sha256" },
+        "latency_result_sha256": { "$ref": "#/$defs/sha256" },
+        "realtime_callback_result_sha256": { "$ref": "#/$defs/sha256" },
+        "transition_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/stratum" }
+        },
+        "model_sample_rate_hz": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "frame_samples": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "algorithmic_latency_samples": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "flush_samples": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "perturbation_latency_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "effective_latency_milliseconds": { "type": "number", "minimum": 0 },
+        "effective_latency_limit_milliseconds": { "type": "number", "minimum": 0, "maximum": 100 },
+        "realtime": { "$ref": "#/$defs/realtime" },
+        "transitions": { "$ref": "#/$defs/transitions" },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "stratum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "offline_cases", "causal_cases", "metrics"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["target-present", "target-absent"] },
+        "offline_cases": { "type": "integer", "minimum": 10, "maximum": 1000000 },
+        "causal_cases": { "type": "integer", "minimum": 10, "maximum": 1000000 },
+        "metrics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/metric" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "operator",
+        "offline_value",
+        "causal_value",
+        "hard_limit",
+        "maximum_regression",
+        "passed"
+      ],
+      "properties": {
+        "metric": { "$ref": "#/$defs/id" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "offline_value": { "type": "number" },
+        "causal_value": { "type": "number" },
+        "hard_limit": { "type": "number" },
+        "maximum_regression": { "type": "number", "minimum": 0 },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "realtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paced_blocks",
+        "deadline_misses",
+        "overload_blocks",
+        "queue_capacity_blocks",
+        "maximum_queue_depth_blocks",
+        "callback_allocations",
+        "callback_locks",
+        "callback_waits",
+        "callback_file_io_operations",
+        "callback_network_operations",
+        "callback_log_operations",
+        "callback_inference_calls"
+      ],
+      "properties": {
+        "paced_blocks": { "type": "integer", "minimum": 10000, "maximum": 9007199254740991 },
+        "deadline_misses": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "overload_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "queue_capacity_blocks": { "type": "integer", "minimum": 16, "maximum": 256 },
+        "maximum_queue_depth_blocks": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "callback_allocations": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "callback_locks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "callback_waits": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "callback_file_io_operations": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "callback_network_operations": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "callback_log_operations": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "callback_inference_calls": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "transitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "absent_to_present_cases",
+        "present_to_absent_cases",
+        "uncertain_transition_cases",
+        "enrollment_mismatch_cases",
+        "reference_loss_cases",
+        "late_results_injected",
+        "late_results_discarded",
+        "stale_generation_results_injected",
+        "stale_generation_results_discarded",
+        "false_attribution_publications"
+      ],
+      "properties": {
+        "absent_to_present_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "present_to_absent_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "uncertain_transition_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "enrollment_mismatch_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "reference_loss_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "late_results_injected": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "late_results_discarded": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "stale_generation_results_injected": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "stale_generation_results_discarded": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "false_attribution_publications": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "key_id": { "$ref": "#/$defs/sha256" },
+        "value_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
+        }
+      }
+    }
+  }
+}

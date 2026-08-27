@@ -8,7 +8,7 @@
 
 [package]
 name = "denoize"
-version = "0.81.0"
+version = "0.82.0"
 edition = "2021"
 rust-version = "1.96"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
@@ -118,6 +118,7 @@ percent-encoding = "2.3.2"
 ureq = { version = "2.12.1", features = ["tls", "native-certs"] }
 url = "2.5.8"
 tract-onnx = { version = "=0.23.4", optional = true }
+crossbeam-queue = { version = "0.3.12", optional = true }
 rustfft = { version = "6.4", optional = true }
 kaldi-native-fbank = { version = "0.1.0", optional = true }
 audio_samples = { version = "2.0.1", optional = true, default-features = false }
@@ -151,7 +152,7 @@ windows-sys = { version = "0.61.2", features = [
 [features]
 default = []
 rnnoise = ["dep:nnnoiseless"]
-onnx = ["dep:tract-onnx"]
+onnx = ["dep:tract-onnx", "dep:crossbeam-queue"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]

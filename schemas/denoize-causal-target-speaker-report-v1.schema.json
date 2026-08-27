@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-causal-target-speaker-report-v1.schema.json",
+  "title": "denoize causal target-speaker render report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "network_accessed",
+    "deterministic",
+    "model",
+    "promotion_evidence",
+    "source_sample_rate",
+    "source_channels",
+    "source_frames",
+    "output_channels",
+    "output_frames",
+    "model_sample_rate",
+    "frame_samples",
+    "algorithmic_latency_samples",
+    "flush_samples",
+    "input_blocks",
+    "flush_blocks",
+    "decision_counts",
+    "presence_transitions",
+    "rendered_audio_published",
+    "mixture_mixdown_policy",
+    "mixture_pcm_sha256",
+    "output_pcm_sha256",
+    "enrollment",
+    "runtime_speaker_identity_verified",
+    "interferer_leakage_measured_at_runtime",
+    "limitations",
+    "warnings"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-causal-target-speaker-report-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+    "network_accessed": { "const": false },
+    "deterministic": { "const": true },
+    "model": { "$ref": "#/$defs/model" },
+    "promotion_evidence": { "$ref": "#/$defs/evidence" },
+    "source_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "source_channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+    "source_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "output_channels": { "const": 1 },
+    "output_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "model_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+    "frame_samples": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+    "algorithmic_latency_samples": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+    "flush_samples": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+    "input_blocks": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "flush_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "decision_counts": { "$ref": "#/$defs/decision_counts" },
+    "presence_transitions": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "rendered_audio_published": { "const": true },
+    "mixture_mixdown_policy": { "const": "arithmetic-mean-mono-v1" },
+    "mixture_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "output_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "enrollment": { "$ref": "#/$defs/enrollment" },
+    "runtime_speaker_identity_verified": { "const": false },
+    "interferer_leakage_measured_at_runtime": { "const": false },
+    "limitations": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[a-z0-9._+-]{1,256}$" },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_sha256",
+        "public_key_sha256",
+        "package_id",
+        "package_revision",
+        "precision_profile",
+        "source_revision",
+        "source_sha256",
+        "source_license_spdx",
+        "checkpoint_sha256",
+        "checkpoint_license_spdx",
+        "accelerator"
+      ],
+      "properties": {
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "public_key_sha256": { "$ref": "#/$defs/sha256" },
+        "package_id": { "$ref": "#/$defs/id" },
+        "package_revision": { "$ref": "#/$defs/id" },
+        "precision_profile": { "$ref": "#/$defs/id" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "accelerator": { "enum": ["cpu", "metal", "cuda"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "offline_signing_key_id",
+        "causal_signing_key_id",
+        "offline_evaluation_result_sha256",
+        "causal_evaluation_result_sha256",
+        "state_reset_flush_result_sha256",
+        "latency_result_sha256",
+        "realtime_callback_result_sha256",
+        "transition_result_sha256",
+        "strata",
+        "accepted"
+      ],
+      "properties": {
+        "offline_signing_key_id": { "$ref": "#/$defs/sha256" },
+        "causal_signing_key_id": { "$ref": "#/$defs/sha256" },
+        "offline_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "state_reset_flush_result_sha256": { "$ref": "#/$defs/sha256" },
+        "latency_result_sha256": { "$ref": "#/$defs/sha256" },
+        "realtime_callback_result_sha256": { "$ref": "#/$defs/sha256" },
+        "transition_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": { "type": "integer", "minimum": 22, "maximum": 256 },
+        "accepted": { "const": true }
+      }
+    },
+    "decision_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "published_present_blocks",
+        "muted_absent_blocks",
+        "muted_uncertain_blocks",
+        "muted_present_warmup_blocks",
+        "muted_safety_gate_blocks",
+        "muted_flush_blocks"
+      ],
+      "properties": {
+        "published_present_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "muted_absent_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "muted_uncertain_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "muted_present_warmup_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "muted_safety_gate_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "muted_flush_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "enrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_sample_rate",
+        "input_channels",
+        "input_frames",
+        "model_sample_rate",
+        "model_samples",
+        "mixdown_policy",
+        "raw_audio_retained",
+        "embedding_retained",
+        "digest_recorded"
+      ],
+      "properties": {
+        "input_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "input_channels": { "type": "integer", "minimum": 1, "maximum": 64 },
+        "input_frames": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "model_sample_rate": { "type": "integer", "minimum": 1, "maximum": 768000 },
+        "model_samples": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "mixdown_policy": { "const": "arithmetic-mean-mono-v1" },
+        "raw_audio_retained": { "const": false },
+        "embedding_retained": { "const": false },
+        "digest_recorded": { "const": false }
+      }
+    }
+  }
+}

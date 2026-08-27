@@ -1,6 +1,6 @@
 [package]
 name = "denoize"
-version = "0.81.0"
+version = "0.82.0"
 edition = "2021"
 authors = ["denoize"]
 description = "Pure-Rust audio denoiser for the world's highest sound quality. Classical DSP + optional RNNoise / DeepFilterNet backends."
@@ -40,6 +40,7 @@ nnnoiseless = { version = "0.5.2", optional = true, default-features = false }
 df = { git = "https://github.com/penguin425/DeepFilterNet", rev = "9b8790dca0fbc6e3625b5d0b9aef7b90740f3563", package = "deep_filter", optional = true, default-features = false, features = ["tract", "default-model", "wav-utils", "transforms"] }
 ndarray = { version = "0.17.2", optional = true }
 tract-onnx = { version = "=0.23.4", optional = true }
+crossbeam-queue = { version = "0.3.12", optional = true }
 rustfft = { version = "6.4", optional = true }
 kaldi-native-fbank = { version = "0.1.0", optional = true }
 audio_samples = { version = "2.0.1", optional = true, default-features = false }
@@ -103,7 +104,7 @@ windows-sys = { version = "0.61.2", features = [
 default = ["m4a-encode"]
 rnnoise = ["dep:nnnoiseless"]
 deepfilter = ["dep:df", "dep:ndarray"]
-onnx = ["dep:tract-onnx"]
+onnx = ["dep:tract-onnx", "dep:crossbeam-queue"]
 mpsenet = ["onnx", "dep:rustfft"]
 bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]

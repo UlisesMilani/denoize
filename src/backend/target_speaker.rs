@@ -67,9 +67,9 @@ impl TargetSpeakerModel {
         package: &RuntimeModelPackage,
         runtime: AcceleratorRuntime,
     ) -> Result<Self, String> {
-        let manifest = package.manifest_v2().ok_or(
-            "target-speaker extraction requires authenticated runtime model package v2",
-        )?;
+        let manifest = package
+            .manifest_v2()
+            .ok_or("target-speaker extraction requires authenticated runtime model package v2")?;
         let contract = validate_runtime_package_contract(manifest)?;
         let profile = package
             .precision_profile_for(runtime)?
@@ -125,11 +125,9 @@ impl TargetSpeakerModel {
             return Err("target-speaker enrollment must not be empty".into());
         }
         let runnable = self.compiled_model(mixture.len(), enrollment.len())?;
-        let mixture_tensor = Tensor::from_shape(
-            &self.contract.mixture_layout.shape(mixture.len()),
-            mixture,
-        )
-        .map_err(model_error)?;
+        let mixture_tensor =
+            Tensor::from_shape(&self.contract.mixture_layout.shape(mixture.len()), mixture)
+                .map_err(model_error)?;
         let enrollment_tensor = Tensor::from_shape(
             &self.contract.enrollment_layout.shape(enrollment.len()),
             enrollment,
@@ -207,7 +205,9 @@ impl TargetSpeakerModel {
         {
             return Err(format!(
                 "target-speaker graph requires {} enrollment samples, got {enrollment_samples}",
-                self.contract.fixed_enrollment_samples.expect("checked Some")
+                self.contract
+                    .fixed_enrollment_samples
+                    .expect("checked Some")
             ));
         }
         let mut compiled = self
@@ -246,11 +246,8 @@ impl TargetSpeakerModel {
             )
             .map_err(model_error)?;
         let model = model.into_typed().map_err(model_error)?;
-        let runnable = super::tract_runtime::prepare(
-            model,
-            self.runtime,
-            "target-speaker extraction model",
-        )?;
+        let runnable =
+            super::tract_runtime::prepare(model, self.runtime, "target-speaker extraction model")?;
         *compiled = Some(CompiledTargetSpeakerModel {
             mixture_samples,
             enrollment_samples,
@@ -305,7 +302,10 @@ fn validate_runtime_package_contract(
         || presence.optional
         || presence.state_id.is_some()
         || presence_axes.as_slice()
-            != [("batch", Some(1)), ("feature", Some(PRESENCE_CLASSES as u64))]
+            != [
+                ("batch", Some(1)),
+                ("feature", Some(PRESENCE_CLASSES as u64)),
+            ]
     {
         return Err(
             "target-speaker diagnostic output must be float32 [batch=1,feature=3] probabilities ordered absent, uncertain, present"
@@ -357,9 +357,7 @@ fn waveform_contract(
         .map(|axis| (axis.kind.as_str(), axis.fixed))
         .collect::<Vec<_>>();
     let (layout, samples) = match axes.as_slice() {
-        [("batch", Some(1)), ("sample", samples)] => {
-            (WaveformLayout::BatchSamples, *samples)
-        }
+        [("batch", Some(1)), ("sample", samples)] => (WaveformLayout::BatchSamples, *samples),
         [("batch", Some(1)), ("channel", Some(1)), ("sample", samples)] => {
             (WaveformLayout::BatchChannelsSamples, *samples)
         }
@@ -421,7 +419,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let package_path = directory.path().join("target-speaker.dmp");
         let mut model_bytes = Vec::new();
-        target_speaker_identity_model().encode(&mut model_bytes).unwrap();
+        target_speaker_identity_model()
+            .encode(&mut model_bytes)
+            .unwrap();
         let license = b"fixture license".to_vec();
         let provenance = br#"{"schema":"fixture-provenance-v1"}"#.to_vec();
         let vectors = serde_json::to_vec(&serde_json::json!({
@@ -468,11 +468,8 @@ mod tests {
             vectors.clone(),
         ];
         let manifest = manifest(&components);
-        let package = RuntimeModelPackage::for_onnx_v2_contract_test(
-            package_path,
-            manifest,
-            components,
-        );
+        let package =
+            RuntimeModelPackage::for_onnx_v2_contract_test(package_path, manifest, components);
         let model =
             TargetSpeakerModel::load_runtime_package(&package, AcceleratorRuntime::Cpu).unwrap();
         let result = model
@@ -488,7 +485,10 @@ mod tests {
         assert!(validate_presence_probabilities([0.3, 0.3, 0.3]).is_err());
         let components = vec![vec![0], vec![0], vec![0], vec![0]];
         let mut invalid = manifest(&components);
-        invalid.tensors.inputs.retain(|tensor| tensor.role == "audio");
+        invalid
+            .tensors
+            .inputs
+            .retain(|tensor| tensor.role == "audio");
         assert!(validate_runtime_package_contract(&invalid)
             .unwrap_err()
             .contains("exactly two inputs"));
@@ -714,7 +714,10 @@ mod tests {
                     value_info("mixture", waveform()),
                     value_info(
                         "enrollment",
-                        vec![dimension_value(1), dimension_parameter("enrollment_samples")],
+                        vec![
+                            dimension_value(1),
+                            dimension_parameter("enrollment_samples"),
+                        ],
                     ),
                 ],
                 output: vec![
