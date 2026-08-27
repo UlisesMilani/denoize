@@ -29,7 +29,7 @@ else
   target_dir=$repo_root/target
 fi
 if [[ -z $app ]]; then
-  app=$(find "$target_dir/auv3-build/$target" -type d -name 'denoize AUv3.app' -print -quit)
+  app=$target_dir/auv3-build/$target/Release/denoize\ AUv3.app
 fi
 if [[ -z $app || ! -d $app || -L $app ]]; then
   echo "AUv3 containing app is missing or is a symbolic link: $app" >&2
