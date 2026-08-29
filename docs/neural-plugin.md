@@ -142,7 +142,7 @@ This release is speech enhancement, not general restoration, target-speaker
 extraction, AEC, or spatial beamforming. v0.79.0 adds the same accessible native
 CLAP editor used by the DSP descriptor; hosts retain generic rendering of all
 four parameters when the custom API is unsupported or creation fails. See
-[Accessible plug-in editor](plugin-editor.md). v0.78.1 added a statically bound
+[Accessible plug-in editor](plugin-editor.md). v0.78.2 added a statically bound
 VST3 3.8 adapter with
 official-validator, pinned Ardour 8.4 processing/state-reload smoke, packaging,
 checksum, SBOM, and signed host-matrix evidence; see

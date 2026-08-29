@@ -1,0 +1,52 @@
+{
+  "schema": "denoize-sdk-abi-v1",
+  "schema_version": 1,
+  "library_version": "0.86.0",
+  "abi_version": 1,
+  "library": "denoize_c",
+  "supported_architectures": ["aarch64", "x86_64"],
+  "build_profile": "ffi-release",
+  "panic_strategy": "unwind-contained",
+  "backend": "classical-scalar",
+  "threading": {
+    "processor": "creator-thread-owned",
+    "cancel_token": "cross-thread-atomic"
+  },
+  "limits": {
+    "max_channels": 32,
+    "max_frames_per_call": 1048576,
+    "max_buffered_frames": 4194304
+  },
+  "status_codes": {
+    "ok": 0,
+    "invalid_argument": 1,
+    "unsupported": 2,
+    "out_of_memory": 3,
+    "invalid_state": 4,
+    "cancelled": 5,
+    "buffer_too_small": 6,
+    "wrong_thread": 7,
+    "panic_contained": 8,
+    "internal": 9
+  },
+  "structs_64_bit": {
+    "denoize_options_v1": { "size": 96, "alignment": 8 },
+    "denoize_process_result_v1": { "size": 88, "alignment": 8 },
+    "denoize_diagnostic_v1": { "size": 72, "alignment": 8 }
+  },
+  "symbols": [
+    "denoize_abi_version",
+    "denoize_cancel_token_cancel_v1",
+    "denoize_cancel_token_destroy_v1",
+    "denoize_cancel_token_reset_v1",
+    "denoize_diagnostic_v1_init",
+    "denoize_options_v1_init",
+    "denoize_process_result_v1_init",
+    "denoize_processor_create_v1",
+    "denoize_processor_destroy_v1",
+    "denoize_processor_finish_interleaved_f32_v1",
+    "denoize_processor_process_interleaved_f32_v1",
+    "denoize_processor_reset_v1",
+    "denoize_sdk_version_copy_v1"
+  ]
+}

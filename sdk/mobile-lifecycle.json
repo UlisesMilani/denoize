@@ -1,0 +1,80 @@
+{
+  "schema": "denoize-mobile-lifecycle-v1",
+  "schema_version": 1,
+  "initial_state": "idle",
+  "terminal_state": "closed",
+  "states": [
+    "backgrounded",
+    "closed",
+    "idle",
+    "interrupted",
+    "ready",
+    "rebuild-required",
+    "running"
+  ],
+  "route_fields": ["buffer_frames", "channels", "sample_rate"],
+  "processor_invalidating_events": [
+    "background",
+    "interrupt",
+    "memory-warning",
+    "route-change"
+  ],
+  "transitions": [
+    {
+      "event": "background",
+      "from": ["ready", "running"],
+      "to": "backgrounded",
+      "requires_route": false,
+      "invalidates_processor": true
+    },
+    {
+      "event": "close",
+      "from": ["backgrounded", "idle", "interrupted", "ready", "rebuild-required", "running"],
+      "to": "closed",
+      "requires_route": false,
+      "invalidates_processor": true
+    },
+    {
+      "event": "configure",
+      "from": ["idle"],
+      "to": "ready",
+      "requires_route": true,
+      "invalidates_processor": false
+    },
+    {
+      "event": "interrupt",
+      "from": ["ready", "running"],
+      "to": "interrupted",
+      "requires_route": false,
+      "invalidates_processor": true
+    },
+    {
+      "event": "memory-warning",
+      "from": ["ready", "running"],
+      "to": "rebuild-required",
+      "requires_route": false,
+      "invalidates_processor": true
+    },
+    {
+      "event": "resume",
+      "from": ["backgrounded", "interrupted", "rebuild-required"],
+      "to": "ready",
+      "requires_route": true,
+      "invalidates_processor": false
+    },
+    {
+      "event": "route-change",
+      "from": ["ready", "running"],
+      "to": "ready",
+      "requires_route": true,
+      "invalidates_processor": true
+    },
+    {
+      "event": "start",
+      "from": ["ready"],
+      "to": "running",
+      "requires_route": false,
+      "invalidates_processor": false
+    }
+  ]
+}

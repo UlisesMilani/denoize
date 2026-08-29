@@ -115,7 +115,7 @@ if ! jq -e \
     (.source.commit | type == "string" and test("^[0-9a-f]{40}$")) and
     .source.ref == ("refs/tags/" + $tag) and
     .source.workflow == ".github/workflows/release.yml" and
-    (.artifacts | type == "array" and length == 25) and
+    (.artifacts | type == "array" and length == 32) and
     (.evidence_files | type == "array" and length > 0)
   ' <<<"$manifest_json" >/dev/null; then
   echo "release evidence manifest is invalid" >&2
@@ -210,6 +210,13 @@ expected_primary_records() {
     plugin aarch64-apple-darwin "denoize-auv3-${tag}-aarch64-apple-darwin.tar.gz" \
     plugin x86_64-apple-darwin "denoize-auv3-${tag}-x86_64-apple-darwin.tar.gz" \
     plugin x86_64-unknown-linux-gnu "denoize-lv2-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+    sdk aarch64-apple-darwin "denoize-c-sdk-${tag}-aarch64-apple-darwin.tar.gz" \
+    sdk x86_64-apple-darwin "denoize-c-sdk-${tag}-x86_64-apple-darwin.tar.gz" \
+    sdk x86_64-pc-windows-msvc "denoize-c-sdk-${tag}-x86_64-pc-windows-msvc.tar.gz" \
+    sdk x86_64-unknown-linux-gnu "denoize-c-sdk-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+    sdk wasm32-unknown-unknown "denoize-web-sdk-${tag}.tar.gz" \
+    sdk android-arm64-v8a+x86_64 "denoize-android-sdk-${tag}.tar.gz" \
+    sdk ios-arm64+simulator+macos "denoize-ios-sdk-${tag}.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.app.tar.gz" \
     desktop aarch64-apple-darwin "denoize_${version}_aarch64.dmg" \
     desktop x86_64-apple-darwin "denoize_${version}_x64.app.tar.gz" \
@@ -338,4 +345,4 @@ for checksum_name in "denoize-${version}.crate.sha256" "denoize-models-${tag}.dm
   )
 done
 
-printf 'release evidence for %s verifies 25 artifacts, 25 CycloneDX SBOMs, and tagged-workflow provenance.\n' "$tag"
+printf 'release evidence for %s verifies 32 artifacts, 32 CycloneDX SBOMs, and tagged-workflow provenance.\n' "$tag"

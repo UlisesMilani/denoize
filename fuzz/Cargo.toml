@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 denoize = { path = "..", default-features = false }
+denoize-c = { path = "../sdk/denoize-c" }
 libfuzzer-sys = "=0.4.13"
 serde_json = "1.0"
 tempfile = "3.27"
@@ -23,6 +24,13 @@ bench = false
 [[bin]]
 name = "automation_documents"
 path = "fuzz_targets/automation_documents.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sdk_abi"
+path = "fuzz_targets/sdk_abi.rs"
 test = false
 doc = false
 bench = false

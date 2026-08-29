@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-mobile-lifecycle-v1.schema.json",
+  "title": "denoize mobile lifecycle contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "initial_state",
+    "terminal_state",
+    "states",
+    "route_fields",
+    "processor_invalidating_events",
+    "transitions"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-mobile-lifecycle-v1" },
+    "schema_version": { "const": 1 },
+    "initial_state": { "const": "idle" },
+    "terminal_state": { "const": "closed" },
+    "states": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "backgrounded" },
+        { "const": "closed" },
+        { "const": "idle" },
+        { "const": "interrupted" },
+        { "const": "ready" },
+        { "const": "rebuild-required" },
+        { "const": "running" }
+      ],
+      "items": false,
+      "minItems": 7,
+      "maxItems": 7
+    },
+    "route_fields": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "buffer_frames" },
+        { "const": "channels" },
+        { "const": "sample_rate" }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "processor_invalidating_events": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "background" },
+        { "const": "interrupt" },
+        { "const": "memory-warning" },
+        { "const": "route-change" }
+      ],
+      "items": false,
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "transitions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/transition" },
+      "minItems": 8,
+      "maxItems": 8
+    }
+  },
+  "$defs": {
+    "state": {
+      "enum": [
+        "backgrounded",
+        "closed",
+        "idle",
+        "interrupted",
+        "ready",
+        "rebuild-required",
+        "running"
+      ]
+    },
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "from", "to", "requires_route", "invalidates_processor"],
+      "properties": {
+        "event": {
+          "enum": [
+            "background",
+            "close",
+            "configure",
+            "interrupt",
+            "memory-warning",
+            "resume",
+            "route-change",
+            "start"
+          ]
+        },
+        "from": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/state" },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "to": { "$ref": "#/$defs/state" },
+        "requires_route": { "type": "boolean" },
+        "invalidates_processor": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -663,18 +663,10 @@ impl Denoiser {
     fn reset_for_channel(&mut self) {
         self.noise = NoiseEstimator::new(self.noise_cfg, self.m, self.sample_rate, self.hop);
         self.noise.adapt = self.config.adapt;
-        for v in &mut self.prev_g {
-            *v = 0.0;
-        }
-        for v in &mut self.prev_y2 {
-            *v = 0.0;
-        }
-        for v in &mut self.prev_lambda_d {
-            *v = 1e-12;
-        }
-        for v in &mut self.prev_gsmooth {
-            *v = 1.0;
-        }
+        self.prev_g.fill(0.0);
+        self.prev_y2.fill(0.0);
+        self.prev_lambda_d.fill(1e-12);
+        self.prev_gsmooth.fill(1.0);
         self.prev_frame_energy = 0.0;
         self.prev_mag.fill(0.0);
         self.pre_emph_prev = 0.0;
@@ -1297,7 +1289,7 @@ impl ChannelStream {
             .try_reserve_exact(input_capacity)
             .map_err(|_| ConfigError::allocation_failed("stream input"))?;
         if profile_target == 0 {
-            input.extend(std::iter::repeat(0.0).take(n));
+            input.extend(std::iter::repeat_n(0.0, n));
         }
         let mut profile = Vec::new();
         profile
@@ -1426,7 +1418,7 @@ impl ChannelStream {
         }
         self.profile_ready = true;
         let n = self.denoiser.frame_size;
-        self.input.extend(std::iter::repeat(0.0).take(n));
+        self.input.extend(std::iter::repeat_n(0.0, n));
         self.input.extend(profile);
     }
 
@@ -1573,7 +1565,7 @@ impl ChannelStream {
         if !self.profile_ready {
             self.initialize_profile();
         }
-        self.input.extend(std::iter::repeat(0.0).take(n));
+        self.input.extend(std::iter::repeat_n(0.0, n));
         self.process_available();
         // Checked by try_reserve_finish before any channel is advanced.
         let target = n + self.input_frames;

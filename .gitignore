@@ -4,4 +4,13 @@ __pycache__/
 /apps/desktop/node_modules/
 /apps/desktop/dist/
 /apps/desktop/src-tauri/target/
+/sdk/denoize-wasm/pkg/
+/sdk/web/node_modules/
+/sdk/web/playwright-report/
+/sdk/web/test-results/
+/sdk/android/.gradle/
+/sdk/android/library/.cxx/
+/sdk/android/library/build/
+/sdk/android/library/src/main/jniLibs/
+/sdk/android/library/src/main/prebuilt/
 /apps/desktop/src-tauri/gen/

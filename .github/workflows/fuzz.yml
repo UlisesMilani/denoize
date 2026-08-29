@@ -27,6 +27,9 @@ jobs:
           - target: automation_documents
             dictionary: fuzz/automation.dict
             max_len: 1048576
+          - target: sdk_abi
+            dictionary: fuzz/sdk_abi.dict
+            max_len: 4096
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -34,13 +37,13 @@ jobs:
       - name: Install nightly Rust and cargo-fuzz
         shell: bash
         run: |
-          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup toolchain install nightly-2026-08-20 --profile minimal --no-self-update
           cargo install cargo-fuzz --locked --version 0.13.2
 
       - name: Run bounded coverage-guided fuzzing
         shell: bash
         run: >-
-          cargo +nightly fuzz run "${{ matrix.target }}" --
+          cargo +nightly-2026-08-20 fuzz run "${{ matrix.target }}" --
           -dict="${{ matrix.dictionary }}"
           -max_len=${{ matrix.max_len }}
           -max_total_time=900

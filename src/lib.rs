@@ -82,6 +82,7 @@ pub mod region;
 pub mod resample;
 pub mod resource;
 pub mod restoration;
+pub mod sdk;
 pub mod service;
 pub mod stft;
 mod stoi_resample;

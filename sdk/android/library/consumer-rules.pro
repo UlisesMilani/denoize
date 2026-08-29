@@ -1,0 +1,3 @@
+-keep class io.github.penguin425.denoize.sdk.NativeBridge { *; }
+-keep class io.github.penguin425.denoize.sdk.DenoizeOptions { *; }
+-keep class io.github.penguin425.denoize.sdk.DenoizeSdkException { *; }

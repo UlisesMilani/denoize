@@ -1,0 +1,22 @@
+[package]
+name = "denoize-c"
+version = "0.86.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+description = "Stable C ABI for the denoize scalar streaming processor"
+publish = false
+
+[lib]
+name = "denoize_c"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+denoize = { path = "../..", version = "0.86.0", default-features = false }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-sdk-capabilities-v1.schema.json",
+  "title": "denoize SDK capability matrix v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "library_version",
+    "stage",
+    "c_abi",
+    "wasm",
+    "web_audio",
+    "android",
+    "ios",
+    "wam",
+    "global_guarantees"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-sdk-capabilities-v1" },
+    "schema_version": { "const": 1 },
+    "library_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "stage": { "const": 33 },
+    "c_abi": { "$ref": "#/$defs/cAbi" },
+    "wasm": { "$ref": "#/$defs/wasm" },
+    "web_audio": { "$ref": "#/$defs/webAudio" },
+    "android": { "$ref": "#/$defs/android" },
+    "ios": { "$ref": "#/$defs/ios" },
+    "wam": { "$ref": "#/$defs/wam" },
+    "global_guarantees": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "bounded-caller-owned-audio" },
+        { "const": "explicit-unsupported-backends" },
+        { "const": "no-implicit-model-download" },
+        { "const": "no-rust-layout-or-panic-across-c" },
+        { "const": "route-generation-rebuild" }
+      ],
+      "items": false,
+      "minItems": 5,
+      "maxItems": 5
+    }
+  },
+  "$defs": {
+    "cAbi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "abi_version", "backend", "architectures", "threading"],
+      "properties": {
+        "status": { "const": "supported" },
+        "abi_version": { "const": 1 },
+        "backend": { "const": "classical-scalar" },
+        "architectures": {
+          "type": "array",
+          "prefixItems": [{ "const": "aarch64" }, { "const": "x86_64" }],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "threading": { "const": "creator-thread-plus-atomic-cancel-token" }
+      }
+    },
+    "wasm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "backend", "finite", "incremental", "simd"],
+      "properties": {
+        "status": { "const": "supported" },
+        "backend": { "const": "classical-scalar" },
+        "finite": { "const": true },
+        "incremental": { "const": true },
+        "simd": { "const": "optional-not-required" }
+      }
+    },
+    "webAudio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "dsp_thread", "render_quantum", "transport"],
+      "properties": {
+        "status": { "const": "supported-with-cross-origin-isolation" },
+        "dsp_thread": { "const": "worker" },
+        "render_quantum": { "const": "observed-not-assumed" },
+        "transport": { "const": "preallocated-shared-ring" }
+      }
+    },
+    "android": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "min_api", "abis", "io", "route_policy"],
+      "properties": {
+        "status": { "const": "supported-worker-wrapper" },
+        "min_api": { "const": 26 },
+        "abis": {
+          "type": "array",
+          "prefixItems": [{ "const": "arm64-v8a" }, { "const": "x86_64" }],
+          "items": false,
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "io": { "const": "application-owned-oboe-aaudio-ring" },
+        "route_policy": { "const": "destroy-and-rebuild" }
+      }
+    },
+    "ios": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "minimum", "architectures", "io", "route_policy"],
+      "properties": {
+        "status": { "const": "supported-worker-wrapper" },
+        "minimum": { "const": "iOS 15" },
+        "architectures": {
+          "type": "array",
+          "prefixItems": [{ "const": "arm64-device" }, { "const": "arm64-simulator" }, { "const": "x86_64-simulator" }],
+          "items": false,
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "io": { "const": "application-owned-audio-unit-ring" },
+        "route_policy": { "const": "destroy-and-rebuild" }
+      }
+    },
+    "wam": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "processor"],
+      "properties": {
+        "status": { "const": "optional-host-matrix-gated" },
+        "processor": { "const": "web-audio-worker-core" }
+      }
+    }
+  }
+}

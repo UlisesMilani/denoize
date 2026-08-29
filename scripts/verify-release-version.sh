@@ -97,6 +97,8 @@ root_lock_version=$(workspace_lock_version Cargo.lock denoize)
 plugin_lock_version=$(workspace_lock_version Cargo.lock denoize-clap)
 editor_lock_version=$(workspace_lock_version Cargo.lock denoize-plugin-editor)
 lv2_lock_version=$(workspace_lock_version Cargo.lock denoize-lv2)
+c_sdk_lock_version=$(workspace_lock_version Cargo.lock denoize-c)
+wasm_sdk_lock_version=$(workspace_lock_version Cargo.lock denoize-wasm)
 tauri_denoize_lock_version=$(workspace_lock_version apps/desktop/src-tauri/Cargo.lock denoize)
 tauri_desktop_lock_version=$(workspace_lock_version apps/desktop/src-tauri/Cargo.lock denoize-desktop)
 
@@ -119,6 +121,18 @@ check_version "plugins/denoize-plugin-editor/Cargo.toml package" "$(manifest_ver
 check_version "Cargo.lock denoize-plugin-editor package" "$editor_lock_version"
 check_version "plugins/denoize-lv2/Cargo.toml package" "$(manifest_version plugins/denoize-lv2/Cargo.toml)"
 check_version "Cargo.lock denoize-lv2 package" "$lv2_lock_version"
+check_version "sdk/denoize-c/Cargo.toml package" "$(manifest_version sdk/denoize-c/Cargo.toml)"
+check_version "Cargo.lock denoize-c package" "$c_sdk_lock_version"
+check_version "sdk/denoize-wasm/Cargo.toml package" "$(manifest_version sdk/denoize-wasm/Cargo.toml)"
+check_version "Cargo.lock denoize-wasm package" "$wasm_sdk_lock_version"
+check_version "sdk/web/package.json" "$(jq -r '.version // empty' sdk/web/package.json)"
+check_version "sdk/web/package-lock.json root" "$(jq -r '.version // empty' sdk/web/package-lock.json)"
+check_version "sdk/web/package-lock.json workspace" "$(jq -r '.packages[""].version // empty' sdk/web/package-lock.json)"
+check_version "sdk/web/wam/descriptor.json" "$(jq -r '.version // empty' sdk/web/wam/descriptor.json)"
+check_version "sdk/denoize-c ABI manifest" "$(jq -r '.library_version // empty' sdk/denoize-c/abi/denoize-abi-v1.json)"
+check_version "sdk/denoize-wasm capability manifest" "$(jq -r '.library_version // empty' sdk/denoize-wasm/capabilities.json)"
+check_version "sdk capability matrix" "$(jq -r '.library_version // empty' sdk/capabilities.json)"
+check_version "sdk/android Gradle module" "$(sed -n 's/^version = "\([^"]*\)"$/\1/p' sdk/android/library/build.gradle.kts)"
 check_version "apps/desktop/package.json" "$(jq -r '.version // empty' apps/desktop/package.json)"
 check_version "apps/desktop/package-lock.json root" "$(jq -r '.version // empty' apps/desktop/package-lock.json)"
 check_version "apps/desktop/package-lock.json workspace" "$(jq -r '.packages[""].version // empty' apps/desktop/package-lock.json)"
@@ -133,4 +147,4 @@ if (( failures > 0 )); then
   exit 1
 fi
 
-echo "release version $expected is synchronized across 17 fields"
+echo "release version $expected is synchronized across 29 fields"

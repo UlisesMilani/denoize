@@ -1,6 +1,6 @@
 # VST3 plug-in
 
-v0.78.1 adds VST3 3.8 bundles for the same two processors shipped by the CLAP
+v0.78.2 adds VST3 3.8 bundles for the same two processors shipped by the CLAP
 binary: `denoize` (`org.penguin425.denoize`) and `denoize Neural`
 (`org.penguin425.denoize.neural`). The adapter statically binds the exact Rust
 CLAP entry into the VST3 module; it never searches a user or system CLAP path.
@@ -10,7 +10,7 @@ latency, reset, overload, and portable-state logic.
 ## Install
 
 Download and verify the matching
-`denoize-vst3-v0.78.1-<target>` archive from the GitHub Release, extract it,
+`denoize-vst3-v0.78.2-<target>` archive from the GitHub Release, extract it,
 then copy `denoize.vst3` to a standard per-user directory:
 
 - Linux: `~/.vst3/`
@@ -47,7 +47,7 @@ The adapter currently exposes single-precision audio only. Native CLAP accepts
 both f32 and f64 buffers, but clap-wrapper 0.16.0 reports VST3 double precision
 as unsupported. A host may convert around the plug-in; denoize does not claim
 an internal f64 VST3 signal path. Hosts render generic parameter controls in
-v0.78.1. v0.79.0 validates an accessible custom editor through native CLAP;
+v0.78.2. v0.79.0 validates an accessible custom editor through native CLAP;
 that evidence does not claim that a VST3 host opened the wrapper-projected
 custom view, so generic VST3 controls remain the documented fallback.
 
@@ -97,7 +97,7 @@ workflow signs one Sigstore/SLSA attestation for the matrix and both logs; the
 final asset verifier checks all three subjects against the
 tag, workflow, source commit, and trusted root.
 
-The v0.78.1 matrix sets `real_host_smoke` to true only for the named Ardour
+The v0.78.2 matrix sets `real_host_smoke` to true only for the named Ardour
 8.4.0~ds1 / Ubuntu 24.04 x86-64 run. `double_precision_audio` and
 `custom_editor` remain false, and `proprietary-hosts-not-exercised` remains an
 explicit limitation. The separate v0.79.0 CLAP editor evidence does not mutate

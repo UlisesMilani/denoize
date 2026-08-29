@@ -1,0 +1,22 @@
+{
+  "schema": "denoize-wasm-capabilities-v1",
+  "schema_version": 1,
+  "library_version": "0.86.0",
+  "backend": "classical-scalar",
+  "finite": true,
+  "incremental": true,
+  "cancellation": "between-bounded-calls",
+  "filesystem": false,
+  "implicit_model_downloads": false,
+  "simd_required": false,
+  "default_render_quantum": null,
+  "observed_render_quantum_required": true,
+  "execution_thread": "worker",
+  "audio_worklet": "preallocated-shared-ring-only",
+  "limits": {
+    "max_channels": 32,
+    "max_frames_per_call": 1048576,
+    "max_buffered_frames": 4194304,
+    "max_render_quantum": 32768
+  }
+}

@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.85.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.86.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -32,6 +32,7 @@ USAGE:
     denoize ipc <COMMAND> [OPTIONS]  (run `denoize ipc --help`)
     denoize update <COMMAND> [OPTIONS]  (run `denoize update --help`)
     denoize project <COMMAND> [OPTIONS]  (run `denoize project --help`)
+    denoize sdk <COMMAND> [OPTIONS]  (run `denoize sdk --help`)
 
 LIVE:
     Low-latency live processing supports classical, rnnoise, and gtcrn when
@@ -353,7 +354,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.85.0 watch-folder automation
+denoize 0.86.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

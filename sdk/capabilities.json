@@ -1,0 +1,51 @@
+{
+  "schema": "denoize-sdk-capabilities-v1",
+  "schema_version": 1,
+  "library_version": "0.86.0",
+  "stage": 33,
+  "c_abi": {
+    "status": "supported",
+    "abi_version": 1,
+    "backend": "classical-scalar",
+    "architectures": ["aarch64", "x86_64"],
+    "threading": "creator-thread-plus-atomic-cancel-token"
+  },
+  "wasm": {
+    "status": "supported",
+    "backend": "classical-scalar",
+    "finite": true,
+    "incremental": true,
+    "simd": "optional-not-required"
+  },
+  "web_audio": {
+    "status": "supported-with-cross-origin-isolation",
+    "dsp_thread": "worker",
+    "render_quantum": "observed-not-assumed",
+    "transport": "preallocated-shared-ring"
+  },
+  "android": {
+    "status": "supported-worker-wrapper",
+    "min_api": 26,
+    "abis": ["arm64-v8a", "x86_64"],
+    "io": "application-owned-oboe-aaudio-ring",
+    "route_policy": "destroy-and-rebuild"
+  },
+  "ios": {
+    "status": "supported-worker-wrapper",
+    "minimum": "iOS 15",
+    "architectures": ["arm64-device", "arm64-simulator", "x86_64-simulator"],
+    "io": "application-owned-audio-unit-ring",
+    "route_policy": "destroy-and-rebuild"
+  },
+  "wam": {
+    "status": "optional-host-matrix-gated",
+    "processor": "web-audio-worker-core"
+  },
+  "global_guarantees": [
+    "bounded-caller-owned-audio",
+    "explicit-unsupported-backends",
+    "no-implicit-model-download",
+    "no-rust-layout-or-panic-across-c",
+    "route-generation-rebuild"
+  ]
+}

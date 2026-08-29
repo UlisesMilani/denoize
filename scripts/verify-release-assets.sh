@@ -35,6 +35,20 @@ expected_assets=(
   "denoize-${tag}-x86_64-pc-windows-msvc.zip.sha256"
   "denoize-${tag}-x86_64-unknown-linux-gnu.tar.gz"
   "denoize-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-c-sdk-${tag}-aarch64-apple-darwin.tar.gz"
+  "denoize-c-sdk-${tag}-aarch64-apple-darwin.tar.gz.sha256"
+  "denoize-c-sdk-${tag}-x86_64-apple-darwin.tar.gz"
+  "denoize-c-sdk-${tag}-x86_64-apple-darwin.tar.gz.sha256"
+  "denoize-c-sdk-${tag}-x86_64-pc-windows-msvc.tar.gz"
+  "denoize-c-sdk-${tag}-x86_64-pc-windows-msvc.tar.gz.sha256"
+  "denoize-c-sdk-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+  "denoize-c-sdk-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+  "denoize-web-sdk-${tag}.tar.gz"
+  "denoize-web-sdk-${tag}.tar.gz.sha256"
+  "denoize-android-sdk-${tag}.tar.gz"
+  "denoize-android-sdk-${tag}.tar.gz.sha256"
+  "denoize-ios-sdk-${tag}.tar.gz"
+  "denoize-ios-sdk-${tag}.tar.gz.sha256"
   "denoize-plugin-${tag}-aarch64-apple-darwin.tar.gz"
   "denoize-plugin-${tag}-aarch64-apple-darwin.tar.gz.sha256"
   "denoize-plugin-${tag}-x86_64-apple-darwin.tar.gz"
@@ -171,6 +185,10 @@ expected_assets=(
   "denoize-aec-report-v1.schema.json"
   "denoize-microphone-array-promotion-evidence-v1.schema.json"
   "denoize-microphone-array-report-v1.schema.json"
+  "denoize-sdk-abi-v1.schema.json"
+  "denoize-sdk-capabilities-v1.schema.json"
+  "denoize-mobile-lifecycle-v1.schema.json"
+  "denoize-wasm-capabilities-v1.schema.json"
   "denoize-update-apply-v1.schema.json"
   "denoize-update-bundle-v1.schema.json"
   "denoize-update-check-v1.schema.json"
@@ -187,7 +205,7 @@ expected_assets=(
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
-update_rollback_versions=(0.83.0 0.84.0)
+update_rollback_versions=(0.84.0 0.85.0)
 update_platforms=(
   "darwin-aarch64-app"
   "darwin-x86_64-app"
@@ -295,6 +313,7 @@ gh release download "$tag" \
   --pattern '*.crate' \
   --pattern '*.sigstore.json' \
   --pattern '*.jsonl' \
+  --pattern 'denoize-vst3-host-matrix-v1.json' \
   --pattern 'denoize-clap-editor-host-*.txt' \
   --pattern 'denoize-auv3-auval-*.txt' \
   --pattern 'denoize-auv3-host-*.txt' \
@@ -364,6 +383,10 @@ gh release download "$tag" \
   --pattern 'denoize-aec-report-v1.schema.json' \
   --pattern 'denoize-microphone-array-promotion-evidence-v1.schema.json' \
   --pattern 'denoize-microphone-array-report-v1.schema.json' \
+  --pattern 'denoize-sdk-abi-v1.schema.json' \
+  --pattern 'denoize-sdk-capabilities-v1.schema.json' \
+  --pattern 'denoize-mobile-lifecycle-v1.schema.json' \
+  --pattern 'denoize-wasm-capabilities-v1.schema.json' \
   --pattern 'denoize-update-*.schema.json' \
   --pattern 'denoize-update-manifest-v1.json' \
   --pattern 'denoize-watch-cycle-v1.schema.json' \
@@ -379,6 +402,121 @@ for checksum in "$tmp_dir"/*.sha256; do
     sha256sum --check "$(basename "$checksum")"
   )
 done
+
+sdk_archive_contains() {
+  local archive=$1
+  local member=$2
+  tar -tzf "$archive" | awk -v expected="$member" '$0 == expected { found = 1 } END { exit !found }'
+}
+
+for sdk_target in \
+  aarch64-apple-darwin \
+  x86_64-apple-darwin \
+  x86_64-pc-windows-msvc \
+  x86_64-unknown-linux-gnu; do
+  sdk_package="denoize-c-sdk-${tag}-${sdk_target}"
+  sdk_archive="$tmp_dir/$sdk_package.tar.gz"
+  case "$sdk_target" in
+    *-apple-darwin) sdk_libraries=(libdenoize_c.dylib libdenoize_c.a) ;;
+    *-pc-windows-msvc) sdk_libraries=(denoize_c.dll denoize_c.dll.lib denoize_c.lib) ;;
+    *-unknown-linux-gnu) sdk_libraries=(libdenoize_c.so libdenoize_c.a) ;;
+  esac
+  for sdk_member in \
+    "$sdk_package/include/denoize.h" \
+    "$sdk_package/abi/denoize-abi-v1.json" \
+    "$sdk_package/capabilities.json" \
+    "$sdk_package/mobile-lifecycle.json"; do
+    if ! sdk_archive_contains "$sdk_archive" "$sdk_member"; then
+      echo "C SDK archive $(basename "$sdk_archive") is missing $sdk_member" >&2
+      exit 1
+    fi
+  done
+  for sdk_library in "${sdk_libraries[@]}"; do
+    if ! sdk_archive_contains "$sdk_archive" "$sdk_package/lib/$sdk_library"; then
+      echo "C SDK archive $(basename "$sdk_archive") is missing $sdk_library" >&2
+      exit 1
+    fi
+  done
+  if ! cmp -s sdk/denoize-c/include/denoize.h \
+    <(tar -xOzf "$sdk_archive" "$sdk_package/include/denoize.h"); then
+    echo "C SDK archive $(basename "$sdk_archive") has the wrong ABI header" >&2
+    exit 1
+  fi
+  if ! cmp -s sdk/capabilities.json \
+    <(tar -xOzf "$sdk_archive" "$sdk_package/capabilities.json"); then
+    echo "C SDK archive $(basename "$sdk_archive") has the wrong capability matrix" >&2
+    exit 1
+  fi
+done
+
+web_package="denoize-web-sdk-${tag}"
+web_archive="$tmp_dir/$web_package.tar.gz"
+for web_member in \
+  "$web_package/denoize-wasm/pkg/denoize_wasm.js" \
+  "$web_package/denoize-wasm/pkg/denoize_wasm_bg.wasm" \
+  "$web_package/web/src/denoize-worklet.js" \
+  "$web_package/web/src/denoize-worker.js" \
+  "$web_package/web/package-lock.json" \
+  "$web_package/web/playwright.config.mjs" \
+  "$web_package/web/wam/descriptor.json" \
+  "$web_package/capabilities.json"; do
+  if ! sdk_archive_contains "$web_archive" "$web_member"; then
+    echo "Web SDK archive is missing $web_member" >&2
+    exit 1
+  fi
+done
+if ! cmp -s sdk/capabilities.json \
+  <(tar -xOzf "$web_archive" "$web_package/capabilities.json"); then
+  echo "Web SDK archive has the wrong capability matrix" >&2
+  exit 1
+fi
+
+android_package="denoize-android-sdk-${tag}"
+android_archive="$tmp_dir/$android_package.tar.gz"
+android_aar="$tmp_dir/denoize-sdk-${version}.aar"
+for android_member in \
+  "$android_package/denoize-sdk-${version}.aar" \
+  "$android_package/capabilities.json" \
+  "$android_package/mobile-lifecycle.json"; do
+  if ! sdk_archive_contains "$android_archive" "$android_member"; then
+    echo "Android SDK archive is missing $android_member" >&2
+    exit 1
+  fi
+done
+tar -xOzf "$android_archive" \
+  "$android_package/denoize-sdk-${version}.aar" > "$android_aar"
+for android_member in \
+  jni/arm64-v8a/libdenoize_c.so \
+  jni/arm64-v8a/libdenoize_jni.so \
+  jni/x86_64/libdenoize_c.so \
+  jni/x86_64/libdenoize_jni.so \
+  assets/denoize/capabilities.json \
+  assets/denoize/mobile-lifecycle.json; do
+  if ! unzip -Z1 "$android_aar" \
+    | awk -v expected="$android_member" '$0 == expected { found = 1 } END { exit !found }'; then
+    echo "Android AAR is missing $android_member" >&2
+    exit 1
+  fi
+done
+
+ios_package="denoize-ios-sdk-${tag}"
+ios_archive="$tmp_dir/$ios_package.tar.gz"
+for ios_member in \
+  "$ios_package/Package.swift" \
+  "$ios_package/DenoizeC.xcframework/Info.plist" \
+  "$ios_package/Sources/DenoizeSDK/DenoizeSDK.swift" \
+  "$ios_package/capabilities.json" \
+  "$ios_package/mobile-lifecycle.json"; do
+  if ! sdk_archive_contains "$ios_archive" "$ios_member"; then
+    echo "iOS SDK archive is missing $ios_member" >&2
+    exit 1
+  fi
+done
+if ! cmp -s sdk/capabilities.json \
+  <(tar -xOzf "$ios_archive" "$ios_package/capabilities.json"); then
+  echo "iOS SDK archive has the wrong capability matrix" >&2
+  exit 1
+fi
 
 bash scripts/verify-release-evidence.sh \
   "$tag" \
@@ -473,6 +611,10 @@ for schema in \
   denoize-aec-report-v1.schema.json \
   denoize-microphone-array-promotion-evidence-v1.schema.json \
   denoize-microphone-array-report-v1.schema.json \
+  denoize-sdk-abi-v1.schema.json \
+  denoize-sdk-capabilities-v1.schema.json \
+  denoize-mobile-lifecycle-v1.schema.json \
+  denoize-wasm-capabilities-v1.schema.json \
   denoize-update-apply-v1.schema.json \
   denoize-update-bundle-v1.schema.json \
   denoize-update-check-v1.schema.json \
@@ -973,7 +1115,7 @@ jq -e \
   .channel == "stable" and
   .version == $version and
   .source_commit == $commit and
-  .compatibility.accepted_from_versions == ["0.83.0", "0.84.0"] and
+  .compatibility.accepted_from_versions == ["0.84.0", "0.85.0"] and
   .rollback_policy.retained_last_known_good == 1 and
   .rollback_policy.manual_recovery == true and
   .rollback_policy.network_required_for_recovery == false and
@@ -999,7 +1141,7 @@ jq -e \
     ($platform_row.candidate.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
-    ([$platform_row.rollbacks[].from_version] == ["0.83.0", "0.84.0"]) and
+    ([$platform_row.rollbacks[].from_version] == ["0.84.0", "0.85.0"]) and
     all($platform_row.rollbacks[]; . as $rollback |
       $rollback.payload.activation == $platform_row.candidate.activation and
       (.bundle_url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and

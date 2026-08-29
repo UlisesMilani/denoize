@@ -1,0 +1,5 @@
+module CDenoize [system] {
+  header "include/CDenoize.h"
+  link "denoize_c"
+  export *
+}

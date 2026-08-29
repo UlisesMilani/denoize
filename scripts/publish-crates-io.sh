@@ -157,6 +157,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/model_package/testdata/minisign.pub" \
     "denoize-${package_version}/src/model_package/testdata/model.onnx.base64" \
     "denoize-${package_version}/src/recommendation.rs" \
+    "denoize-${package_version}/src/sdk.rs" \
     "denoize-${package_version}/src/neural_daw.rs" \
     "denoize-${package_version}/src/target_speaker.rs" \
     "denoize-${package_version}/src/backend/target_speaker.rs" \
@@ -189,6 +190,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/restoration.md" \
     "denoize-${package_version}/docs/universal-restoration.md" \
     "denoize-${package_version}/docs/updates.md" \
+    "denoize-${package_version}/sdk/capabilities.json" \
+    "denoize-${package_version}/sdk/mobile-lifecycle.json" \
     "denoize-${package_version}/schemas/denoize-assessment-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-automation-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-cli-output-v1.schema.json" \
@@ -262,6 +265,10 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-aec-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-microphone-array-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-microphone-array-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-mobile-lifecycle-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-sdk-abi-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-sdk-capabilities-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-wasm-capabilities-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-apply-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-bundle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-update-check-v1.schema.json" \

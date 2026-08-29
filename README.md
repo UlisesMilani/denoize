@@ -992,7 +992,7 @@ the exact three-event automation gesture, and exercises resize and lifecycle
 rejection paths. See [Accessible plug-in editor](docs/plugin-editor.md) for the
 supported window APIs, accessibility contract, evidence, and explicit limits.
 
-VST3 3.8 bundles are available from v0.78.1. They statically adapt the same two
+VST3 3.8 bundles are available from v0.78.2. They statically adapt the same two
 descriptors through exact pinned CLAP-wrapper, CLAP SDK, and VST3 SDK revisions,
 so they cannot load a same-named external CLAP binary. The official 3.8.1
 validator gate requires 94/94 passes. A pinned Ardour 8.4 headless real-host
@@ -1185,10 +1185,10 @@ and a separate update-asset attestation. A bundle contains both the candidate
 and its verified last-known-good installation, so startup-health or explicit
 recovery does not require a network. See [recoverable application updates](docs/updates.md).
 
-Every installable CLI archive, CLAP/VST3/AUv3 archive, desktop package,
-crates.io archive, and offline model bundle also has a per-artifact CycloneDX
-SBOM. The release
-evidence archive binds those 24 artifacts and SBOMs to their sizes and SHA-256 digests,
+Every installable CLI archive, CLAP/VST3/AUv3/LV2 archive, desktop package,
+C/Web/Android/iOS SDK archive, crates.io archive, and offline model bundle also
+has a per-artifact CycloneDX SBOM. The release evidence archive binds those 32
+artifacts and SBOMs to their sizes and SHA-256 digests,
 while companion GitHub Sigstore/SLSA bundles prove the exact tag commit and
 release workflow. See [release evidence and offline verification](docs/release-evidence.md)
 for the trust model and an air-gapped verification procedure.
@@ -1209,7 +1209,7 @@ this repository with its primary `Cargo.toml`.
 
 1. Synchronize the root/crates.io manifests and lockfile, the desktop npm and
    Tauri manifests/configuration and lockfiles, and the generated CLI banner.
-2. Run `bash scripts/verify-release-version.sh` to check all 13 version fields.
+2. Run `bash scripts/verify-release-version.sh` to check all release version fields.
 3. Commit and push the version change.
 4. Create the tag from a commit on the default branch and push it:
 
@@ -1898,6 +1898,22 @@ all supported audio containers, execution documents, signed receipts and keys,
 trust policies, and offline model bundles with finite input, RSS, and per-case
 time limits. See [resilience testing](docs/resilience.md) for the exact commands,
 resource-accounting scope, corpus-promotion rule, and debug-only fault protocol.
+
+## Embedding SDKs
+
+v0.86.0 adds a stable C ABI v1, scalar finite/incremental WASM, a bounded
+Worker/AudioWorklet transport, and Android/iOS worker wrappers over the same C
+core. SDK calls never download models or silently substitute unsupported
+backends. The CLI exposes the exact machine-readable contracts:
+
+```sh
+denoize sdk capabilities --pretty
+denoize sdk lifecycle --pretty
+```
+
+See [embedding SDKs](docs/sdk.md) for package targets, ownership and buffer
+rules, browser isolation requirements, mobile route generations, examples, and
+release verification.
 
 ## Library API
 
