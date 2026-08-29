@@ -203,6 +203,14 @@ def main() -> None:
             )
     if "compileSdk = 36" not in android_build:
         raise AssertionError("Android SDK does not compile against stable API 36")
+    for packaging_contract in (
+        'sourceSets.getByName("main")',
+        'jniLibs.srcDir("src/main/prebuilt")',
+    ):
+        if packaging_contract not in android_build:
+            raise AssertionError(
+                f"Android AAR omits prebuilt native source {packaging_contract}"
+            )
     if "IMPORTED_NO_SONAME TRUE" not in android_cmake:
         raise AssertionError("Android JNI link can embed a build-path DT_NEEDED entry")
     for workflow_name, workflow_path in (

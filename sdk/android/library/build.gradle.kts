@@ -35,6 +35,10 @@ android {
         buildConfig = false
     }
 
+    sourceSets.getByName("main") {
+        jniLibs.srcDir("src/main/prebuilt")
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
