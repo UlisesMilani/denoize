@@ -226,6 +226,15 @@ def main() -> None:
                     f"{workflow_name} workflow omits stable Android package {package}"
                 )
     ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    for android_ci_contract in (
+        'script: DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$RUNNER_TEMP"',
+        "- name: Inspect Android SDK archive",
+        'archive="$RUNNER_TEMP/denoize-android-sdk-v${version}.tar.gz"',
+    ):
+        if android_ci_contract not in ci_workflow:
+            raise AssertionError(
+                f"Android CI does not preserve the package across emulator commands: {android_ci_contract}"
+            )
     for job_name in ("sdk-native", "sdk-web"):
         job_start = ci_workflow.index(f"  {job_name}:")
         next_job = re.search(

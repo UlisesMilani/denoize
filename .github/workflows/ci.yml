@@ -770,11 +770,15 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-boot-timeout: 900
-          script: |
-            output_dir=$(mktemp -d /tmp/denoize-android-sdk-package.XXXXXX)
-            archive=$(DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$output_dir")
-            package="denoize-android-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
-            tar -tzf "$archive" | grep -F "$package/denoize-sdk-" >/dev/null
+          script: DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$RUNNER_TEMP"
+
+      - name: Inspect Android SDK archive
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          archive="$RUNNER_TEMP/denoize-android-sdk-v${version}.tar.gz"
+          package="denoize-android-sdk-v${version}"
+          tar -tzf "$archive" | grep -F "$package/denoize-sdk-" >/dev/null
 
   sdk-ios:
     name: iOS SDK (device and simulator)
