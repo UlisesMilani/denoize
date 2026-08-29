@@ -211,8 +211,36 @@ def main() -> None:
                 raise AssertionError(
                     f"{workflow_name} workflow omits stable Android package {package}"
                 )
-    if "connectedDebugAndroidTest" not in ANDROID_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
+    ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    for job_name in ("sdk-native", "sdk-web"):
+        job_start = ci_workflow.index(f"  {job_name}:")
+        next_job = re.search(
+            r"^  [a-z][a-z0-9-]+:$",
+            ci_workflow[job_start + 1 :],
+            re.MULTILINE,
+        )
+        job_end = (
+            job_start + 1 + next_job.start()
+            if next_job is not None
+            else len(ci_workflow)
+        )
+        job = ci_workflow[job_start:job_end]
+        if "rustup component add clippy --toolchain 1.96.0" not in job:
+            raise AssertionError(f"{job_name} does not install pinned Clippy")
+
+    android_package = ANDROID_PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    if "connectedDebugAndroidTest" not in android_package:
         raise AssertionError("Android package gate does not run instrumentation tests")
+    for archiver_variable in (
+        "AR_aarch64_linux_android",
+        "AR_x86_64_linux_android",
+    ):
+        if archiver_variable not in android_package:
+            raise AssertionError(
+                f"Android cross-compile omits NDK archiver {archiver_variable}"
+            )
+    if '"$ar_variable=$ndk_bin/llvm-ar"' not in android_package:
+        raise AssertionError("Android cross-compile does not use the pinned NDK llvm-ar")
     if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
         raise AssertionError("iOS package gate does not expose simulator tests")
     for package_script in (

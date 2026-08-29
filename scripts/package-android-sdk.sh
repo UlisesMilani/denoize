@@ -82,12 +82,14 @@ build_android_library() {
   local linker=$3
   local cargo_linker=$4
   local cc_variable=$5
+  local ar_variable=$6
   local destination="$staging/sdk/android/library/src/main/prebuilt/$abi"
   mkdir -p "$destination"
   env \
     RUSTUP_TOOLCHAIN="$toolchain" \
     "$cargo_linker=$ndk_bin/$linker" \
     "$cc_variable=$ndk_bin/$linker" \
+    "$ar_variable=$ndk_bin/llvm-ar" \
     cargo build --locked --profile ffi-release -p denoize-c --target "$rust_target"
   local library="$target_dir/$rust_target/ffi-release/libdenoize_c.so"
   if [[ ! -s "$library" ]]; then
@@ -99,10 +101,12 @@ build_android_library() {
 
 build_android_library \
   arm64-v8a aarch64-linux-android aarch64-linux-android26-clang \
-  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER CC_aarch64_linux_android
+  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER CC_aarch64_linux_android \
+  AR_aarch64_linux_android
 build_android_library \
   x86_64 x86_64-linux-android x86_64-linux-android26-clang \
-  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER CC_x86_64_linux_android
+  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER CC_x86_64_linux_android \
+  AR_x86_64_linux_android
 
 assets="$staging/sdk/android/library/src/main/assets/denoize"
 mkdir -p "$assets/schemas"
