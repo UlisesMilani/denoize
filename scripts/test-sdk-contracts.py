@@ -7,6 +7,7 @@ import argparse
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 
 import jsonschema
@@ -63,6 +64,7 @@ IOS_SOURCE_HEADER = ROOT / "sdk" / "ios" / "Sources" / "CDenoize" / "include" / 
 C_PACKAGE_SCRIPT = ROOT / "scripts" / "package-c-sdk.sh"
 ANDROID_PACKAGE_SCRIPT = ROOT / "scripts" / "package-android-sdk.sh"
 IOS_PACKAGE_SCRIPT = ROOT / "scripts" / "package-ios-sdk.sh"
+SDK_RELEASE_REF_SCRIPT = ROOT / "scripts" / "verify-sdk-release-ref.sh"
 RELEASE_ASSET_VERIFIER = ROOT / "scripts" / "verify-release-assets.sh"
 ABI_FUZZ_TARGET = ROOT / "fuzz" / "fuzz_targets" / "sdk_abi.rs"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -213,6 +215,80 @@ def main() -> None:
         raise AssertionError("Android package gate does not run instrumentation tests")
     if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
         raise AssertionError("iOS package gate does not expose simulator tests")
+    for package_script in (
+        C_PACKAGE_SCRIPT,
+        ROOT / "scripts" / "package-web-sdk.sh",
+        ANDROID_PACKAGE_SCRIPT,
+        IOS_PACKAGE_SCRIPT,
+    ):
+        if 'verify_sdk_release_ref "$tag" "$version"' not in package_script.read_text(
+            encoding="utf-8"
+        ):
+            raise AssertionError(
+                f"SDK package script bypasses the tag-only release-ref gate: {package_script}"
+            )
+
+    release_ref_command = (
+        f"source {shlex.quote(str(SDK_RELEASE_REF_SCRIPT))}; "
+        "verify_sdk_release_ref v0.86.0 0.86.0"
+    )
+    for environment in (
+        {
+            "GITHUB_REF": "refs/pull/212/merge",
+            "GITHUB_REF_NAME": "212/merge",
+            "GITHUB_REF_TYPE": "branch",
+        },
+        {
+            "GITHUB_REF": "refs/heads/feature/sdk-stage33",
+            "GITHUB_REF_NAME": "feature/sdk-stage33",
+            "GITHUB_REF_TYPE": "branch",
+        },
+        {
+            "GITHUB_REF": "refs/tags/v0.86.0",
+            "GITHUB_REF_NAME": "v0.86.0",
+            "GITHUB_REF_TYPE": "tag",
+        },
+        {
+            "GITHUB_REF_NAME": "v0.86.0",
+            "GITHUB_REF_TYPE": "tag",
+        },
+    ):
+        completed = subprocess.run(
+            ["bash", "-c", release_ref_command],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(
+                f"valid SDK build ref was rejected: {environment}: {completed.stderr}"
+            )
+    mismatch = subprocess.run(
+        ["bash", "-c", release_ref_command],
+        env={
+            "GITHUB_REF": "refs/tags/v0.85.0",
+            "GITHUB_REF_NAME": "v0.85.0",
+            "GITHUB_REF_TYPE": "tag",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if mismatch.returncode == 0 or "does not match SDK version 0.86.0" not in mismatch.stderr:
+        raise AssertionError("mismatched SDK release tag was not rejected")
+    missing_tag_name = subprocess.run(
+        ["bash", "-c", release_ref_command],
+        env={"GITHUB_REF_TYPE": "tag"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if (
+        missing_tag_name.returncode == 0
+        or "release tag <empty>" not in missing_tag_name.stderr
+    ):
+        raise AssertionError("tag build without release identity was not rejected")
     abi_fuzz_target = ABI_FUZZ_TARGET.read_text(encoding="utf-8")
     for operation in ("denoize_processor_create_v1", "denoize_processor_process_interleaved_f32_v1", "denoize_processor_finish_interleaved_f32_v1", "denoize_processor_destroy_v1"):
         if operation not in abi_fuzz_target:
