@@ -237,6 +237,14 @@ def main() -> None:
             raise AssertionError(
                 f"Android CI does not preserve the package across emulator commands: {android_ci_contract}"
             )
+    for ios_ci_contract in (
+        'DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$RUNNER_TEMP"',
+        'archive="$RUNNER_TEMP/denoize-ios-sdk-v${version}.tar.gz"',
+    ):
+        if ios_ci_contract not in ci_workflow:
+            raise AssertionError(
+                f"iOS CI does not use the deterministic package path: {ios_ci_contract}"
+            )
     for job_name in ("sdk-native", "sdk-web"):
         job_start = ci_workflow.index(f"  {job_name}:")
         next_job = re.search(

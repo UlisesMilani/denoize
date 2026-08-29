@@ -796,9 +796,10 @@ jobs:
       - name: Build and test Swift package and XCFramework
         shell: bash
         run: |
-          output_dir=$(mktemp -d "$RUNNER_TEMP/denoize-ios-sdk-package.XXXXXX")
-          archive=$(DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$output_dir")
-          package="denoize-ios-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$RUNNER_TEMP"
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          archive="$RUNNER_TEMP/denoize-ios-sdk-v${version}.tar.gz"
+          package="denoize-ios-sdk-v${version}"
           tar -tzf "$archive" | grep -F "$package/DenoizeC.xcframework/" >/dev/null
           tar -tzf "$archive" | grep -Fx "$package/Package.swift"
 
