@@ -276,8 +276,14 @@ def main() -> None:
             raise AssertionError(
                 f"Android AAR does not verify portable JNI dependency {dependency_gate}"
             )
-    if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
+    ios_package = IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in ios_package:
         raise AssertionError("iOS package gate does not expose simulator tests")
+    swift_typecheck = "swiftc -typecheck"
+    if swift_typecheck not in ios_package:
+        raise AssertionError("iOS package gate does not type-check Swift before packaging")
+    if ios_package.index(swift_typecheck) > ios_package.index("rustup target add"):
+        raise AssertionError("iOS Swift type-check runs after Rust cross-builds")
     for package_script in (
         C_PACKAGE_SCRIPT,
         ROOT / "scripts" / "package-web-sdk.sh",
