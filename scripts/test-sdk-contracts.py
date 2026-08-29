@@ -192,6 +192,8 @@ def main() -> None:
     for wrapper_name, wrapper in (("Android", android), ("iOS", ios)):
         if "downloads or installs models implicitly" not in wrapper:
             raise AssertionError(f"{wrapper_name} wrapper lost the no-implicit-download guard")
+    if ios.count("guard let handle = self.handle") != 3:
+        raise AssertionError("iOS cancellation closures do not capture their handle explicitly")
     for jni_class in ("NativeBridge", "DenoizeOptions", "DenoizeSdkException"):
         qualified = f"io.github.penguin425.denoize.sdk.{jni_class}"
         if qualified not in android_consumer_rules:
@@ -368,6 +370,16 @@ def main() -> None:
         raise AssertionError("ABI symbols must be unique and canonically sorted")
     header = HEADER.read_text(encoding="utf-8")
     rust = RUST.read_text(encoding="utf-8")
+    for status_name, status_value in manifest["status_codes"].items():
+        macro_name = f"DENOIZE_STATUS_{status_name.upper()}"
+        if not re.search(
+            rf"^#define {re.escape(macro_name)} {status_value}$",
+            header,
+            re.MULTILINE,
+        ):
+            raise AssertionError(
+                f"C status is not a Swift-importable integer macro: {macro_name}"
+            )
     for symbol in symbols:
         if not re.search(rf"\b{re.escape(symbol)}\s*\(", header):
             raise AssertionError(f"ABI symbol is absent from current header: {symbol}")
