@@ -1261,6 +1261,35 @@ shapes, unknown fields, path escapes, and output collisions fail before
 publication. Missing sources can be relocated only to a complete fingerprint
 and presentation-geometry match.
 
+For non-linear work, the additive v2 contract provides rational-time clips with
+arbitrary placement/overlap, nested graphs, tracks and buses, transitions,
+immutable effect revisions, automation, repair masks, an append-only undo/redo
+journal, complete cache identities, and explicit-loss interchange:
+
+```sh
+denoize project v2 migrate project.json project-v2.json --root . --pretty
+denoize project v2 validate project-v2.json --root . --pretty
+denoize project v2 render project-v2.json mix.wav --root . --jobs 4 --pretty
+denoize project v2 cache key project-v2.json --format wav-f32 --jobs 4 --pretty
+denoize project v2 interchange assess project-v2.json --format otio --pretty
+```
+
+The stable renderer executes gain, polarity, and repair-mask nodes in a fixed
+ID order; a graph containing `denoise-recipe-v1` fails explicitly until routed
+through the existing execution-plan renderer. Plain OTIO export/inspection is
+read-only and loss-reporting. OTIO bundles and ADM/BW64 are assessment-only in
+v0.85.0, so they are not advertised as authored outputs.
+
+`project v2 validate --root` decodes and rehashes current sources and
+authenticates each signed model package, separately fingerprinted Minisign key,
+package identity, and SPDX license identity. After rendering, `project v2
+provenance sign` creates a detached Ed25519 assertion binding those identities,
+every owner-qualified edit node in the selected nested-graph closure and its
+root-clock affected range, the published output bytes, and decoded PCM;
+`provenance verify` rechecks all output bindings. It targets the C2PA 2.4 edit
+vocabulary but does not claim an embedded C2PA manifest store. Ogg Opus remains
+explicitly detached.
+
 Offline `.dpb` bundles carry the manifest, settings, presets, verification
 evidence, source licenses, model public keys, plans, and receipts. Source audio
 and model package payloads remain references unless their include flag and a

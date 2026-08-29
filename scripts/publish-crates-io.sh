@@ -170,6 +170,11 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/project_automation.rs" \
     "denoize-${package_version}/src/project_bundle.rs" \
     "denoize-${package_version}/src/project_execution.rs" \
+    "denoize-${package_version}/src/project_v2.rs" \
+    "denoize-${package_version}/src/project_v2_cache.rs" \
+    "denoize-${package_version}/src/project_v2_interchange.rs" \
+    "denoize-${package_version}/src/project_v2_journal.rs" \
+    "denoize-${package_version}/src/project_v2_render.rs" \
     "denoize-${package_version}/LICENSES/clack-0.1.1-MIT.txt" \
     "denoize-${package_version}/LICENSES/clap-sys-0.5.0-MIT.txt" \
     "denoize-${package_version}/docs/json.md" \
@@ -219,6 +224,19 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-project-receipt-verification-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-project-render-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-project-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-cache-key-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-cache-record-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-cache-request-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-cache-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-checkpoint-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-external-inspection-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-interchange-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-journal-entry-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-journal-inspection-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-provenance-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-render-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2-verification-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-project-v2.schema.json" \
     "denoize-${package_version}/schemas/denoize-project-verification-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-project-watch-cycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-receipt-public-key-v1.schema.json" \

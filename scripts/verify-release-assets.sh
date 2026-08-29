@@ -133,6 +133,19 @@ expected_assets=(
   "denoize-project-receipt-verification-v1.schema.json"
   "denoize-project-render-v1.schema.json"
   "denoize-project-v1.schema.json"
+  "denoize-project-v2-cache-key-v1.schema.json"
+  "denoize-project-v2-cache-record-v1.schema.json"
+  "denoize-project-v2-cache-request-v1.schema.json"
+  "denoize-project-v2-cache-verification-v1.schema.json"
+  "denoize-project-v2-checkpoint-v1.schema.json"
+  "denoize-project-v2-external-inspection-v1.schema.json"
+  "denoize-project-v2-interchange-v1.schema.json"
+  "denoize-project-v2-journal-entry-v1.schema.json"
+  "denoize-project-v2-journal-inspection-v1.schema.json"
+  "denoize-project-v2-provenance-v1.schema.json"
+  "denoize-project-v2-render-v1.schema.json"
+  "denoize-project-v2-verification-v1.schema.json"
+  "denoize-project-v2.schema.json"
   "denoize-project-verification-v1.schema.json"
   "denoize-project-watch-cycle-v1.schema.json"
   "denoize-receipt-public-key-v1.schema.json"
@@ -174,7 +187,7 @@ expected_assets=(
   "denoize-models-${tag}.dmb.sha256"
   "latest.json"
 )
-update_rollback_versions=(0.82.0 0.83.0)
+update_rollback_versions=(0.83.0 0.84.0)
 update_platforms=(
   "darwin-aarch64-app"
   "darwin-x86_64-app"
@@ -422,6 +435,19 @@ for schema in \
   denoize-project-receipt-verification-v1.schema.json \
   denoize-project-render-v1.schema.json \
   denoize-project-v1.schema.json \
+  denoize-project-v2-cache-key-v1.schema.json \
+  denoize-project-v2-cache-record-v1.schema.json \
+  denoize-project-v2-cache-request-v1.schema.json \
+  denoize-project-v2-cache-verification-v1.schema.json \
+  denoize-project-v2-checkpoint-v1.schema.json \
+  denoize-project-v2-external-inspection-v1.schema.json \
+  denoize-project-v2-interchange-v1.schema.json \
+  denoize-project-v2-journal-entry-v1.schema.json \
+  denoize-project-v2-journal-inspection-v1.schema.json \
+  denoize-project-v2-provenance-v1.schema.json \
+  denoize-project-v2-render-v1.schema.json \
+  denoize-project-v2-verification-v1.schema.json \
+  denoize-project-v2.schema.json \
   denoize-project-verification-v1.schema.json \
   denoize-project-watch-cycle-v1.schema.json \
   denoize-receipt-public-key-v1.schema.json \
@@ -947,7 +973,7 @@ jq -e \
   .channel == "stable" and
   .version == $version and
   .source_commit == $commit and
-  .compatibility.accepted_from_versions == ["0.82.0", "0.83.0"] and
+  .compatibility.accepted_from_versions == ["0.83.0", "0.84.0"] and
   .rollback_policy.retained_last_known_good == 1 and
   .rollback_policy.manual_recovery == true and
   .rollback_policy.network_required_for_recovery == false and
@@ -973,7 +999,7 @@ jq -e \
     ($platform_row.candidate.artifact.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.sbom.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
     ($platform_row.candidate.provenance.url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and
-    ([$platform_row.rollbacks[].from_version] == ["0.82.0", "0.83.0"]) and
+    ([$platform_row.rollbacks[].from_version] == ["0.83.0", "0.84.0"]) and
     all($platform_row.rollbacks[]; . as $rollback |
       $rollback.payload.activation == $platform_row.candidate.activation and
       (.bundle_url | startswith("https://github.com/" + $repository + "/releases/download/v" + $version + "/")) and

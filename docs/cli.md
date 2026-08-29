@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.84.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.85.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -353,7 +353,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.84.0 watch-folder automation
+denoize 0.85.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]
@@ -656,6 +656,7 @@ Portable project and deterministic partial-file timeline commands:
     denoize project watch <INPUT_DIR> <OUTPUT_DIR> --root DIR \
         --receipt-key SECRET.json [--timeline ID] [--once] [--settle-ms N] \
         [--poll-ms N] [--recursive] [--pretty]
+    denoize project v2 <COMMAND>  (run `denoize project v2 help`)
 
 CHANNEL_MAP is a '+'-separated list of zero-based source channels, for example
 `0+1` or `0+0`. Times are quantized exactly once onto the source presentation

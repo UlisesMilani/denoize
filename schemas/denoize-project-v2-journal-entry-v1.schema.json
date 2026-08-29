@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-journal-entry-v1.schema.json",
+  "title": "denoize project v2 journal entry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "sequence", "parent_digest", "command_digest", "result_digest", "command"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-journal-entry-v1" },
+    "schema_version": { "const": 1 },
+    "sequence": { "$ref": "denoize-project-v2.schema.json#/$defs/revision" },
+    "parent_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "command_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "result_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" },
+    "command": { "$ref": "#/$defs/command" }
+  },
+  "$defs": {
+    "owner": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["owner", "graph_id", "track_id"], "properties": { "owner": { "const": "track" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "track_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" } } },
+        { "type": "object", "additionalProperties": false, "required": ["owner", "graph_id", "bus_id"], "properties": { "owner": { "const": "bus" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "bus_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" } } }
+      ]
+    },
+    "command": {
+      "oneOf": [
+        { "type": "object", "additionalProperties": false, "required": ["command", "graph_id", "clip", "transitions"], "properties": { "command": { "enum": ["insert-clip", "remove-clip"] }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "clip": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" }, "transitions": { "type": "array", "maxItems": 256, "items": { "$ref": "denoize-project-v2.schema.json#/$defs/transition" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["command", "graph_id", "clip_id", "from_track_id", "from_start", "to_track_id", "to_start"], "properties": { "command": { "const": "move-clip" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "clip_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "from_track_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "from_start": { "$ref": "denoize-project-v2.schema.json#/$defs/time" }, "to_track_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "to_start": { "$ref": "denoize-project-v2.schema.json#/$defs/time" } } },
+        { "type": "object", "additionalProperties": false, "required": ["command", "graph_id", "original", "left", "right"], "properties": { "command": { "const": "split-clip" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "original": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" }, "left": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" }, "right": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" } } },
+        { "type": "object", "additionalProperties": false, "required": ["command", "graph_id", "left", "right", "joined"], "properties": { "command": { "const": "join-clips" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, "left": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" }, "right": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" }, "joined": { "$ref": "denoize-project-v2.schema.json#/$defs/clip" } } },
+        { "type": "object", "additionalProperties": false, "required": ["command", "owner", "before", "after"], "properties": { "command": { "const": "replace-effect-chain" }, "owner": { "$ref": "#/$defs/owner" }, "before": { "type": "array", "maxItems": 256, "items": { "$ref": "denoize-project-v2.schema.json#/$defs/effectReference" } }, "after": { "type": "array", "maxItems": 256, "items": { "$ref": "denoize-project-v2.schema.json#/$defs/effectReference" } } } },
+        { "type": "object", "additionalProperties": false, "required": ["command", "before", "after"], "properties": { "command": { "const": "replace-effect-revision" }, "before": { "$ref": "denoize-project-v2.schema.json#/$defs/effect" }, "after": { "$ref": "denoize-project-v2.schema.json#/$defs/effect" } } },
+        { "type": "object", "additionalProperties": false, "required": ["command", "before", "after"], "properties": { "command": { "const": "select-effect-revision" }, "before": { "$ref": "denoize-project-v2.schema.json#/$defs/effectReference" }, "after": { "$ref": "denoize-project-v2.schema.json#/$defs/effectReference" } } }
+      ]
+    }
+  }
+}

@@ -4457,6 +4457,7 @@ Portable project and deterministic partial-file timeline commands:
     denoize project watch <INPUT_DIR> <OUTPUT_DIR> --root DIR \\
         --receipt-key SECRET.json [--timeline ID] [--once] [--settle-ms N] \\
         [--poll-ms N] [--recursive] [--pretty]
+    denoize project v2 <COMMAND>  (run `denoize project v2 help`)
 
 CHANNEL_MAP is a '+'-separated list of zero-based source channels, for example
 `0+1` or `0+0`. Times are quantized exactly once onto the source presentation
@@ -4490,8 +4491,686 @@ fn run_project(args: &[String]) -> Result<(), String> {
         "receipt" => run_project_receipt(&args[1..]),
         "batch" => run_project_batch_command(&args[1..]),
         "watch" => run_project_watch(&args[1..]),
+        "v2" => run_project_v2(&args[1..]),
         command => Err(format!("unknown project command: {command}")),
     }
+}
+
+fn project_v2_usage() -> &'static str {
+    "\
+Durable non-destructive project graph v2 commands:
+
+    denoize project v2 migrate <V1.json> <V2.json> --root DIR [--pretty] [--force]
+    denoize project v2 inspect <V2.json> [--pretty]
+    denoize project v2 validate <V2.json> --root DIR [--pretty]
+    denoize project v2 render <V2.json> <OUTPUT> --root DIR \\
+        [--graph ID] [--jobs N] [--max-memory-mib N] \\
+        [--max-output-frames N] [--pretty] [--force]
+    denoize project v2 journal inspect <JOURNAL.ndjson> [--pretty]
+    denoize project v2 cache key <V2.json> [--graph ID] \\
+        [--format wav-f32|wav-pcm24|flac24|opus|mp3|m4a] \\
+        [--bitrate BPS] [--jobs N] [--pretty]
+    denoize project v2 interchange assess <V2.json> \\
+        --format otio|otioz|otiod|adm-bw64 \\
+        [--graph ID] [--direction import|export] [--pretty]
+    denoize project v2 otio export <V2.json> <OUTPUT.otio> --root DIR \\
+        [--graph ID] [--accept-losses] [--pretty] [--force]
+    denoize project v2 otio inspect <INPUT.otio> [--pretty]
+    denoize project v2 provenance sign <V2.json> <OUTPUT_AUDIO> <PROVENANCE.json> \\
+        --root DIR --secret-key SECRET_KEY.json --format wav-f32|wav-pcm24|flac24|opus|mp3|m4a \\
+        [--graph ID] [--pretty] [--force]
+    denoize project v2 provenance verify <PROVENANCE.json> <OUTPUT_AUDIO> \\
+        --public-key PUBLIC_KEY.json [--pretty]
+
+The v2 manifest is a closed executable graph: unknown fields and nodes fail
+closed. Cache keys bind source bytes, graph topology, immutable effects,
+automation, models, runtime choice, and output settings. OTIO/ADM are explicit
+loss-reporting interchange boundaries and never import free-form executable
+effects. Provenance output is a detached C2PA 2.4-targeted, Ed25519-signed
+assertion; this release does not embed a C2PA manifest store. Ogg/Opus always
+uses its explicit detached carrier.
+"
+}
+
+fn run_project_v2(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        None | Some("help") => {
+            print!("{}", project_v2_usage());
+            Ok(())
+        }
+        Some("migrate") => run_project_v2_migrate(&args[1..]),
+        Some("inspect") => run_project_v2_inspect(&args[1..], false),
+        Some("validate") => run_project_v2_inspect(&args[1..], true),
+        Some("render") => run_project_v2_render(&args[1..]),
+        Some("journal") => run_project_v2_journal(&args[1..]),
+        Some("cache") => run_project_v2_cache(&args[1..]),
+        Some("interchange") => run_project_v2_interchange(&args[1..]),
+        Some("otio") => run_project_v2_otio(&args[1..]),
+        Some("provenance") => run_project_v2_provenance(&args[1..]),
+        Some(command) => Err(format!("unknown project v2 command: {command}")),
+    }
+}
+
+fn run_project_v2_migrate(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project v2 migrate requires V1.json V2.json".into());
+    }
+    let mut root = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--pretty" => pretty = true,
+            "--force" => force = true,
+            value => return Err(format!("unknown project v2 migrate option: {value}")),
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project v2 migrate requires --root DIR")?,
+    )?;
+    let legacy = denoize::ProjectManifest::from_file(&args[0])?;
+    denoize::validate_project_files(&legacy, &root, DecodeLimits::default())?;
+    reject_project_v2_cli_file_aliases(
+        std::path::Path::new(&args[1]),
+        &[(std::path::Path::new(&args[0]), "v1 manifest")],
+        "project v2 migration output",
+    )?;
+    reject_project_v1_migration_reference_aliases(&legacy, &root, std::path::Path::new(&args[1]))?;
+    let migrated = denoize::project_v2::migrate_project_v1_to_v2(&legacy)?;
+    let report =
+        denoize::project_v2::verify_project_v2_files(&migrated, &root, DecodeLimits::default())?;
+    denoize::project_v2::write_project_v2_manifest(
+        &args[1],
+        &migrated,
+        project_commit_mode(force),
+        pretty,
+    )?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_v2_inspect(args: &[String], validation_only: bool) -> Result<(), String> {
+    let command = if validation_only {
+        "validate"
+    } else {
+        "inspect"
+    };
+    let input = args
+        .first()
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project v2 inspect/validate requires V2.json")?;
+    let mut pretty = false;
+    let mut root = None;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" if validation_only => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--pretty" => pretty = true,
+            value => return Err(format!("unknown project v2 {command} option: {value}")),
+        }
+        index += 1;
+    }
+    let manifest = denoize::project_v2::ProjectV2Manifest::from_file(input)?;
+    if validation_only {
+        let root = canonical_cli_project_root(
+            root.as_deref()
+                .ok_or("project v2 validate requires --root DIR")?,
+        )?;
+        print_project_document(
+            &denoize::project_v2::verify_project_v2_files(
+                &manifest,
+                root,
+                DecodeLimits::default(),
+            )?,
+            pretty,
+        )
+    } else {
+        print_project_document(&manifest, pretty)
+    }
+}
+
+fn run_project_v2_render(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project v2 render requires V2.json OUTPUT".into());
+    }
+    let mut root = None;
+    let mut graph = None;
+    let mut jobs = 1_u16;
+    let mut max_memory_bytes = 1024_u64 * 1024 * 1024;
+    let mut max_output_frames = 48_000_u64 * 60 * 60 * 8;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--graph" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut graph, value, option)?;
+            }
+            "--jobs" => {
+                let value = project_option_value(args, &mut index, option)?;
+                jobs = value
+                    .parse()
+                    .map_err(|_| format!("invalid project v2 jobs: {value}"))?;
+            }
+            "--max-memory-mib" => {
+                let value = project_option_value(args, &mut index, option)?;
+                max_memory_bytes = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid project v2 memory limit: {value}"))?
+                    .checked_mul(1024 * 1024)
+                    .ok_or("project v2 memory limit overflows")?;
+            }
+            "--max-output-frames" => {
+                let value = project_option_value(args, &mut index, option)?;
+                max_output_frames = value
+                    .parse()
+                    .map_err(|_| format!("invalid project v2 frame limit: {value}"))?;
+            }
+            "--pretty" => pretty = true,
+            "--force" => force = true,
+            value => return Err(format!("unknown project v2 render option: {value}")),
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project v2 render requires --root DIR")?,
+    )?;
+    let manifest = denoize::project_v2::ProjectV2Manifest::from_file(&args[0])?;
+    let graph = graph.unwrap_or_else(|| manifest.root_graph_id.clone());
+    reject_project_v2_cli_file_aliases(
+        std::path::Path::new(&args[1]),
+        &[(std::path::Path::new(&args[0]), "v2 manifest")],
+        "project v2 render output",
+    )?;
+    let options = denoize::project_v2::ProjectV2RenderOptions {
+        deterministic: true,
+        jobs,
+        max_memory_bytes,
+        max_output_frames,
+    };
+    let limits = DecodeLimits::default().with_max_working_set_bytes(Some(max_memory_bytes));
+    let report = denoize::project_v2::publish_project_v2_graph(
+        &manifest,
+        &graph,
+        root,
+        &args[1],
+        options,
+        limits,
+        EncodeOptions::default(),
+        project_commit_mode(force),
+    )?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_v2_journal(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("inspect") {
+        return Err("project v2 journal requires `inspect`".into());
+    }
+    let input = args
+        .get(1)
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project v2 journal inspect requires JOURNAL.ndjson")?;
+    let mut pretty = false;
+    for option in &args[2..] {
+        match option.as_str() {
+            "--pretty" => pretty = true,
+            value => return Err(format!("unknown project v2 journal option: {value}")),
+        }
+    }
+    let report = denoize::project_v2::read_project_v2_journal(input)?;
+    print_project_document(&report, pretty)
+}
+
+fn run_project_v2_cache(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("key") {
+        return Err("project v2 cache requires `key`".into());
+    }
+    let input = args
+        .get(1)
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project v2 cache key requires V2.json")?;
+    let mut graph = None;
+    let mut format = denoize::project_v2::ProjectV2OutputFormat::WavFloat32;
+    let mut bitrate = None;
+    let mut jobs = 1_u16;
+    let mut pretty = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--graph" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut graph, value, option)?;
+            }
+            "--format" => {
+                let value = project_option_value(args, &mut index, option)?;
+                format = parse_project_v2_output_format(&value)?;
+            }
+            "--bitrate" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(
+                    &mut bitrate,
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid project v2 bitrate: {value}"))?,
+                    option,
+                )?;
+            }
+            "--jobs" => {
+                let value = project_option_value(args, &mut index, option)?;
+                jobs = value
+                    .parse()
+                    .map_err(|_| format!("invalid project v2 jobs: {value}"))?;
+            }
+            "--pretty" => pretty = true,
+            value => return Err(format!("unknown project v2 cache option: {value}")),
+        }
+        index += 1;
+    }
+    let manifest = denoize::project_v2::ProjectV2Manifest::from_file(input)?;
+    let graph_id = graph.unwrap_or_else(|| manifest.root_graph_id.clone());
+    let graph = manifest.graph(&graph_id)?;
+    let lossy = matches!(
+        format,
+        denoize::project_v2::ProjectV2OutputFormat::OggOpus
+            | denoize::project_v2::ProjectV2OutputFormat::Mp3
+            | denoize::project_v2::ProjectV2OutputFormat::M4a
+    );
+    let output = denoize::project_v2::ProjectV2OutputSettings {
+        format,
+        sample_rate: graph.sample_rate,
+        channels: graph.channels,
+        bitrate_bps: if lossy {
+            Some(bitrate.unwrap_or(192_000))
+        } else {
+            bitrate
+        },
+        metadata_policy: "drop".into(),
+        provenance_policy_digest: None,
+    };
+    let request = denoize::project_v2::ProjectV2CacheRequest::from_manifest(
+        &manifest,
+        &graph_id,
+        denoize::project_v2::ProjectV2RuntimeIdentity::deterministic_scalar(jobs),
+        output,
+    )?;
+    let document = denoize::project_v2::ProjectV2CacheKeyReport::new(request)?;
+    print_project_document(&document, pretty)
+}
+
+fn parse_project_v2_output_format(
+    value: &str,
+) -> Result<denoize::project_v2::ProjectV2OutputFormat, String> {
+    match value {
+        "wav-f32" | "wav-float32" => Ok(denoize::project_v2::ProjectV2OutputFormat::WavFloat32),
+        "wav-pcm24" | "wav24" => Ok(denoize::project_v2::ProjectV2OutputFormat::WavPcm24),
+        "flac24" | "flac" => Ok(denoize::project_v2::ProjectV2OutputFormat::Flac24),
+        "opus" | "ogg-opus" => Ok(denoize::project_v2::ProjectV2OutputFormat::OggOpus),
+        "mp3" => Ok(denoize::project_v2::ProjectV2OutputFormat::Mp3),
+        "m4a" => Ok(denoize::project_v2::ProjectV2OutputFormat::M4a),
+        _ => Err(format!("unknown project v2 output format: {value}")),
+    }
+}
+
+fn run_project_v2_interchange(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("assess") {
+        return Err("project v2 interchange requires `assess`".into());
+    }
+    let input = args
+        .get(1)
+        .filter(|value| !value.starts_with('-'))
+        .ok_or("project v2 interchange assess requires V2.json")?;
+    let mut graph = None;
+    let mut format = None;
+    let mut direction = denoize::project_v2::ProjectV2InterchangeDirection::Export;
+    let mut pretty = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--graph" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut graph, value, option)?;
+            }
+            "--format" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(
+                    &mut format,
+                    parse_project_v2_interchange_format(&value)?,
+                    option,
+                )?;
+            }
+            "--direction" => {
+                let value = project_option_value(args, &mut index, option)?;
+                direction = match value.as_str() {
+                    "import" => denoize::project_v2::ProjectV2InterchangeDirection::Import,
+                    "export" => denoize::project_v2::ProjectV2InterchangeDirection::Export,
+                    _ => return Err(format!("unknown project v2 interchange direction: {value}")),
+                };
+            }
+            "--pretty" => pretty = true,
+            value => return Err(format!("unknown project v2 interchange option: {value}")),
+        }
+        index += 1;
+    }
+    let manifest = denoize::project_v2::ProjectV2Manifest::from_file(input)?;
+    let graph = graph.unwrap_or_else(|| manifest.root_graph_id.clone());
+    let report = denoize::project_v2::assess_project_v2_interchange(
+        &manifest,
+        &graph,
+        format.ok_or("project v2 interchange requires --format")?,
+        direction,
+    )?;
+    print_project_document(&report, pretty)
+}
+
+fn parse_project_v2_interchange_format(
+    value: &str,
+) -> Result<denoize::project_v2::ProjectV2InterchangeFormat, String> {
+    match value {
+        "otio" => Ok(denoize::project_v2::ProjectV2InterchangeFormat::Otio),
+        "otioz" => Ok(denoize::project_v2::ProjectV2InterchangeFormat::Otioz),
+        "otiod" => Ok(denoize::project_v2::ProjectV2InterchangeFormat::Otiod),
+        "adm-bw64" | "adm" | "bw64" => Ok(denoize::project_v2::ProjectV2InterchangeFormat::AdmBw64),
+        _ => Err(format!("unknown project v2 interchange format: {value}")),
+    }
+}
+
+fn run_project_v2_otio(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("inspect") => {
+            let input = args
+                .get(1)
+                .filter(|value| !value.starts_with('-'))
+                .ok_or("project v2 otio inspect requires INPUT.otio")?;
+            let mut pretty = false;
+            for option in &args[2..] {
+                match option.as_str() {
+                    "--pretty" => pretty = true,
+                    value => {
+                        return Err(format!("unknown project v2 otio inspect option: {value}"))
+                    }
+                }
+            }
+            print_project_document(
+                &denoize::project_v2::inspect_project_v2_otio(input)?,
+                pretty,
+            )
+        }
+        Some("export") => {
+            if args.len() < 3 || args[1].starts_with('-') || args[2].starts_with('-') {
+                return Err("project v2 otio export requires V2.json OUTPUT.otio".into());
+            }
+            let mut graph = None;
+            let mut root = None;
+            let mut accept_losses = false;
+            let mut pretty = false;
+            let mut force = false;
+            let mut index = 3;
+            while index < args.len() {
+                let option = args[index].as_str();
+                match option {
+                    "--root" => {
+                        let value = project_option_value(args, &mut index, option)?;
+                        set_project_option(&mut root, value, option)?;
+                    }
+                    "--graph" => {
+                        let value = project_option_value(args, &mut index, option)?;
+                        set_project_option(&mut graph, value, option)?;
+                    }
+                    "--accept-losses" => accept_losses = true,
+                    "--pretty" => pretty = true,
+                    "--force" => force = true,
+                    value => return Err(format!("unknown project v2 otio export option: {value}")),
+                }
+                index += 1;
+            }
+            let manifest = denoize::project_v2::ProjectV2Manifest::from_file(&args[1])?;
+            let graph = graph.unwrap_or_else(|| manifest.root_graph_id.clone());
+            let root = canonical_cli_project_root(
+                root.as_deref()
+                    .ok_or("project v2 otio export requires --root DIR")?,
+            )?;
+            reject_project_v2_cli_file_aliases(
+                std::path::Path::new(&args[2]),
+                &[(std::path::Path::new(&args[1]), "v2 manifest")],
+                "project v2 OTIO output",
+            )?;
+            let report = denoize::project_v2::export_project_v2_otio(
+                &manifest,
+                &graph,
+                &root,
+                &args[2],
+                accept_losses,
+                project_commit_mode(force),
+            )?;
+            print_project_document(&report, pretty)
+        }
+        _ => Err("project v2 otio requires `export` or `inspect`".into()),
+    }
+}
+
+fn run_project_v2_provenance(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("sign") => run_project_v2_provenance_sign(&args[1..]),
+        Some("verify") => run_project_v2_provenance_verify(&args[1..]),
+        _ => Err("project v2 provenance requires `sign` or `verify`".into()),
+    }
+}
+
+fn run_project_v2_provenance_sign(args: &[String]) -> Result<(), String> {
+    if args.len() < 3
+        || args[0].starts_with('-')
+        || args[1].starts_with('-')
+        || args[2].starts_with('-')
+    {
+        return Err(
+            "project v2 provenance sign requires V2.json OUTPUT_AUDIO PROVENANCE.json".into(),
+        );
+    }
+    let mut root = None;
+    let mut secret_key = None;
+    let mut graph = None;
+    let mut format = None;
+    let mut pretty = false;
+    let mut force = false;
+    let mut index = 3;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--root" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut root, value, option)?;
+            }
+            "--secret-key" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut secret_key, value, option)?;
+            }
+            "--graph" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut graph, value, option)?;
+            }
+            "--format" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut format, parse_project_v2_output_format(&value)?, option)?;
+            }
+            "--pretty" => pretty = true,
+            "--force" => force = true,
+            value => {
+                return Err(format!(
+                    "unknown project v2 provenance sign option: {value}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    let root = canonical_cli_project_root(
+        root.as_deref()
+            .ok_or("project v2 provenance sign requires --root DIR")?,
+    )?;
+    let secret_key = secret_key
+        .as_deref()
+        .ok_or("project v2 provenance sign requires --secret-key")?;
+    let format = format.ok_or("project v2 provenance sign requires --format")?;
+    let manifest = denoize::project_v2::ProjectV2Manifest::from_file(&args[0])?;
+    let graph = graph.unwrap_or_else(|| manifest.root_graph_id.clone());
+    reject_project_v2_cli_file_aliases(
+        std::path::Path::new(&args[2]),
+        &[
+            (std::path::Path::new(&args[0]), "v2 manifest"),
+            (std::path::Path::new(&args[1]), "published audio"),
+            (std::path::Path::new(secret_key), "provenance secret key"),
+        ],
+        "project v2 provenance output",
+    )?;
+    denoize::project_v2::validate_project_v2_publication_destination(
+        &manifest,
+        &root,
+        std::path::Path::new(&args[2]),
+    )?;
+    // No output container is mutated in v0.85.0. The signed assertion is an
+    // explicit detached handoff; Ogg Opus receives a distinct carrier label so
+    // callers cannot accidentally claim embedded support.
+    let carrier = if format == denoize::project_v2::ProjectV2OutputFormat::OggOpus {
+        denoize::project_v2::ProjectV2ProvenanceCarrier::DetachedOggOpus
+    } else {
+        denoize::project_v2::ProjectV2ProvenanceCarrier::DetachedGeneric
+    };
+    let payload = denoize::project_v2::build_project_v2_provenance_payload(
+        &manifest,
+        &graph,
+        root,
+        &args[1],
+        format,
+        carrier,
+        DecodeLimits::default(),
+    )?;
+    let signed = denoize::project_v2::sign_project_v2_provenance(
+        payload,
+        &ReceiptSecretKey::from_file(secret_key)?,
+    )?;
+    denoize::project_v2::write_signed_project_v2_provenance(
+        &args[2],
+        &signed,
+        project_commit_mode(force),
+        pretty,
+    )?;
+    print_project_document(&signed, pretty)
+}
+
+fn run_project_v2_provenance_verify(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 || args[0].starts_with('-') || args[1].starts_with('-') {
+        return Err("project v2 provenance verify requires PROVENANCE.json OUTPUT_AUDIO".into());
+    }
+    let mut public_key = None;
+    let mut pretty = false;
+    let mut index = 2;
+    while index < args.len() {
+        let option = args[index].as_str();
+        match option {
+            "--public-key" => {
+                let value = project_option_value(args, &mut index, option)?;
+                set_project_option(&mut public_key, value, option)?;
+            }
+            "--pretty" => pretty = true,
+            value => {
+                return Err(format!(
+                    "unknown project v2 provenance verify option: {value}"
+                ))
+            }
+        }
+        index += 1;
+    }
+    let public_key = public_key
+        .as_deref()
+        .ok_or("project v2 provenance verify requires --public-key")?;
+    let signed = denoize::project_v2::SignedProjectV2Provenance::from_file(&args[0])?;
+    denoize::project_v2::verify_project_v2_provenance_output(
+        &signed,
+        &ReceiptPublicKey::from_file(public_key)?,
+        &args[1],
+        DecodeLimits::default(),
+    )?;
+    print_project_document(&signed, pretty)
+}
+
+fn reject_project_v2_cli_file_aliases(
+    output: &std::path::Path,
+    protected: &[(&std::path::Path, &str)],
+    context: &str,
+) -> Result<(), String> {
+    let destination = normalized_project_destination(output, context)?;
+    let existing_target = std::fs::canonicalize(&destination).ok();
+    for (path, label) in protected {
+        let protected = std::fs::canonicalize(path)
+            .map_err(|error| format!("re-resolve {label} {}: {error}", path.display()))?;
+        if destination == protected || existing_target.as_ref() == Some(&protected) {
+            return Err(format!("{context} must not replace or alias its {label}"));
+        }
+    }
+    Ok(())
+}
+
+fn reject_project_v1_migration_reference_aliases(
+    manifest: &denoize::ProjectManifest,
+    root: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), String> {
+    let context = "project v2 migration output";
+    let destination = normalized_project_destination(output, context)?;
+    let existing_target = std::fs::canonicalize(&destination).ok();
+    let mut locators = Vec::new();
+    for source in &manifest.sources {
+        locators.push(source.locator.as_str());
+        if let Some(license) = &source.license {
+            locators.push(license.locator.as_str());
+        }
+    }
+    for reference in manifest
+        .settings
+        .iter()
+        .chain(&manifest.presets)
+        .chain(&manifest.plans)
+        .chain(&manifest.receipts)
+    {
+        locators.push(reference.locator.as_str());
+    }
+    for model in &manifest.models {
+        locators.push(model.package.locator.as_str());
+        locators.push(model.public_key.locator.as_str());
+    }
+    for locator in locators {
+        let requested = root.join(locator);
+        let artifact = std::fs::canonicalize(&requested)
+            .ok()
+            .or_else(|| normalized_project_destination(&requested, "v1 project artifact").ok());
+        if let Some(artifact) = artifact {
+            if destination == artifact || existing_target.as_ref() == Some(&artifact) {
+                return Err(format!(
+                    "{context} collides with referenced v1 artifact {locator}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_project_bundle(args: &[String]) -> Result<(), String> {
@@ -14539,7 +15218,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "7120b9f84090e815069c6e5199dec158d2a2ad322374dc62474e20f11d8306b7";
+        "af8186b247f73a5f0be66e675a91374863927479926ea5cf06485e946a9186d7";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

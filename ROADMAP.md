@@ -70,7 +70,7 @@ stop/rollback conditions behind this order are maintained in
 | 6 | 29 | Offline then causal target-speaker extraction with enrollment privacy, leakage/failure handling, speaker and ASR gates | Offline released in v0.77.0; causal implementation complete for v0.82.0, release pending |
 | 7 | 30 | Far-end-reference acoustic echo cancellation with delay tracking, double-talk handling, sidechain/live routing, and strict real-time gates | Native file/stream core, signed evidence, schemas, and CLI implemented for v0.83.0; plug-in/live host promotion pending |
 | 8 | 31 | Microphone-array enhancement with explicit channel roles/geometry, WPE/MVDR baseline, streaming neural spatial processing, and program-stereo protection | Explicit-geometry offline WPE/MVDR baseline, signed evidence, schemas, and CLI implemented for v0.84.0; neural streaming remains artifact/evidence-gated |
-| 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Planned |
+| 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Closed graph, bounded deterministic renderer, contiguous immutable history, authenticated model/key/license references, journal/checkpoint/trusted-local-cache API, v1 migration, plain-OTIO loss reporting, nested-closure detached provenance, 13 schemas, CLI, and tests implemented for v0.85.0; multi-writer journaling, untrusted distributed cache, bundle/ADM authoring, embedded C2PA, and external denoise-effect execution remain gated |
 | 10 | 33 | Stable C ABI, finite/live WASM, mobile SDKs, and optional Web Audio Module packaging after runtime and processing ABI stabilization | Planned |
 
 Post-roadmap candidates remain research-gated rather than silently extending the
@@ -264,11 +264,15 @@ Target-speaker enrollment audio is not retained by default.
 
 Stage 32 deliberately follows stable restoration chains so the project format
 does not encode provisional DSP semantics. OTIO and ADM/BW64 are explicit,
-loss-reporting interchange adapters, not the executable effect graph. Its C2PA
-export appends verifiable operation and model fingerprints without claiming that
-provenance assertions prove truth. WAV/FLAC/M4A/MP3 may use a pinned Rust SDK
-carrier; Ogg/Opus remains detached until the specification's carrier has a
-merged, conformance-tested implementation.
+loss-reporting interchange adapters, not the executable effect graph. The
+v0.85.0 baseline authors plain OTIO only; OTIOZ/OTIOD and ADM/BW64 currently
+produce assessment reports rather than files. Its provenance handoff appends
+verifiable operation, affected-range, model, output-byte, and decoded-PCM
+fingerprints without claiming that assertions prove truth. It uses a detached,
+domain-separated Ed25519 assertion targeting the C2PA 2.4 edit vocabulary. No
+format claims an embedded C2PA manifest store in this release, and Ogg/Opus has
+an explicit detached carrier until a pinned upstream implementation passes
+byte-level conformance tests.
 
 Stage 33 follows runtime and timeline stabilization so exported ABI
 compatibility can be maintained rather than repeatedly broken. It ships in

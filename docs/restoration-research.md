@@ -825,6 +825,27 @@ parameters; sample-accurate automation; repair masks; render cache keys; and an
 append-only command journal with checkpoints. Source media is referenced by
 relative locator plus size/digest, with optional explicit embedding.
 
+The v0.85.0 implementation candidate realizes that closed baseline with exact
+rational validation, arbitrary overlaps, nested graphs/buses, stable-ID `f64`
+mixing, source resampling, immutable gain/polarity/repair-mask effects, bounded
+hash-linked commands and checkpoints, and complete cache request/record/hit
+verification. Its v1 migration, schema traversal tests, real-WAV overlap and
+nested-graph resampling tests, one-versus-four-job PCM equality, inverse edit
+tests, final-record truncation recovery, malformed cache key/container rejection,
+and source/model/key/output rehashing make the durability claims executable
+rather than descriptive.
+
+The candidate also fixes its promotion boundary. `denoise-recipe-v1` remains a
+typed authenticated graph node but is rejected by the local v2 renderer until
+the independently verified execution-plan renderer is selected. Plain `.otio`
+can be exported and inspected with enumerated losses; OTIOZ/OTIOD and ADM/BW64
+are assessment-only, not authored formats. Edit provenance is a detached,
+domain-separated Ed25519 assertion that targets C2PA 2.4 action vocabulary and
+binds the complete selected nested-graph edit closure, owner graph IDs, root-clock
+affected ranges, models, output bytes, and decoded PCM. It is not an embedded
+C2PA manifest store or a claim that the signer is truthful. These limitations are
+release gates, not silently substituted behavior.
+
 OpenTimelineIO informs timeline/track/transition/rational-time interchange, but
 its core timeline references rather than contains media
 ([serialized schema](https://github.com/AcademySoftwareFoundation/OpenTimelineIO/blob/main/docs/tutorials/otio-serialized-schema.md),
@@ -866,16 +887,26 @@ upstream implementation passes byte-level conformance tests; specification
 support is not reported as implementation support.
 
 Cache identity binds source digests, exact clip ranges, graph topology, every
-parameter/automation curve, implementation version, model package fingerprint,
-runtime/determinism choice, and output format. Property tests cover overlap
-rendering, rational-rate conversion, split/join, nested buses, undo/redo inverse,
-journal truncation, unknown fields, migrations, moved/missing/changed media,
-cache poisoning, crash recovery, and deterministic parallel render.
+parameter/automation curve, implementation version, authenticated model package,
+public-key and license identity, runtime/determinism choice, and output format.
+Current tests cover overlap rendering, rational-rate conversion, nested-graph
+resampling, graph/bus cycles, undo inverse, exact checkpoint-prefix binding,
+journal truncation, root-parent and contiguous effect-history invariants, unknown
+fields, migration identity preservation, nested provenance projection,
+missing/changed media, cache key/container tampering, publication collisions,
+and scheduler-independent render output.
+
+The cache record is not a signature. The v0.85.0 verifier assumes a trusted
+local cache namespace and does not claim authenticity if an attacker can replace
+both the record and its output. A distributed or shared untrusted cache remains
+gated on an independently signed render receipt or expected output digest.
 
 The v2 graph uses stable node IDs and immutable revisions; edits append commands
 and create a new root rather than mutating historical nodes. Checkpoints may
 compact a journal only after binding the previous root and synchronizing the new
-snapshot. Cache hits are accepted only after source, range, graph, parameter,
+snapshot. Journal mutation is deliberately single-writer; embedders serialize
+writers instead of relying on atomic replacement as a cross-process lock. Cache
+hits are accepted only after source, range, graph, parameter,
 model, runtime, format, and output digest verification. Undo/redo operates on
 commands and must be inverse under property tests; it cannot delete an external
 source or an already published export. Unknown future nodes, lossy OTIO/ADM

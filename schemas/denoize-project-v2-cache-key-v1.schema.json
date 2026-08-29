@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-cache-key-v1.schema.json",
+  "title": "denoize project v2 cache key",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "schema_version", "key", "request"],
+  "properties": { "schema": { "const": "denoize-project-v2-cache-key-v1" }, "schema_version": { "const": 1 }, "key": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" }, "request": { "$ref": "denoize-project-v2-cache-request-v1.schema.json" } }
+}

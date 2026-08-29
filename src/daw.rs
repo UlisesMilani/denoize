@@ -24,6 +24,10 @@ pub const DAW_FIXED_LATENCY_MILLIS: f64 = 10.0;
 pub const DAW_MAX_SAMPLE_RATE: u32 = crate::config::MAX_HOST_SAMPLE_RATE;
 pub(crate) const MAX_DAW_DOCUMENT_BYTES: u64 = 64 * 1024;
 const MAX_PRESET_NAME_CHARS: usize = 80;
+// CLAP hosts can deliberately feed f32 subnormals even when the plug-in is
+// processing through its f64 path. Flush that inaudible range before it enters
+// the delay and detector state so callback cost does not depend on MXCSR state.
+const DAW_DENORMAL_FLOOR: f64 = f32::MIN_POSITIVE as f64;
 
 /// Stable, host-independent plug-in parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -384,6 +388,8 @@ pub struct DawRealtimeParameters {
     minimum_gain: f64,
     detector_attack: f64,
     detector_release: f64,
+    noise_floor_fall: f64,
+    noise_floor_rise: f64,
     gain_attack: f64,
     gain_release: f64,
     stereo_link: bool,
@@ -468,6 +474,8 @@ impl DawRealtimeProcessor {
             minimum_gain: db_to_linear(-60.0 * f64::from(parameters.amount)),
             detector_attack: time_coefficient(self.sample_rate, 3.0),
             detector_release: time_coefficient(self.sample_rate, f64::from(parameters.release_ms)),
+            noise_floor_fall: time_coefficient(self.sample_rate, 45.0),
+            noise_floor_rise: time_coefficient(self.sample_rate, 1_500.0),
             gain_attack: time_coefficient(self.sample_rate, 2.0),
             gain_release: time_coefficient(self.sample_rate, f64::from(parameters.release_ms)),
             stereo_link: parameters.stereo_link,
@@ -491,7 +499,7 @@ impl DawRealtimeProcessor {
         parameters: &DawRealtimeParameters,
     ) -> [f64; 2] {
         for sample in input.iter_mut().take(self.channels) {
-            if !sample.is_finite() {
+            if !sample.is_finite() || sample.abs() < DAW_DENORMAL_FLOOR {
                 *sample = 0.0;
             }
         }
@@ -525,8 +533,11 @@ impl DawRealtimeProcessor {
             // drag the adaptive threshold upward during a phrase.
             let current_noise = self.noise_floor[channel];
             if level < current_noise || level < parameters.threshold * 6.0 {
-                let noise_ms = if level < current_noise { 45.0 } else { 1_500.0 };
-                let noise_coefficient = time_coefficient(self.sample_rate, noise_ms);
+                let noise_coefficient = if level < current_noise {
+                    parameters.noise_floor_fall
+                } else {
+                    parameters.noise_floor_rise
+                };
                 self.noise_floor[channel] = noise_coefficient * current_noise
                     + (1.0 - noise_coefficient) * level.max(1.0e-9);
             }
@@ -710,6 +721,39 @@ mod tests {
             }
             assert_eq!(nonzero, vec![(expected, 1.0)]);
         }
+    }
+
+    #[test]
+    fn realtime_processor_flushes_denormals_but_preserves_normal_samples() {
+        let mut processor = DawRealtimeProcessor::new(48_000.0, 1).unwrap();
+        let mut parameters = DawParameters::default();
+        parameters.bypass = true;
+        let runtime = processor.prepare_parameters(&parameters).unwrap();
+        let latency = processor.latency_frames() as usize;
+        let denormals = [
+            f64::from(f32::from_bits(1)),
+            -f64::from(f32::MIN_POSITIVE) * 0.5,
+            f64::from_bits(1),
+        ];
+
+        for sample in denormals {
+            assert_eq!(processor.process_frame_f64([sample, 0.0], &runtime)[0], 0.0);
+        }
+        for _ in 0..latency {
+            assert_eq!(processor.process_frame_f64([0.0, 0.0], &runtime)[0], 0.0);
+        }
+
+        processor.reset();
+        let minimum_normal = f64::from(f32::MIN_POSITIVE);
+        assert_eq!(
+            processor.process_frame_f64([minimum_normal, 0.0], &runtime)[0],
+            0.0
+        );
+        let mut delayed = 0.0;
+        for _ in 0..latency {
+            delayed = processor.process_frame_f64([0.0, 0.0], &runtime)[0];
+        }
+        assert_eq!(delayed, minimum_normal);
     }
 
     #[test]

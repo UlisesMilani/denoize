@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-project-v2-interchange-v1.schema.json",
+  "title": "denoize project v2 interchange report",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "schema_version", "manifest_digest", "graph_id", "format", "direction", "exact", "read_only", "project_mutated", "mapped_clips", "mapped_tracks", "losses"],
+  "properties": {
+    "schema": { "const": "denoize-project-v2-interchange-v1" }, "schema_version": { "const": 1 },
+    "manifest_digest": { "$ref": "denoize-project-v2.schema.json#/$defs/digest" }, "graph_id": { "$ref": "denoize-project-v2.schema.json#/$defs/identifier" },
+    "format": { "enum": ["otio", "otioz", "otiod", "adm-bw64"] }, "direction": { "enum": ["import", "export"] },
+    "exact": { "type": "boolean" }, "read_only": { "type": "boolean" }, "project_mutated": { "const": false },
+    "mapped_clips": { "type": "integer", "minimum": 0, "maximum": 200000 }, "mapped_tracks": { "type": "integer", "minimum": 0, "maximum": 8192 },
+    "losses": { "type": "array", "maxItems": 200000, "items": { "$ref": "#/$defs/loss" } }
+  },
+  "$defs": {
+    "loss": { "type": "object", "additionalProperties": false, "required": ["kind", "node_id", "detail"], "properties": { "kind": { "enum": ["arbitrary-placement-metadata-only", "automation-not-executable", "bus-topology-flattened", "effect-not-executable", "embedded-media-requires-bundle", "missing-adm-object-metadata", "model-binding-sidecar-only", "nested-graph-flattened", "provenance-sidecar-only", "repair-mask-sidecar-only", "timeline-structure-read-only", "transition-sidecar-only", "unsupported-external-schema"] }, "node_id": { "oneOf": [{ "$ref": "denoize-project-v2.schema.json#/$defs/identifier" }, { "type": "null" }] }, "detail": { "$ref": "denoize-project-v2.schema.json#/$defs/text" } } }
+  }
+}

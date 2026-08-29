@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate every Stage 23 project document against its checked-in schema."""
+"""Validate the Stage 23 and Stage 32 project contracts."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import tempfile
 import wave
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, RefResolver
 
 
 PROJECT_SCHEMAS = {
@@ -25,6 +25,40 @@ PROJECT_SCHEMAS = {
     "denoize-project-bundle-import-v1": "denoize-project-bundle-import-v1.schema.json",
     "denoize-project-batch-v1": "denoize-project-batch-v1.schema.json",
     "denoize-project-watch-cycle-v1": "denoize-project-watch-cycle-v1.schema.json",
+    "denoize-project-v2": "denoize-project-v2.schema.json",
+    "denoize-project-v2-verification-v1": "denoize-project-v2-verification-v1.schema.json",
+    "denoize-project-v2-render-v1": "denoize-project-v2-render-v1.schema.json",
+    "denoize-project-v2-journal-entry-v1": "denoize-project-v2-journal-entry-v1.schema.json",
+    "denoize-project-v2-journal-inspection-v1": "denoize-project-v2-journal-inspection-v1.schema.json",
+    "denoize-project-v2-checkpoint-v1": "denoize-project-v2-checkpoint-v1.schema.json",
+    "denoize-project-v2-cache-request-v1": "denoize-project-v2-cache-request-v1.schema.json",
+    "denoize-project-v2-cache-key-v1": "denoize-project-v2-cache-key-v1.schema.json",
+    "denoize-project-v2-cache-record-v1": "denoize-project-v2-cache-record-v1.schema.json",
+    "denoize-project-v2-cache-verification-v1": "denoize-project-v2-cache-verification-v1.schema.json",
+    "denoize-project-v2-interchange-v1": "denoize-project-v2-interchange-v1.schema.json",
+    "denoize-project-v2-external-inspection-v1": "denoize-project-v2-external-inspection-v1.schema.json",
+    "denoize-project-v2-provenance-v1": "denoize-project-v2-provenance-v1.schema.json",
+}
+
+RUNTIME_PROJECT_SCHEMAS = {
+    "denoize-project-v1",
+    "denoize-project-verification-v1",
+    "denoize-project-render-v1",
+    "denoize-project-execution-plan-v1",
+    "denoize-project-execution-receipt-v1",
+    "denoize-project-receipt-verification-v1",
+    "denoize-project-bundle-v1",
+    "denoize-project-bundle-import-v1",
+    "denoize-project-batch-v1",
+    "denoize-project-watch-cycle-v1",
+    "denoize-project-v2",
+    "denoize-project-v2-verification-v1",
+    "denoize-project-v2-render-v1",
+    "denoize-project-v2-journal-inspection-v1",
+    "denoize-project-v2-cache-key-v1",
+    "denoize-project-v2-interchange-v1",
+    "denoize-project-v2-external-inspection-v1",
+    "denoize-project-v2-provenance-v1",
 }
 
 
@@ -71,12 +105,18 @@ def write_source(path: Path) -> None:
 
 
 def load_validators(repository: Path) -> dict[str, Draft202012Validator]:
-    validators: dict[str, Draft202012Validator] = {}
+    schemas: dict[str, dict[str, object]] = {}
     for schema_name, filename in PROJECT_SCHEMAS.items():
         path = repository / "schemas" / filename
         schema = read_json(path)
         Draft202012Validator.check_schema(schema)
-        validators[schema_name] = Draft202012Validator(schema)
+        schemas[schema_name] = schema
+    store = {str(schema["$id"]): schema for schema in schemas.values()}
+    validators: dict[str, Draft202012Validator] = {}
+    for schema_name, schema in schemas.items():
+        validators[schema_name] = Draft202012Validator(
+            schema, resolver=RefResolver.from_schema(schema, store=store)
+        )
     return validators
 
 
@@ -94,7 +134,7 @@ def validate_documents(
         if validators[schema_name].is_valid(future):
             raise RuntimeError(f"{schema_name} does not reject an unknown future field")
         observed.add(schema_name)
-    missing = sorted(set(validators) - observed)
+    missing = sorted(RUNTIME_PROJECT_SCHEMAS - observed)
     if missing:
         raise RuntimeError(f"no runtime document was validated for: {', '.join(missing)}")
 
@@ -109,6 +149,36 @@ def validate_documents(
     unsafe_locator["sources"][0]["locator"] = "nested/.."
     if validators["denoize-project-v1"].is_valid(unsafe_locator):
         raise RuntimeError("project schema accepts a traversal locator")
+
+    manifest_v2 = next(
+        document for document in documents if document.get("schema") == "denoize-project-v2"
+    )
+    unsafe_v2 = json.loads(json.dumps(manifest_v2))
+    unsafe_v2["sources"][0]["storage"]["locator"] = "nested/../source.wav"
+    if validators["denoize-project-v2"].is_valid(unsafe_v2):
+        raise RuntimeError("project v2 schema accepts a traversal locator")
+    future_node = json.loads(json.dumps(manifest_v2))
+    future_node["graphs"][0]["clips"][0]["future_node"] = True
+    if validators["denoize-project-v2"].is_valid(future_node):
+        raise RuntimeError("project v2 schema accepts an unknown executable node field")
+    later_without_parent = json.loads(json.dumps(manifest_v2))
+    later_without_parent["root_revision"] = 2
+    if validators["denoize-project-v2"].is_valid(later_without_parent):
+        raise RuntimeError("project v2 schema accepts a later root without its parent")
+    initial_with_parent = json.loads(json.dumps(manifest_v2))
+    initial_with_parent["parent_digest"] = "00" * 32
+    if validators["denoize-project-v2"].is_valid(initial_with_parent):
+        raise RuntimeError("project v2 schema accepts an initial root with a parent")
+
+    provenance_v2 = next(
+        document
+        for document in documents
+        if document.get("schema") == "denoize-project-v2-provenance-v1"
+    )
+    action_without_owner = json.loads(json.dumps(provenance_v2))
+    del action_without_owner["payload"]["actions"][0]["graph_id"]
+    if validators["denoize-project-v2-provenance-v1"].is_valid(action_without_owner):
+        raise RuntimeError("project v2 provenance accepts an action without its owner graph")
 
 
 def exercise(binary: Path, repository: Path) -> None:
@@ -129,6 +199,13 @@ def exercise(binary: Path, repository: Path) -> None:
         inbox = root / "inbox"
         watched_output = root / "watched-output"
         watched_manifest = inbox / "watched.json"
+        manifest_v2 = root / "project-v2.json"
+        muted_manifest_v2 = root / "project-v2-muted.json"
+        output_v2 = root / "rendered-v2.wav"
+        muted_output_v2 = root / "rendered-v2-muted.wav"
+        provenance_v2 = root / "rendered-v2.provenance.json"
+        otio = root / "project.otio"
+        journal_v2 = root / "project-v2.ndjson"
         write_source(source)
         setting.write_text("strength = 0.5\n", encoding="utf-8")
 
@@ -236,6 +313,130 @@ def exercise(binary: Path, repository: Path) -> None:
             )
         )
 
+        documents.append(
+            run_json(
+                binary,
+                "project",
+                "v2",
+                "migrate",
+                manifest,
+                manifest_v2,
+                "--root",
+                root,
+            )
+        )
+        documents.append(run_json(binary, "project", "v2", "inspect", manifest_v2))
+        documents.append(
+            run_json(
+                binary,
+                "project",
+                "v2",
+                "validate",
+                manifest_v2,
+                "--root",
+                root,
+            )
+        )
+        documents.append(
+            run_json(
+                binary,
+                "project",
+                "v2",
+                "render",
+                manifest_v2,
+                output_v2,
+                "--root",
+                root,
+                "--max-memory-mib",
+                "64",
+            )
+        )
+        muted_document = read_json(manifest_v2)
+        for graph in muted_document["graphs"]:
+            for track in graph["tracks"]:
+                track["muted"] = True
+        muted_manifest_v2.write_text(
+            json.dumps(muted_document, separators=(",", ":")), encoding="utf-8"
+        )
+        documents.append(
+            run_json(
+                binary,
+                "project",
+                "v2",
+                "render",
+                muted_manifest_v2,
+                muted_output_v2,
+                "--root",
+                root,
+                "--max-memory-mib",
+                "64",
+            )
+        )
+        documents.append(
+            run_json(binary, "project", "v2", "cache", "key", manifest_v2)
+        )
+        documents.append(
+            run_json(
+                binary,
+                "project",
+                "v2",
+                "interchange",
+                "assess",
+                manifest_v2,
+                "--format",
+                "otio",
+            )
+        )
+        documents.append(
+            run_json(
+                binary,
+                "project",
+                "v2",
+                "otio",
+                "export",
+                manifest_v2,
+                otio,
+                "--root",
+                root,
+                "--accept-losses",
+            )
+        )
+        documents.append(run_json(binary, "project", "v2", "otio", "inspect", otio))
+        signed_provenance = run_json(
+            binary,
+            "project",
+            "v2",
+            "provenance",
+            "sign",
+            manifest_v2,
+            output_v2,
+            provenance_v2,
+            "--root",
+            root,
+            "--secret-key",
+            secret,
+            "--format",
+            "wav-f32",
+        )
+        documents.append(signed_provenance)
+        verified_provenance = run_json(
+            binary,
+            "project",
+            "v2",
+            "provenance",
+            "verify",
+            provenance_v2,
+            output_v2,
+            "--public-key",
+            public,
+        )
+        if verified_provenance != signed_provenance:
+            raise RuntimeError("project v2 provenance sign and verify reports differ")
+        journal_v2.write_bytes(b"")
+        documents.append(
+            run_json(binary, "project", "v2", "journal", "inspect", journal_v2)
+        )
+
         inbox.mkdir()
         run_json(
             binary,
@@ -280,7 +481,7 @@ def main() -> int:
     if not binary.is_file():
         parser.error(f"denoize binary does not exist: {binary}")
     exercise(binary, repository)
-    print(f"validated {len(PROJECT_SCHEMAS)} Stage 23 project JSON contracts")
+    print(f"validated {len(PROJECT_SCHEMAS)} project JSON contracts through Stage 32")
     return 0
 
 
