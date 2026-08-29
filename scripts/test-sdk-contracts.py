@@ -204,8 +204,10 @@ def main() -> None:
     if "compileSdk = 36" not in android_build:
         raise AssertionError("Android SDK does not compile against stable API 36")
     for packaging_contract in (
-        'sourceSets.named("main")',
-        'jniLibs.directories.add("src/main/prebuilt")',
+        "sourceSets {",
+        'named("main")',
+        "jniLibs {",
+        'directories.add("src/main/prebuilt")',
     ):
         if packaging_contract not in android_build:
             raise AssertionError(
@@ -253,6 +255,11 @@ def main() -> None:
             )
     if '"$ar_variable=$ndk_bin/llvm-ar"' not in android_package:
         raise AssertionError("Android cross-compile does not use the pinned NDK llvm-ar")
+    config_gate = 'gradle --no-daemon -p "$staging/sdk/android" help >/dev/null'
+    if config_gate not in android_package:
+        raise AssertionError("Android package gate does not validate AGP configuration early")
+    if android_package.index(config_gate) > android_package.index("build_android_library()"):
+        raise AssertionError("Android AGP configuration is validated after Rust cross-builds")
     for dependency_gate in ("llvm-readelf", r"\[libdenoize_c\.so\]"):
         if dependency_gate not in android_package:
             raise AssertionError(

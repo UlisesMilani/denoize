@@ -76,6 +76,9 @@ cp -R sdk/android "$staging/sdk/android"
 mkdir -p "$staging/sdk/denoize-c"
 cp -R sdk/denoize-c/include "$staging/sdk/denoize-c/include"
 
+# Evaluate the AGP/Kotlin DSL before spending time on both Rust cross-builds.
+gradle --no-daemon -p "$staging/sdk/android" help >/dev/null
+
 build_android_library() {
   local abi=$1
   local rust_target=$2
