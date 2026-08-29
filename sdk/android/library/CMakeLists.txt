@@ -12,7 +12,9 @@ if(NOT EXISTS "${DENOIZE_C_LIBRARY}")
 endif()
 
 add_library(denoize_c SHARED IMPORTED)
-set_target_properties(denoize_c PROPERTIES IMPORTED_LOCATION "${DENOIZE_C_LIBRARY}")
+set_target_properties(denoize_c PROPERTIES
+  IMPORTED_LOCATION "${DENOIZE_C_LIBRARY}"
+  IMPORTED_NO_SONAME TRUE)
 
 add_library(denoize_jni SHARED src/main/cpp/denoize_jni.c)
 target_include_directories(denoize_jni PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../denoize-c/include")

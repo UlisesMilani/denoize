@@ -44,6 +44,7 @@ ANDROID_WRAPPER = (
 )
 ANDROID_CONSUMER_RULES = ROOT / "sdk" / "android" / "library" / "consumer-rules.pro"
 ANDROID_BUILD = ROOT / "sdk" / "android" / "library" / "build.gradle.kts"
+ANDROID_CMAKE = ROOT / "sdk" / "android" / "library" / "CMakeLists.txt"
 ANDROID_DEVICE_TEST = (
     ROOT
     / "sdk"
@@ -169,6 +170,7 @@ def main() -> None:
 
     android = ANDROID_WRAPPER.read_text(encoding="utf-8")
     android_build = ANDROID_BUILD.read_text(encoding="utf-8")
+    android_cmake = ANDROID_CMAKE.read_text(encoding="utf-8")
     android_consumer_rules = ANDROID_CONSUMER_RULES.read_text(encoding="utf-8")
     android_device_test = ANDROID_DEVICE_TEST.read_text(encoding="utf-8")
     ios = IOS_WRAPPER.read_text(encoding="utf-8")
@@ -201,6 +203,8 @@ def main() -> None:
             )
     if "compileSdk = 36" not in android_build:
         raise AssertionError("Android SDK does not compile against stable API 36")
+    if "IMPORTED_NO_SONAME TRUE" not in android_cmake:
+        raise AssertionError("Android JNI link can embed a build-path DT_NEEDED entry")
     for workflow_name, workflow_path in (
         ("CI", CI_WORKFLOW),
         ("release", RELEASE_WORKFLOW),
@@ -241,6 +245,11 @@ def main() -> None:
             )
     if '"$ar_variable=$ndk_bin/llvm-ar"' not in android_package:
         raise AssertionError("Android cross-compile does not use the pinned NDK llvm-ar")
+    for dependency_gate in ("llvm-readelf", r"\[libdenoize_c\.so\]"):
+        if dependency_gate not in android_package:
+            raise AssertionError(
+                f"Android AAR does not verify portable JNI dependency {dependency_gate}"
+            )
     if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
         raise AssertionError("iOS package gate does not expose simulator tests")
     for package_script in (

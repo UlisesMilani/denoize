@@ -116,9 +116,6 @@ cp schemas/denoize-sdk-abi-v1.schema.json \
   schemas/denoize-mobile-lifecycle-v1.schema.json \
   "$assets/schemas/"
 
-if [[ ${DENOIZE_ANDROID_RUN_INSTRUMENTATION:-0} == 1 ]]; then
-  gradle --no-daemon -p "$staging/sdk/android" :library:connectedDebugAndroidTest
-fi
 gradle --no-daemon -p "$staging/sdk/android" :library:assembleRelease
 aar="$staging/sdk/android/library/build/outputs/aar/library-release.aar"
 if [[ ! -s "$aar" ]]; then
@@ -138,6 +135,21 @@ for member in \
     exit 1
   fi
 done
+for abi in arm64-v8a x86_64; do
+  jni_library="$staging/libdenoize_jni-$abi.so"
+  unzip -p "$aar" "jni/$abi/libdenoize_jni.so" > "$jni_library"
+  if ! "$ndk_bin/llvm-readelf" -d "$jni_library" | awk '
+    /\(NEEDED\)/ && /\[libdenoize_c\.so\]/ { found = 1 }
+    END { exit !found }
+  '; then
+    echo "Android JNI library for $abi does not depend on portable libdenoize_c.so" >&2
+    exit 1
+  fi
+done
+
+if [[ ${DENOIZE_ANDROID_RUN_INSTRUMENTATION:-0} == 1 ]]; then
+  gradle --no-daemon -p "$staging/sdk/android" :library:connectedDebugAndroidTest
+fi
 
 mkdir -p "$output_dir"
 output_dir=$(cd -- "$output_dir" && pwd)
