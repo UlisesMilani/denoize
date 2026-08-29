@@ -7,7 +7,7 @@ version = "0.86.0"
 
 android {
     namespace = "io.github.penguin425.denoize.sdk"
-    compileSdk = 37
+    compileSdk = 36
     ndkVersion = "28.2.13676358"
 
     defaultConfig {

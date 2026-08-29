@@ -42,6 +42,7 @@ ANDROID_WRAPPER = (
     / "DenoizeSdk.kt"
 )
 ANDROID_CONSUMER_RULES = ROOT / "sdk" / "android" / "library" / "consumer-rules.pro"
+ANDROID_BUILD = ROOT / "sdk" / "android" / "library" / "build.gradle.kts"
 ANDROID_DEVICE_TEST = (
     ROOT
     / "sdk"
@@ -64,6 +65,8 @@ ANDROID_PACKAGE_SCRIPT = ROOT / "scripts" / "package-android-sdk.sh"
 IOS_PACKAGE_SCRIPT = ROOT / "scripts" / "package-ios-sdk.sh"
 RELEASE_ASSET_VERIFIER = ROOT / "scripts" / "verify-release-assets.sh"
 ABI_FUZZ_TARGET = ROOT / "fuzz" / "fuzz_targets" / "sdk_abi.rs"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
 
 def exported_symbols(library: pathlib.Path) -> set[str]:
@@ -163,6 +166,7 @@ def main() -> None:
         raise AssertionError("AudioWorklet embeds DSP or assumes a 128-frame quantum")
 
     android = ANDROID_WRAPPER.read_text(encoding="utf-8")
+    android_build = ANDROID_BUILD.read_text(encoding="utf-8")
     android_consumer_rules = ANDROID_CONSUMER_RULES.read_text(encoding="utf-8")
     android_device_test = ANDROID_DEVICE_TEST.read_text(encoding="utf-8")
     ios = IOS_WRAPPER.read_text(encoding="utf-8")
@@ -193,6 +197,18 @@ def main() -> None:
             raise AssertionError(
                 f"Android emulator gate omits {required_device_gate}"
             )
+    if "compileSdk = 36" not in android_build:
+        raise AssertionError("Android SDK does not compile against stable API 36")
+    for workflow_name, workflow_path in (
+        ("CI", CI_WORKFLOW),
+        ("release", RELEASE_WORKFLOW),
+    ):
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for package in ('"platforms;android-36"', '"build-tools;36.0.0"'):
+            if package not in workflow:
+                raise AssertionError(
+                    f"{workflow_name} workflow omits stable Android package {package}"
+                )
     if "connectedDebugAndroidTest" not in ANDROID_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
         raise AssertionError("Android package gate does not run instrumentation tests")
     if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
