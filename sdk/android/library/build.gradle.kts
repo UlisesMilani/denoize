@@ -35,8 +35,8 @@ android {
         buildConfig = false
     }
 
-    sourceSets.getByName("main") {
-        jniLibs.srcDir("src/main/prebuilt")
+    sourceSets.named("main") {
+        jniLibs.directories.add("src/main/prebuilt")
     }
 
     compileOptions {

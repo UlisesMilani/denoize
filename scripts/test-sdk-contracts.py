@@ -204,8 +204,8 @@ def main() -> None:
     if "compileSdk = 36" not in android_build:
         raise AssertionError("Android SDK does not compile against stable API 36")
     for packaging_contract in (
-        'sourceSets.getByName("main")',
-        'jniLibs.srcDir("src/main/prebuilt")',
+        'sourceSets.named("main")',
+        'jniLibs.directories.add("src/main/prebuilt")',
     ):
         if packaging_contract not in android_build:
             raise AssertionError(
