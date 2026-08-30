@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.89.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.90.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -20,6 +20,7 @@ USAGE:
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize target-sound <INPUT> --query QUERY.json --target TARGET.wav --residual RESIDUAL.wav --output OUTPUT.wav --report REPORT.json --mode preserve|remove --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize target-sound causal <INPUT> --query QUERY.json --target TARGET.wav --residual RESIDUAL.wav --output OUTPUT.wav --report REPORT.json --mode preserve|remove --model-package PACKAGE --model-package-key KEY --offline-promotion-evidence EVIDENCE --offline-promotion-evidence-key KEY --causal-promotion-evidence EVIDENCE --causal-promotion-evidence-key KEY [OPTIONS]
     denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction CORRECTION.wav --report REPORT.json --task TASK --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
@@ -300,7 +301,9 @@ CAUSAL OPTIONS:
 ```text
 USAGE:
     denoize target-sound <INPUT> --query <QUERY.json> --target <TARGET.wav> --residual <RESIDUAL.wav> --output <OUTPUT.wav> --report <REPORT.json> --mode <preserve|remove> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-sound causal <INPUT> --query <QUERY.json> --target <TARGET.wav> --residual <RESIDUAL.wav> --output <OUTPUT.wav> --report <REPORT.json> --mode <preserve|remove> --model-package <CAUSAL-PACKAGE.dmp> --model-package-key <KEY> --offline-promotion-evidence <OFFLINE.json> --offline-promotion-evidence-key <KEY.json> --causal-promotion-evidence <CAUSAL.json> --causal-promotion-evidence-key <KEY.json> [OPTIONS]
     denoize target-sound evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+    denoize target-sound causal evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
 
 Extract or remove one sound selected from an authenticated finite class
 catalog. Open text is never accepted or sent to the model. The graph must
@@ -309,6 +312,12 @@ audio publication is withheld unless presence and every conservation, signal,
 geometry, spatial, package, license, and evaluation gate passes. The three WAV
 artifacts and path-free report are published together when accepted. No model,
 checkpoint, catalog, or dataset is bundled.
+
+The causal form preserves continuous timing and always publishes a complete
+decomposition. Unsafe, absent, uncertain, warm-up, late, or overloaded blocks
+use target silence plus untouched residual. Its separately signed evidence
+binds the accepted offline baseline, recurrent package, snapshot/reset tests,
+named-device end-to-end latency, callback audit, and transition audit.
 
 OPTIONS:
         --query <PATH.json>                         complete ordered finite catalog and selected ID
@@ -321,10 +330,15 @@ OPTIONS:
         --model-package-key <PATH>                  trusted Minisign public key
         --promotion-evidence <PATH>                 accepted signed target-sound evidence
         --promotion-evidence-key <PATH>             trusted Ed25519 evidence public key
+        --offline-promotion-evidence <PATH>         accepted offline baseline evidence (causal form)
+        --offline-promotion-evidence-key <PATH>     trusted offline Ed25519 key (causal form)
+        --causal-promotion-evidence <PATH>          accepted causal non-inferiority evidence
+        --causal-promotion-evidence-key <PATH>      trusted causal Ed25519 key
         --minimum-present-probability <F>           present threshold, 0.5..1 (default: 0.9)
         --minimum-absent-probability <F>            absent threshold, 0.5..1 (default: 0.9)
+        --present-hold-blocks <N>                   consecutive present blocks, 1..100 (causal default: 3)
         --maximum-model-recombination-error <F>     graph target+residual error, 0..0.1 (default: 0.01)
-        --maximum-publication-recombination-error <F> source-rate error, 0..1e-6 (default: 1e-12)
+        --maximum-publication-recombination-error <F> source-rate error (offline 0..1e-6, default 1e-12; causal 0..1e-5, default 1e-6)
         --maximum-target-peak <F>                   target absolute peak, 0.5..1 (default: 1)
         --maximum-residual-peak <F>                 residual absolute peak, 0.5..1 (default: 1)
         --maximum-energy-gain-db <F>                target/residual energy gain, 0..12 dB (default: 3)
@@ -477,7 +491,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.89.0 watch-folder automation
+denoize 0.90.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

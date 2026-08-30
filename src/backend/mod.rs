@@ -1,6 +1,8 @@
 //! Optional AI denoising backends (feature-gated).
 
 #[cfg(feature = "onnx")]
+pub(crate) mod causal_target_sound;
+#[cfg(feature = "onnx")]
 pub(crate) mod causal_target_speaker;
 mod classical;
 #[cfg(feature = "onnx")]

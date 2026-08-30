@@ -182,6 +182,9 @@ expected_assets=(
   "denoize-target-sound-query-v1.schema.json"
   "denoize-target-sound-promotion-evidence-v1.schema.json"
   "denoize-target-sound-report-v1.schema.json"
+  "denoize-causal-target-sound-promotion-evidence-v1.schema.json"
+  "denoize-causal-target-sound-report-v1.schema.json"
+  "denoize-causal-target-sound-snapshot-v1.schema.json"
   "denoize-causal-target-speaker-promotion-evidence-v1.schema.json"
   "denoize-causal-target-speaker-report-v1.schema.json"
   "denoize-aec-promotion-evidence-v1.schema.json"
@@ -388,6 +391,9 @@ gh release download "$tag" \
   --pattern 'denoize-target-sound-query-v1.schema.json' \
   --pattern 'denoize-target-sound-promotion-evidence-v1.schema.json' \
   --pattern 'denoize-target-sound-report-v1.schema.json' \
+  --pattern 'denoize-causal-target-sound-promotion-evidence-v1.schema.json' \
+  --pattern 'denoize-causal-target-sound-report-v1.schema.json' \
+  --pattern 'denoize-causal-target-sound-snapshot-v1.schema.json' \
   --pattern 'denoize-causal-target-speaker-promotion-evidence-v1.schema.json' \
   --pattern 'denoize-causal-target-speaker-report-v1.schema.json' \
   --pattern 'denoize-aec-promotion-evidence-v1.schema.json' \
@@ -624,6 +630,9 @@ for schema in \
   denoize-target-sound-query-v1.schema.json \
   denoize-target-sound-promotion-evidence-v1.schema.json \
   denoize-target-sound-report-v1.schema.json \
+  denoize-causal-target-sound-promotion-evidence-v1.schema.json \
+  denoize-causal-target-sound-report-v1.schema.json \
+  denoize-causal-target-sound-snapshot-v1.schema.json \
   denoize-causal-target-speaker-promotion-evidence-v1.schema.json \
   denoize-causal-target-speaker-report-v1.schema.json \
   denoize-aec-promotion-evidence-v1.schema.json \

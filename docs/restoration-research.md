@@ -22,6 +22,7 @@ model can ship.
 | 34 | Meeting speaker tracks | Bounded anonymous CSS/diarization with an explicit residual | Builds on consent, array, timeline, and SDK contracts without conflating audio tracks with transcription or identity | Unknown/overlap/speaker-count calibration, permutation continuity, privacy, licensed real-meeting evidence |
 | 35 | Music/general-audio restoration | Finished-mixture codec repair and bandwidth extension before dry-stem estimation | Music needs phase, transient, stereo, instrument, genre, and mastering-intent protections that speech gates omit | Exact model/data/license BOM, clean bypass, full-song and professional-listening evidence |
 | 36 | Semantic target sound | Offline closed-catalog preserve/remove before causal or open-language extraction | Semantic foreground choice needs explicit class identity, absence, conservation, protected-foreground, and spatial gates | Exact model/data/license BOM, calibrated absence, one-hot catalog binding, residual conservation, and class-stratified listening evidence |
+| 37 | Causal semantic target sound | Recurrent closed-catalog preserve/remove with complete conservative decomposition | Streaming adds state, transition, overload, callback, clock, and device-latency failure domains that an offline score cannot cover | Exact offline non-inferiority, reset/snapshot/flush parity, zero partial removal, and <=100 ms named-device end-to-end evidence |
 
 The key product decision is to separate “sounds better” from “faithfully
 restored.” Deterministic repair and discriminative neural output are defaults.
@@ -1014,7 +1015,7 @@ not substitute for named physical-device latency evidence.
 
 ## Extended implementation and research watchlist
 
-Stages 34 through 36 now have bounded product contracts while concrete neural
+Stages 34 through 37 now have bounded product contracts while concrete neural
 artifacts remain gated. Later capabilities have product value, but are
 deliberately excluded from the implementation commitment until their stated
 promotion conditions hold.
@@ -1023,7 +1024,8 @@ promotion conditions hold.
 |---:|---|---|---|
 | 34 | Meeting speaker tracks | Implemented as the v0.87.0 bounded anonymous baseline after Stages 29, 31, and 32 | Any concrete checkpoint still requires licensed real-meeting evidence, stable speaker-count/overlap uncertainty, and its complete redistribution chain |
 | 35 | Music/general-audio restoration | Implemented for v0.88.0 as task-bound finished-mixture codec/bandwidth candidate rendering; dry stems remain separate and opt-in | Any concrete checkpoint still requires a redistributable exact dependency/data chain plus phase, stereo, transient, clean-bypass, full-song, instrument, genre, and listening evidence |
-| 36 | Semantic target-sound extraction | Implemented for v0.89.0 as offline preserve/remove over an authenticated finite one-hot catalog | A concrete checkpoint still needs complete artifact/data licenses and signed class/absence/spatial evidence; causal promotion additionally needs state, overload, and end-to-end device latency evidence |
+| 36 | Semantic target-sound extraction | Implemented for v0.89.0 as offline preserve/remove over an authenticated finite one-hot catalog | A concrete checkpoint still needs complete artifact/data licenses and signed class/absence/spatial evidence |
+| 37 | Causal semantic target-sound extraction | Implemented for v0.90.0 as a recurrent finite-catalog adapter, complete target/residual fallback, portable state, and fixed-pool bridge | A concrete checkpoint still needs the Stage 36 evidence plus signed causal non-inferiority, callback, transition, and named-device end-to-end latency evidence; each host surface needs a separate host matrix |
 | watch | Audio-visual target extraction | Do not schedule yet | Explicit camera/face consent, sync, occlusion/spoofing, biometric retention, and audio-only failure policy |
 
 ### Meeting speaker-track decomposition
@@ -1209,8 +1211,8 @@ The evidence points to three separate products rather than one widening flag:
 
 1. an offline closed-catalog operation with explicit absence and residual
    conservation;
-2. a later causal closed-catalog operation with authenticated state, overload,
-   device, and end-to-end latency evidence;
+2. a separately gated causal closed-catalog operation with authenticated state,
+   overload, device, and end-to-end latency evidence (implemented in Stage 37);
 3. open-language extraction only after prompt, text-encoder, multilingual,
    artifact, and absence semantics have their own closed contract.
 
@@ -1268,16 +1270,67 @@ artifact/training/evaluation manifests, and zero restricted redistributed or
 unresolved-license items. See
 [the product contract](target-sound.md).
 
-#### Remaining causal and open-language gates
+### Stage 37 — causal closed-catalog target-sound extraction
 
-The v0.89.0 package is finite and stateless. A causal promotion must add named
-recurrent state with portable reset/snapshot semantics, discontinuity and
-dropout treatment, bounded callback work, allocation/lock-free host behavior,
-overload fallback that does not expose a partial semantic removal, and
-continuous target/residual conservation across chunk and resampler boundaries.
-End-to-end measurements must include capture, chunking, lookahead, resampling,
-inference, buffering, host scheduling, and output on each named device; model
-runtime alone is insufficient.
+Waveformer supplies the closest architecture reference: a fixed label vector,
+causal encoder, streaming blocks, and published chunk/runtime measurements.
+Semantic Hearing supplies the stricter binaural and spatial-evaluation warning.
+Neither paper supplies the denoize graph conversion, exact recurrent-state ABI,
+source-clock conservation, overload policy, callback trace, or named-device
+end-to-end measurement. Stage 37 therefore promotes a contract and evaluator
+boundary, not an upstream checkpoint or reproduction claim.
+
+The v0.90.0 adapter accepts only fixed equal frame/hop streaming graphs with
+mono-center or ordered stereo, fixed one-hot query, same-geometry target and
+residual, normalized three-way presence, and at least one exact float32 or
+int64 recurrent state pair. Signed vectors exercise zero-state reset,
+nonzero-state recurrence, and zero-audio flush before user audio. Algorithmic
+latency is capped at 100 ms and flush must cover it. Portable JSON snapshots
+bind the immutable package, configuration, query, catalog, class, generation,
+clock, hold state, and typed recurrent tensors; restore advances generation so
+pre-restore results cannot be consumed.
+
+The publication rule is intentionally stronger than ordinary streaming
+silence. Every accepted block publishes a target and derives the residual as
+`input - target`. Absence, uncertainty, presence warm-up, failed signal gates,
+flush withholding, inference failure, discontinuity, late/stale result, or
+queue/pool overload publishes `target = 0` and `residual = input`. A
+source-clock acceptance mask is resampled alongside the candidate and zeros
+the target wherever a filtered or mapped sample touches withheld model time;
+the final residual is again derived from the original source. This closes the
+partial semantic-removal leak that otherwise occurs at chunk and sample-rate
+conversion boundaries.
+
+The fixed-pool bridge owns one permanent inference worker and preallocates its
+audio blocks. Callback submission, due-result retrieval, generation reset, and
+the conservative fallback use lock-free bounded queues/atomics and caller-owned
+buffers; they do not allocate, lock, wait, infer, log, or perform I/O. Tokens
+carry generation and absolute frame, gaps reset state at the exact next frame,
+and late/stale results are discarded.
+
+The second signed evidence layer exactly reproduces the separately signed
+Stage 36 catalog, strata, case counts, metric operators, values, and limits,
+then adds a bounded causal regression for each metric. It binds distinct
+offline and causal package/configuration/evaluation identities, state/reset/
+flush and snapshot round-trip results, recombination, perturbation latency,
+callback, and transition results. At least three named devices must report the
+sum of capture, chunking, lookahead, resampling, inference, buffering, host,
+and output latency, with worst total no greater than the signed limit or 100
+ms. At least 10,000 paced callback blocks must have zero deadlines, overloads,
+allocations, locks, waits, I/O, logs, or inference calls. At least 100 cases per
+reset, discontinuity, dropout, overload, snapshot, resampler, query mutation,
+late, and stale boundary must discard every injected late/stale result and
+record zero partial-removal or recombination violations.
+
+This closes the causal software and evidence boundary but not model
+availability or host promotion. The immutable artifact audit above still
+finds no upstream checkpoint with a complete checkpoint/training/evaluation
+redistribution chain and signed Stage 36 plus Stage 37 evidence. v0.90.0
+therefore bundles no model, dataset, or catalog, and upstream latency remains
+context rather than a denoize claim. See
+[the causal product contract](target-sound.md#causal-extraction).
+
+#### Remaining open-language gate
 
 Open-language support remains a separate later stage. It needs a frozen text
 encoder and tokenizer, canonical prompt/locale representation, alias and
