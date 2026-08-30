@@ -89,6 +89,9 @@ jobs:
       - name: Validate target-sound JSON contracts
         run: python3 scripts/test-target-sound-schemas.py
 
+      - name: Validate causal target-sound JSON contracts
+        run: python3 scripts/test-causal-target-sound-schemas.py
+
       - name: Validate acoustic echo cancellation JSON contracts
         run: python3 scripts/test-aec-schemas.py
 
@@ -158,6 +161,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-sound-schemas.py", encoding="utf-8").read(), "scripts/test-target-sound-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-causal-target-sound-schemas.py", encoding="utf-8").read(), "scripts/test-causal-target-sound-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-meeting-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-meeting-speaker-schemas.py", "exec")'
@@ -1219,6 +1223,9 @@ jobs:
           target_sound_query_schema="$asset_dir/denoize-target-sound-query-v1.schema.json"
           target_sound_promotion_evidence_schema="$asset_dir/denoize-target-sound-promotion-evidence-v1.schema.json"
           target_sound_report_schema="$asset_dir/denoize-target-sound-report-v1.schema.json"
+          causal_target_sound_promotion_evidence_schema="$asset_dir/denoize-causal-target-sound-promotion-evidence-v1.schema.json"
+          causal_target_sound_report_schema="$asset_dir/denoize-causal-target-sound-report-v1.schema.json"
+          causal_target_sound_snapshot_schema="$asset_dir/denoize-causal-target-sound-snapshot-v1.schema.json"
           causal_target_speaker_promotion_evidence_schema="$asset_dir/denoize-causal-target-speaker-promotion-evidence-v1.schema.json"
           causal_target_speaker_report_schema="$asset_dir/denoize-causal-target-speaker-report-v1.schema.json"
           aec_promotion_evidence_schema="$asset_dir/denoize-aec-promotion-evidence-v1.schema.json"
@@ -1295,6 +1302,9 @@ jobs:
           cp schemas/denoize-target-sound-query-v1.schema.json "$target_sound_query_schema"
           cp schemas/denoize-target-sound-promotion-evidence-v1.schema.json "$target_sound_promotion_evidence_schema"
           cp schemas/denoize-target-sound-report-v1.schema.json "$target_sound_report_schema"
+          cp schemas/denoize-causal-target-sound-promotion-evidence-v1.schema.json "$causal_target_sound_promotion_evidence_schema"
+          cp schemas/denoize-causal-target-sound-report-v1.schema.json "$causal_target_sound_report_schema"
+          cp schemas/denoize-causal-target-sound-snapshot-v1.schema.json "$causal_target_sound_snapshot_schema"
           cp schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json "$causal_target_speaker_promotion_evidence_schema"
           cp schemas/denoize-causal-target-speaker-report-v1.schema.json "$causal_target_speaker_report_schema"
           cp schemas/denoize-aec-promotion-evidence-v1.schema.json "$aec_promotion_evidence_schema"
@@ -1356,6 +1366,8 @@ jobs:
             "$target_speaker_promotion_evidence_schema" "$target_speaker_report_schema" \
             "$target_sound_query_schema" "$target_sound_promotion_evidence_schema" \
             "$target_sound_report_schema" \
+            "$causal_target_sound_promotion_evidence_schema" \
+            "$causal_target_sound_report_schema" "$causal_target_sound_snapshot_schema" \
             "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
             "$aec_promotion_evidence_schema" "$aec_report_schema" \
             "$microphone_array_promotion_evidence_schema" "$microphone_array_report_schema" \

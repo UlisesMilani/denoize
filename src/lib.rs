@@ -46,6 +46,8 @@ pub mod batch_resume;
 pub mod benchmark;
 pub mod bessel;
 #[cfg(feature = "onnx")]
+pub mod causal_target_sound;
+#[cfg(feature = "onnx")]
 pub mod causal_target_speaker;
 pub mod channel_layout;
 pub mod config;
@@ -126,6 +128,24 @@ pub use backend::{
     OnnxModelConfig, SgmseProfile, StreamingBackendSession,
 };
 pub use benchmark::{ArtifactReport, BenchmarkReport, ComparisonReport};
+#[cfg(feature = "onnx")]
+pub use causal_target_sound::{
+    estimate_causal_target_sound_memory_bytes, sign_causal_target_sound_promotion_evidence,
+    write_causal_target_sound_conservative_fallback, CausalTargetSoundBlock,
+    CausalTargetSoundBlockDecision, CausalTargetSoundConfig, CausalTargetSoundDecisionCounts,
+    CausalTargetSoundDeviceLatencyMeasurement, CausalTargetSoundEvidenceIdentity,
+    CausalTargetSoundMetricEvidence, CausalTargetSoundModelIdentity,
+    CausalTargetSoundPromotionEvidencePayload, CausalTargetSoundQueryIdentity,
+    CausalTargetSoundRealtimeAudit, CausalTargetSoundRealtimeMetrics,
+    CausalTargetSoundRealtimeReceiveError, CausalTargetSoundRealtimeResult,
+    CausalTargetSoundRealtimeScheduler, CausalTargetSoundRealtimeSubmitError,
+    CausalTargetSoundRealtimeToken, CausalTargetSoundRenderReport, CausalTargetSoundRenderResult,
+    CausalTargetSoundSession, CausalTargetSoundSnapshot, CausalTargetSoundSnapshotState,
+    CausalTargetSoundStratumEvidence, CausalTargetSoundStream, CausalTargetSoundTransitionAudit,
+    SignedCausalTargetSoundPromotionEvidence, CAUSAL_TARGET_SOUND_EVIDENCE_SCHEMA,
+    CAUSAL_TARGET_SOUND_REPORT_SCHEMA, CAUSAL_TARGET_SOUND_SCHEMA_VERSION,
+    CAUSAL_TARGET_SOUND_SNAPSHOT_SCHEMA,
+};
 #[cfg(feature = "onnx")]
 pub use causal_target_speaker::{
     estimate_causal_target_speaker_memory_bytes, sign_causal_target_speaker_promotion_evidence,

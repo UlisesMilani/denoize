@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-causal-target-sound-promotion-evidence-v1.schema.json",
+  "title": "denoize signed causal target-sound promotion evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "payload", "signature"],
+  "properties": {
+    "schema": { "const": "denoize-causal-target-sound-promotion-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "payload": { "$ref": "#/$defs/payload" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[a-z0-9._+-]{1,256}$" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completed_at_unix_seconds",
+        "offline_model_package_sha256",
+        "causal_model_package_sha256",
+        "causal_source_revision",
+        "causal_source_sha256",
+        "causal_checkpoint_sha256",
+        "offline_configuration_sha256",
+        "causal_configuration_sha256",
+        "query_catalog_sha256",
+        "query_catalog_revision",
+        "query_class_ids_sha256",
+        "query_class_count",
+        "offline_evaluation_result_sha256",
+        "causal_evaluation_result_sha256",
+        "state_reset_flush_result_sha256",
+        "snapshot_roundtrip_result_sha256",
+        "recombination_result_sha256",
+        "latency_result_sha256",
+        "realtime_callback_result_sha256",
+        "transition_result_sha256",
+        "strata",
+        "model_sample_rate_hz",
+        "model_channels",
+        "frame_samples",
+        "algorithmic_latency_samples",
+        "flush_samples",
+        "perturbation_latency_cases",
+        "effective_latency_limit_milliseconds",
+        "worst_effective_latency_milliseconds",
+        "device_measurements",
+        "realtime",
+        "transitions",
+        "accepted"
+      ],
+      "properties": {
+        "completed_at_unix_seconds": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "offline_model_package_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_model_package_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_source_revision": { "$ref": "#/$defs/id" },
+        "causal_source_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "offline_configuration_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_configuration_sha256": { "$ref": "#/$defs/sha256" },
+        "query_catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "query_catalog_revision": { "$ref": "#/$defs/id" },
+        "query_class_ids_sha256": { "$ref": "#/$defs/sha256" },
+        "query_class_count": { "type": "integer", "minimum": 2, "maximum": 4096 },
+        "offline_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "causal_evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "state_reset_flush_result_sha256": { "$ref": "#/$defs/sha256" },
+        "snapshot_roundtrip_result_sha256": { "$ref": "#/$defs/sha256" },
+        "recombination_result_sha256": { "$ref": "#/$defs/sha256" },
+        "latency_result_sha256": { "$ref": "#/$defs/sha256" },
+        "realtime_callback_result_sha256": { "$ref": "#/$defs/sha256" },
+        "transition_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/stratum" }
+        },
+        "model_sample_rate_hz": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+        "model_channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "frame_samples": { "type": "integer", "minimum": 1, "maximum": 262144 },
+        "algorithmic_latency_samples": { "type": "integer", "minimum": 0, "maximum": 262144 },
+        "flush_samples": { "type": "integer", "minimum": 0, "maximum": 262144 },
+        "perturbation_latency_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "effective_latency_limit_milliseconds": { "type": "number", "minimum": 0, "maximum": 100 },
+        "worst_effective_latency_milliseconds": { "type": "number", "minimum": 0, "maximum": 100 },
+        "device_measurements": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/device" }
+        },
+        "realtime": { "$ref": "#/$defs/realtime" },
+        "transitions": { "$ref": "#/$defs/transitions" },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "stratum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "offline_cases", "causal_cases", "metrics"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["target-present", "target-absent", "protected-foreground", "binaural-spatial"] },
+        "offline_cases": { "type": "integer", "minimum": 50, "maximum": 1000000 },
+        "causal_cases": { "type": "integer", "minimum": 50, "maximum": 1000000 },
+        "metrics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/metric" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "operator", "offline_value", "causal_value", "hard_limit", "maximum_regression", "passed"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/id" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "offline_value": { "type": "number" },
+        "causal_value": { "type": "number" },
+        "hard_limit": { "type": "number" },
+        "maximum_regression": { "type": "number", "minimum": 0 },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id", "device_class", "operating_system", "audio_stack",
+        "sample_rate_hz", "channels", "capture_milliseconds", "chunk_milliseconds",
+        "lookahead_milliseconds", "resampling_milliseconds", "inference_milliseconds",
+        "buffering_milliseconds", "host_milliseconds", "output_milliseconds", "total_milliseconds"
+      ],
+      "properties": {
+        "device_id": { "$ref": "#/$defs/id" },
+        "device_class": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "operating_system": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "audio_stack": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "sample_rate_hz": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+        "channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+        "capture_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "chunk_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "lookahead_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "resampling_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "inference_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "buffering_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "host_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "output_milliseconds": { "$ref": "#/$defs/milliseconds" },
+        "total_milliseconds": { "$ref": "#/$defs/milliseconds" }
+      }
+    },
+    "milliseconds": { "type": "number", "minimum": 0, "maximum": 1000 },
+    "realtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "paced_blocks", "deadline_misses", "overload_blocks", "queue_capacity_blocks",
+        "maximum_queue_depth_blocks", "callback_allocations", "callback_locks",
+        "callback_waits", "callback_file_io_operations", "callback_network_operations",
+        "callback_log_operations", "callback_inference_calls"
+      ],
+      "properties": {
+        "paced_blocks": { "type": "integer", "minimum": 10000, "maximum": 9007199254740991 },
+        "deadline_misses": { "$ref": "#/$defs/counter" },
+        "overload_blocks": { "$ref": "#/$defs/counter" },
+        "queue_capacity_blocks": { "type": "integer", "minimum": 16, "maximum": 256 },
+        "maximum_queue_depth_blocks": { "type": "integer", "minimum": 0, "maximum": 255 },
+        "callback_allocations": { "$ref": "#/$defs/counter" },
+        "callback_locks": { "$ref": "#/$defs/counter" },
+        "callback_waits": { "$ref": "#/$defs/counter" },
+        "callback_file_io_operations": { "$ref": "#/$defs/counter" },
+        "callback_network_operations": { "$ref": "#/$defs/counter" },
+        "callback_log_operations": { "$ref": "#/$defs/counter" },
+        "callback_inference_calls": { "$ref": "#/$defs/counter" }
+      }
+    },
+    "counter": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "transitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reset_cases", "discontinuity_cases", "dropout_cases", "overload_fallback_cases",
+        "snapshot_roundtrip_cases", "resampler_boundary_cases", "query_mutation_rejections",
+        "late_results_injected", "late_results_discarded",
+        "stale_generation_results_injected", "stale_generation_results_discarded",
+        "partial_semantic_removal_publications", "recombination_violations"
+      ],
+      "properties": {
+        "reset_cases": { "$ref": "#/$defs/cases" },
+        "discontinuity_cases": { "$ref": "#/$defs/cases" },
+        "dropout_cases": { "$ref": "#/$defs/cases" },
+        "overload_fallback_cases": { "$ref": "#/$defs/cases" },
+        "snapshot_roundtrip_cases": { "$ref": "#/$defs/cases" },
+        "resampler_boundary_cases": { "$ref": "#/$defs/cases" },
+        "query_mutation_rejections": { "$ref": "#/$defs/cases" },
+        "late_results_injected": { "$ref": "#/$defs/cases" },
+        "late_results_discarded": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "stale_generation_results_injected": { "$ref": "#/$defs/cases" },
+        "stale_generation_results_discarded": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "partial_semantic_removal_publications": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "recombination_violations": { "type": "integer", "minimum": 0, "maximum": 1000000 }
+      }
+    },
+    "cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "key_id": { "$ref": "#/$defs/sha256" },
+        "value_base64": { "type": "string", "minLength": 88, "maxLength": 88, "pattern": "^[A-Za-z0-9+/]{86}==$" }
+      }
+    }
+  }
+}

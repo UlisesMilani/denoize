@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-causal-target-sound-snapshot-v1.schema.json",
+  "title": "denoize portable causal target-sound recurrent-state snapshot v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "model_package_sha256", "configuration_sha256",
+    "query_sha256", "query_catalog_sha256", "selected_class_id",
+    "snapshot_generation", "next_frame", "present_streak", "states"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-causal-target-sound-snapshot-v1" },
+    "schema_version": { "const": 1 },
+    "model_package_sha256": { "$ref": "#/$defs/sha256" },
+    "configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "query_sha256": { "$ref": "#/$defs/sha256" },
+    "query_catalog_sha256": { "$ref": "#/$defs/sha256" },
+    "selected_class_id": { "$ref": "#/$defs/id" },
+    "snapshot_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "next_frame": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "present_streak": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "states": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": { "$ref": "#/$defs/state" }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[a-z0-9._+-]{1,256}$" },
+    "shape": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "type": "integer", "minimum": 1, "maximum": 16777216 }
+    },
+    "state": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["element_type", "shape", "values"],
+          "properties": {
+            "element_type": { "const": "float32" },
+            "shape": { "$ref": "#/$defs/shape" },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8388608,
+              "items": { "type": "number", "minimum": -3.4028235e38, "maximum": 3.4028235e38 }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["element_type", "shape", "values"],
+          "properties": {
+            "element_type": { "const": "int64" },
+            "shape": { "$ref": "#/$defs/shape" },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8388608,
+              "items": { "type": "integer" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

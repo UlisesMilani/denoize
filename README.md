@@ -412,8 +412,8 @@ contracts.
 
 ### Closed-catalog target-sound extraction
 
-Stage 36 preserves or removes one sound selected by ID from a complete,
-authenticated finite catalog:
+Stages 36 and 37 preserve or remove one sound selected by ID from a complete,
+authenticated finite catalog. The first form is offline:
 
 ```bash
 denoize target-sound program.wav \
@@ -450,6 +450,42 @@ and the closed [query](schemas/denoize-target-sound-query-v1.schema.json),
 [report](schemas/denoize-target-sound-report-v1.schema.json), and
 [promotion evidence](schemas/denoize-target-sound-promotion-evidence-v1.schema.json)
 contracts.
+
+The explicit causal form uses an authenticated recurrent package and requires
+both the accepted offline baseline and separately signed causal evidence:
+
+```bash
+denoize target-sound causal program.wav \
+  --query keyboard-query.json \
+  --target keyboard.wav \
+  --residual without-keyboard.wav \
+  --output selected.wav \
+  --report causal-target-sound-report.json \
+  --mode remove \
+  --model-package causal-target-sound.dmp \
+  --model-package-key operator-model.pub \
+  --offline-promotion-evidence offline-evidence.json \
+  --offline-promotion-evidence-key offline-evaluator.pub.json \
+  --causal-promotion-evidence causal-evidence.json \
+  --causal-promotion-evidence-key causal-evaluator.pub.json
+```
+
+Every causal block publishes a complete pair. Accepted blocks use the model
+target and an exact `input - target` residual; absent, uncertain, warm-up,
+unsafe, flush, late, stale, inference-failed, or overloaded blocks use target
+silence and the untouched input residual. Typed recurrent snapshots bind the
+package/config/query/catalog/class and generation. A fixed-pool worker keeps
+inference off the callback, and a source-clock publication mask prevents
+resampling from carrying semantic removal across withheld boundaries.
+
+Causal promotion retains all 14 offline strata and hard limits, adds per-metric
+non-inferiority, reset/snapshot/flush and transition evidence, at least 10,000
+zero-violation paced callback blocks, and at least three named-device
+end-to-end latency measurements no greater than 100 ms. See the closed causal
+[evidence](schemas/denoize-causal-target-sound-promotion-evidence-v1.schema.json),
+[report](schemas/denoize-causal-target-sound-report-v1.schema.json), and
+[snapshot](schemas/denoize-causal-target-sound-snapshot-v1.schema.json)
+contracts. No model, checkpoint, catalog, or dataset is bundled.
 
 ## Supported input formats
 
@@ -2000,9 +2036,12 @@ resource-accounting scope, corpus-promotion rule, and debug-only fault protocol.
 
 ## Embedding SDKs
 
-v0.89.0 adds the Rust API and CLI for authenticated finite-catalog target-sound
-preserve/remove with calibrated absence and exact residual conservation. It is
-not yet projected through the stable C/WASM/mobile capability matrix. v0.88.0
+v0.90.0 adds authenticated recurrent finite-catalog target-sound preserve/remove,
+portable typed state, complete conservative target/residual fallback, a
+fixed-pool real-time bridge, source-clock boundary masking, and signed causal
+non-inferiority/device-latency evidence. It is not yet projected through the
+stable C/WASM/mobile capability matrix. v0.89.0 adds the offline target-sound
+API and CLI with calibrated absence and exact residual conservation. v0.88.0
 adds bounded finished-mixture music codec/bandwidth candidate rendering,
 mandatory correction/report artifacts, and phase/transient/stereo/license gates.
 v0.87.0 adds bounded anonymous meeting speaker tracks, explicit overlap and

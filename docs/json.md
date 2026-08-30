@@ -1,6 +1,6 @@
 # Stable JSON automation contracts
 
-denoize publishes eighty-nine versioned JSON contracts for local automation. Their
+denoize publishes ninety-two versioned JSON contracts for local automation. Their
 schemas are shipped in every GitHub release and in the crates.io source package:
 
 - [`denoize-automation-v1.schema.json`](../schemas/denoize-automation-v1.schema.json)
@@ -214,6 +214,28 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes Ed25519-signed offline/causal non-inferiority across all 22 strata,
   recurrent reset/flush, <=100 ms perturbation latency, callback-safety, and
   absent/present/uncertain/late/stale transition evidence.
+- [`denoize-target-sound-query-v1.schema.json`](../schemas/denoize-target-sound-query-v1.schema.json)
+  describes a complete ordered finite class catalog, its revision, and one
+  exact selected ID; labels are audit metadata and open text is not accepted.
+- [`denoize-target-sound-report-v1.schema.json`](../schemas/denoize-target-sound-report-v1.schema.json)
+  describes a fail-closed offline preserve/remove decision, complete catalog
+  and model identity, presence and signal/spatial gates, and exact target plus
+  source-derived residual publication without paths.
+- [`denoize-target-sound-promotion-evidence-v1.schema.json`](../schemas/denoize-target-sound-promotion-evidence-v1.schema.json)
+  authenticates the package/config/catalog, complete artifact and data-license
+  manifests, per-class present/absent coverage, fourteen semantic/spatial
+  strata, objective results, listening results, and accepted decision.
+- [`denoize-causal-target-sound-report-v1.schema.json`](../schemas/denoize-causal-target-sound-report-v1.schema.json)
+  describes the continuous target/residual render, dual evidence identities,
+  exact latency/flush/source clocks, all block decisions, source-clock
+  withheld frames, PCM bindings, and zero partial-removal fallbacks.
+- [`denoize-causal-target-sound-promotion-evidence-v1.schema.json`](../schemas/denoize-causal-target-sound-promotion-evidence-v1.schema.json)
+  authenticates exact offline/causal non-inferiority, recurrent reset/flush
+  and snapshot results, <=100 ms named-device end-to-end latency, a paced
+  callback audit, and reset/dropout/overload/resampler/late/stale transitions.
+- [`denoize-causal-target-sound-snapshot-v1.schema.json`](../schemas/denoize-causal-target-sound-snapshot-v1.schema.json)
+  describes portable package/config/query/catalog/class-bound generation and
+  frame-clock state with bounded fixed-shape float32 or int64 recurrent tensors.
 - [`denoize-aec-report-v1.schema.json`](../schemas/denoize-aec-report-v1.schema.json)
   describes an exact-duration, path-free mono AEC render: explicit microphone/
   reference clock mapping, signed delay and confidence, filter/latency geometry,
@@ -296,7 +318,8 @@ runtime model package manifests, and IPC documents deliberately reject unknown
 fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
 assessment, deterministic and universal restoration reports and masks,
-universal promotion evidence, all four target-speaker contracts, both AEC
+universal promotion evidence, all four target-speaker contracts, all six
+target-sound contracts, both AEC
 contracts, both microphone-array contracts, and all three meeting-speaker
 contracts also reject unknown fields so a consumer cannot silently ignore a
 new safety dimension.

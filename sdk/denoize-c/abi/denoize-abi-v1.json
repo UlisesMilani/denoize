@@ -1,7 +1,7 @@
 {
   "schema": "denoize-sdk-abi-v1",
   "schema_version": 1,
-  "library_version": "0.89.0",
+  "library_version": "0.90.0",
   "abi_version": 1,
   "library": "denoize_c",
   "supported_architectures": ["aarch64", "x86_64"],

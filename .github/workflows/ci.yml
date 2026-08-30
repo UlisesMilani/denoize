@@ -91,6 +91,9 @@ jobs:
       - name: Validate target-sound JSON contracts
         run: python3 scripts/test-target-sound-schemas.py
 
+      - name: Validate causal target-sound JSON contracts
+        run: python3 scripts/test-causal-target-sound-schemas.py
+
       - name: Validate acoustic echo cancellation JSON contracts
         run: python3 scripts/test-aec-schemas.py
 
@@ -169,6 +172,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-sound-schemas.py", encoding="utf-8").read(), "scripts/test-target-sound-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-causal-target-sound-schemas.py", encoding="utf-8").read(), "scripts/test-causal-target-sound-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-meeting-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-meeting-speaker-schemas.py", "exec")'
