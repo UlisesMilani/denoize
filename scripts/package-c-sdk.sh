@@ -79,6 +79,13 @@ for library in "${required_libraries[@]}"; do
   cp "$library_dir/$library" "$root/lib/"
 done
 
+while IFS= read -r -d '' packaged_text; do
+  if LC_ALL=C grep -q $'\r' "$packaged_text"; then
+    echo "C SDK release text contains a CR byte: ${packaged_text#"$root/"}" >&2
+    exit 1
+  fi
+done < <(find "$root" -type f ! -path "$root/lib/*" -print0)
+
 archive="$output_dir/$package.tar.gz"
 tar -C "$staging" -czf "$archive" "$package"
 if command -v sha256sum >/dev/null 2>&1; then
