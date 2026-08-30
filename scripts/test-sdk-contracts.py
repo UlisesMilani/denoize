@@ -305,6 +305,32 @@ def main() -> None:
                 f"SDK package script bypasses the tag-only release-ref gate: {package_script}"
             )
 
+    for release_text in (
+        HEADER,
+        MANIFEST,
+        SDK_MANIFEST,
+        LIFECYCLE_MANIFEST,
+        SCHEMA,
+        SDK_SCHEMA,
+        LIFECYCLE_SCHEMA,
+        ROOT / "LICENSE",
+        ROOT / "THIRD_PARTY.md",
+        ROOT / "LICENSES" / "Apache-2.0.txt",
+    ):
+        relative = release_text.relative_to(ROOT).as_posix()
+        attributes = subprocess.run(
+            ["git", "check-attr", "text", "eol", "--", relative],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.splitlines()
+        expected = [f"{relative}: text: set", f"{relative}: eol: lf"]
+        if attributes != expected:
+            raise AssertionError(
+                f"C SDK release text is not pinned to LF: {relative}: {attributes}"
+            )
+
     release_ref_command = (
         f"source {shlex.quote(str(SDK_RELEASE_REF_SCRIPT))}; "
         "verify_sdk_release_ref v0.86.0 0.86.0"
