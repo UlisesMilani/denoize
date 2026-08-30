@@ -409,13 +409,15 @@ jobs:
         run: |
           output_dir=$(mktemp -d /tmp/denoize-vst3-package.XXXXXX)
           bundle=target/vst3-build/x86_64-unknown-linux-gnu/Release/denoize.vst3
-          for target in \
-            x86_64-unknown-linux-gnu \
-            aarch64-apple-darwin \
-            x86_64-pc-windows-msvc; do
-            bash scripts/package-vst3-plugin.sh \
-              "$target" v9.8.7 "$output_dir" "$bundle"
-          done
+          bash scripts/package-vst3-plugin.sh \
+            x86_64-unknown-linux-gnu v9.8.7 "$output_dir"
+          single_config_bundle=target/vst3-build/aarch64-apple-darwin/denoize.vst3
+          mkdir -p "$(dirname "$single_config_bundle")"
+          cp -R "$bundle" "$single_config_bundle"
+          bash scripts/package-vst3-plugin.sh \
+            aarch64-apple-darwin v9.8.7 "$output_dir"
+          bash scripts/package-vst3-plugin.sh \
+            x86_64-pc-windows-msvc v9.8.7 "$output_dir" "$bundle"
           tar -tzf "$output_dir/denoize-vst3-v9.8.7-x86_64-unknown-linux-gnu.tar.gz" \
             | grep -F 'denoize.vst3/Contents/x86_64-linux/denoize.so' >/dev/null
           tar -tzf "$output_dir/denoize-vst3-v9.8.7-aarch64-apple-darwin.tar.gz" \
@@ -591,9 +593,8 @@ jobs:
       - name: Validate both Audio Units in official and real hosts
         shell: bash
         run: |
-          app=$(find target/auv3-build/aarch64-apple-darwin \
-            -type d -name 'denoize AUv3.app' -print -quit)
-          test -n "$app"
+          app='target/auv3-build/aarch64-apple-darwin/Release/denoize AUv3.app'
+          test -d "$app"
           report_dir="$RUNNER_TEMP/denoize-auv3-report"
           mkdir -p "$report_dir"
           auval_report="$report_dir/denoize-auv3-auval-v9.8.7-aarch64-apple-darwin.txt"
@@ -621,9 +622,8 @@ jobs:
       - name: Test AUv3 release archive layout
         shell: bash
         run: |
-          app=$(find target/auv3-build/aarch64-apple-darwin \
-            -type d -name 'denoize AUv3.app' -print -quit)
-          test -n "$app"
+          app='target/auv3-build/aarch64-apple-darwin/Release/denoize AUv3.app'
+          test -d "$app"
           output_dir=$(mktemp -d "$RUNNER_TEMP/denoize-auv3-package.XXXXXX")
           archive=$(bash scripts/package-auv3-plugin.sh \
             aarch64-apple-darwin v9.8.7 "$output_dir" "$app")
@@ -645,6 +645,7 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
           rustup target add x86_64-unknown-linux-gnu
+          rustup component add clippy --toolchain 1.96.0
 
       - name: Install SDK contract dependencies
         run: |
@@ -682,6 +683,7 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --no-self-update
           rustup default 1.96.0
           rustup target add wasm32-unknown-unknown
+          rustup component add clippy --toolchain 1.96.0
 
       - name: Install pinned wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --locked --version 0.2.126
@@ -753,8 +755,8 @@ jobs:
         run: |
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager \
-            "platforms;android-37" \
-            "build-tools;37.0.0" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
             "cmake;3.22.1" \
             "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
@@ -776,11 +778,15 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-boot-timeout: 900
-          script: |
-            output_dir=$(mktemp -d /tmp/denoize-android-sdk-package.XXXXXX)
-            archive=$(DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$output_dir")
-            package="denoize-android-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
-            tar -tzf "$archive" | grep -F "$package/denoize-sdk-" >/dev/null
+          script: DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$RUNNER_TEMP"
+
+      - name: Inspect Android SDK archive
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          archive="$RUNNER_TEMP/denoize-android-sdk-v${version}.tar.gz"
+          package="denoize-android-sdk-v${version}"
+          tar -tzf "$archive" | grep -F "$package/denoize-sdk-" >/dev/null
 
   sdk-ios:
     name: iOS SDK (device and simulator)
@@ -798,9 +804,10 @@ jobs:
       - name: Build and test Swift package and XCFramework
         shell: bash
         run: |
-          output_dir=$(mktemp -d "$RUNNER_TEMP/denoize-ios-sdk-package.XXXXXX")
-          archive=$(DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$output_dir")
-          package="denoize-ios-sdk-v$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$RUNNER_TEMP"
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          archive="$RUNNER_TEMP/denoize-ios-sdk-v${version}.tar.gz"
+          package="denoize-ios-sdk-v${version}"
           tar -tzf "$archive" | grep -F "$package/DenoizeC.xcframework/" >/dev/null
           tar -tzf "$archive" | grep -Fx "$package/Package.swift"
 

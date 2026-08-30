@@ -19,6 +19,7 @@ esac
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+. "$repo_dir/scripts/verify-sdk-release-ref.sh"
 
 version=$(awk '
   $0 == "[package]" { package = 1; next }
@@ -31,10 +32,7 @@ version=$(awk '
   }
 ' Cargo.toml)
 tag="v$version"
-if [[ -n ${GITHUB_REF_NAME:-} && ${GITHUB_REF_NAME} != "$tag" ]]; then
-  echo "release tag ${GITHUB_REF_NAME} does not match SDK version $version" >&2
-  exit 1
-fi
+verify_sdk_release_ref "$tag" "$version"
 
 target_dir=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -80,6 +78,13 @@ cp -R LICENSES "$root/"
 for library in "${required_libraries[@]}"; do
   cp "$library_dir/$library" "$root/lib/"
 done
+
+while IFS= read -r -d '' packaged_text; do
+  if LC_ALL=C grep -q $'\r' "$packaged_text"; then
+    echo "C SDK release text contains a CR byte: ${packaged_text#"$root/"}" >&2
+    exit 1
+  fi
+done < <(find "$root" -type f ! -path "$root/lib/*" -print0)
 
 archive="$output_dir/$package.tar.gz"
 tar -C "$staging" -czf "$archive" "$package"

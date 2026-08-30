@@ -10,7 +10,7 @@ if [[ $(uname -s) != Darwin ]]; then
   echo "the iOS SDK must be packaged on macOS with Xcode" >&2
   exit 2
 fi
-for command in cargo lipo swift xcodebuild; do
+for command in cargo lipo swift swiftc xcodebuild; do
   if ! command -v "$command" >/dev/null 2>&1; then
     echo "$command is required to package the iOS SDK" >&2
     exit 2
@@ -20,6 +20,7 @@ done
 output_dir=${1:-.}
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+. "$repo_dir/scripts/verify-sdk-release-ref.sh"
 version=$(awk '
   $0 == "[package]" { package = 1; next }
   package && /^version = "/ {
@@ -31,10 +32,13 @@ version=$(awk '
   }
 ' Cargo.toml)
 tag="v$version"
-if [[ -n ${GITHUB_REF_NAME:-} && ${GITHUB_REF_NAME} != "$tag" ]]; then
-  echo "release tag ${GITHUB_REF_NAME} does not match SDK version $version" >&2
-  exit 1
-fi
+verify_sdk_release_ref "$tag" "$version"
+
+# Type-check the Swift wrapper and Clang-imported C header before building five
+# Rust targets. Linking is intentionally deferred to the packaged XCFramework.
+swiftc -typecheck \
+  -I "$repo_dir/sdk/ios/Sources/CDenoize" \
+  "$repo_dir/sdk/ios/Sources/DenoizeSDK/DenoizeSDK.swift"
 
 toolchain=${RUSTUP_TOOLCHAIN:-1.96.0}
 targets=(

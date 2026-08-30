@@ -1,10 +1,12 @@
 # denoize Android SDK
 
 The Android AAR is a worker-thread wrapper over the stable C ABI. The checked-in
-Gradle project pins AGP 9.3.0 with built-in Kotlin, Gradle 9.5.0, API 37, NDK
+Gradle project pins AGP 9.3.0 with built-in Kotlin, Gradle 9.5.0, API 36, NDK
 28.2.13676358, JDK 17, and 64-bit `arm64-v8a`/`x86_64` splits. Release packaging
-supplies the matching `libdenoize_c.so` as an out-of-`jniLibs` CMake imported
-target for each ABI before Gradle runs, avoiding duplicate native packaging.
+supplies the matching `libdenoize_c.so` in one explicit `jniLibs` source for
+each ABI before Gradle runs. CMake imports that same file for linking, while
+`IMPORTED_NO_SONAME` keeps the JNI dependency name independent of its build
+path.
 
 `DenoizeProcessor` is owned by its creating worker thread. Its separate cancel
 token may be called from another thread. The JNI bridge copies Java arrays and

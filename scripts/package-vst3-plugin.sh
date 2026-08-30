@@ -37,7 +37,23 @@ else
   target_dir=$repo_dir/target
 fi
 if [[ -z $bundle ]]; then
-  bundle=$target_dir/vst3-build/$target/Release/denoize.vst3
+  build_root=$target_dir/vst3-build/$target
+  for candidate in \
+    "$build_root/Release/denoize.vst3" \
+    "$build_root/denoize.vst3"
+  do
+    if [[ -e $candidate || -L $candidate ]]; then
+      if [[ -n $bundle ]]; then
+        echo "VST3 build contains ambiguous release bundles: $bundle and $candidate" >&2
+        exit 1
+      fi
+      bundle=$candidate
+    fi
+  done
+  if [[ -z $bundle ]]; then
+    echo "VST3 bundle is missing from single- and multi-config release layouts under $build_root" >&2
+    exit 1
+  fi
 fi
 if [[ ! -e $bundle || -L $bundle ]]; then
   echo "VST3 bundle is missing or is a symbolic link: $bundle" >&2

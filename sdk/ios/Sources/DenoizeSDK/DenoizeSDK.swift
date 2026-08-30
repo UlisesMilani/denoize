@@ -106,7 +106,7 @@ public final class DenoizeCancellation: @unchecked Sendable {
 
     public func cancel() throws {
         try withLock {
-            guard let handle else {
+            guard let handle = self.handle else {
                 throw DenoizeSDKError.invalidState("cancellation token is closed")
             }
             let status = denoize_cancel_token_cancel_v1(handle)
@@ -118,7 +118,7 @@ public final class DenoizeCancellation: @unchecked Sendable {
 
     fileprivate func reset() throws {
         try withLock {
-            guard let handle else {
+            guard let handle = self.handle else {
                 throw DenoizeSDKError.invalidState("cancellation token is closed")
             }
             let status = denoize_cancel_token_reset_v1(handle)
@@ -130,7 +130,7 @@ public final class DenoizeCancellation: @unchecked Sendable {
 
     public func close() throws {
         try withLock {
-            guard let handle else { return }
+            guard let handle = self.handle else { return }
             let status = denoize_cancel_token_destroy_v1(handle)
             guard status == DENOIZE_STATUS_OK else {
                 throw sdkError(status: status, message: "destroy denoize cancellation token")

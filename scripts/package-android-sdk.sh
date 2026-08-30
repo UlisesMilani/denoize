@@ -10,6 +10,7 @@ fi
 output_dir=${1:-.}
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+. "$repo_dir/scripts/verify-sdk-release-ref.sh"
 
 ndk_root=${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}
 if [[ -z "$ndk_root" || ! -d "$ndk_root/toolchains/llvm/prebuilt" ]]; then
@@ -60,10 +61,7 @@ version=$(awk '
   }
 ' Cargo.toml)
 tag="v$version"
-if [[ -n ${GITHUB_REF_NAME:-} && ${GITHUB_REF_NAME} != "$tag" ]]; then
-  echo "release tag ${GITHUB_REF_NAME} does not match SDK version $version" >&2
-  exit 1
-fi
+verify_sdk_release_ref "$tag" "$version"
 
 toolchain=${RUSTUP_TOOLCHAIN:-1.96.0}
 rustup target add --toolchain "$toolchain" \
@@ -78,18 +76,23 @@ cp -R sdk/android "$staging/sdk/android"
 mkdir -p "$staging/sdk/denoize-c"
 cp -R sdk/denoize-c/include "$staging/sdk/denoize-c/include"
 
+# Evaluate the AGP/Kotlin DSL before spending time on both Rust cross-builds.
+gradle --no-daemon -p "$staging/sdk/android" help >/dev/null
+
 build_android_library() {
   local abi=$1
   local rust_target=$2
   local linker=$3
   local cargo_linker=$4
   local cc_variable=$5
+  local ar_variable=$6
   local destination="$staging/sdk/android/library/src/main/prebuilt/$abi"
   mkdir -p "$destination"
   env \
     RUSTUP_TOOLCHAIN="$toolchain" \
     "$cargo_linker=$ndk_bin/$linker" \
     "$cc_variable=$ndk_bin/$linker" \
+    "$ar_variable=$ndk_bin/llvm-ar" \
     cargo build --locked --profile ffi-release -p denoize-c --target "$rust_target"
   local library="$target_dir/$rust_target/ffi-release/libdenoize_c.so"
   if [[ ! -s "$library" ]]; then
@@ -101,10 +104,12 @@ build_android_library() {
 
 build_android_library \
   arm64-v8a aarch64-linux-android aarch64-linux-android26-clang \
-  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER CC_aarch64_linux_android
+  CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER CC_aarch64_linux_android \
+  AR_aarch64_linux_android
 build_android_library \
   x86_64 x86_64-linux-android x86_64-linux-android26-clang \
-  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER CC_x86_64_linux_android
+  CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER CC_x86_64_linux_android \
+  AR_x86_64_linux_android
 
 assets="$staging/sdk/android/library/src/main/assets/denoize"
 mkdir -p "$assets/schemas"
@@ -114,9 +119,6 @@ cp schemas/denoize-sdk-abi-v1.schema.json \
   schemas/denoize-mobile-lifecycle-v1.schema.json \
   "$assets/schemas/"
 
-if [[ ${DENOIZE_ANDROID_RUN_INSTRUMENTATION:-0} == 1 ]]; then
-  gradle --no-daemon -p "$staging/sdk/android" :library:connectedDebugAndroidTest
-fi
 gradle --no-daemon -p "$staging/sdk/android" :library:assembleRelease
 aar="$staging/sdk/android/library/build/outputs/aar/library-release.aar"
 if [[ ! -s "$aar" ]]; then
@@ -136,6 +138,21 @@ for member in \
     exit 1
   fi
 done
+for abi in arm64-v8a x86_64; do
+  jni_library="$staging/libdenoize_jni-$abi.so"
+  unzip -p "$aar" "jni/$abi/libdenoize_jni.so" > "$jni_library"
+  if ! "$ndk_bin/llvm-readelf" -d "$jni_library" | awk '
+    /\(NEEDED\)/ && /\[libdenoize_c\.so\]/ { found = 1 }
+    END { exit !found }
+  '; then
+    echo "Android JNI library for $abi does not depend on portable libdenoize_c.so" >&2
+    exit 1
+  fi
+done
+
+if [[ ${DENOIZE_ANDROID_RUN_INSTRUMENTATION:-0} == 1 ]]; then
+  gradle --no-daemon -p "$staging/sdk/android" :library:connectedDebugAndroidTest
+fi
 
 mkdir -p "$output_dir"
 output_dir=$(cd -- "$output_dir" && pwd)

@@ -25,8 +25,20 @@ static int exercise_component(OSType subtype, NSString *label) {
         instantiation_error = error;
         dispatch_semaphore_signal(completed);
     }];
-    if (dispatch_semaphore_wait(
-            completed, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC)) != 0) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:30.0];
+    BOOL signaled = NO;
+    while (!signaled && deadline.timeIntervalSinceNow > 0.0) {
+        if (dispatch_semaphore_wait(completed, DISPATCH_TIME_NOW) == 0) {
+            signaled = YES;
+            break;
+        }
+        [[NSRunLoop currentRunLoop]
+            runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    if (!signaled && dispatch_semaphore_wait(completed, DISPATCH_TIME_NOW) == 0) {
+        signaled = YES;
+    }
+    if (!signaled) {
         fprintf(stderr, "component %s instantiation timed out\n", label.UTF8String);
         return 1;
     }
