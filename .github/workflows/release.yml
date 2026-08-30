@@ -1349,6 +1349,7 @@ jobs:
             "$microphone_array_promotion_evidence_schema" "$microphone_array_report_schema" \
             "$meeting_speaker_promotion_evidence_schema" "$meeting_speaker_report_schema" \
             "$meeting_track_labels_schema" \
+            "$music_restoration_promotion_evidence_schema" "$music_restoration_report_schema" \
             "$sdk_abi_schema" "$sdk_capabilities_schema" \
             "$mobile_lifecycle_schema" "$wasm_capabilities_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
