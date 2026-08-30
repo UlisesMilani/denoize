@@ -1,6 +1,6 @@
 [package]
 name = "denoize-c"
-version = "0.88.0"
+version = "0.89.0"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -12,7 +12,7 @@ name = "denoize_c"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-denoize = { path = "../..", version = "0.88.0", default-features = false }
+denoize = { path = "../..", version = "0.89.0", default-features = false }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

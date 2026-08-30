@@ -176,6 +176,29 @@ def main() -> None:
     gpu_resources["precision_profiles"][0]["resources"]["accelerators"] = ["cuda"]
     manifest_validator.validate(gpu_resources)
 
+    semantic = copy.deepcopy(manifest)
+    semantic["tensors"]["inputs"].append(
+        {
+            "name": "query",
+            "role": "query",
+            "element_type": "float32",
+            "axes": [
+                {"name": "batch", "kind": "batch", "fixed": 1},
+                {"name": "classes", "kind": "feature", "fixed": 2},
+            ],
+            "optional": False,
+            "state_id": None,
+        }
+    )
+    residual = copy.deepcopy(semantic["tensors"]["outputs"][0])
+    residual["name"] = "residual"
+    residual["role"] = "residual"
+    semantic["tensors"]["outputs"].append(residual)
+    manifest_validator.validate(semantic)
+    open_text = copy.deepcopy(semantic)
+    open_text["tensors"]["inputs"][1]["role"] = "natural-language"
+    assert not manifest_validator.is_valid(open_text)
+
     unknown = copy.deepcopy(manifest)
     unknown["command"] = "python converter.py"
     assert not manifest_validator.is_valid(unknown)

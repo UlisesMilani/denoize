@@ -1,6 +1,6 @@
 # Restoration platform research review
 
-Research cut-off: 2026-08-27. This review turns papers and format specifications
+Research cut-off: 2026-08-31. This review turns papers and format specifications
 into denoize implementation decisions. A paper result is evidence for a
 candidate, not permission to distribute its code, checkpoint, or training
 material; all three license layers are audited independently before a managed
@@ -21,6 +21,7 @@ model can ship.
 | 33 | SDKs | Versioned C ABI first, then finite WASM, AudioWorklet, mobile wrappers, and optional Web Audio Module packaging | ABI stability depends on the runtime, timeline, and error model above | ABI checker, ownership/thread rules, negotiated browser render-quantum deadline, mobile lifecycle |
 | 34 | Meeting speaker tracks | Bounded anonymous CSS/diarization with an explicit residual | Builds on consent, array, timeline, and SDK contracts without conflating audio tracks with transcription or identity | Unknown/overlap/speaker-count calibration, permutation continuity, privacy, licensed real-meeting evidence |
 | 35 | Music/general-audio restoration | Finished-mixture codec repair and bandwidth extension before dry-stem estimation | Music needs phase, transient, stereo, instrument, genre, and mastering-intent protections that speech gates omit | Exact model/data/license BOM, clean bypass, full-song and professional-listening evidence |
+| 36 | Semantic target sound | Offline closed-catalog preserve/remove before causal or open-language extraction | Semantic foreground choice needs explicit class identity, absence, conservation, protected-foreground, and spatial gates | Exact model/data/license BOM, calibrated absence, one-hot catalog binding, residual conservation, and class-stratified listening evidence |
 
 The key product decision is to separate “sounds better” from “faithfully
 restored.” Deterministic repair and discriminative neural output are defaults.
@@ -1011,9 +1012,9 @@ contracts, publish all SDK archives and schemas, and bind them into the same
 SBOM/provenance evidence set as the applications. These virtual-device gates do
 not substitute for named physical-device latency evidence.
 
-## Post-roadmap implementation and research watchlist
+## Extended implementation and research watchlist
 
-Stages 34 and 35 now have bounded product contracts while concrete neural
+Stages 34 through 36 now have bounded product contracts while concrete neural
 artifacts remain gated. Later capabilities have product value, but are
 deliberately excluded from the implementation commitment until their stated
 promotion conditions hold.
@@ -1022,7 +1023,7 @@ promotion conditions hold.
 |---:|---|---|---|
 | 34 | Meeting speaker tracks | Implemented as the v0.87.0 bounded anonymous baseline after Stages 29, 31, and 32 | Any concrete checkpoint still requires licensed real-meeting evidence, stable speaker-count/overlap uncertainty, and its complete redistribution chain |
 | 35 | Music/general-audio restoration | Implemented for v0.88.0 as task-bound finished-mixture codec/bandwidth candidate rendering; dry stems remain separate and opt-in | Any concrete checkpoint still requires a redistributable exact dependency/data chain plus phase, stereo, transient, clean-bypass, full-song, instrument, genre, and listening evidence |
-| watch | Semantic target-sound extraction | Research adapter only | Closed query semantics, target-absence calibration, residual conservation, distributable weights/data, and real-time evidence |
+| 36 | Semantic target-sound extraction | Implemented for v0.89.0 as offline preserve/remove over an authenticated finite one-hot catalog | A concrete checkpoint still needs complete artifact/data licenses and signed class/absence/spatial evidence; causal promotion additionally needs state, overload, and end-to-end device latency evidence |
 | watch | Audio-visual target extraction | Do not schedule yet | Explicit camera/face consent, sync, occlusion/spoofing, biometric retention, and audio-only failure policy |
 
 ### Meeting speaker-track decomposition
@@ -1168,31 +1169,122 @@ conservation semantics, alignment checks, phase-aware and per-instrument gates,
 and its own redistributable dependency and dataset chain. See
 [the product contract](music-restoration.md).
 
-### Semantic target-sound extraction
+### Stage 36 — closed-catalog target-sound extraction
 
-This feature would let a user explicitly preserve or remove a described class
-such as keyboard, alarm, dog bark, or cough. It must be separate from automatic
-denoising because a language/class query can be ambiguous and the requested
-sound may be absent. [Waveformer](https://github.com/vb000/Waveformer) is the
-best causal fixed-class reference: the official MIT repository reports
-approximately 10 ms chunks, under 20 ms end-to-end latency, and single-thread
-RTF 0.66–0.94 on its reference CPU
-([paper](https://arxiv.org/abs/2211.02250)). Those numbers still require
-denoize-path measurement and a separate checkpoint/training-corpus audit.
+#### Evidence from papers
 
-[AudioSep](https://github.com/Audio-AGI/AudioSep) demonstrates open-domain,
-natural-language queried separation and zero-shot transfer, while Semantic
-Hearing demonstrates 20-class binaural extraction that preserves spatial cues
-and reports 6.56 ms model runtime on a connected smartphone
-([AudioSep paper](https://arxiv.org/abs/2308.05037),
-[Semantic Hearing](https://arxiv.org/abs/2311.00320)). Both broaden the failure
-surface: text encoders, web-derived corpora, prompt equivalence, class
-confusion, absence, and residual spatial consistency become release gates.
-Promotion requires calibrated `present`/`uncertain`/`absent`, a closed
-machine-readable class/query record, target and residual outputs whose
-recombination error is bounded, false-removal tests for protected foreground,
-and complete code/checkpoint/data licenses. A generative diffusion separator is
-not used as the safe default.
+This feature lets a user explicitly preserve or remove a class such as
+keyboard, alarm, dog bark, or cough. It must be separate from automatic
+denoising because the query changes foreground semantics, nearby classes can be
+confused, and the requested sound may be absent.
+
+[Waveformer](https://github.com/vb000/Waveformer) is the strongest causal
+fixed-class reference. It uses one-hot or multi-hot label encoding with a
+dilated causal-convolution encoder and transformer decoder. The
+[paper](https://arxiv.org/abs/2211.02250) reports 2.2–3.3 dB SI-SNRi gains over
+its streaming baselines, and the official repository reports roughly 10 ms
+chunks, single-thread CPU real-time factors from 0.66 to 0.94, and less than
+20 ms end-to-end latency. These measurements motivate the later causal track;
+they are not measurements of the denoize runtime, converted graphs, resamplers,
+audio device, or publication path.
+
+[AudioSep](https://github.com/Audio-AGI/AudioSep) and its
+[paper](https://arxiv.org/abs/2308.05037) demonstrate open-domain
+natural-language queried separation and transfer across AudioSet, AudioCaps,
+VGGSound, MUSIC, Clotho, and ESC-50 evaluations. That flexibility requires a
+text encoder and introduces prompt equivalence, negation, ambiguity,
+language/locale, web-derived training, and text/audio alignment failure modes.
+Those semantics are not representable safely as a label added to a finite
+tensor contract, so open text is not accepted by Stage 36.
+
+[Semantic Hearing](https://arxiv.org/abs/2311.00320) demonstrates a 20-class
+binaural model, synthesized HRTF/room training, in-the-wild evaluation, and
+spatial preservation. The paper reports 6.56 ms model runtime for a 10 ms chunk
+on a connected iPhone 11, average 7.17 dB signal improvement, and a 22-person
+study. The result makes ITD/ILD and protected spatial foreground mandatory
+evaluation dimensions; it does not prove denoize end-to-end latency or that a
+different graph preserves spatial perception.
+
+The evidence points to three separate products rather than one widening flag:
+
+1. an offline closed-catalog operation with explicit absence and residual
+   conservation;
+2. a later causal closed-catalog operation with authenticated state, overload,
+   device, and end-to-end latency evidence;
+3. open-language extraction only after prompt, text-encoder, multilingual,
+   artifact, and absence semantics have their own closed contract.
+
+#### Immutable artifact and license audit
+
+The source revisions below were frozen during the Stage 36 review. Repository
+license labels apply to repository code; they do not automatically grant the
+same terms for a separately hosted checkpoint or every source recording used
+to train it.
+
+| Candidate | Audited identity | Technical value | Distribution decision |
+|---|---|---|---|
+| [Waveformer](https://github.com/vb000/Waveformer) | source `db51a4916e8001db1d6fde8cc9c19a3bed82a1b5`, MIT code; checkpoint archive and FSDSoundScapes recipe are separately hosted | Best direct causal one-hot architecture; training recipe composes FSDKaggle2018 foreground and TAU Urban Acoustic Scenes 2019 background material | Architecture and evaluator reference only. Do not bundle the checkpoint until its own license plus every source-recording and generated-mixture redistribution term is recorded, and do not reuse upstream latency as denoize evidence |
+| [Semantic Hearing](https://github.com/vb000/SemanticHearing) | source `07e9786c7a741f0a7c722dcde66a2679ca068c50`, MIT code; `39.pt` and `BinauralCuratedDataset.tar` are separate downloads | Direct binaural target extraction and spatial-cue reference across 20 classes | Architecture, dataset-format, and spatial-evaluation reference only. The repository's code license is not sufficient checkpoint/dataset redistribution evidence; no asset is bundled |
+| [AudioSep](https://github.com/Audio-AGI/AudioSep) | source `944583f18b84589dc965de3ad77525c945334252`, MIT code; official Space exposes a multi-gigabyte PyTorch checkpoint separately | Strong open-language and zero-shot comparison, plus a useful cross-dataset evaluation matrix | Not accepted by the finite Stage 36 adapter. A third-party model card or top-level code license cannot establish the official checkpoint's complete text encoder, dependency, training-data, and redistribution chain |
+
+The audit found no frozen upstream artifact that both fits the finite runtime
+contract and clears the complete checkpoint/training/evaluation license and
+signed-evidence boundary. v0.89.0 therefore bundles neither weights nor a
+class catalog and makes no upstream quality or real-time claim.
+
+#### Implemented v0.89.0 boundary
+
+The query document carries the entire ordered catalog, its revision, and one
+selected ID. Independent domain-bound digests cover the full query, catalog,
+and ordered class IDs. A dedicated package-v2 adapter accepts exactly fixed
+`[1,C,W]` program audio and `[1,K]` one-hot query inputs, then returns
+same-geometry target and residual audio plus ordered
+absent/uncertain/present probabilities. Mono-center or ordered stereo L/R,
+fixed class count, clocks, graph, numerical vectors, resources, provenance, and
+licenses authenticate before source audio is opened. Labels are audit metadata
+and never enter the graph.
+
+The offline renderer averages overlapping windows and requires calibrated
+presence. It checks the model's target-plus-residual decomposition, then forms
+the source-clock residual exactly as `input - target`. Duration, geometry,
+finite normalized samples, target/residual peaks and energy, stereo
+correlation, and Mid/Side energy drift are all hard gates. Absent, uncertain,
+or failed candidates return no audio values. The CLI publishes only a path-free
+report for those outcomes; accepted float32 target and residual WAVs are staged
+before the mode-selected output.
+
+Signed promotion evidence fixes 14 sorted strata: binaural-spatial,
+class-confusable, clean-bypass, low-SNR, multi-instance, music foreground,
+query alias, speech foreground, target absent/present, tonal/transient target,
+unseen domain, and unseen interferer. Hard metrics include SI-SDR improvement,
+protected-foreground SDR, absence false-positive and presence false-negative
+rates, calibration error, residual leakage, target-absence RMS, ITD/ILD,
+recombination, duration, clipping, and finite output. Global gates require
+every authenticated class in a signed coverage manifest, at least 20 present
+and 20 absent cases per class, worst-class false-positive/false-negative rates
+of at most `0.01`/`0.05`, at least 1,000 paired cases, 200 each for absence,
+protected foreground, and binaural, 20 listeners, complete
+artifact/training/evaluation manifests, and zero restricted redistributed or
+unresolved-license items. See
+[the product contract](target-sound.md).
+
+#### Remaining causal and open-language gates
+
+The v0.89.0 package is finite and stateless. A causal promotion must add named
+recurrent state with portable reset/snapshot semantics, discontinuity and
+dropout treatment, bounded callback work, allocation/lock-free host behavior,
+overload fallback that does not expose a partial semantic removal, and
+continuous target/residual conservation across chunk and resampler boundaries.
+End-to-end measurements must include capture, chunking, lookahead, resampling,
+inference, buffering, host scheduling, and output on each named device; model
+runtime alone is insufficient.
+
+Open-language support remains a separate later stage. It needs a frozen text
+encoder and tokenizer, canonical prompt/locale representation, alias and
+negation behavior, adversarial prompt and class-confusion evaluation,
+calibrated absence under unseen descriptions, complete web-corpus provenance,
+and residual/spatial gates at least as strict as Stage 36. A generative or
+diffusion separator is not the safe default.
 
 ### Audio-visual target extraction
 

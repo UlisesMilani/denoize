@@ -204,6 +204,7 @@
                 "audio",
                 "far-end-reference",
                 "enrollment",
+                "query",
                 "microphone-geometry",
                 "state",
                 "control"
@@ -218,7 +219,7 @@
         { "$ref": "#/$defs/tensorBase" },
         {
           "properties": {
-            "role": { "enum": ["audio", "state", "mask", "diagnostic"] },
+            "role": { "enum": ["audio", "residual", "state", "mask", "diagnostic"] },
             "optional": { "const": false }
           }
         }

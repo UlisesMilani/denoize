@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.88.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.89.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -19,6 +19,7 @@ USAGE:
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize target-sound <INPUT> --query QUERY.json --target TARGET.wav --residual RESIDUAL.wav --output OUTPUT.wav --report REPORT.json --mode preserve|remove --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction CORRECTION.wav --report REPORT.json --task TASK --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
@@ -294,6 +295,49 @@ CAUSAL OPTIONS:
     metadata, replacement, and JSON options above also apply to causal mode.
 ```
 
+## Closed-catalog target-sound extraction
+
+```text
+USAGE:
+    denoize target-sound <INPUT> --query <QUERY.json> --target <TARGET.wav> --residual <RESIDUAL.wav> --output <OUTPUT.wav> --report <REPORT.json> --mode <preserve|remove> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-sound evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Extract or remove one sound selected from an authenticated finite class
+catalog. Open text is never accepted or sent to the model. The graph must
+produce target, residual, and calibrated absent/uncertain/present values; all
+audio publication is withheld unless presence and every conservation, signal,
+geometry, spatial, package, license, and evaluation gate passes. The three WAV
+artifacts and path-free report are published together when accepted. No model,
+checkpoint, catalog, or dataset is bundled.
+
+OPTIONS:
+        --query <PATH.json>                         complete ordered finite catalog and selected ID
+        --target <PATH.wav>                         required float WAV target estimate
+        --residual <PATH.wav>                       required float WAV exact mixture residual
+        --output <PATH.wav>                         target for preserve; residual for remove
+        --report <PATH.json>                        required closed path-free audit report
+        --mode <NAME>                               preserve|remove (required)
+        --model-package <PATH>                      required signed runtime package v2
+        --model-package-key <PATH>                  trusted Minisign public key
+        --promotion-evidence <PATH>                 accepted signed target-sound evidence
+        --promotion-evidence-key <PATH>             trusted Ed25519 evidence public key
+        --minimum-present-probability <F>           present threshold, 0.5..1 (default: 0.9)
+        --minimum-absent-probability <F>            absent threshold, 0.5..1 (default: 0.9)
+        --maximum-model-recombination-error <F>     graph target+residual error, 0..0.1 (default: 0.01)
+        --maximum-publication-recombination-error <F> source-rate error, 0..1e-6 (default: 1e-12)
+        --maximum-target-peak <F>                   target absolute peak, 0.5..1 (default: 1)
+        --maximum-residual-peak <F>                 residual absolute peak, 0.5..1 (default: 1)
+        --maximum-energy-gain-db <F>                target/residual energy gain, 0..12 dB (default: 3)
+        --maximum-stereo-correlation-delta <F>      resampling spatial drift, 0..0.25 (default: 0.05)
+        --maximum-mid-side-ratio-delta-db <F>       resampling spatial drift, 0..6 dB (default: 1.5)
+        --accelerator <NAME>                        cpu|auto|gpu|metal|cuda (default: cpu)
+        --max-memory <MB>                           bound decode, model, target, residual, and report memory
+        --replace                                   atomically replace each published destination
+        --json                                      emit compact report JSON
+        --pretty                                    emit indented report JSON
+    -h, --help                                      show this help
+```
+
 ## Anonymous meeting speaker tracks
 
 ```text
@@ -433,7 +477,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.88.0 watch-folder automation
+denoize 0.89.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

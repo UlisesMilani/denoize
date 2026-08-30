@@ -414,6 +414,7 @@ USAGE:
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize target-sound <INPUT> --query QUERY.json --target TARGET.wav --residual RESIDUAL.wav --output OUTPUT.wav --report REPORT.json --mode preserve|remove --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction CORRECTION.wav --report REPORT.json --task TASK --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
@@ -6893,6 +6894,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("target-speaker") {
         return run_target_speaker(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("target-sound") {
+        return run_target_sound(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("meeting-speakers") {
         return run_meeting_speakers(&args[1..]);
     }
@@ -10828,6 +10832,636 @@ mod music_restoration_cli_tests {
             "0.9".into(),
         ]);
         assert!(parse_music_restoration_args(&duplicate).is_err());
+    }
+}
+
+fn target_sound_usage() -> &'static str {
+    "\
+USAGE:
+    denoize target-sound <INPUT> --query <QUERY.json> --target <TARGET.wav> --residual <RESIDUAL.wav> --output <OUTPUT.wav> --report <REPORT.json> --mode <preserve|remove> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize target-sound evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Extract or remove one sound selected from an authenticated finite class
+catalog. Open text is never accepted or sent to the model. The graph must
+produce target, residual, and calibrated absent/uncertain/present values; all
+audio publication is withheld unless presence and every conservation, signal,
+geometry, spatial, package, license, and evaluation gate passes. The three WAV
+artifacts and path-free report are published together when accepted. No model,
+checkpoint, catalog, or dataset is bundled.
+
+OPTIONS:
+        --query <PATH.json>                         complete ordered finite catalog and selected ID
+        --target <PATH.wav>                         required float WAV target estimate
+        --residual <PATH.wav>                       required float WAV exact mixture residual
+        --output <PATH.wav>                         target for preserve; residual for remove
+        --report <PATH.json>                        required closed path-free audit report
+        --mode <NAME>                               preserve|remove (required)
+        --model-package <PATH>                      required signed runtime package v2
+        --model-package-key <PATH>                  trusted Minisign public key
+        --promotion-evidence <PATH>                 accepted signed target-sound evidence
+        --promotion-evidence-key <PATH>             trusted Ed25519 evidence public key
+        --minimum-present-probability <F>           present threshold, 0.5..1 (default: 0.9)
+        --minimum-absent-probability <F>            absent threshold, 0.5..1 (default: 0.9)
+        --maximum-model-recombination-error <F>     graph target+residual error, 0..0.1 (default: 0.01)
+        --maximum-publication-recombination-error <F> source-rate error, 0..1e-6 (default: 1e-12)
+        --maximum-target-peak <F>                   target absolute peak, 0.5..1 (default: 1)
+        --maximum-residual-peak <F>                 residual absolute peak, 0.5..1 (default: 1)
+        --maximum-energy-gain-db <F>                target/residual energy gain, 0..12 dB (default: 3)
+        --maximum-stereo-correlation-delta <F>      resampling spatial drift, 0..0.25 (default: 0.05)
+        --maximum-mid-side-ratio-delta-db <F>       resampling spatial drift, 0..6 dB (default: 1.5)
+        --accelerator <NAME>                        cpu|auto|gpu|metal|cuda (default: cpu)
+        --max-memory <MB>                           bound decode, model, target, residual, and report memory
+        --replace                                   atomically replace each published destination
+        --json                                      emit compact report JSON
+        --pretty                                    emit indented report JSON
+    -h, --help                                      show this help
+"
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+#[derive(Debug)]
+struct TargetSoundCliOptions {
+    input: String,
+    query: String,
+    target: String,
+    residual: String,
+    output: String,
+    report: String,
+    package: String,
+    package_key: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    config: denoize::TargetSoundConfig,
+    accelerator: AcceleratorPreference,
+    max_memory_mb: Option<usize>,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_target_sound_mode(value: &str) -> Result<denoize::TargetSoundMode, String> {
+    match value {
+        "preserve" => Ok(denoize::TargetSoundMode::Preserve),
+        "remove" => Ok(denoize::TargetSoundMode::Remove),
+        _ => Err(format!(
+            "unknown target-sound mode: {value} (expected preserve or remove)"
+        )),
+    }
+}
+
+fn parse_target_sound_args(args: &[String]) -> Result<TargetSoundCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut query = None;
+    let mut target = None;
+    let mut residual = None;
+    let mut output = None;
+    let mut report = None;
+    let mut mode = None;
+    let mut package = None;
+    let mut package_key = None;
+    let mut promotion_evidence = None;
+    let mut promotion_evidence_key = None;
+    let mut config = denoize::TargetSoundConfig::default();
+    let mut accelerator = AcceleratorPreference::Cpu;
+    let mut accelerator_seen = false;
+    let mut max_memory_mb = None;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut scalar_options = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--minimum-present-probability"
+                | "--minimum-absent-probability"
+                | "--maximum-model-recombination-error"
+                | "--maximum-publication-recombination-error"
+                | "--maximum-target-peak"
+                | "--maximum-residual-peak"
+                | "--maximum-energy-gain-db"
+                | "--maximum-stereo-correlation-delta"
+                | "--maximum-mid-side-ratio-delta-db"
+        ) && !scalar_options.insert(argument)
+        {
+            return Err(format!("{argument} may be supplied only once"));
+        }
+        match argument {
+            "--query" if query.is_none() => {
+                query = Some(parse_value(args, &mut index, "--query")?);
+            }
+            "--query" => return Err("--query may be supplied only once".into()),
+            "--target" if target.is_none() => {
+                target = Some(parse_value(args, &mut index, "--target")?);
+            }
+            "--target" => return Err("--target may be supplied only once".into()),
+            "--residual" if residual.is_none() => {
+                residual = Some(parse_value(args, &mut index, "--residual")?);
+            }
+            "--residual" => return Err("--residual may be supplied only once".into()),
+            "--output" if output.is_none() => {
+                output = Some(parse_value(args, &mut index, "--output")?);
+            }
+            "--output" => return Err("--output may be supplied only once".into()),
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--mode" if mode.is_none() => {
+                let value: String = parse_value(args, &mut index, "--mode")?;
+                mode = Some(parse_target_sound_mode(&value)?);
+            }
+            "--mode" => return Err("--mode may be supplied only once".into()),
+            "--model-package" if package.is_none() => {
+                package = Some(parse_value(args, &mut index, "--model-package")?);
+            }
+            "--model-package" => return Err("--model-package may be supplied only once".into()),
+            "--model-package-key" if package_key.is_none() => {
+                package_key = Some(parse_value(args, &mut index, "--model-package-key")?);
+            }
+            "--model-package-key" => {
+                return Err("--model-package-key may be supplied only once".into());
+            }
+            "--promotion-evidence" if promotion_evidence.is_none() => {
+                promotion_evidence = Some(parse_value(args, &mut index, "--promotion-evidence")?);
+            }
+            "--promotion-evidence" => {
+                return Err("--promotion-evidence may be supplied only once".into());
+            }
+            "--promotion-evidence-key" if promotion_evidence_key.is_none() => {
+                promotion_evidence_key =
+                    Some(parse_value(args, &mut index, "--promotion-evidence-key")?);
+            }
+            "--promotion-evidence-key" => {
+                return Err("--promotion-evidence-key may be supplied only once".into());
+            }
+            "--minimum-present-probability" => {
+                config.minimum_present_probability =
+                    parse_value(args, &mut index, "--minimum-present-probability")?;
+            }
+            "--minimum-absent-probability" => {
+                config.minimum_absent_probability =
+                    parse_value(args, &mut index, "--minimum-absent-probability")?;
+            }
+            "--maximum-model-recombination-error" => {
+                config.maximum_model_recombination_error =
+                    parse_value(args, &mut index, "--maximum-model-recombination-error")?;
+            }
+            "--maximum-publication-recombination-error" => {
+                config.maximum_publication_recombination_error = parse_value(
+                    args,
+                    &mut index,
+                    "--maximum-publication-recombination-error",
+                )?;
+            }
+            "--maximum-target-peak" => {
+                config.maximum_target_peak =
+                    parse_value(args, &mut index, "--maximum-target-peak")?;
+            }
+            "--maximum-residual-peak" => {
+                config.maximum_residual_peak =
+                    parse_value(args, &mut index, "--maximum-residual-peak")?;
+            }
+            "--maximum-energy-gain-db" => {
+                config.maximum_energy_gain_db =
+                    parse_value(args, &mut index, "--maximum-energy-gain-db")?;
+            }
+            "--maximum-stereo-correlation-delta" => {
+                config.maximum_stereo_correlation_delta =
+                    parse_value(args, &mut index, "--maximum-stereo-correlation-delta")?;
+            }
+            "--maximum-mid-side-ratio-delta-db" => {
+                config.maximum_mid_side_energy_ratio_delta_db =
+                    parse_value(args, &mut index, "--maximum-mid-side-ratio-delta-db")?;
+            }
+            "--accelerator" if !accelerator_seen => {
+                accelerator_seen = true;
+                let value: String = parse_value(args, &mut index, "--accelerator")?;
+                accelerator = AcceleratorPreference::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown target-sound accelerator: {value} (expected cpu, auto, gpu, metal, or cuda)"
+                    )
+                })?;
+            }
+            "--accelerator" => return Err("--accelerator may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("target-sound accepts only one of --json or --pretty".into());
+            }
+            "-h" | "--help" => return Err("target-sound help requested".into()),
+            "-" => {
+                return Err(
+                    "target-sound requires regular-file paths; stdin/stdout are unsupported".into(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown target-sound option: {value}"));
+            }
+            value => {
+                if !positional.is_empty() {
+                    return Err(format!("unexpected extra target-sound argument: {value}"));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let input = positional
+        .first()
+        .cloned()
+        .ok_or("target-sound requires INPUT")?;
+    let query = query.ok_or("target-sound requires --query")?;
+    let target = target.ok_or("target-sound requires --target")?;
+    let residual = residual.ok_or("target-sound requires --residual")?;
+    let output = output.ok_or("target-sound requires --output")?;
+    let report = report.ok_or("target-sound requires --report")?;
+    config.mode = mode.ok_or("target-sound requires --mode")?;
+    for (path, context) in [
+        (&target, "target"),
+        (&residual, "residual"),
+        (&output, "selected output"),
+    ] {
+        if OutputFormat::from_path(std::path::Path::new(path))? != OutputFormat::Wav {
+            return Err(format!(
+                "target-sound {context} must be WAV to avoid lossy encoding"
+            ));
+        }
+    }
+    if std::path::Path::new(&report)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        != Some("json")
+    {
+        return Err("target-sound report must use a .json extension".into());
+    }
+    let package = package.ok_or("target-sound requires --model-package")?;
+    let package_key = package_key.ok_or("target-sound requires --model-package-key")?;
+    let promotion_evidence =
+        promotion_evidence.ok_or("target-sound requires --promotion-evidence")?;
+    let promotion_evidence_key =
+        promotion_evidence_key.ok_or("target-sound requires --promotion-evidence-key")?;
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    config.validate()?;
+    Ok(TargetSoundCliOptions {
+        input,
+        query,
+        target,
+        residual,
+        output,
+        report,
+        package,
+        package_key,
+        promotion_evidence,
+        promotion_evidence_key,
+        config,
+        accelerator,
+        max_memory_mb,
+        commit_mode,
+        print_mode,
+    })
+}
+
+fn run_target_sound(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", target_sound_usage());
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("evidence") {
+        return run_target_sound_evidence(&args[1..]);
+    }
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        return Err("target-sound --help accepts no other arguments".into());
+    }
+    let options = parse_target_sound_args(args)?;
+    validate_target_sound_publication_paths(&options)?;
+    run_target_sound_audio(options)
+}
+
+fn run_target_sound_evidence(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err(
+            "target-sound evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]"
+                .into(),
+        );
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("target-sound evidence verify accepts only one output mode".into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown target-sound evidence option: {value}"));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(
+            "target-sound evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into(),
+        );
+    }
+    let evidence = denoize::SignedTargetSoundPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence)
+                .map_err(|error| format!("serialize target-sound evidence: {error}"))?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified target-sound evidence: package={} catalog={} classes={}/{} per_class_present={} per_class_absent={} worst_fp={} worst_fn={} strata={} paired_cases={} absent={} protected={} binaural={} listeners={} accepted={}",
+            evidence.payload.model_package_sha256,
+            evidence.payload.query_catalog_sha256,
+            evidence.payload.evaluated_class_count,
+            evidence.payload.query_class_count,
+            evidence.payload.minimum_present_cases_per_class,
+            evidence.payload.minimum_absent_cases_per_class,
+            evidence.payload.worst_class_false_positive_rate,
+            evidence.payload.worst_class_false_negative_rate,
+            evidence.payload.strata.len(),
+            evidence.payload.paired_cases,
+            evidence.payload.target_absent_cases,
+            evidence.payload.protected_foreground_cases,
+            evidence.payload.binaural_cases,
+            evidence.payload.listener_count,
+            evidence.payload.accepted,
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err("target-sound evidence is authentic but does not pass promotion gates".into());
+    }
+    Ok(())
+}
+
+fn validate_target_sound_publication_paths(options: &TargetSoundCliOptions) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (options.input.as_str(), "target-sound input"),
+        (options.query.as_str(), "target-sound query"),
+        (options.package.as_str(), "target-sound package"),
+        (options.package_key.as_str(), "target-sound package key"),
+        (
+            options.promotion_evidence.as_str(),
+            "target-sound promotion evidence",
+        ),
+        (
+            options.promotion_evidence_key.as_str(),
+            "target-sound promotion evidence key",
+        ),
+    ] {
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (options.target.as_str(), "target-sound target"),
+        (options.residual.as_str(), "target-sound residual"),
+        (options.output.as_str(), "target-sound selected output"),
+        (options.report.as_str(), "target-sound report"),
+    ] {
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace an input, query, package, key, or evidence document"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "onnx")]
+fn run_target_sound_audio(options: TargetSoundCliOptions) -> Result<(), String> {
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let query = denoize::TargetSoundQuery::from_file(&options.query)?;
+    let evidence =
+        denoize::SignedTargetSoundPromotionEvidence::from_file(&options.promotion_evidence)?;
+    let evidence_key = ReceiptPublicKey::from_file(&options.promotion_evidence_key)?;
+    let package = RuntimeModelPackage::open(&options.package, &options.package_key)?;
+    // Authenticate package bytes, tensor semantics, numerical vectors,
+    // configuration, finite catalog, licenses, and promotion evidence before
+    // opening user-controlled audio.
+    let session = denoize::TargetSoundSession::prepare(
+        package,
+        &evidence,
+        &evidence_key,
+        &query,
+        &options.config,
+        options.accelerator,
+    )?;
+    let model_working_set = session.model_working_set_bytes()?;
+    ensure_memory_limit(
+        model_working_set,
+        options.max_memory_mb,
+        "target-sound model working set",
+    )?;
+    let mut input_session = AudioInputSession::open(&options.input)?;
+    let session_memory = estimate_session_memory_bytes(&input_session);
+    ensure_memory_limit(
+        model_working_set.saturating_add(session_memory),
+        options.max_memory_mb,
+        "target-sound input/model preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(model_working_set)
+            .saturating_sub(session_memory)
+    });
+    let input = read_audio_from_session_with_limits(
+        &mut input_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let working_set = session
+        .processing_working_set_bytes(&input)?
+        .saturating_add(model_working_set)
+        .saturating_add(session_memory);
+    ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "target-sound decoded/model/target/residual working set",
+    )?;
+    let result = session.extract(&input, &query, &options.config)?;
+    let staged_report = stage_restoration_json(&options.report, &result.report)?;
+    if let (Some(target), Some(residual), Some(output)) = (
+        result.target.as_ref(),
+        result.residual.as_ref(),
+        result.output.as_ref(),
+    ) {
+        let encode_options = EncodeOptions::default();
+        OutputFormat::Wav.validate_config(target, &encode_options)?;
+        OutputFormat::Wav.validate_config(residual, &encode_options)?;
+        OutputFormat::Wav.validate_config(output, &encode_options)?;
+        let mut staged_target = AtomicOutput::new(&options.target)?;
+        denoize::encode::write_audio_to_file(
+            staged_target.file_mut(),
+            OutputFormat::Wav,
+            target,
+            encode_options,
+        )?;
+        let mut staged_residual = AtomicOutput::new(&options.residual)?;
+        denoize::encode::write_audio_to_file(
+            staged_residual.file_mut(),
+            OutputFormat::Wav,
+            residual,
+            encode_options,
+        )?;
+        let mut staged_output = AtomicOutput::new(&options.output)?;
+        denoize::encode::write_audio_to_file(
+            staged_output.file_mut(),
+            OutputFormat::Wav,
+            output,
+            encode_options,
+        )?;
+        // Publish the report first and the mode-selected output last. A partial
+        // multi-file commit can never leave a selected output without its audit.
+        staged_report.commit(options.commit_mode)?;
+        staged_target.commit(options.commit_mode)?;
+        staged_residual.commit(options.commit_mode)?;
+        staged_output.commit(options.commit_mode)?;
+    } else {
+        // Withheld decisions intentionally publish only the audit report.
+        staged_report.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => {
+            println!(
+                "target-sound extraction: mode={:?} class={} index={} decision={:?} presence={:?} published={} frames={} package={}",
+                result.report.mode,
+                result.report.query.class_id,
+                result.report.query.class_index,
+                result.report.decision,
+                result.report.presence.state,
+                result.report.output_published,
+                result.report.source_frames,
+                result.report.model.package_sha256,
+            );
+            for warning in &result.report.warnings {
+                println!("warning: {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "onnx"))]
+fn run_target_sound_audio(_options: TargetSoundCliOptions) -> Result<(), String> {
+    Err("target-sound extraction requires a build with the onnx feature".into())
+}
+
+#[cfg(test)]
+mod target_sound_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn valid_arguments() -> Vec<String> {
+        arguments(&[
+            "program.wav",
+            "--query",
+            "query.json",
+            "--target",
+            "target.wav",
+            "--residual",
+            "residual.wav",
+            "--output",
+            "output.wav",
+            "--report",
+            "report.json",
+            "--mode",
+            "preserve",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "evidence.pub.json",
+        ])
+    }
+
+    #[test]
+    fn parser_requires_query_all_outputs_and_explicit_mode() {
+        let error = parse_target_sound_args(&arguments(&["program.wav"])).unwrap_err();
+        assert_eq!(error, "target-sound requires --query");
+        let parsed = parse_target_sound_args(&valid_arguments()).unwrap();
+        assert_eq!(parsed.config.mode, denoize::TargetSoundMode::Preserve);
+        assert_eq!(parsed.config.minimum_present_probability, 0.9);
+        assert_eq!(parsed.commit_mode, CommitMode::NoClobber);
+    }
+
+    #[test]
+    fn parser_rejects_lossy_artifacts_and_duplicate_thresholds() {
+        let mut lossy = valid_arguments();
+        let residual = lossy
+            .iter()
+            .position(|argument| argument == "residual.wav")
+            .unwrap();
+        lossy[residual] = "residual.mp3".into();
+        assert!(parse_target_sound_args(&lossy).is_err());
+
+        let mut duplicate = valid_arguments();
+        duplicate.extend([
+            "--minimum-present-probability".into(),
+            "0.9".into(),
+            "--minimum-present-probability".into(),
+            "0.95".into(),
+        ]);
+        assert!(parse_target_sound_args(&duplicate).is_err());
     }
 }
 
@@ -16531,7 +17165,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "8ec41a1a59650358841b18a8998ce7ef2789e15123a131c6d4bcfd7af0c0834d";
+        "3b79a4097f4c535dd0203060a3234e7452493b8240fb5f3a29d376763b7dbc04";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

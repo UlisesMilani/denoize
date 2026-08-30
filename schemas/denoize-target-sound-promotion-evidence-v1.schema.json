@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-target-sound-promotion-evidence-v1.schema.json",
+  "title": "denoize signed target-sound promotion evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "payload", "signature"],
+  "properties": {
+    "schema": { "const": "denoize-target-sound-promotion-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "payload": { "$ref": "#/$defs/payload" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,256}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completed_at_unix_seconds",
+        "model_package_sha256",
+        "source_revision",
+        "source_sha256",
+        "checkpoint_sha256",
+        "configuration_sha256",
+        "query_catalog_sha256",
+        "query_catalog_revision",
+        "query_class_ids_sha256",
+        "query_class_count",
+        "class_coverage_manifest_sha256",
+        "evaluated_class_count",
+        "minimum_present_cases_per_class",
+        "minimum_absent_cases_per_class",
+        "worst_class_false_positive_rate",
+        "worst_class_false_negative_rate",
+        "artifact_bom_sha256",
+        "training_dataset_license_manifest_sha256",
+        "evaluation_corpus_manifest_sha256",
+        "evaluation_corpus_license_manifest_sha256",
+        "evaluation_result_sha256",
+        "listening_result_sha256",
+        "strata",
+        "paired_cases",
+        "target_absent_cases",
+        "protected_foreground_cases",
+        "binaural_cases",
+        "listener_count",
+        "listener_preference",
+        "redistributed_restricted_artifacts",
+        "unresolved_artifact_licenses",
+        "unresolved_training_dataset_licenses",
+        "unresolved_evaluation_dataset_licenses",
+        "accepted"
+      ],
+      "properties": {
+        "completed_at_unix_seconds": { "$ref": "#/$defs/count" },
+        "model_package_sha256": { "$ref": "#/$defs/sha256" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "configuration_sha256": { "$ref": "#/$defs/sha256" },
+        "query_catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "query_catalog_revision": { "$ref": "#/$defs/id" },
+        "query_class_ids_sha256": { "$ref": "#/$defs/sha256" },
+        "query_class_count": { "type": "integer", "minimum": 2, "maximum": 4096 },
+        "class_coverage_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluated_class_count": { "type": "integer", "minimum": 2, "maximum": 4096 },
+        "minimum_present_cases_per_class": { "type": "integer", "minimum": 20, "maximum": 1000000 },
+        "minimum_absent_cases_per_class": { "type": "integer", "minimum": 20, "maximum": 1000000 },
+        "worst_class_false_positive_rate": { "type": "number", "minimum": 0, "maximum": 0.01 },
+        "worst_class_false_negative_rate": { "type": "number", "minimum": 0, "maximum": 0.05 },
+        "artifact_bom_sha256": { "$ref": "#/$defs/sha256" },
+        "training_dataset_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "listening_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": {
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/stratum" }
+        },
+        "paired_cases": { "type": "integer", "minimum": 1000, "maximum": 10000000 },
+        "target_absent_cases": { "type": "integer", "minimum": 200, "maximum": 1000000 },
+        "protected_foreground_cases": { "type": "integer", "minimum": 200, "maximum": 1000000 },
+        "binaural_cases": { "type": "integer", "minimum": 200, "maximum": 1000000 },
+        "listener_count": { "type": "integer", "minimum": 20, "maximum": 100000 },
+        "listener_preference": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "redistributed_restricted_artifacts": { "const": 0 },
+        "unresolved_artifact_licenses": { "const": 0 },
+        "unresolved_training_dataset_licenses": { "const": 0 },
+        "unresolved_evaluation_dataset_licenses": { "const": 0 },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "stratum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "cases", "metrics"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": {
+          "enum": [
+            "target-present",
+            "target-absent",
+            "protected-foreground",
+            "binaural-spatial"
+          ]
+        },
+        "cases": { "type": "integer", "minimum": 50, "maximum": 1000000 },
+        "metrics": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 10,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/metric" }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "value", "operator", "limit", "passed"],
+      "properties": {
+        "metric": { "$ref": "#/$defs/id" },
+        "value": { "type": "number", "minimum": -1000000, "maximum": 1000000 },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "limit": { "type": "number", "minimum": -1000000, "maximum": 1000000 },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "key_id": { "$ref": "#/$defs/sha256" },
+        "value_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
+        }
+      }
+    }
+  }
+}

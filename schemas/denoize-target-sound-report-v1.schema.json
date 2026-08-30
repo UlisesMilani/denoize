@@ -1,0 +1,407 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-target-sound-report-v1.schema.json",
+  "title": "denoize fail-closed target-sound extraction report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "denoize_version",
+    "configuration_sha256",
+    "mode",
+    "network_accessed",
+    "deterministic",
+    "closed_class_query",
+    "model_invoked",
+    "query",
+    "model",
+    "promotion_evidence",
+    "decision",
+    "candidate_accepted",
+    "target_published",
+    "residual_published",
+    "output_published",
+    "candidates_retained",
+    "source_sample_rate",
+    "source_channels",
+    "source_frames",
+    "model_sample_rate",
+    "model_channels",
+    "model_window_samples",
+    "model_hop_samples",
+    "model_windows",
+    "input_pcm_sha256",
+    "target_pcm_sha256",
+    "residual_pcm_sha256",
+    "output_pcm_sha256",
+    "presence",
+    "measurements",
+    "safety_gates",
+    "path_fields_recorded",
+    "limitations",
+    "warnings"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-target-sound-report-v1" },
+    "schema_version": { "const": 1 },
+    "denoize_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "configuration_sha256": { "$ref": "#/$defs/sha256" },
+    "mode": { "enum": ["preserve", "remove"] },
+    "network_accessed": { "const": false },
+    "deterministic": { "const": true },
+    "closed_class_query": { "const": true },
+    "model_invoked": { "const": true },
+    "query": { "$ref": "#/$defs/query" },
+    "model": { "$ref": "#/$defs/model" },
+    "promotion_evidence": { "$ref": "#/$defs/evidence" },
+    "decision": {
+      "enum": [
+        "accepted-present",
+        "withheld-absent",
+        "withheld-uncertain",
+        "withheld-safety-gate"
+      ]
+    },
+    "candidate_accepted": { "type": "boolean" },
+    "target_published": { "type": "boolean" },
+    "residual_published": { "type": "boolean" },
+    "output_published": { "type": "boolean" },
+    "candidates_retained": { "type": "boolean" },
+    "source_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "source_channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "source_frames": { "type": "integer", "minimum": 1 },
+    "model_sample_rate": { "type": "integer", "minimum": 8000, "maximum": 192000 },
+    "model_channels": { "type": "integer", "minimum": 1, "maximum": 2 },
+    "model_window_samples": { "type": "integer", "minimum": 256, "maximum": 16777216 },
+    "model_hop_samples": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+    "model_windows": { "type": "integer", "minimum": 1, "maximum": 500000 },
+    "input_pcm_sha256": { "$ref": "#/$defs/sha256" },
+    "target_pcm_sha256": { "$ref": "#/$defs/nullable_sha256" },
+    "residual_pcm_sha256": { "$ref": "#/$defs/nullable_sha256" },
+    "output_pcm_sha256": { "$ref": "#/$defs/nullable_sha256" },
+    "presence": { "$ref": "#/$defs/presence" },
+    "measurements": { "$ref": "#/$defs/measurements" },
+    "safety_gates": {
+      "type": "array",
+      "minItems": 11,
+      "maxItems": 15,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/gate" }
+    },
+    "path_fields_recorded": { "const": 0 },
+    "limitations": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "decision": { "const": "accepted-present" } } },
+      "then": {
+        "properties": {
+          "candidate_accepted": { "const": true },
+          "target_published": { "const": true },
+          "residual_published": { "const": true },
+          "output_published": { "const": true },
+          "candidates_retained": { "const": true },
+          "target_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "residual_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "output_pcm_sha256": { "$ref": "#/$defs/sha256" },
+          "presence": {
+            "allOf": [
+              { "$ref": "#/$defs/presence" },
+              { "properties": { "state": { "const": "present" } } }
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_accepted": { "const": false },
+          "target_published": { "const": false },
+          "residual_published": { "const": false },
+          "output_published": { "const": false },
+          "candidates_retained": { "const": false },
+          "target_pcm_sha256": { "type": "null" },
+          "residual_pcm_sha256": { "type": "null" },
+          "output_pcm_sha256": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "withheld-absent" } } },
+      "then": {
+        "properties": {
+          "presence": {
+            "allOf": [
+              { "$ref": "#/$defs/presence" },
+              { "properties": { "state": { "const": "absent" } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "withheld-uncertain" } } },
+      "then": {
+        "properties": {
+          "presence": {
+            "allOf": [
+              { "$ref": "#/$defs/presence" },
+              { "properties": { "state": { "const": "uncertain" } } }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "decision": { "const": "withheld-safety-gate" } } },
+      "then": {
+        "properties": {
+          "presence": {
+            "allOf": [
+              { "$ref": "#/$defs/presence" },
+              { "properties": { "state": { "const": "present" } } }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "nullable_sha256": {
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,256}$" },
+    "probability": { "type": "number", "minimum": 0, "maximum": 1 },
+    "bounded": { "type": "number", "minimum": -240, "maximum": 240 },
+    "nullable_delta": {
+      "oneOf": [
+        { "type": "number", "minimum": 0, "maximum": 240 },
+        { "type": "null" }
+      ]
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query_sha256",
+        "catalog_sha256",
+        "catalog_revision",
+        "class_ids_sha256",
+        "class_count",
+        "class_id",
+        "class_index",
+        "canonical_label",
+        "encoding",
+        "open_text_accepted"
+      ],
+      "properties": {
+        "query_sha256": { "$ref": "#/$defs/sha256" },
+        "catalog_sha256": { "$ref": "#/$defs/sha256" },
+        "catalog_revision": { "$ref": "#/$defs/id" },
+        "class_ids_sha256": { "$ref": "#/$defs/sha256" },
+        "class_count": { "type": "integer", "minimum": 2, "maximum": 4096 },
+        "class_id": { "$ref": "#/$defs/id" },
+        "class_index": { "type": "integer", "minimum": 0, "maximum": 4095 },
+        "canonical_label": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "encoding": { "const": "one-hot-v1" },
+        "open_text_accepted": { "const": false }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "sha256", "license_spdx"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "revision": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sha256": { "$ref": "#/$defs/nullable_sha256" },
+        "license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_sha256",
+        "public_key_sha256",
+        "package_id",
+        "package_revision",
+        "precision_profile",
+        "package_license_spdx",
+        "source_revision",
+        "source_sha256",
+        "source_license_spdx",
+        "checkpoint_sha256",
+        "checkpoint_license_spdx",
+        "training_datasets",
+        "accelerator"
+      ],
+      "properties": {
+        "package_sha256": { "$ref": "#/$defs/sha256" },
+        "public_key_sha256": { "$ref": "#/$defs/sha256" },
+        "package_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "package_revision": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "precision_profile": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "package_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "source_revision": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "source_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_license_spdx": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "training_datasets": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/dataset" }
+        },
+        "accelerator": { "enum": ["cpu", "metal", "cuda"] }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "signing_key_id",
+        "class_coverage_manifest_sha256",
+        "evaluated_class_count",
+        "minimum_present_cases_per_class",
+        "minimum_absent_cases_per_class",
+        "worst_class_false_positive_rate",
+        "worst_class_false_negative_rate",
+        "artifact_bom_sha256",
+        "training_dataset_license_manifest_sha256",
+        "evaluation_corpus_manifest_sha256",
+        "evaluation_corpus_license_manifest_sha256",
+        "evaluation_result_sha256",
+        "listening_result_sha256",
+        "strata",
+        "paired_cases",
+        "target_absent_cases",
+        "protected_foreground_cases",
+        "binaural_cases",
+        "listener_count",
+        "accepted"
+      ],
+      "properties": {
+        "signing_key_id": { "$ref": "#/$defs/sha256" },
+        "class_coverage_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluated_class_count": { "type": "integer", "minimum": 2, "maximum": 4096 },
+        "minimum_present_cases_per_class": { "type": "integer", "minimum": 20, "maximum": 1000000 },
+        "minimum_absent_cases_per_class": { "type": "integer", "minimum": 20, "maximum": 1000000 },
+        "worst_class_false_positive_rate": { "type": "number", "minimum": 0, "maximum": 0.01 },
+        "worst_class_false_negative_rate": { "type": "number", "minimum": 0, "maximum": 0.05 },
+        "artifact_bom_sha256": { "$ref": "#/$defs/sha256" },
+        "training_dataset_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "listening_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": { "const": 14 },
+        "paired_cases": { "type": "integer", "minimum": 1000, "maximum": 10000000 },
+        "target_absent_cases": { "type": "integer", "minimum": 200, "maximum": 1000000 },
+        "protected_foreground_cases": { "type": "integer", "minimum": 200, "maximum": 1000000 },
+        "binaural_cases": { "type": "integer", "minimum": 200, "maximum": 1000000 },
+        "listener_count": { "type": "integer", "minimum": 20, "maximum": 100000 },
+        "accepted": { "const": true }
+      }
+    },
+    "presence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "absent_probability",
+        "uncertain_probability",
+        "present_probability",
+        "minimum_absent_probability",
+        "minimum_present_probability"
+      ],
+      "properties": {
+        "state": { "enum": ["present", "absent", "uncertain"] },
+        "absent_probability": { "$ref": "#/$defs/probability" },
+        "uncertain_probability": { "$ref": "#/$defs/probability" },
+        "present_probability": { "$ref": "#/$defs/probability" },
+        "minimum_absent_probability": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "minimum_present_probability": { "type": "number", "minimum": 0.5, "maximum": 1 }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_rms_dbfs",
+        "target_rms_dbfs",
+        "residual_rms_dbfs",
+        "input_peak",
+        "target_peak",
+        "residual_peak",
+        "target_energy_gain_db",
+        "residual_energy_gain_db",
+        "model_recombination_maximum_absolute_error",
+        "publication_recombination_maximum_absolute_error",
+        "target_stereo_correlation_delta",
+        "target_mid_side_energy_ratio_delta_db",
+        "residual_stereo_correlation_delta",
+        "residual_mid_side_energy_ratio_delta_db"
+      ],
+      "properties": {
+        "input_rms_dbfs": { "$ref": "#/$defs/bounded" },
+        "target_rms_dbfs": { "$ref": "#/$defs/bounded" },
+        "residual_rms_dbfs": { "$ref": "#/$defs/bounded" },
+        "input_peak": { "type": "number", "minimum": 0, "maximum": 240 },
+        "target_peak": { "type": "number", "minimum": 0, "maximum": 240 },
+        "residual_peak": { "type": "number", "minimum": 0, "maximum": 240 },
+        "target_energy_gain_db": { "$ref": "#/$defs/bounded" },
+        "residual_energy_gain_db": { "$ref": "#/$defs/bounded" },
+        "model_recombination_maximum_absolute_error": { "type": "number", "minimum": 0, "maximum": 240 },
+        "publication_recombination_maximum_absolute_error": { "type": "number", "minimum": 0, "maximum": 240 },
+        "target_stereo_correlation_delta": { "$ref": "#/$defs/nullable_delta" },
+        "target_mid_side_energy_ratio_delta_db": { "$ref": "#/$defs/nullable_delta" },
+        "residual_stereo_correlation_delta": { "$ref": "#/$defs/nullable_delta" },
+        "residual_mid_side_energy_ratio_delta_db": { "$ref": "#/$defs/nullable_delta" }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "observed", "limit", "passed"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "query-catalog",
+            "geometry",
+            "finite-normalized-samples",
+            "model-recombination",
+            "published-recombination",
+            "target-peak",
+            "residual-peak",
+            "target-energy-gain",
+            "residual-energy-gain",
+            "target-stereo-correlation",
+            "target-mid-side-energy",
+            "residual-stereo-correlation",
+            "residual-mid-side-energy",
+            "target-presence",
+            "promotion-evidence"
+          ]
+        },
+        "observed": { "$ref": "#/$defs/bounded" },
+        "limit": { "$ref": "#/$defs/bounded" },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}

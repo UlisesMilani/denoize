@@ -67,6 +67,12 @@ trap 'rm -f "$temporary_output"' EXIT
   "$binary" target-speaker --help
   echo '```'
   echo
+  echo '## Closed-catalog target-sound extraction'
+  echo
+  echo '```text'
+  "$binary" target-sound --help
+  echo '```'
+  echo
   echo '## Anonymous meeting speaker tracks'
   echo
   echo '```text'

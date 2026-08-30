@@ -10,6 +10,8 @@ pub(crate) mod music_restoration;
 mod session;
 mod stream;
 #[cfg(feature = "onnx")]
+pub(crate) mod target_sound;
+#[cfg(feature = "onnx")]
 pub(crate) mod target_speaker;
 #[cfg(any(
     feature = "onnx",
