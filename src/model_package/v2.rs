@@ -1022,6 +1022,7 @@ fn validate_tensors(
             "audio"
                 | "far-end-reference"
                 | "enrollment"
+                | "query"
                 | "microphone-geometry"
                 | "state"
                 | "control"
@@ -1036,7 +1037,7 @@ fn validate_tensors(
         if tensor.optional
             || !matches!(
                 tensor.role.as_str(),
-                "audio" | "state" | "mask" | "diagnostic"
+                "audio" | "residual" | "state" | "mask" | "diagnostic"
             )
         {
             return Err(format!(
@@ -1922,6 +1923,32 @@ mod tests {
         assert!(validate_manifest_v2(&manifest, "0000000000000001")
             .unwrap_err()
             .contains("do not match"));
+    }
+
+    #[test]
+    fn semantic_query_and_residual_roles_are_explicit_and_closed() {
+        let mut manifest = manifest();
+        let mut query = tensor("query", "query");
+        query.axes[1].name = "classes".into();
+        query.axes[1].kind = "feature".into();
+        query.axes[1].fixed = Some(2);
+        manifest.tensors.inputs.push(query);
+        manifest
+            .tensors
+            .outputs
+            .push(tensor("residual", "residual"));
+        validate_manifest_v2(&manifest, "0000000000000001").unwrap();
+
+        let mut overloaded = manifest.clone();
+        overloaded.tensors.inputs[1].role = "natural-language".into();
+        assert!(validate_manifest_v2(&overloaded, "0000000000000001")
+            .unwrap_err()
+            .contains("unsupported runtime model v2 input role"));
+        let mut overloaded = manifest;
+        overloaded.tensors.outputs[1].role = "target-or-residual".into();
+        assert!(validate_manifest_v2(&overloaded, "0000000000000001")
+            .unwrap_err()
+            .contains("unsupported runtime model v2 output role"));
     }
 
     #[test]

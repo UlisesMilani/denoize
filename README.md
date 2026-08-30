@@ -410,6 +410,47 @@ and the closed [report](schemas/denoize-music-restoration-report-v1.schema.json)
 and [promotion evidence](schemas/denoize-music-restoration-promotion-evidence-v1.schema.json)
 contracts.
 
+### Closed-catalog target-sound extraction
+
+Stage 36 preserves or removes one sound selected by ID from a complete,
+authenticated finite catalog:
+
+```bash
+denoize target-sound program.wav \
+  --query keyboard-query.json \
+  --target keyboard.wav \
+  --residual without-keyboard.wav \
+  --output selected.wav \
+  --report target-sound-report.json \
+  --mode preserve \
+  --model-package target-sound.dmp \
+  --model-package-key operator-model.pub \
+  --promotion-evidence target-sound-evidence.json \
+  --promotion-evidence-key evaluator.pub.json
+```
+
+The graph receives only a one-hot class index, never open text. Its fixed
+target, residual, and absent/uncertain/present outputs must match the signed
+catalog and package. Authentication, package, graph, and inference errors fail
+before publication. Once a bounded candidate reaches evaluation, target
+absence, uncertainty, or any conservation, peak, energy, geometry, or
+stereo-spatial failure publishes only a path-free report; it publishes no audio
+or mixture fallback. An accepted job writes float32 target and exact
+source-clock residual WAVs, then selects target for `preserve` or residual for
+`remove`.
+
+No model, checkpoint, catalog, or dataset is bundled. Signed promotion evidence
+binds the full artifact/data/license BOM and fourteen class-confusion, absence,
+protected-foreground, transient/tonal, unseen-domain, and binaural-spatial
+strata, plus present/absent coverage and worst-case error bounds for every
+catalog class. See
+[Closed-catalog target-sound extraction](docs/target-sound.md), the
+[paper and artifact boundary](docs/restoration-research.md#stage-36--closed-catalog-target-sound-extraction),
+and the closed [query](schemas/denoize-target-sound-query-v1.schema.json),
+[report](schemas/denoize-target-sound-report-v1.schema.json), and
+[promotion evidence](schemas/denoize-target-sound-promotion-evidence-v1.schema.json)
+contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -1959,7 +2000,10 @@ resource-accounting scope, corpus-promotion rule, and debug-only fault protocol.
 
 ## Embedding SDKs
 
-v0.88.0 adds bounded finished-mixture music codec/bandwidth candidate rendering,
+v0.89.0 adds the Rust API and CLI for authenticated finite-catalog target-sound
+preserve/remove with calibrated absence and exact residual conservation. It is
+not yet projected through the stable C/WASM/mobile capability matrix. v0.88.0
+adds bounded finished-mixture music codec/bandwidth candidate rendering,
 mandatory correction/report artifacts, and phase/transient/stereo/license gates.
 v0.87.0 adds bounded anonymous meeting speaker tracks, explicit overlap and
 unknown regions, consent-bound optional labels, and an exact reconstruction

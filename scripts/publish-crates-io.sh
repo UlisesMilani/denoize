@@ -161,6 +161,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/neural_daw.rs" \
     "denoize-${package_version}/src/target_speaker.rs" \
     "denoize-${package_version}/src/backend/target_speaker.rs" \
+    "denoize-${package_version}/src/target_sound.rs" \
+    "denoize-${package_version}/src/backend/target_sound.rs" \
     "denoize-${package_version}/src/causal_target_speaker.rs" \
     "denoize-${package_version}/src/backend/causal_target_speaker.rs" \
     "denoize-${package_version}/src/acoustic_echo.rs" \
@@ -185,6 +187,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/diagnostics.md" \
     "denoize-${package_version}/docs/neural-plugin.md" \
     "denoize-${package_version}/docs/target-speaker.md" \
+    "denoize-${package_version}/docs/target-sound.md" \
     "denoize-${package_version}/docs/microphone-array.md" \
     "denoize-${package_version}/docs/meeting-speakers.md" \
     "denoize-${package_version}/docs/projects.md" \
@@ -262,6 +265,9 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-universal-restoration-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-target-speaker-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-target-speaker-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-target-sound-query-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-target-sound-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-target-sound-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-causal-target-speaker-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-causal-target-speaker-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-aec-promotion-evidence-v1.schema.json" \
@@ -296,6 +302,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-universal-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-neural-daw-schemas.py" \
     "denoize-${package_version}/scripts/test-target-speaker-schemas.py" \
+    "denoize-${package_version}/scripts/test-target-sound-schemas.py" \
     "denoize-${package_version}/scripts/test-aec-schemas.py" \
     "denoize-${package_version}/scripts/test-microphone-array-schemas.py" \
     "denoize-${package_version}/scripts/test-meeting-speaker-schemas.py" \

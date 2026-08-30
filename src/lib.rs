@@ -89,6 +89,7 @@ pub mod service;
 pub mod stft;
 mod stoi_resample;
 pub mod stream;
+pub mod target_sound;
 pub mod target_speaker;
 pub mod universal_restoration;
 pub mod update;
@@ -303,6 +304,20 @@ pub use restoration::{
     RestorationReport, RestorationResult, RestorationStatus, WindPlosiveConfig, WpeChannelMode,
     WpeConfig, MAX_RESTORATION_CHANNELS, MAX_RESTORATION_MASK_RUNS, MAX_RESTORATION_OPERATIONS,
     RESTORATION_MASK_SCHEMA, RESTORATION_REPORT_SCHEMA, RESTORATION_SCHEMA_VERSION,
+};
+#[cfg(feature = "onnx")]
+pub use target_sound::TargetSoundSession;
+pub use target_sound::{
+    estimate_target_sound_memory_bytes, sign_target_sound_promotion_evidence,
+    SignedTargetSoundPromotionEvidence, TargetSoundCatalogClass, TargetSoundConfig,
+    TargetSoundDecision, TargetSoundEvidenceIdentity, TargetSoundEvidenceStratum,
+    TargetSoundMetricOperator, TargetSoundMetricOutcome, TargetSoundMode, TargetSoundModelIdentity,
+    TargetSoundPresence, TargetSoundPresenceAssessment, TargetSoundPromotionEvidencePayload,
+    TargetSoundQuery, TargetSoundQueryIdentity, TargetSoundReport, TargetSoundResult,
+    TargetSoundSafetyGate, TargetSoundSafetyGateKind, TargetSoundSafetyMeasurements,
+    TargetSoundStratumKind, TargetSoundTrainingDatasetIdentity, MAX_TARGET_SOUND_AUDIO_SECONDS,
+    MAX_TARGET_SOUND_CLASSES, MAX_TARGET_SOUND_WINDOWS, TARGET_SOUND_EVIDENCE_SCHEMA,
+    TARGET_SOUND_QUERY_SCHEMA, TARGET_SOUND_REPORT_SCHEMA, TARGET_SOUND_SCHEMA_VERSION,
 };
 #[cfg(feature = "onnx")]
 pub use target_speaker::TargetSpeakerSession;

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-target-sound-query-v1.schema.json",
+  "title": "denoize closed-catalog target-sound query v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "catalog_revision",
+    "classes",
+    "selected_class_id"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-target-sound-query-v1" },
+    "schema_version": { "const": 1 },
+    "catalog_revision": { "$ref": "#/$defs/id" },
+    "classes": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4096,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/class" }
+    },
+    "selected_class_id": { "$ref": "#/$defs/id" }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._+-]{1,256}$"
+    },
+    "class": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "canonical_label"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "canonical_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"
+        }
+      }
+    }
+  }
+}
