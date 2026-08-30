@@ -322,6 +322,22 @@ def reject_semantics(document: dict, validator) -> None:
     raise AssertionError("invalid music-restoration semantics unexpectedly passed")
 
 
+def release_workflow_uploads_schemas() -> None:
+    workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    upload_blocks = [
+        fragment.split("--clobber", 1)[0]
+        for fragment in workflow.split('gh release upload "$GITHUB_REF_NAME"')[1:]
+    ]
+    required = (
+        '"$music_restoration_promotion_evidence_schema"',
+        '"$music_restoration_report_schema"',
+    )
+    if not any(all(asset in block for asset in required) for block in upload_blocks):
+        raise AssertionError(
+            "music-restoration schemas must be uploaded to every tagged release"
+        )
+
+
 def main() -> None:
     evidence_validator = jsonschema.Draft202012Validator(
         schema("denoize-music-restoration-promotion-evidence-v1.schema.json")
@@ -363,6 +379,7 @@ def main() -> None:
         copy.deepcopy(invalid["model"]["training_datasets"][0])
     )
     reject_semantics(invalid, report_semantics)
+    release_workflow_uploads_schemas()
 
     print("music-restoration JSON schema and semantic tests passed")
 
