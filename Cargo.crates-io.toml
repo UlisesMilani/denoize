@@ -8,7 +8,7 @@
 
 [package]
 name = "denoize"
-version = "0.87.0"
+version = "0.88.0"
 edition = "2021"
 rust-version = "1.96"
 authors = ["KAORU <133386210+penguin425@users.noreply.github.com>"]
@@ -56,6 +56,7 @@ include = [
     "/scripts/test-aec-schemas.py",
     "/scripts/test-microphone-array-schemas.py",
     "/scripts/test-meeting-speaker-schemas.py",
+    "/scripts/test-music-restoration-schemas.py",
     "/scripts/test-runtime-model-package-schemas.py",
     "/scripts/test-evaluation-evidence.sh",
     "/scripts/build-offline-model-bundle.sh",
@@ -73,6 +74,7 @@ include = [
     "/docs/acoustic-echo-cancellation.md",
     "/docs/microphone-array.md",
     "/docs/meeting-speakers.md",
+    "/docs/music-restoration.md",
     "/docs/projects.md",
     "/docs/resilience.md",
     "/docs/release-evidence.md",

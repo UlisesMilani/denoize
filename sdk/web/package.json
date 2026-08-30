@@ -1,6 +1,6 @@
 {
   "name": "@denoize/web-sdk",
-  "version": "0.87.0",
+  "version": "0.88.0",
   "private": true,
   "type": "module",
   "description": "AudioWorklet and Worker transport for the denoize scalar WASM SDK",

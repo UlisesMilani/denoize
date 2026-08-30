@@ -71,6 +71,7 @@ pub mod metadata;
 pub mod microphone_array;
 pub mod model_package;
 pub mod models;
+pub mod music_restoration;
 pub mod neural_daw;
 pub mod noise;
 pub mod perceptual;
@@ -242,6 +243,17 @@ pub use model_package::{
     RuntimeModelTrainingDatasetContractV2, RUNTIME_MODEL_PACKAGE_SCHEMA,
     RUNTIME_MODEL_PACKAGE_SCHEMA_V2, RUNTIME_MODEL_PACKAGE_VERSION,
     RUNTIME_MODEL_PACKAGE_VERSION_V2,
+};
+#[cfg(feature = "onnx")]
+pub use music_restoration::MusicRestorationSession;
+pub use music_restoration::{
+    estimate_music_restoration_memory_bytes, sign_music_restoration_promotion_evidence,
+    MusicRestorationConfig, MusicRestorationDecision, MusicRestorationEvidenceIdentity,
+    MusicRestorationEvidenceStratum, MusicRestorationModelIdentity,
+    MusicRestorationPromotionEvidencePayload, MusicRestorationRegion, MusicRestorationReport,
+    MusicRestorationResult, MusicRestorationTask, MusicRestorationTrainingDatasetIdentity,
+    SignedMusicRestorationPromotionEvidence, MUSIC_RESTORATION_EVIDENCE_SCHEMA,
+    MUSIC_RESTORATION_REPORT_SCHEMA, MUSIC_RESTORATION_SCHEMA_VERSION,
 };
 pub use neural_daw::{
     neural_daw_chunk_frames, neural_daw_latency_frames, neural_daw_latency_millis,

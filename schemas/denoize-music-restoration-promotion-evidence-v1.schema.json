@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/schemas/denoize-music-restoration-promotion-evidence-v1.schema.json",
+  "title": "denoize signed music-restoration promotion evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "payload", "signature"],
+  "properties": {
+    "schema": { "const": "denoize-music-restoration-promotion-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "payload": { "$ref": "#/$defs/payload" },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,256}$" },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "task": { "enum": ["codec-repair", "bandwidth-extension"] },
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "completed_at_unix_seconds",
+        "task",
+        "model_package_sha256",
+        "source_revision",
+        "source_sha256",
+        "checkpoint_sha256",
+        "configuration_sha256",
+        "artifact_bom_sha256",
+        "training_dataset_license_manifest_sha256",
+        "evaluation_corpus_manifest_sha256",
+        "evaluation_corpus_license_manifest_sha256",
+        "evaluation_result_sha256",
+        "listening_result_sha256",
+        "strata",
+        "paired_clips",
+        "full_length_tracks",
+        "instrument_classes",
+        "genres",
+        "clean_bypass_cases",
+        "mono_cases",
+        "stereo_cases",
+        "listener_count",
+        "listener_preference",
+        "redistributed_restricted_artifacts",
+        "accepted"
+      ],
+      "properties": {
+        "completed_at_unix_seconds": { "$ref": "#/$defs/count" },
+        "task": { "$ref": "#/$defs/task" },
+        "model_package_sha256": { "$ref": "#/$defs/sha256" },
+        "source_revision": { "$ref": "#/$defs/id" },
+        "source_sha256": { "$ref": "#/$defs/sha256" },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "configuration_sha256": { "$ref": "#/$defs/sha256" },
+        "artifact_bom_sha256": { "$ref": "#/$defs/sha256" },
+        "training_dataset_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_corpus_license_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "evaluation_result_sha256": { "$ref": "#/$defs/sha256" },
+        "listening_result_sha256": { "$ref": "#/$defs/sha256" },
+        "strata": {
+          "type": "array",
+          "minItems": 12,
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/stratum" }
+        },
+        "paired_clips": { "type": "integer", "minimum": 1000, "maximum": 10000000 },
+        "full_length_tracks": { "type": "integer", "minimum": 50, "maximum": 1000000 },
+        "instrument_classes": { "type": "integer", "minimum": 8, "maximum": 1000 },
+        "genres": { "type": "integer", "minimum": 8, "maximum": 10000 },
+        "clean_bypass_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "mono_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "stereo_cases": { "type": "integer", "minimum": 100, "maximum": 1000000 },
+        "listener_count": { "type": "integer", "minimum": 20, "maximum": 100000 },
+        "listener_preference": { "type": "number", "minimum": 0.5, "maximum": 1 },
+        "redistributed_restricted_artifacts": { "const": 0 },
+        "accepted": { "type": "boolean" }
+      }
+    },
+    "stratum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "cases",
+        "multi_mel_snr_improvement_db",
+        "zimtohrli_regression",
+        "fad_clap_regression",
+        "low_band_snr_db",
+        "transient_loss_rate",
+        "stereo_correlation_error",
+        "phase_error_radians",
+        "duration_mismatch_samples",
+        "clipped_samples",
+        "non_finite_samples",
+        "passed"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "cases": { "type": "integer", "minimum": 10, "maximum": 1000000 },
+        "multi_mel_snr_improvement_db": { "type": "number", "minimum": -240, "maximum": 240 },
+        "zimtohrli_regression": { "type": "number", "minimum": -1, "maximum": 1 },
+        "fad_clap_regression": { "type": "number", "minimum": -1000, "maximum": 1000 },
+        "low_band_snr_db": { "type": "number", "minimum": -240, "maximum": 240 },
+        "transient_loss_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "stereo_correlation_error": { "type": "number", "minimum": 0, "maximum": 2 },
+        "phase_error_radians": { "type": "number", "minimum": 0, "maximum": 3.141592653589793 },
+        "duration_mismatch_samples": { "$ref": "#/$defs/count" },
+        "clipped_samples": { "$ref": "#/$defs/count" },
+        "non_finite_samples": { "$ref": "#/$defs/count" },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "ed25519" },
+        "key_id": { "$ref": "#/$defs/sha256" },
+        "value_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
+        }
+      }
+    }
+  }
+}

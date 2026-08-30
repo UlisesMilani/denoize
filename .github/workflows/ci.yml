@@ -97,6 +97,9 @@ jobs:
       - name: Validate meeting speaker-track JSON contracts
         run: python3 scripts/test-meeting-speaker-schemas.py
 
+      - name: Validate music-restoration JSON contracts
+        run: python3 scripts/test-music-restoration-schemas.py
+
       - name: Run bounded deterministic resilience matrix
         env:
           DENOIZE_RESILIENCE_FEATURES: full
@@ -165,6 +168,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-meeting-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-meeting-speaker-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-music-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-music-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/generate-plugin-editor-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/generate-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/generate-lv2-host-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-plugin-editor-evidence.py", encoding="utf-8").read(), "scripts/test-plugin-editor-evidence.py", "exec")'

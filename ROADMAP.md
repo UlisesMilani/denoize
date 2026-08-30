@@ -73,13 +73,13 @@ stop/rollback conditions behind this order are maintained in
 | 9 | 32 | Project/timeline v2 with arbitrary overlaps, tracks, buses, effect chains, automation, cache, undo/redo, repair masks, portable sources, multiple export formats, and optional C2PA edit provenance | Closed graph, bounded deterministic renderer, contiguous immutable history, authenticated model/key/license references, journal/checkpoint/trusted-local-cache API, v1 migration, plain-OTIO loss reporting, nested-closure detached provenance, 13 schemas, CLI, and tests implemented for v0.85.0; multi-writer journaling, untrusted distributed cache, bundle/ADM authoring, embedded C2PA, and external denoise-effect execution remain gated |
 | 10 | 33 | Stable C ABI, finite/live WASM, mobile SDKs, and optional Web Audio Module packaging after runtime and processing ABI stabilization | Stable ABI v1, scalar finite/incremental WASM, non-blocking Worker/AudioWorklet transport, Android/iOS worker wrappers, lifecycle contracts, sanitizer-backed ABI mutation, emulator/simulator gates, SDK archives, schemas, CLI discovery, and cross-platform release jobs implemented for v0.86.0; WAM promotion remains host-matrix-gated |
 | 11 | 34 | Bounded continuous speech separation and anonymous diarization into meeting speaker tracks, with optional Stage 29 enrollment mapping | Dedicated package-v2 adapter, eight-track cap, exact bounded permutation stitching, explicit activity/overlap/unknown regions, reconstruction residual, consent-bound labels, signed evidence, schemas, CLI, and tests implemented for v0.87.0; checkpoint redistribution remains artifact-gated |
+| 12 | 35 | Mixture-preserving music/general-audio codec repair and bandwidth-extension candidates, before any opt-in dry-stem estimation | Dedicated package-v2 adapter, exact bypass/uncertain/apply clock, mandatory correction and report artifacts, phase/transient/stereo/clean-bypass gates, full model/data/license BOM, signed 12-stratum evidence, schemas, CLI, and tests implemented for v0.88.0; no checkpoint is bundled |
 
-The remaining post-roadmap candidates stay research-gated rather than silently
+The remaining research-watch capabilities stay gated rather than silently
 extending the implementation commitment:
 
 | Candidate order | Capability | Status |
 |---:|---|---|
-| 35 | Music/general-audio restoration, beginning with mixture-preserving codec/bandwidth repair before opt-in dry-stem estimation | Recommended after Stage 33; exact checkpoint/training-data redistribution chain pending |
 | Watch | Semantic target-sound extraction by closed class/query | Target-absence, residual-conservation, licensing, and real-time gates pending |
 | Watch | Audio-visual target extraction | Consent, biometric retention, synchronization, occlusion/spoofing, and fallback design pending |
 
@@ -281,12 +281,12 @@ then optional Web Audio Module packaging. Browser code observes the actual
 render quantum (128 frames is only the Web Audio default), and mobile routes
 rebuild state after sample-rate, buffer, or channel changes.
 
-Meeting speaker tracks and music/general-audio restoration are the leading
-post-roadmap candidates. Semantic target-sound extraction, unified audio
-foundation models, and audio-visual target extraction remain a documented
-research watchlist rather than committed stages. The current evidence,
-redistributable-weight status, or privacy/fidelity gates are not yet strong
-enough to place them ahead of Stages 25–33; promotion conditions are recorded in
+Stages 34 and 35 now provide bounded adapters and evidence contracts without
+bundling unaudited checkpoints. Semantic target-sound extraction, unified audio
+foundation models, audio-visual target extraction, and dry-stem restoration
+remain a documented research watchlist rather than silently broadening those
+operations. Their evidence, redistributable-weight status, or privacy/fidelity
+gates are not yet strong enough for promotion; conditions are recorded in
 [docs/restoration-research.md](docs/restoration-research.md).
 
 ## Investigation status

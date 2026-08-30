@@ -1,7 +1,7 @@
 # denoize CLI reference
 
 ```text
-denoize 0.87.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
+denoize 0.88.0 — pure-Rust audio denoiser engineered for the world's highest sound quality
 
 Classical DSP + optional local AI backends for files, streams, and realtime audio.
 Input: WAV/BWF/RF64, AIFF, CAF, FLAC, Ogg Opus/Vorbis, MP3, M4A/ALAC, AAC (built in; no ffmpeg).
@@ -20,6 +20,7 @@ USAGE:
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction CORRECTION.wav --report REPORT.json --task TASK --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config CONFIG --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
@@ -332,6 +333,44 @@ OPTIONS:
     -h, --help                                    show this help
 ```
 
+## Bounded music and general-audio restoration
+
+```text
+USAGE:
+    denoize music-restore <PROGRAM> <CANDIDATE.wav> --correction <CORRECTION.wav> --report <REPORT.json> --task <codec-repair|bandwidth-extension> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize music-restore evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Render a bounded restoration candidate for one complete mono or stereo music
+mixture. This operation repairs codec damage or extends bandwidth; it never
+claims recovered ground truth, estimates dry stems, or applies creative
+mastering. Confidently clean and uncertain frames remain unchanged. The
+candidate, exact in-memory correction residual, and path-free audit report are
+all required publication artifacts. Only authenticated package-v2 models with
+accepted, task-matched promotion evidence may process audio.
+
+OPTIONS:
+        --correction <PATH.wav>                    required float32 correction residual
+        --report <PATH.json>                       required closed path-free audit report
+        --task <NAME>                              codec-repair|bandwidth-extension (required)
+        --model-package <PATH>                     required signed runtime package v2
+        --model-package-key <PATH>                 trusted Minisign public key
+        --promotion-evidence <PATH>                accepted signed restoration evidence
+        --promotion-evidence-key <PATH>            trusted Ed25519 evidence public key
+        --minimum-apply-probability <F>            apply threshold, 0.5..1 (default: 0.8)
+        --minimum-bypass-probability <F>           clean-bypass threshold, 0.5..1 (default: 0.8)
+        --minimum-apply-frames <N>                 consecutive frames needed to apply, 1..100 (default: 2)
+        --maximum-output-peak <F>                  candidate absolute peak, 0.5..1 (default: 1)
+        --maximum-absolute-correction <F>          per-sample correction limit, 0.01..1 (default: 0.5)
+        --maximum-stereo-correlation-delta <F>     stereo correlation change, 0..0.25 (default: 0.05)
+        --maximum-mid-side-ratio-delta-db <F>      mid/side energy change, 0..6 dB (default: 1.5)
+        --accelerator <NAME>                       cpu|auto|gpu|metal|cuda (default: cpu)
+        --max-memory <MB>                          bound decode, model, candidate, and residual memory
+        --replace                                  atomically replace all three destinations
+        --json                                     emit compact report JSON
+        --pretty                                   emit indented report JSON
+    -h, --help                                     show this help
+```
+
 ## Fail-closed acoustic echo cancellation
 
 ```text
@@ -394,7 +433,7 @@ OPTIONS:
 ## Watch-folder automation
 
 ```text
-denoize 0.87.0 watch-folder automation
+denoize 0.88.0 watch-folder automation
 
 USAGE:
     denoize watch <INPUT_DIR> <OUTPUT_DIR> --receipt-key <SECRET_KEY.json> [OPTIONS]

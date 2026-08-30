@@ -5,6 +5,8 @@ pub(crate) mod causal_target_speaker;
 mod classical;
 #[cfg(feature = "onnx")]
 pub(crate) mod meeting_speaker;
+#[cfg(feature = "onnx")]
+pub(crate) mod music_restoration;
 mod session;
 mod stream;
 #[cfg(feature = "onnx")]

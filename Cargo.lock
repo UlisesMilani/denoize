@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "denoize"
-version = "0.87.0"
+version = "0.88.0"
 dependencies = [
  "audio_samples",
  "audio_samples_qoe",
@@ -1141,14 +1141,14 @@ dependencies = [
 
 [[package]]
 name = "denoize-c"
-version = "0.87.0"
+version = "0.88.0"
 dependencies = [
  "denoize",
 ]
 
 [[package]]
 name = "denoize-clap"
-version = "0.87.0"
+version = "0.88.0"
 dependencies = [
  "clack-extensions",
  "clack-plugin",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-lv2"
-version = "0.87.0"
+version = "0.88.0"
 dependencies = [
  "denoize",
  "lv2",
@@ -1169,7 +1169,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-plugin-editor"
-version = "0.87.0"
+version = "0.88.0"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "denoize-wasm"
-version = "0.87.0"
+version = "0.88.0"
 dependencies = [
  "serde_json",
  "wasm-bindgen",

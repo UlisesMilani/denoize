@@ -377,6 +377,39 @@ the closed [report](schemas/denoize-meeting-speaker-report-v1.schema.json),
 [promotion evidence](schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json),
 and [label](schemas/denoize-meeting-track-labels-v1.schema.json) contracts.
 
+### Bounded music and general-audio restoration
+
+Stage 35 renders a conservative codec-repair or bandwidth-extension candidate
+for one complete mono or stereo mixture:
+
+```bash
+denoize music-restore program.wav candidate.wav \
+  --correction correction.wav \
+  --report music-restoration-report.json \
+  --task codec-repair \
+  --model-package music-restoration.dmp \
+  --model-package-key operator-model.pub \
+  --promotion-evidence music-restoration-evidence.json \
+  --promotion-evidence-key evaluator.pub.json
+```
+
+The dedicated package-v2 adapter requires same-geometry candidate audio and
+ordered bypass/uncertain/apply probabilities. Clean and uncertain frames keep
+the mixture unchanged. Correction, peak, phase-sensitive stereo correlation,
+Mid/Side energy, finite-value, and exact-duration gates run before publication;
+candidate, float32 correction WAV, and path-free report are all mandatory and
+the candidate is committed last. The report explicitly claims neither recovered
+ground truth, dry stems, nor creative mastering.
+
+No music model or checkpoint is bundled. Signed promotion evidence binds the
+full artifact/data/license BOM and twelve codec, clean, mono/stereo, phase,
+transient, long-form, unseen-genre, and wideband strata. See
+[Bounded music restoration](docs/music-restoration.md), the
+[paper and immutable artifact audit](docs/restoration-research.md#stage-35--music-and-general-audio-restoration),
+and the closed [report](schemas/denoize-music-restoration-report-v1.schema.json)
+and [promotion evidence](schemas/denoize-music-restoration-promotion-evidence-v1.schema.json)
+contracts.
+
 ## Supported input formats
 
 | Format | Decoder | Notes |
@@ -1926,11 +1959,13 @@ resource-accounting scope, corpus-promotion rule, and debug-only fault protocol.
 
 ## Embedding SDKs
 
+v0.88.0 adds bounded finished-mixture music codec/bandwidth candidate rendering,
+mandatory correction/report artifacts, and phase/transient/stereo/license gates.
 v0.87.0 adds bounded anonymous meeting speaker tracks, explicit overlap and
 unknown regions, consent-bound optional labels, and an exact reconstruction
-residual. v0.86.0 adds a stable C ABI v1, scalar finite/incremental WASM, a bounded
-Worker/AudioWorklet transport, and Android/iOS worker wrappers over the same C
-core. SDK calls never download models or silently substitute unsupported
+residual. v0.86.0 adds a stable C ABI v1, scalar finite/incremental WASM, a
+bounded Worker/AudioWorklet transport, and Android/iOS worker wrappers over the
+same C core. SDK calls never download models or silently substitute unsupported
 backends. The CLI exposes the exact machine-readable contracts:
 
 ```sh

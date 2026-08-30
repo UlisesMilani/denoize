@@ -3,7 +3,7 @@
   "name": "denoize",
   "vendor": "denoize",
   "description": "Optional WAM adapter over the denoize WASM Worker and AudioWorklet transport",
-  "version": "0.87.0",
+  "version": "0.88.0",
   "apiVersion": "2.0.0",
   "isInstrument": false,
   "hasAudioInput": true,

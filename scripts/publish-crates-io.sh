@@ -271,6 +271,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-meeting-speaker-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-meeting-track-labels-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-music-restoration-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-music-restoration-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-mobile-lifecycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-sdk-abi-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-sdk-capabilities-v1.schema.json" \
@@ -297,6 +299,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-aec-schemas.py" \
     "denoize-${package_version}/scripts/test-microphone-array-schemas.py" \
     "denoize-${package_version}/scripts/test-meeting-speaker-schemas.py" \
+    "denoize-${package_version}/scripts/test-music-restoration-schemas.py" \
     "denoize-${package_version}/scripts/test-runtime-model-package-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
