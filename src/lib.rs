@@ -66,6 +66,7 @@ pub mod ipc;
 #[cfg(feature = "live")]
 pub mod live;
 pub mod loudness;
+pub mod meeting_speaker;
 pub mod metadata;
 pub mod microphone_array;
 pub mod model_package;
@@ -204,6 +205,18 @@ pub use hardware::{
 };
 pub use input::AudioInputSession;
 pub use input::StreamSpoolLimits;
+#[cfg(feature = "onnx")]
+pub use meeting_speaker::MeetingSpeakerSession;
+pub use meeting_speaker::{
+    estimate_meeting_speaker_memory_bytes, sign_meeting_speaker_promotion_evidence,
+    MeetingActivityState, MeetingRegion, MeetingSpeakerConfig, MeetingSpeakerEvidenceIdentity,
+    MeetingSpeakerEvidenceStratum, MeetingSpeakerModelIdentity,
+    MeetingSpeakerPromotionEvidencePayload, MeetingSpeakerReport, MeetingSpeakerResult,
+    MeetingSpeakerSegment, MeetingSpeakerTrackSummary, MeetingTrackLabel,
+    MeetingTrackLabelsDocument, SignedMeetingSpeakerPromotionEvidence, MAX_MEETING_SPEAKER_TRACKS,
+    MEETING_SPEAKER_EVIDENCE_SCHEMA, MEETING_SPEAKER_REPORT_SCHEMA, MEETING_SPEAKER_SCHEMA_VERSION,
+    MEETING_TRACK_LABELS_SCHEMA,
+};
 pub use microphone_array::{
     estimate_microphone_array_memory_bytes, sign_microphone_array_promotion_evidence,
     ArrayCoordinateUnit, ArrayHandedness, ArrayInputSemantics, MicrophoneArrayConfig,

@@ -233,6 +233,18 @@ schemas are shipped in every GitHub release and in the crates.io source package:
   describes Ed25519-signed implementation/configuration/corpus/result identity,
   the exact 12-stratum geometry/noise/meeting/program-stereo matrix, fidelity,
   leakage, DOA, ASR, listening, and zero-violation paced evidence gates.
+- [`denoize-meeting-speaker-report-v1.schema.json`](../schemas/denoize-meeting-speaker-report-v1.schema.json)
+  maps lossless anonymous speaker channels and their presentation-sample
+  activity/overlap ranges, explicit unknown regions, ambiguous permutation
+  windows, and the exact reconstruction residual without paths or embeddings.
+- [`denoize-meeting-speaker-promotion-evidence-v1.schema.json`](../schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json)
+  authenticates the exact package/configuration, corpus and corpus-license
+  manifests, twelve real-meeting/overlap/count/unknown strata, listening, and
+  zero-retention privacy gates.
+- [`denoize-meeting-track-labels-v1.schema.json`](../schemas/denoize-meeting-track-labels-v1.schema.json)
+  optionally binds an anonymous track to explicit consent and an accepted
+  Stage 29 report while requiring that enrollment audio and speaker embeddings
+  were not retained.
 - [`denoize-update-manifest-v1.schema.json`](../schemas/denoize-update-manifest-v1.schema.json)
   describes the signed channel, source commit, compatibility gate, rollback
   policy, and exact platform artifact/SBOM/provenance graph.
@@ -275,8 +287,9 @@ fields because their exact typed representation participates in signing,
 authorization, admission, trust, or source-binding decisions. Diagnostic,
 assessment, deterministic and universal restoration reports and masks,
 universal promotion evidence, all four target-speaker contracts, both AEC
-contracts, and both microphone-array contracts also reject unknown fields so a
-consumer cannot silently ignore a new safety dimension.
+contracts, both microphone-array contracts, and all three meeting-speaker
+contracts also reject unknown fields so a consumer cannot silently ignore a
+new safety dimension.
 Signed plug-in editor evidence and host matrices are closed for the same reason.
 
 ## Portable project contracts

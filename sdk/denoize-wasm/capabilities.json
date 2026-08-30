@@ -1,7 +1,7 @@
 {
   "schema": "denoize-wasm-capabilities-v1",
   "schema_version": 1,
-  "library_version": "0.86.0",
+  "library_version": "0.87.0",
   "backend": "classical-scalar",
   "finite": true,
   "incremental": true,

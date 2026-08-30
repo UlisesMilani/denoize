@@ -92,6 +92,9 @@ jobs:
       - name: Validate microphone-array JSON contracts
         run: python3 scripts/test-microphone-array-schemas.py
 
+      - name: Validate meeting speaker-track JSON contracts
+        run: python3 scripts/test-meeting-speaker-schemas.py
+
       - name: Validate DeepFilterNet speech quality
         run: |
           cargo build --locked --features full --bin denoize
@@ -150,6 +153,7 @@ jobs:
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-aec-schemas.py", encoding="utf-8").read(), "scripts/test-aec-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-microphone-array-schemas.py", encoding="utf-8").read(), "scripts/test-microphone-array-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/test-meeting-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-meeting-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/generate-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/generate-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-vst3-host-matrix.py", encoding="utf-8").read(), "scripts/test-vst3-host-matrix.py", "exec")'
           python3 -c 'compile(open("scripts/test-lv2-host-evidence.py", encoding="utf-8").read(), "scripts/test-lv2-host-evidence.py", "exec")'
@@ -1210,6 +1214,9 @@ jobs:
           aec_report_schema="$asset_dir/denoize-aec-report-v1.schema.json"
           microphone_array_promotion_evidence_schema="$asset_dir/denoize-microphone-array-promotion-evidence-v1.schema.json"
           microphone_array_report_schema="$asset_dir/denoize-microphone-array-report-v1.schema.json"
+          meeting_speaker_promotion_evidence_schema="$asset_dir/denoize-meeting-speaker-promotion-evidence-v1.schema.json"
+          meeting_speaker_report_schema="$asset_dir/denoize-meeting-speaker-report-v1.schema.json"
+          meeting_track_labels_schema="$asset_dir/denoize-meeting-track-labels-v1.schema.json"
           sdk_abi_schema="$asset_dir/denoize-sdk-abi-v1.schema.json"
           sdk_capabilities_schema="$asset_dir/denoize-sdk-capabilities-v1.schema.json"
           mobile_lifecycle_schema="$asset_dir/denoize-mobile-lifecycle-v1.schema.json"
@@ -1278,6 +1285,9 @@ jobs:
           cp schemas/denoize-aec-report-v1.schema.json "$aec_report_schema"
           cp schemas/denoize-microphone-array-promotion-evidence-v1.schema.json "$microphone_array_promotion_evidence_schema"
           cp schemas/denoize-microphone-array-report-v1.schema.json "$microphone_array_report_schema"
+          cp schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json "$meeting_speaker_promotion_evidence_schema"
+          cp schemas/denoize-meeting-speaker-report-v1.schema.json "$meeting_speaker_report_schema"
+          cp schemas/denoize-meeting-track-labels-v1.schema.json "$meeting_track_labels_schema"
           cp schemas/denoize-sdk-abi-v1.schema.json "$sdk_abi_schema"
           cp schemas/denoize-sdk-capabilities-v1.schema.json "$sdk_capabilities_schema"
           cp schemas/denoize-mobile-lifecycle-v1.schema.json "$mobile_lifecycle_schema"
@@ -1329,6 +1339,8 @@ jobs:
             "$causal_target_speaker_promotion_evidence_schema" "$causal_target_speaker_report_schema" \
             "$aec_promotion_evidence_schema" "$aec_report_schema" \
             "$microphone_array_promotion_evidence_schema" "$microphone_array_report_schema" \
+            "$meeting_speaker_promotion_evidence_schema" "$meeting_speaker_report_schema" \
+            "$meeting_track_labels_schema" \
             "$sdk_abi_schema" "$sdk_capabilities_schema" \
             "$mobile_lifecycle_schema" "$wasm_capabilities_schema" \
             "$watch_cycle_schema" "$watch_quarantine_schema" \
@@ -1508,7 +1520,7 @@ jobs:
           rollback_root="$update_dir/rollback"
           mkdir -p "$candidate_dir" "$candidate_sbom_dir" "$rollback_root"
           version=${GITHUB_REF_NAME#v}
-          rollback_versions=(0.84.0 0.85.0)
+          rollback_versions=(0.85.0 0.86.0)
           desktop_names=(
             "denoize_${version}_aarch64.app.tar.gz"
             "denoize_${version}_x64.app.tar.gz"

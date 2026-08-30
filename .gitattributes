@@ -1,1 +1,10 @@
 patches/*.patch -whitespace
+
+# Release archives are byte-verified on Linux. Keep SDK text stable when the
+# source is checked out by Windows release runners.
+sdk/denoize-c/** text eol=lf
+sdk/*.json text eol=lf
+schemas/*.json text eol=lf
+LICENSE text eol=lf
+THIRD_PARTY.md text eol=lf
+LICENSES/** text eol=lf

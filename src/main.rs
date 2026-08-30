@@ -414,6 +414,7 @@ USAGE:
     denoize restore <INPUT> [OUTPUT] [OPTIONS]
     denoize universal <INPUT> <OUTPUT> --model-package PACKAGE --model-package-key KEY [OPTIONS]
     denoize target-speaker <MIXTURE> <ENROLLMENT> <OUTPUT> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
+    denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package PACKAGE --model-package-key KEY --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize aec <MICROPHONE> <FAR_END_REFERENCE> <OUTPUT> --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize array <MICROPHONE_ARRAY> <OUTPUT> --array-config CONFIG --promotion-evidence EVIDENCE --promotion-evidence-key KEY [OPTIONS]
     denoize plan <INPUT> <OUTPUT> [OPTIONS] [--pretty]
@@ -6891,6 +6892,9 @@ fn run(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("target-speaker") {
         return run_target_speaker(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("meeting-speakers") {
+        return run_meeting_speakers(&args[1..]);
+    }
     if args.first().map(String::as_str) == Some("aec") {
         return run_aec(&args[1..]);
     }
@@ -9679,6 +9683,575 @@ fn run_universal_audio(options: UniversalCliOptions) -> Result<(), String> {
 #[cfg(not(feature = "bsrnn"))]
 fn run_universal_audio(_options: UniversalCliOptions) -> Result<(), String> {
     Err("universal audio restoration requires a build with the bsrnn feature".into())
+}
+
+fn meeting_speaker_usage() -> &'static str {
+    "\
+USAGE:
+    denoize meeting-speakers <MEETING> <OUTPUT.wav> --model-package <PACKAGE.dmp> --model-package-key <KEY> --promotion-evidence <EVIDENCE.json> --promotion-evidence-key <PUBLIC-KEY.json> [OPTIONS]
+    denoize meeting-speakers evidence verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]
+
+Separate a mono meeting or an explicitly fixed microphone array into at most
+eight anonymous speaker channels plus one final unassigned-residual channel.
+The signed package must expose fixed-window separated audio, per-track
+inactive/uncertain/active probabilities, and global no-speech/assigned/unknown
+probabilities. The residual is required and exactly recombines with every
+published track to the arithmetic-mean reference. Unknown speech is never
+forced into an identity. The output is WAV only; the report maps its first N
+channels to speaker-NNN and its final channel to unassigned.
+
+OPTIONS:
+        --model-package <PATH>                    required signed runtime package v2
+        --model-package-key <PATH>                trusted Minisign public key
+        --promotion-evidence <PATH>               accepted signed meeting evaluation evidence
+        --promotion-evidence-key <PATH>           trusted Ed25519 evidence public key
+        --track-labels <PATH.json>                optional Stage 29 consent-bound labels
+        --minimum-active-probability <F>          active threshold, 0.5..1 (default: 0.8)
+        --minimum-inactive-probability <F>        inactive threshold, 0.5..1 (default: 0.8)
+        --minimum-unknown-probability <F>         unknown threshold, 0.5..1 (default: 0.8)
+        --minimum-active-frames <N>               consecutive frames needed to publish, 1..100 (default: 2)
+        --permutation-minimum-correlation <F>     window stitch threshold, 0..1 (default: 0.2)
+        --permutation-minimum-margin <F>          best/runner-up stitch margin, 0..1 (default: 0.05)
+        --maximum-track-peak <F>                  absolute track peak, 0.5..1 (default: 1)
+        --maximum-residual-peak <F>               absolute residual peak, 0.5..1 (default: 1)
+        --accelerator <NAME>                      cpu|auto|gpu|metal|cuda (default: cpu)
+        --report <PATH.json>                      atomically write the closed path-free report
+        --max-memory <MB>                         bound decode, model, tracks, and residual memory
+        --replace                                 atomically replace output/report destinations
+        --json                                    emit compact report JSON
+        --pretty                                  emit indented report JSON
+    -h, --help                                    show this help
+"
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+#[derive(Debug)]
+struct MeetingSpeakerCliOptions {
+    input: String,
+    output: String,
+    package: String,
+    package_key: String,
+    promotion_evidence: String,
+    promotion_evidence_key: String,
+    track_labels: Option<String>,
+    report: Option<String>,
+    config: denoize::MeetingSpeakerConfig,
+    accelerator: AcceleratorPreference,
+    max_memory_mb: Option<usize>,
+    commit_mode: CommitMode,
+    print_mode: DiagnosticPrintMode,
+}
+
+fn parse_meeting_speaker_args(args: &[String]) -> Result<MeetingSpeakerCliOptions, String> {
+    let mut positional = Vec::new();
+    let mut package = None;
+    let mut package_key = None;
+    let mut promotion_evidence = None;
+    let mut promotion_evidence_key = None;
+    let mut track_labels = None;
+    let mut report = None;
+    let mut config = denoize::MeetingSpeakerConfig::default();
+    let mut accelerator = AcceleratorPreference::Cpu;
+    let mut accelerator_seen = false;
+    let mut max_memory_mb = None;
+    let mut commit_mode = CommitMode::NoClobber;
+    let mut print_mode = DiagnosticPrintMode::Human;
+    let mut scalar_options = std::collections::HashSet::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if matches!(
+            argument,
+            "--minimum-active-probability"
+                | "--minimum-inactive-probability"
+                | "--minimum-unknown-probability"
+                | "--minimum-active-frames"
+                | "--permutation-minimum-correlation"
+                | "--permutation-minimum-margin"
+                | "--maximum-track-peak"
+                | "--maximum-residual-peak"
+        ) && !scalar_options.insert(argument)
+        {
+            return Err(format!("{argument} may be supplied only once"));
+        }
+        match argument {
+            "--model-package" if package.is_none() => {
+                package = Some(parse_value(args, &mut index, "--model-package")?);
+            }
+            "--model-package" => return Err("--model-package may be supplied only once".into()),
+            "--model-package-key" if package_key.is_none() => {
+                package_key = Some(parse_value(args, &mut index, "--model-package-key")?);
+            }
+            "--model-package-key" => {
+                return Err("--model-package-key may be supplied only once".into());
+            }
+            "--promotion-evidence" if promotion_evidence.is_none() => {
+                promotion_evidence = Some(parse_value(args, &mut index, "--promotion-evidence")?);
+            }
+            "--promotion-evidence" => {
+                return Err("--promotion-evidence may be supplied only once".into());
+            }
+            "--promotion-evidence-key" if promotion_evidence_key.is_none() => {
+                promotion_evidence_key =
+                    Some(parse_value(args, &mut index, "--promotion-evidence-key")?);
+            }
+            "--promotion-evidence-key" => {
+                return Err("--promotion-evidence-key may be supplied only once".into());
+            }
+            "--track-labels" if track_labels.is_none() => {
+                track_labels = Some(parse_value(args, &mut index, "--track-labels")?);
+            }
+            "--track-labels" => return Err("--track-labels may be supplied only once".into()),
+            "--minimum-active-probability" => {
+                config.minimum_active_probability =
+                    parse_value(args, &mut index, "--minimum-active-probability")?;
+            }
+            "--minimum-inactive-probability" => {
+                config.minimum_inactive_probability =
+                    parse_value(args, &mut index, "--minimum-inactive-probability")?;
+            }
+            "--minimum-unknown-probability" => {
+                config.minimum_unknown_probability =
+                    parse_value(args, &mut index, "--minimum-unknown-probability")?;
+            }
+            "--minimum-active-frames" => {
+                config.minimum_active_frames =
+                    parse_value(args, &mut index, "--minimum-active-frames")?;
+            }
+            "--permutation-minimum-correlation" => {
+                config.permutation_minimum_correlation =
+                    parse_value(args, &mut index, "--permutation-minimum-correlation")?;
+            }
+            "--permutation-minimum-margin" => {
+                config.permutation_minimum_margin =
+                    parse_value(args, &mut index, "--permutation-minimum-margin")?;
+            }
+            "--maximum-track-peak" => {
+                config.maximum_track_peak = parse_value(args, &mut index, "--maximum-track-peak")?;
+            }
+            "--maximum-residual-peak" => {
+                config.maximum_residual_peak =
+                    parse_value(args, &mut index, "--maximum-residual-peak")?;
+            }
+            "--accelerator" if !accelerator_seen => {
+                accelerator_seen = true;
+                let value: String = parse_value(args, &mut index, "--accelerator")?;
+                accelerator = AcceleratorPreference::parse(&value).ok_or_else(|| {
+                    format!(
+                        "unknown meeting-speaker accelerator: {value} (expected cpu, auto, gpu, metal, or cuda)"
+                    )
+                })?;
+            }
+            "--accelerator" => return Err("--accelerator may be supplied only once".into()),
+            "--report" if report.is_none() => {
+                report = Some(parse_value(args, &mut index, "--report")?);
+            }
+            "--report" => return Err("--report may be supplied only once".into()),
+            "--max-memory" if max_memory_mb.is_none() => {
+                max_memory_mb = Some(parse_value(args, &mut index, "--max-memory")?);
+            }
+            "--max-memory" => return Err("--max-memory may be supplied only once".into()),
+            "--replace" if commit_mode == CommitMode::NoClobber => {
+                commit_mode = CommitMode::Replace;
+            }
+            "--replace" => return Err("--replace may be supplied only once".into()),
+            "--json" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::Json;
+            }
+            "--pretty" if print_mode == DiagnosticPrintMode::Human => {
+                print_mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("meeting-speakers accepts only one of --json or --pretty".into());
+            }
+            "-h" | "--help" => return Err("meeting-speakers help requested".into()),
+            "-" => {
+                return Err(
+                    "meeting-speakers requires regular-file paths; stdin/stdout are unsupported"
+                        .into(),
+                );
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown meeting-speakers option: {value}"));
+            }
+            value => {
+                if positional.len() == 2 {
+                    return Err(format!(
+                        "unexpected extra meeting-speakers argument: {value}"
+                    ));
+                }
+                positional.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    let input = positional
+        .first()
+        .cloned()
+        .ok_or("meeting-speakers requires MEETING")?;
+    let output = positional
+        .get(1)
+        .cloned()
+        .ok_or("meeting-speakers requires OUTPUT.wav")?;
+    if OutputFormat::from_path(std::path::Path::new(&output))? != OutputFormat::Wav {
+        return Err(
+            "meeting-speakers output must be WAV so every track and residual is lossless".into(),
+        );
+    }
+    let package = package.ok_or("meeting-speakers requires --model-package")?;
+    let package_key = package_key.ok_or("meeting-speakers requires --model-package-key")?;
+    let promotion_evidence =
+        promotion_evidence.ok_or("meeting-speakers requires --promotion-evidence")?;
+    let promotion_evidence_key =
+        promotion_evidence_key.ok_or("meeting-speakers requires --promotion-evidence-key")?;
+    checked_mib_limit_bytes(max_memory_mb, "--max-memory")?;
+    config.validate()?;
+    Ok(MeetingSpeakerCliOptions {
+        input,
+        output,
+        package,
+        package_key,
+        promotion_evidence,
+        promotion_evidence_key,
+        track_labels,
+        report,
+        config,
+        accelerator,
+        max_memory_mb,
+        commit_mode,
+        print_mode,
+    })
+}
+
+fn run_meeting_speakers(args: &[String]) -> Result<(), String> {
+    if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help") {
+        print!("{}", meeting_speaker_usage());
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("evidence") {
+        return run_meeting_speaker_evidence(&args[1..]);
+    }
+    if args
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-h" | "--help"))
+    {
+        return Err("meeting-speakers --help accepts no other arguments".into());
+    }
+    let options = parse_meeting_speaker_args(args)?;
+    validate_meeting_speaker_publication_paths(&options)?;
+    run_meeting_speaker_audio(options)
+}
+
+fn run_meeting_speaker_evidence(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("verify") {
+        return Err(
+            "meeting-speaker evidence requires: verify <EVIDENCE.json> <PUBLIC-KEY.json> [--json|--pretty]"
+                .into(),
+        );
+    }
+    let mut positional = Vec::new();
+    let mut mode = DiagnosticPrintMode::Human;
+    for argument in &args[1..] {
+        match argument.as_str() {
+            "--json" if mode == DiagnosticPrintMode::Human => mode = DiagnosticPrintMode::Json,
+            "--pretty" if mode == DiagnosticPrintMode::Human => {
+                mode = DiagnosticPrintMode::PrettyJson;
+            }
+            "--json" | "--pretty" => {
+                return Err("meeting-speaker evidence verify accepts only one output mode".into());
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("unknown meeting-speaker evidence option: {value}"));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(
+            "meeting-speaker evidence verify requires EVIDENCE.json and PUBLIC-KEY.json".into(),
+        );
+    }
+    let evidence = denoize::SignedMeetingSpeakerPromotionEvidence::from_file(&positional[0])?;
+    let key = ReceiptPublicKey::from_file(&positional[1])?;
+    evidence.verify_signature(&key)?;
+    match mode {
+        DiagnosticPrintMode::Json => println!(
+            "{}",
+            serde_json::to_string(&evidence)
+                .map_err(|error| format!("serialize meeting-speaker evidence: {error}"))?
+        ),
+        DiagnosticPrintMode::PrettyJson => println!("{}", evidence.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "verified meeting-speaker evidence: strata={} real_meetings={} speakers={} languages={} retained_embeddings={} accepted={}",
+            evidence.payload.strata.len(),
+            evidence.payload.real_meeting_cases,
+            evidence.payload.distinct_speakers,
+            evidence.payload.language_count,
+            evidence.payload.retained_speaker_embeddings,
+            evidence.payload.accepted,
+        ),
+    }
+    if !evidence.payload.accepted {
+        return Err(
+            "meeting-speaker evidence is authentic but does not pass promotion gates".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_meeting_speaker_publication_paths(
+    options: &MeetingSpeakerCliOptions,
+) -> Result<(), String> {
+    let mut sources = Vec::new();
+    for (path, context) in [
+        (Some(options.input.as_str()), "meeting-speaker input"),
+        (Some(options.package.as_str()), "meeting-speaker package"),
+        (
+            Some(options.package_key.as_str()),
+            "meeting-speaker package key",
+        ),
+        (
+            Some(options.promotion_evidence.as_str()),
+            "meeting-speaker evidence",
+        ),
+        (
+            Some(options.promotion_evidence_key.as_str()),
+            "meeting-speaker evidence key",
+        ),
+        (
+            options.track_labels.as_deref(),
+            "meeting-speaker track labels",
+        ),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        sources.push((
+            std::fs::canonicalize(path)
+                .map_err(|error| format!("resolve {context} {path}: {error}"))?,
+            context,
+        ));
+    }
+    for left in 0..sources.len() {
+        for right in left + 1..sources.len() {
+            if sources[left].0 == sources[right].0 {
+                return Err(format!(
+                    "{} and {} must use distinct source files",
+                    sources[left].1, sources[right].1
+                ));
+            }
+        }
+    }
+    let mut destinations = Vec::new();
+    for (path, context) in [
+        (Some(options.output.as_str()), "meeting-speaker WAV output"),
+        (options.report.as_deref(), "meeting-speaker report"),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        let normalized = normalized_project_destination(std::path::Path::new(path), context)?;
+        let existing = std::fs::canonicalize(&normalized).ok();
+        if sources.iter().any(|(source, _)| {
+            normalized == *source || existing.as_ref().is_some_and(|path| path == source)
+        }) {
+            return Err(format!(
+                "{context} must not replace an input, package, key, evidence, or label document"
+            ));
+        }
+        ensure_restoration_destination_available(&normalized, options.commit_mode)?;
+        destinations.push((batch_collision_key(&normalized), context));
+    }
+    destinations.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(pair) = destinations.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "{} and {} must use distinct destinations",
+            pair[0].1, pair[1].1
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "onnx")]
+fn run_meeting_speaker_audio(options: MeetingSpeakerCliOptions) -> Result<(), String> {
+    let maximum = checked_mib_limit_bytes(options.max_memory_mb, "--max-memory")?;
+    let evidence =
+        denoize::SignedMeetingSpeakerPromotionEvidence::from_file(&options.promotion_evidence)?;
+    let evidence_key = ReceiptPublicKey::from_file(&options.promotion_evidence_key)?;
+    let package = RuntimeModelPackage::open(&options.package, &options.package_key)?;
+    let labels = options
+        .track_labels
+        .as_deref()
+        .map(denoize::MeetingTrackLabelsDocument::from_file)
+        .transpose()?
+        .map_or_else(Vec::new, |document| document.labels);
+    // Authenticate the graph, vectors, evidence, privacy record, and selected
+    // accelerator before opening user-controlled meeting audio.
+    let session = denoize::MeetingSpeakerSession::prepare(
+        package,
+        &evidence,
+        &evidence_key,
+        &options.config,
+        options.accelerator,
+    )?;
+    let model_working_set = session.model_working_set_bytes()?;
+    ensure_memory_limit(
+        model_working_set,
+        options.max_memory_mb,
+        "meeting-speaker model working set",
+    )?;
+    let mut input_session = AudioInputSession::open(&options.input)?;
+    let session_memory = estimate_session_memory_bytes(&input_session);
+    ensure_memory_limit(
+        model_working_set.saturating_add(session_memory),
+        options.max_memory_mb,
+        "meeting-speaker input/model preflight",
+    )?;
+    let decode_maximum = maximum.map(|limit| {
+        limit
+            .saturating_sub(model_working_set)
+            .saturating_sub(session_memory)
+    });
+    let input = read_audio_from_session_with_limits(
+        &mut input_session,
+        DecodeLimits::new(
+            metadata_limits_for_available_bytes(decode_maximum),
+            decode_maximum,
+        ),
+    )?;
+    let working_set = session
+        .processing_working_set_bytes(&input)?
+        .saturating_add(model_working_set)
+        .saturating_add(session_memory);
+    ensure_memory_limit(
+        working_set,
+        options.max_memory_mb,
+        "meeting-speaker decoded/model/tracks/residual working set",
+    )?;
+    let result = session.separate(&input, &options.config, &labels)?;
+    let mut channels = Vec::new();
+    channels
+        .try_reserve_exact(result.tracks.len() + 1)
+        .map_err(|_| "unable to reserve meeting-speaker WAV channels".to_string())?;
+    for track in result.tracks {
+        channels.push(
+            track
+                .channels
+                .into_iter()
+                .next()
+                .ok_or("meeting-speaker track lost its mono channel")?,
+        );
+    }
+    channels.push(
+        result
+            .unassigned
+            .channels
+            .into_iter()
+            .next()
+            .ok_or("meeting-speaker residual lost its mono channel")?,
+    );
+    let output = denoize::Audio {
+        sample_rate: input.sample_rate,
+        channels,
+        bits_per_sample: input.bits_per_sample,
+        sample_format: input.sample_format,
+        channel_mask: None,
+    };
+    let mut staged_report = options
+        .report
+        .as_deref()
+        .map(|path| stage_restoration_json(path, &result.report))
+        .transpose()?;
+    let encode_options = EncodeOptions::default();
+    OutputFormat::Wav.validate_config(&output, &encode_options)?;
+    denoize::write_audio_transactional(
+        &options.output,
+        &output,
+        encode_options,
+        None,
+        options.commit_mode,
+    )?;
+    if let Some(report) = staged_report.take() {
+        report.commit(options.commit_mode)?;
+    }
+    match options.print_mode {
+        DiagnosticPrintMode::Json => println!("{}", result.report.to_json()?),
+        DiagnosticPrintMode::PrettyJson => println!("{}", result.report.to_pretty_json()?),
+        DiagnosticPrintMode::Human => println!(
+            "meeting speakers: tracks={} residual_channel={} unknown_regions={} overlap_regions={} ambiguous_windows={} frames={} package={}",
+            result.report.published_tracks,
+            result.report.published_tracks + 1,
+            result.report.unknown_regions.len(),
+            result.report.overlap_regions.len(),
+            result.report.permutation_ambiguous_windows,
+            result.report.source_frames,
+            result.report.model.package_sha256,
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "onnx"))]
+fn run_meeting_speaker_audio(_options: MeetingSpeakerCliOptions) -> Result<(), String> {
+    Err("meeting speaker tracks require a build with the onnx feature".into())
+}
+
+#[cfg(test)]
+mod meeting_speaker_cli_tests {
+    use super::*;
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parser_requires_authenticated_package_and_evidence() {
+        let error =
+            parse_meeting_speaker_args(&arguments(&["meeting.wav", "tracks.wav"])).unwrap_err();
+        assert_eq!(error, "meeting-speakers requires --model-package");
+        let parsed = parse_meeting_speaker_args(&arguments(&[
+            "meeting.wav",
+            "tracks.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "evidence.pub.json",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.config.minimum_active_probability, 0.8);
+        assert_eq!(parsed.commit_mode, CommitMode::NoClobber);
+    }
+
+    #[test]
+    fn parser_rejects_lossy_output_and_ambiguous_thresholds() {
+        let base = [
+            "meeting.wav",
+            "tracks.wav",
+            "--model-package",
+            "model.dmp",
+            "--model-package-key",
+            "model.pub",
+            "--promotion-evidence",
+            "evidence.json",
+            "--promotion-evidence-key",
+            "evidence.pub.json",
+        ];
+        let mut duplicate = base.to_vec();
+        duplicate.extend([
+            "--minimum-active-probability",
+            "0.8",
+            "--minimum-active-probability",
+            "0.9",
+        ]);
+        assert!(parse_meeting_speaker_args(&arguments(&duplicate)).is_err());
+        let mut lossy = base.to_vec();
+        lossy[1] = "tracks.mp3";
+        assert!(parse_meeting_speaker_args(&arguments(&lossy)).is_err());
+    }
 }
 
 fn microphone_array_usage() -> &'static str {
@@ -15381,7 +15954,7 @@ mod batch_tests {
     // The package version is intentionally part of the v3 recipe ABI. Update
     // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
-        "6bd6f98f52e0f234eb64093590560121d3af59acd029bfe8173df9989eafcc08";
+        "71e6b2f5ed99ba7f2b26a02adbbf82ba596d4465eae0417c48885d655b8f26a9";
 
     #[test]
     fn batch_reuses_one_prepared_backend_for_equal_resolved_options() {

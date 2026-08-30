@@ -399,7 +399,11 @@ fn validate_sample_rates(from_rate: u32, to_rate: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn planned_output_frames(frames: usize, from_rate: u32, to_rate: u32) -> Result<usize, String> {
+pub(crate) fn planned_output_frames(
+    frames: usize,
+    from_rate: u32,
+    to_rate: u32,
+) -> Result<usize, String> {
     let numerator = (frames as u128)
         .checked_mul(to_rate as u128)
         .and_then(|value| value.checked_add(from_rate as u128 / 2))

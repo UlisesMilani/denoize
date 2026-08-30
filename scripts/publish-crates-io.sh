@@ -165,6 +165,8 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/src/backend/causal_target_speaker.rs" \
     "denoize-${package_version}/src/acoustic_echo.rs" \
     "denoize-${package_version}/src/microphone_array.rs" \
+    "denoize-${package_version}/src/meeting_speaker.rs" \
+    "denoize-${package_version}/src/backend/meeting_speaker.rs" \
     "denoize-${package_version}/src/region.rs" \
     "denoize-${package_version}/src/universal_restoration.rs" \
     "denoize-${package_version}/src/project.rs" \
@@ -184,6 +186,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/docs/neural-plugin.md" \
     "denoize-${package_version}/docs/target-speaker.md" \
     "denoize-${package_version}/docs/microphone-array.md" \
+    "denoize-${package_version}/docs/meeting-speakers.md" \
     "denoize-${package_version}/docs/projects.md" \
     "denoize-${package_version}/docs/release-evidence.md" \
     "denoize-${package_version}/docs/restoration-research.md" \
@@ -265,6 +268,9 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/schemas/denoize-aec-report-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-microphone-array-promotion-evidence-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-microphone-array-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-meeting-speaker-promotion-evidence-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-meeting-speaker-report-v1.schema.json" \
+    "denoize-${package_version}/schemas/denoize-meeting-track-labels-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-mobile-lifecycle-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-sdk-abi-v1.schema.json" \
     "denoize-${package_version}/schemas/denoize-sdk-capabilities-v1.schema.json" \
@@ -290,6 +296,7 @@ if [[ "$is_dry_run" == true ]]; then
     "denoize-${package_version}/scripts/test-target-speaker-schemas.py" \
     "denoize-${package_version}/scripts/test-aec-schemas.py" \
     "denoize-${package_version}/scripts/test-microphone-array-schemas.py" \
+    "denoize-${package_version}/scripts/test-meeting-speaker-schemas.py" \
     "denoize-${package_version}/scripts/test-runtime-model-package-schemas.py" \
     "denoize-${package_version}/scripts/verify-release-evidence.sh"
   do
