@@ -28,6 +28,7 @@ clang -fobjc-arc -fblocks -Wall -Wextra -Werror \
   -framework AudioToolbox -framework AVFoundation -framework Foundation \
   "$script_dir/auv3-host-smoke.m" -o "$work_dir/denoize-auv3-host"
 pluginkit -a "$appex"
+status=0
 {
   echo "denoize AUv3 AVFoundation real-host report"
   echo "host: AVFoundation"
@@ -35,7 +36,11 @@ pluginkit -a "$appex"
   echo "operating_system: macos"
   echo "architecture: $(uname -m)"
   "$work_dir/denoize-auv3-host"
-} > "$work_dir/report.txt" 2>&1
+} > "$work_dir/report.txt" 2>&1 || status=$?
 mkdir -p "$(dirname -- "$report")"
 cp "$work_dir/report.txt" "$report"
+if [[ $status -ne 0 ]]; then
+  cat "$report" >&2
+  exit "$status"
+fi
 printf '%s\n' "$report"

@@ -7,7 +7,7 @@ version = "0.87.0"
 
 android {
     namespace = "io.github.penguin425.denoize.sdk"
-    compileSdk = 37
+    compileSdk = 36
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
@@ -33,6 +33,14 @@ android {
 
     buildFeatures {
         buildConfig = false
+    }
+
+    sourceSets {
+        named("main") {
+            jniLibs {
+                directories.add("src/main/prebuilt")
+            }
+        }
     }
 
     compileOptions {

@@ -10,6 +10,7 @@ fi
 output_dir=${1:-.}
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
+. "$repo_dir/scripts/verify-sdk-release-ref.sh"
 
 version=$(awk '
   $0 == "[package]" { package = 1; next }
@@ -22,10 +23,7 @@ version=$(awk '
   }
 ' Cargo.toml)
 tag="v$version"
-if [[ -n ${GITHUB_REF_NAME:-} && ${GITHUB_REF_NAME} != "$tag" ]]; then
-  echo "release tag ${GITHUB_REF_NAME} does not match SDK version $version" >&2
-  exit 1
-fi
+verify_sdk_release_ref "$tag" "$version"
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo "wasm-bindgen CLI is required to package the Web SDK" >&2
   exit 2

@@ -7,6 +7,7 @@ import argparse
 import json
 import pathlib
 import re
+import shlex
 import subprocess
 
 import jsonschema
@@ -42,6 +43,8 @@ ANDROID_WRAPPER = (
     / "DenoizeSdk.kt"
 )
 ANDROID_CONSUMER_RULES = ROOT / "sdk" / "android" / "library" / "consumer-rules.pro"
+ANDROID_BUILD = ROOT / "sdk" / "android" / "library" / "build.gradle.kts"
+ANDROID_CMAKE = ROOT / "sdk" / "android" / "library" / "CMakeLists.txt"
 ANDROID_DEVICE_TEST = (
     ROOT
     / "sdk"
@@ -62,8 +65,11 @@ IOS_SOURCE_HEADER = ROOT / "sdk" / "ios" / "Sources" / "CDenoize" / "include" / 
 C_PACKAGE_SCRIPT = ROOT / "scripts" / "package-c-sdk.sh"
 ANDROID_PACKAGE_SCRIPT = ROOT / "scripts" / "package-android-sdk.sh"
 IOS_PACKAGE_SCRIPT = ROOT / "scripts" / "package-ios-sdk.sh"
+SDK_RELEASE_REF_SCRIPT = ROOT / "scripts" / "verify-sdk-release-ref.sh"
 RELEASE_ASSET_VERIFIER = ROOT / "scripts" / "verify-release-assets.sh"
 ABI_FUZZ_TARGET = ROOT / "fuzz" / "fuzz_targets" / "sdk_abi.rs"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
 
 def exported_symbols(library: pathlib.Path) -> set[str]:
@@ -163,6 +169,8 @@ def main() -> None:
         raise AssertionError("AudioWorklet embeds DSP or assumes a 128-frame quantum")
 
     android = ANDROID_WRAPPER.read_text(encoding="utf-8")
+    android_build = ANDROID_BUILD.read_text(encoding="utf-8")
+    android_cmake = ANDROID_CMAKE.read_text(encoding="utf-8")
     android_consumer_rules = ANDROID_CONSUMER_RULES.read_text(encoding="utf-8")
     android_device_test = ANDROID_DEVICE_TEST.read_text(encoding="utf-8")
     ios = IOS_WRAPPER.read_text(encoding="utf-8")
@@ -184,6 +192,8 @@ def main() -> None:
     for wrapper_name, wrapper in (("Android", android), ("iOS", ios)):
         if "downloads or installs models implicitly" not in wrapper:
             raise AssertionError(f"{wrapper_name} wrapper lost the no-implicit-download guard")
+    if ios.count("guard let handle = self.handle") != 3:
+        raise AssertionError("iOS cancellation closures do not capture their handle explicitly")
     for jni_class in ("NativeBridge", "DenoizeOptions", "DenoizeSdkException"):
         qualified = f"io.github.penguin425.denoize.sdk.{jni_class}"
         if qualified not in android_consumer_rules:
@@ -193,10 +203,169 @@ def main() -> None:
             raise AssertionError(
                 f"Android emulator gate omits {required_device_gate}"
             )
-    if "connectedDebugAndroidTest" not in ANDROID_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
+    if "compileSdk = 36" not in android_build:
+        raise AssertionError("Android SDK does not compile against stable API 36")
+    for packaging_contract in (
+        "sourceSets {",
+        'named("main")',
+        "jniLibs {",
+        'directories.add("src/main/prebuilt")',
+    ):
+        if packaging_contract not in android_build:
+            raise AssertionError(
+                f"Android AAR omits prebuilt native source {packaging_contract}"
+            )
+    if "IMPORTED_NO_SONAME TRUE" not in android_cmake:
+        raise AssertionError("Android JNI link can embed a build-path DT_NEEDED entry")
+    for workflow_name, workflow_path in (
+        ("CI", CI_WORKFLOW),
+        ("release", RELEASE_WORKFLOW),
+    ):
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for package in ('"platforms;android-36"', '"build-tools;36.0.0"'):
+            if package not in workflow:
+                raise AssertionError(
+                    f"{workflow_name} workflow omits stable Android package {package}"
+                )
+    ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    for android_ci_contract in (
+        'script: DENOIZE_ANDROID_RUN_INSTRUMENTATION=1 bash scripts/package-android-sdk.sh "$RUNNER_TEMP"',
+        "- name: Inspect Android SDK archive",
+        'archive="$RUNNER_TEMP/denoize-android-sdk-v${version}.tar.gz"',
+    ):
+        if android_ci_contract not in ci_workflow:
+            raise AssertionError(
+                f"Android CI does not preserve the package across emulator commands: {android_ci_contract}"
+            )
+    for ios_ci_contract in (
+        'DENOIZE_IOS_RUN_SIMULATOR_TESTS=1 bash scripts/package-ios-sdk.sh "$RUNNER_TEMP"',
+        'archive="$RUNNER_TEMP/denoize-ios-sdk-v${version}.tar.gz"',
+    ):
+        if ios_ci_contract not in ci_workflow:
+            raise AssertionError(
+                f"iOS CI does not use the deterministic package path: {ios_ci_contract}"
+            )
+    for job_name in ("sdk-native", "sdk-web"):
+        job_start = ci_workflow.index(f"  {job_name}:")
+        next_job = re.search(
+            r"^  [a-z][a-z0-9-]+:$",
+            ci_workflow[job_start + 1 :],
+            re.MULTILINE,
+        )
+        job_end = (
+            job_start + 1 + next_job.start()
+            if next_job is not None
+            else len(ci_workflow)
+        )
+        job = ci_workflow[job_start:job_end]
+        if "rustup component add clippy --toolchain 1.96.0" not in job:
+            raise AssertionError(f"{job_name} does not install pinned Clippy")
+
+    android_package = ANDROID_PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    if "connectedDebugAndroidTest" not in android_package:
         raise AssertionError("Android package gate does not run instrumentation tests")
-    if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8"):
+    for archiver_variable in (
+        "AR_aarch64_linux_android",
+        "AR_x86_64_linux_android",
+    ):
+        if archiver_variable not in android_package:
+            raise AssertionError(
+                f"Android cross-compile omits NDK archiver {archiver_variable}"
+            )
+    if '"$ar_variable=$ndk_bin/llvm-ar"' not in android_package:
+        raise AssertionError("Android cross-compile does not use the pinned NDK llvm-ar")
+    config_gate = 'gradle --no-daemon -p "$staging/sdk/android" help >/dev/null'
+    if config_gate not in android_package:
+        raise AssertionError("Android package gate does not validate AGP configuration early")
+    if android_package.index(config_gate) > android_package.index("build_android_library()"):
+        raise AssertionError("Android AGP configuration is validated after Rust cross-builds")
+    for dependency_gate in ("llvm-readelf", r"\[libdenoize_c\.so\]"):
+        if dependency_gate not in android_package:
+            raise AssertionError(
+                f"Android AAR does not verify portable JNI dependency {dependency_gate}"
+            )
+    ios_package = IOS_PACKAGE_SCRIPT.read_text(encoding="utf-8")
+    if "DENOIZE_IOS_RUN_SIMULATOR_TESTS" not in ios_package:
         raise AssertionError("iOS package gate does not expose simulator tests")
+    swift_typecheck = "swiftc -typecheck"
+    if swift_typecheck not in ios_package:
+        raise AssertionError("iOS package gate does not type-check Swift before packaging")
+    if ios_package.index(swift_typecheck) > ios_package.index("rustup target add"):
+        raise AssertionError("iOS Swift type-check runs after Rust cross-builds")
+    for package_script in (
+        C_PACKAGE_SCRIPT,
+        ROOT / "scripts" / "package-web-sdk.sh",
+        ANDROID_PACKAGE_SCRIPT,
+        IOS_PACKAGE_SCRIPT,
+    ):
+        if 'verify_sdk_release_ref "$tag" "$version"' not in package_script.read_text(
+            encoding="utf-8"
+        ):
+            raise AssertionError(
+                f"SDK package script bypasses the tag-only release-ref gate: {package_script}"
+            )
+
+    release_ref_command = (
+        f"source {shlex.quote(str(SDK_RELEASE_REF_SCRIPT))}; "
+        "verify_sdk_release_ref v0.86.0 0.86.0"
+    )
+    for environment in (
+        {
+            "GITHUB_REF": "refs/pull/212/merge",
+            "GITHUB_REF_NAME": "212/merge",
+            "GITHUB_REF_TYPE": "branch",
+        },
+        {
+            "GITHUB_REF": "refs/heads/feature/sdk-stage33",
+            "GITHUB_REF_NAME": "feature/sdk-stage33",
+            "GITHUB_REF_TYPE": "branch",
+        },
+        {
+            "GITHUB_REF": "refs/tags/v0.86.0",
+            "GITHUB_REF_NAME": "v0.86.0",
+            "GITHUB_REF_TYPE": "tag",
+        },
+        {
+            "GITHUB_REF_NAME": "v0.86.0",
+            "GITHUB_REF_TYPE": "tag",
+        },
+    ):
+        completed = subprocess.run(
+            ["bash", "-c", release_ref_command],
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(
+                f"valid SDK build ref was rejected: {environment}: {completed.stderr}"
+            )
+    mismatch = subprocess.run(
+        ["bash", "-c", release_ref_command],
+        env={
+            "GITHUB_REF": "refs/tags/v0.85.0",
+            "GITHUB_REF_NAME": "v0.85.0",
+            "GITHUB_REF_TYPE": "tag",
+        },
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if mismatch.returncode == 0 or "does not match SDK version 0.86.0" not in mismatch.stderr:
+        raise AssertionError("mismatched SDK release tag was not rejected")
+    missing_tag_name = subprocess.run(
+        ["bash", "-c", release_ref_command],
+        env={"GITHUB_REF_TYPE": "tag"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if (
+        missing_tag_name.returncode == 0
+        or "release tag <empty>" not in missing_tag_name.stderr
+    ):
+        raise AssertionError("tag build without release identity was not rejected")
     abi_fuzz_target = ABI_FUZZ_TARGET.read_text(encoding="utf-8")
     for operation in ("denoize_processor_create_v1", "denoize_processor_process_interleaved_f32_v1", "denoize_processor_finish_interleaved_f32_v1", "denoize_processor_destroy_v1"):
         if operation not in abi_fuzz_target:
@@ -215,6 +384,16 @@ def main() -> None:
         raise AssertionError("ABI symbols must be unique and canonically sorted")
     header = HEADER.read_text(encoding="utf-8")
     rust = RUST.read_text(encoding="utf-8")
+    for status_name, status_value in manifest["status_codes"].items():
+        macro_name = f"DENOIZE_STATUS_{status_name.upper()}"
+        if not re.search(
+            rf"^#define {re.escape(macro_name)} {status_value}$",
+            header,
+            re.MULTILINE,
+        ):
+            raise AssertionError(
+                f"C status is not a Swift-importable integer macro: {macro_name}"
+            )
     for symbol in symbols:
         if not re.search(rf"\b{re.escape(symbol)}\s*\(", header):
             raise AssertionError(f"ABI symbol is absent from current header: {symbol}")

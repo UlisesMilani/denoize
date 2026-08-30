@@ -125,7 +125,7 @@ if [[ -z $wrapper_status ]]; then
   git -C "$clap_wrapper_root" apply --check "$auv3_patch"
   git -C "$clap_wrapper_root" apply "$auv3_patch"
 else
-  expected_status=' M src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm'
+  expected_status=$' M cmake/shared_prologue.cmake\n M src/detail/standalone/macos/auv3/AUv3HostAppDelegate.mm'
   if [[ $wrapper_status != "$expected_status" ]]; then
     echo "clap-wrapper cache contains changes other than the pinned AUv3 patch" >&2
     printf '%s\n' "$wrapper_status" >&2
@@ -181,14 +181,14 @@ cmake -S "$repo_root/plugins/denoize-formats" \
   -DDENOIZE_EMBEDDED_CLAP_BUNDLE="$clap_bundle"
 cmake --build "$build_dir" --config Release --target denoize-formats --parallel 2
 
-app=$(find "$build_dir" -type d -name 'denoize AUv3.app' -print -quit)
-if [[ -z $app ]]; then
-  echo "AUv3 containing app was not created below $build_dir" >&2
+app=$build_dir/Release/denoize\ AUv3.app
+if [[ ! -d $app || -L $app ]]; then
+  echo "AUv3 containing app was not created at the expected Xcode path: $app" >&2
   exit 1
 fi
 appex=$app/Contents/PlugIns/denoize.appex
 embedded_model=$appex/Contents/PlugIns/denoize.clap/Contents/Resources/denoize-models/gtcrn-dns3/gtcrn_simple.onnx
-if [[ ! -d $appex || ! -f $embedded_model ]]; then
+if [[ ! -d $appex || -L $appex || ! -f $embedded_model || -L $embedded_model ]]; then
   echo "AUv3 app is missing its appex, embedded CLAP, or GTCRN model" >&2
   exit 1
 fi
@@ -196,6 +196,14 @@ if [[ $(shasum -a 256 "$embedded_model" | awk '{print $1}') != "$model_sha" ]]; 
   echo "embedded AUv3 model digest changed during assembly" >&2
   exit 1
 fi
+appex_entitlements=$clap_wrapper_root/src/detail/auv3/auv3.entitlements
+if [[ ! -f $appex_entitlements || -L $appex_entitlements ]]; then
+  echo "pinned AUv3 entitlements are missing or are a symbolic link" >&2
+  exit 1
+fi
+plutil -lint "$appex_entitlements" >/dev/null
+codesign --force --sign - --timestamp=none \
+  --entitlements "$appex_entitlements" "$appex"
 codesign --force --sign - --timestamp=none "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 printf '%s\n' "$app"
