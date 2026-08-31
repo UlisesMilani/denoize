@@ -1088,6 +1088,11 @@ ordinary rates. Finite fractional CLAP sample rates are supported. A late,
 invalid, or missing result uses latency-aligned dry audio by default; last-safe
 gain and silence require an explicit parameter choice. The advertised
 reference input is reserved for later typed target-speaker/AEC semantics.
+If the verified model is missing or invalid, neural inference stays disabled
+and the same selected fixed-latency fallback is used. The processor remains
+active so host automation, generic parameter views, accessibility tools, and
+project state continue to work. Install or repair the model, then reactivate or
+reload the effect to enable inference.
 
 Portable presets use
 [`denoize-daw-preset-v1`](schemas/denoize-daw-preset-v1.schema.json). Complete

@@ -18,10 +18,15 @@ denoize plugin neural latency --sample-rate 48000 --pretty
 
 The expected graph SHA-256 is
 `b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87`.
-Activation fails closed if the managed artifact or its authenticated install
-provenance is absent, redirected, replaced, or inconsistent with this build.
-The model is verified and the tract graph is prepared on the permanent neural
-worker before activation returns.
+Neural inference fails closed if the managed artifact or its authenticated
+install provenance is absent, redirected, replaced, or inconsistent with this
+build. In that state the plug-in remains active as a fixed-latency fallback
+processor, so host automation, generic parameter views, accessibility tools,
+and project state remain usable without running an unverified graph. Audio uses
+the selected overload fallback (`delayed-dry` by default). Install or repair the
+model, then reactivate or reload the effect to enable neural inference. When
+the model is available, it is verified and the tract graph is prepared on the
+permanent neural worker before activation returns.
 
 ## Scheduling contract
 
