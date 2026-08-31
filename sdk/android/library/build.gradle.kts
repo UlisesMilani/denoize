@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "io.github.penguin425.denoize"
-version = "0.90.1"
+version = "0.90.2"
 
 android {
     namespace = "io.github.penguin425.denoize.sdk"
