@@ -10125,7 +10125,7 @@ mod tests {
     const FRONTEND_PARITY_ITEM_ID_HEX: &str =
         "28a3a5bc0a5112777268b438a5357badea3c055ea91a1472a9cdba3c1a8522f0";
     // The package version is intentionally part of the v3 recipe ABI. Update
-    // this golden value when an intentional release bump lands.
+    // this value in both frontend tests when an intentional release bump lands.
     const FRONTEND_PARITY_RECIPE_HEX: &str =
         "fdd85e95f07bbfd165029bc799b832740da62b82f324e56c43689f6cfae3fa25";
 
