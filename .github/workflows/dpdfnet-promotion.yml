@@ -228,6 +228,16 @@ jobs:
             -SourceCommit "$env:GITHUB_SHA" `
             -DurationSeconds 60
 
+      - name: Preserve rejected Windows host diagnostics
+        if: failure() && runner.os == 'Windows'
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-host-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dpdfnet-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Attest experimental artifact and measurements
         if: github.event_name != 'pull_request'
         id: attest

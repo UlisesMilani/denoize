@@ -236,6 +236,8 @@ if ($hostEvidence.model_id -ne "dpdfnet2-48khz-hr" -or
   $hostEvidence.active_seconds -lt $DurationSeconds -or
   $hostEvidence.metrics.overload_blocks -ne 0 -or $hostEvidence.metrics.late_blocks -ne 0 -or
   $hostEvidence.metrics.invalid_blocks -ne 0 -or $hostEvidence.metrics.worker_errors -ne 0) {
+  Write-Host "Rejected real REAPER host evidence:"
+  Write-Host ($hostEvidence | ConvertTo-Json -Depth 10)
   throw "real REAPER DPDFNet worker evidence did not pass"
 }
 $processResult = Get-Content -LiteralPath $processMetrics -Raw | ConvertFrom-Json

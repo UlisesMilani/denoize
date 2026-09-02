@@ -649,6 +649,41 @@ def main() -> int:
         assert platform["accepted"] is True
         assert len(platform["checks"]) == 11
 
+        preempted_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        preempted_stress["timing"].update(
+            {
+                "p99_9_ms": 8.654417,
+                "maximum_ms": 13.000958,
+                "calls_over_budget": 1,
+                "calls_over_budget_fraction": 1 / 6000,
+            }
+        )
+        preempted_stress_path = platform_root / "preempted-stress.json"
+        preempted_stress_path.write_text(
+            json.dumps(preempted_stress) + "\n", encoding="utf-8"
+        )
+        preempted_platform_path = platform_root / "preempted-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(preempted_stress_path),
+                "--worker",
+                str(worker_path),
+                "--output",
+                str(preempted_platform_path),
+            ]
+        )
+        preempted_platform = json.loads(
+            preempted_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(preempted_platform)
+        assert preempted_platform["accepted"] is True
+        by_id = {item["id"]: item for item in preempted_platform["checks"]}
+        assert by_id["stress-maximum-ms"]["limit"] == 20.0
+        assert by_id["stress-deadline-misses"]["limit"] == 6
+
         lowest_stress = json.loads(stress_path.read_text(encoding="utf-8"))
         lowest_stress["environment"].update(
             {

@@ -293,6 +293,13 @@ the normal Linux runner, attests them, verifies those attestations offline on
 stay inside its 15-minute job limit. See the
 [GitHub-hosted runner specification](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#supported-runners-and-hardware-resources).
 
+Hosted runners are not real-time schedulers. Their direct-hop gate therefore
+requires p99.9 at or below 10 ms, at most 0.1% of calls above 10 ms, and no
+single call above 20 ms. The paced production CLAP worker remains stricter:
+overload, late, invalid, and worker-error counters must all be zero. This keeps
+an isolated VM preemption from being misclassified as a model failure without
+hiding a sustained deadline problem.
+
 ## Sources
 
 - [Issue #221](https://github.com/penguin425/denoize/issues/221)
