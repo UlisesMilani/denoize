@@ -101,14 +101,22 @@ jobs:
             Linux)
               cpu_model=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)
               os_version=$(uname -srmo)
+              # RUNNER_TEMP is below /home on GitHub's Linux images. The
+              # runner grants service accounts access to that ancestor with
+              # an extended ACL, which the production atomic-output guard
+              # correctly rejects for model provenance. Use a private child
+              # of the sticky system temp directory instead.
+              model_root=$(mktemp -d /tmp/denoize-models.XXXXXX)
               ;;
             macOS)
               cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model)
               os_version=$(sw_vers -productName)-$(sw_vers -productVersion)-$(sw_vers -buildVersion)
+              model_root="$RUNNER_TEMP/denoize-models"
               ;;
             Windows)
               cpu_model=$(powershell.exe -NoProfile -Command '(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name).Trim()' | tr -d '\r')
               os_version=$(powershell.exe -NoProfile -Command '[System.Environment]::OSVersion.VersionString' | tr -d '\r')
+              model_root="$RUNNER_TEMP/denoize-models"
               ;;
             *) exit 1 ;;
           esac
@@ -119,7 +127,7 @@ jobs:
             echo "DENOIZE_EVIDENCE_CPU_MODEL=$cpu_model"
             echo "DENOIZE_EVIDENCE_HARDWARE_TIER=portable-ci"
             echo "DENOIZE_EVIDENCE_RUNNER_LABEL=${{ matrix.os }}"
-            echo "DENOIZE_MODEL_DIR=$RUNNER_TEMP/denoize-models"
+            echo "DENOIZE_MODEL_DIR=$model_root"
             echo "DENOIZE_EVIDENCE_DIR=$RUNNER_TEMP/dpdfnet-evidence"
           } >> "$GITHUB_ENV"
 
@@ -277,7 +285,7 @@ jobs:
           cpu_model=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)
           os_version=$(uname -srmo)
           evidence_dir="$RUNNER_TEMP/dpdfnet-lowest-supported"
-          model_root="$RUNNER_TEMP/denoize-lowest-models"
+          model_root=$(mktemp -d /tmp/denoize-lowest-models.XXXXXX)
           test "$(nproc)" -eq 1
           {
             echo "DENOIZE_EVIDENCE_SOURCE_COMMIT=$GITHUB_SHA"
