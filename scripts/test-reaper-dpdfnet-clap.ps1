@@ -68,7 +68,10 @@ Copy-Item -LiteralPath $PluginBinary -Destination $plugin
 ) | Set-Content -LiteralPath (Join-Path $resourceDir "reaper.ini") -Encoding ascii
 
 $sampleRate = 48000
-$sampleCount = $sampleRate * 10
+# Keep the media item longer than the measured interval. A repeated short item
+# introduces transport discontinuities and recurrent-state resets into what is
+# intended to be a sustained real-time scheduling measurement.
+$sampleCount = $sampleRate * ($DurationSeconds + 10)
 $dataSize = $sampleCount * 2
 $writer = [System.IO.BinaryWriter]::new([System.IO.File]::Create($tone))
 try {
@@ -134,7 +137,7 @@ $env:DENOIZE_REAPER_PLAY_DELAY = "3"
 $env:DENOIZE_REAPER_SET_DELAY = [string]$DurationSeconds
 $env:DENOIZE_REAPER_AUDIO = $tone
 $env:DENOIZE_REAPER_PLAY = "1"
-$env:DENOIZE_REAPER_REPEAT = "1"
+$env:DENOIZE_REAPER_REPEAT = "0"
 $env:DENOIZE_REAPER_OPEN_AUDIO_DEVICE = "1"
 $env:DENOIZE_REAPER_REMOVE_FX = "1"
 $env:DENOIZE_REAPER_PLUGIN_PARAMETER_COUNT = "4"
@@ -227,6 +230,7 @@ $expectedNames = @("Bypass", "Mix", "Output Gain", "Overload Fallback")
 if ($parameters.Count -ne 4 -or $osara.Count -ne 4 -or
   @(Compare-Object $expectedNames $names).Count -ne 0 -or
   $lines -notcontains "performance`tno-anticipative-fx`ttrue" -or
+  $lines -notcontains "transport`trepeat`tfalse" -or
   $lines -notcontains "removed`ttrue" -or $lines -notcontains "complete`t0") {
   throw "REAPER/OSARA-style parameter evidence did not pass"
 }

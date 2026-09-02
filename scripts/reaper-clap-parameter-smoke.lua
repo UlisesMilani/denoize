@@ -278,9 +278,13 @@ end
 local play_delay = tonumber(os.getenv("DENOIZE_REAPER_PLAY_DELAY") or "0") or 0
 local playback_started = nil
 local function start_playback()
-  if os.getenv("DENOIZE_REAPER_REPEAT") == "1" then
-    reaper.GetSetRepeat(1)
-  end
+  local repeat_enabled = os.getenv("DENOIZE_REAPER_REPEAT") == "1"
+  reaper.GetSetRepeat(repeat_enabled and 1 or 0)
+  write_line(
+    "transport",
+    "repeat",
+    tostring(reaper.GetSetRepeat(-1) == 1)
+  )
   reaper.Main_OnCommand(1007, 0)
   playback_started = reaper.time_precise()
   write_line("play", reaper.GetPlayState())
