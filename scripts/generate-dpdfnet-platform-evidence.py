@@ -250,6 +250,14 @@ def generate(args: argparse.Namespace) -> bool:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    if not accepted:
+        failed = "; ".join(
+            f"{item['id']}: observed={item['observed']!r} "
+            f"{item['operator']} limit={item['limit']!r}"
+            for item in checks
+            if not item["passed"]
+        )
+        print(f"failed DPDFNet platform checks: {failed}", file=sys.stderr)
     return accepted
 
 

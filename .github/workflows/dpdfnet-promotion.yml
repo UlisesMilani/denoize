@@ -179,6 +179,16 @@ jobs:
             --worker "$DENOIZE_EVIDENCE_DIR/worker.json" \
             --output "$DENOIZE_EVIDENCE_DIR/platform.json"
 
+      - name: Preserve rejected platform diagnostics
+        if: failure()
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dpdfnet-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Build and package experimental CLAP
         shell: bash
         run: |
