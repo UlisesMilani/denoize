@@ -53,14 +53,18 @@ const PLAYBACK_QUEUE_CHUNKS: u64 = 8;
 const RNNOISE_SAMPLE_RATE: u64 = 48_000;
 #[cfg(feature = "rnnoise")]
 const RNNOISE_FRAME_FRAMES: u64 = 480;
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn", feature = "dpdfnet"))]
 const STREAM_RESAMPLER_CHUNK_FRAMES: u64 = 1_024;
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn", feature = "dpdfnet"))]
 const STREAM_RESAMPLER_SUB_CHUNKS: u64 = 2;
 #[cfg(feature = "gtcrn")]
 const GTCRN_SAMPLE_RATE: u64 = crate::backend::gtcrn::SAMPLE_RATE as u64;
 #[cfg(feature = "gtcrn")]
 const GTCRN_HOP_FRAMES: u64 = crate::backend::gtcrn::HOP_SIZE as u64;
+#[cfg(feature = "dpdfnet")]
+const DPDFNET_SAMPLE_RATE: u64 = crate::backend::dpdfnet::SAMPLE_RATE as u64;
+#[cfg(feature = "dpdfnet")]
+const DPDFNET_HOP_FRAMES: u64 = crate::backend::dpdfnet::HOP_SIZE as u64;
 
 static CTRL_C_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
 static CTRL_C_SESSION: OnceLock<Mutex<Option<Weak<AtomicBool>>>> = OnceLock::new();
@@ -194,6 +198,13 @@ impl LiveConfig {
                 "disabled for the causal GTCRN realtime backend",
             ));
         }
+        #[cfg(feature = "dpdfnet")]
+        if self.backend == Backend::Dpdfnet && self.denoiser.vad {
+            return Err(ConfigError::invalid(
+                "vad",
+                "disabled for the causal DPDFNet realtime backend",
+            ));
+        }
         self.backend_options.validate_config(self.backend)
     }
 }
@@ -208,6 +219,8 @@ pub fn backend_is_live_capable(backend: Backend) -> bool {
         Backend::Rnnoise => true,
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => true,
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => true,
         _ => false,
     }
 }
@@ -300,6 +313,32 @@ fn maximum_ready_burst_frames(
                 checked_resource_add("live GTCRN ready burst", upstream_debt, second_src_debt)?;
             checked_resource_add("live GTCRN ready burst", chunk_frames, backlog)
         }
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => {
+            let first_src_debt =
+                stream_resampler_output_debt(sample_rate as u64, DPDFNET_SAMPLE_RATE)?;
+            // A partial hop, one full WOLA window, and the four-hop authenticated
+            // content offset may be retained together before aligned output.
+            let model_debt = DPDFNET_HOP_FRAMES
+                .checked_mul(crate::backend::dpdfnet::MODEL_LOOKAHEAD_HOPS as u64 + 2)
+                .and_then(|frames| frames.checked_sub(1))
+                .ok_or(ConfigError::ResourceOverflow {
+                    resource: "live DPDFNet ready burst",
+                })?;
+            let debt_at_model_rate =
+                checked_resource_add("live DPDFNet ready burst", first_src_debt, model_debt)?;
+            let upstream_debt = checked_ceil_scale(
+                "live DPDFNet ready burst",
+                debt_at_model_rate,
+                sample_rate as u64,
+                DPDFNET_SAMPLE_RATE,
+            )?;
+            let second_src_debt =
+                stream_resampler_output_debt(DPDFNET_SAMPLE_RATE, sample_rate as u64)?;
+            let backlog =
+                checked_resource_add("live DPDFNet ready burst", upstream_debt, second_src_debt)?;
+            checked_resource_add("live DPDFNet ready burst", chunk_frames, backlog)
+        }
         #[allow(unreachable_patterns)]
         _ => Err(ConfigError::invalid(
             "backend",
@@ -308,7 +347,7 @@ fn maximum_ready_burst_frames(
     }
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn", feature = "dpdfnet"))]
 fn stream_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, ConfigError> {
     if from_rate == to_rate {
         return Ok(0);
@@ -348,7 +387,7 @@ fn stream_resampler_output_debt(from_rate: u64, to_rate: u64) -> Result<u64, Con
     checked_resource_add("live RNNoise resampler quantum", delayed, 2)
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn", feature = "dpdfnet"))]
 fn checked_ceil_scale(
     resource: &'static str,
     value: u64,
@@ -368,7 +407,7 @@ fn checked_ceil_div(
     Ok(adjusted / denominator)
 }
 
-#[cfg(any(feature = "rnnoise", feature = "gtcrn"))]
+#[cfg(any(feature = "rnnoise", feature = "gtcrn", feature = "dpdfnet"))]
 fn greatest_common_divisor(mut lhs: u64, mut rhs: u64) -> u64 {
     while rhs != 0 {
         let remainder = lhs % rhs;

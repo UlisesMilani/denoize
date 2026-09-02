@@ -1089,6 +1089,8 @@ impl Entry for DenoizeEntry {
 struct DenoizeFactory {
     realtime: PluginDescriptor,
     neural: PluginDescriptor,
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    neural_hq: PluginDescriptor,
 }
 
 impl DenoizeFactory {
@@ -1096,19 +1098,27 @@ impl DenoizeFactory {
         Self {
             realtime: <DenoizePlugin as DefaultPluginFactory>::get_descriptor(),
             neural: <neural::NeuralPlugin as DefaultPluginFactory>::get_descriptor(),
+            #[cfg(feature = "experimental-dpdfnet-hq")]
+            neural_hq: <neural::NeuralHqPlugin as DefaultPluginFactory>::get_descriptor(),
         }
     }
 }
 
 impl PluginFactoryImpl for DenoizeFactory {
     fn plugin_count(&self) -> u32 {
-        2
+        if cfg!(feature = "experimental-dpdfnet-hq") {
+            3
+        } else {
+            2
+        }
     }
 
     fn plugin_descriptor(&self, index: u32) -> Option<&PluginDescriptor> {
         match index {
             0 => Some(&self.realtime),
             1 => Some(&self.neural),
+            #[cfg(feature = "experimental-dpdfnet-hq")]
+            2 => Some(&self.neural_hq),
             _ => None,
         }
     }
@@ -1133,6 +1143,15 @@ impl PluginFactoryImpl for DenoizeFactory {
                 <neural::NeuralPlugin as DefaultPluginFactory>::new_main_thread,
             ))
         } else {
+            #[cfg(feature = "experimental-dpdfnet-hq")]
+            if plugin_id == self.neural_hq.id().unwrap_or_default() {
+                return Some(PluginInstance::new::<neural::NeuralHqPlugin>(
+                    host_info,
+                    &self.neural_hq,
+                    <neural::NeuralHqPlugin as DefaultPluginFactory>::new_shared,
+                    <neural::NeuralHqPlugin as DefaultPluginFactory>::new_main_thread,
+                ));
+            }
             None
         }
     }
@@ -1326,7 +1345,14 @@ mod tests {
     #[test]
     fn bundle_exposes_stable_realtime_and_neural_plugin_ids() {
         let factory = DenoizeFactory::new();
-        assert_eq!(factory.plugin_count(), 2);
+        assert_eq!(
+            factory.plugin_count(),
+            if cfg!(feature = "experimental-dpdfnet-hq") {
+                3
+            } else {
+                2
+            }
+        );
         assert_eq!(
             factory
                 .plugin_descriptor(0)
@@ -1347,6 +1373,20 @@ mod tests {
                 .unwrap(),
             neural::NEURAL_PLUGIN_ID
         );
+        #[cfg(feature = "experimental-dpdfnet-hq")]
+        assert_eq!(
+            factory
+                .plugin_descriptor(2)
+                .unwrap()
+                .id()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            neural::NEURAL_HQ_PLUGIN_ID
+        );
+        #[cfg(feature = "experimental-dpdfnet-hq")]
+        assert!(factory.plugin_descriptor(3).is_none());
+        #[cfg(not(feature = "experimental-dpdfnet-hq"))]
         assert!(factory.plugin_descriptor(2).is_none());
     }
 

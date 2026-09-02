@@ -46,6 +46,18 @@ include = [
     "/scripts/validate-bsrnn.py",
     "/scripts/export-sgmse.py",
     "/scripts/validate-sgmse.py",
+    "/scripts/run-dpdfnet-gtcrn-poc.py",
+    "/scripts/run-dpdfnet-gtcrn-evaluation.py",
+    "/scripts/validate-dpdfnet-poc.py",
+    "/scripts/prepare-dpdfnet-blind-listening.py",
+    "/scripts/score-dpdfnet-blind-listening.py",
+    "/scripts/generate-dpdfnet-platform-evidence.py",
+    "/scripts/generate-dpdfnet-promotion-evidence.py",
+    "/scripts/fetch-dpdfnet-reporter-evidence.py",
+    "/scripts/test-dpdfnet-promotion-evidence.py",
+    "/scripts/package-dpdfnet-experimental-clap.sh",
+    "/scripts/test-reaper-dpdfnet-clap.ps1",
+    "/scripts/reaper-clap-parameter-smoke.lua",
     "/scripts/generate-cli-docs.sh",
     "/scripts/test-diagnostic-schemas.py",
     "/scripts/test-project-schemas.py",
@@ -68,6 +80,9 @@ include = [
     "/scripts/verify-release-evidence.sh",
     "/docs/cli.md",
     "/docs/diagnostics.md",
+    "/docs/dpdfnet-gtcrn-poc.md",
+    "/docs/dpdfnet-experimental-clap.md",
+    "/docs/dpdfnet-reporter-template.md",
     "/docs/evaluation.md",
     "/docs/json.md",
     "/docs/models.md",
@@ -94,6 +109,21 @@ include = [
 [lib]
 name = "denoize"
 path = "src/lib.rs"
+
+[[example]]
+name = "dpdfnet_gtcrn_poc"
+path = "examples/dpdfnet_gtcrn_poc.rs"
+required-features = ["dpdfnet", "gtcrn"]
+
+[[example]]
+name = "dpdfnet_gtcrn_matrix"
+path = "examples/dpdfnet_gtcrn_matrix.rs"
+required-features = ["dpdfnet", "gtcrn"]
+
+[[example]]
+name = "dpdfnet_gtcrn_stress"
+path = "examples/dpdfnet_gtcrn_stress.rs"
+required-features = ["dpdfnet", "gtcrn"]
 
 [[bin]]
 name = "denoize"
@@ -159,6 +189,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 
@@ -172,22 +203,23 @@ bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
+dpdfnet = ["onnx", "dep:rustfft"]
 accelerators = ["onnx", "dep:tract-metal", "dep:metal", "dep:tract-cuda", "dep:cudarc"]
 visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 live = ["dep:cpal"]
-full = ["rnnoise", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol", "live"]
+full = ["rnnoise", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "dpdfnet", "accelerators", "visqol", "live"]
 
 [dev-dependencies]
 minisign = "0.9.1"
 prost = "0.14"
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
+features = ["rnnoise", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "dpdfnet", "visqol"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("deepfilter", "live", "m4a-encode", "fdk-aac-encoder", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "visqol"))',
+    'cfg(feature, values("deepfilter", "live", "m4a-encode", "fdk-aac-encoder", "onnx", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "dpdfnet", "accelerators", "visqol"))',
 ] }
 
 [profile.release]

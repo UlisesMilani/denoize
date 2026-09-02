@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 
 use super::{Backend, BackendOptions, ChannelMode};
 use crate::config::{ConfigError, MAX_STREAM_BLOCK_FRAMES, MAX_STREAM_CHANNELS};
@@ -40,6 +41,18 @@ enum StreamingBackend {
     Mossformer2(Box<super::mossformer2::StreamingProcessor>),
     #[cfg(feature = "gtcrn")]
     Gtcrn(Box<super::gtcrn::StreamingProcessor>),
+    #[cfg(feature = "dpdfnet")]
+    Dpdfnet(Box<super::dpdfnet::StreamingProcessor>),
+}
+
+#[derive(Default)]
+struct StreamConstruction<'a> {
+    daw_host_rate: bool,
+    #[cfg(feature = "gtcrn")]
+    gtcrn: Option<&'a super::gtcrn::GtcrnModel>,
+    #[cfg(feature = "dpdfnet")]
+    dpdfnet: Option<&'a super::dpdfnet::DpdfnetModel>,
+    marker: PhantomData<&'a ()>,
 }
 
 impl StreamingBackendSession {
@@ -56,6 +69,8 @@ impl StreamingBackendSession {
             Backend::Mossformer2 => true,
             #[cfg(feature = "gtcrn")]
             Backend::Gtcrn => true,
+            #[cfg(feature = "dpdfnet")]
+            Backend::Dpdfnet => true,
             _ => false,
         }
     }
@@ -100,9 +115,7 @@ impl StreamingBackendSession {
             denoiser,
             backend_options,
             accelerator,
-            false,
-            #[cfg(feature = "gtcrn")]
-            None,
+            StreamConstruction::default(),
         )
     }
 
@@ -149,8 +162,10 @@ impl StreamingBackendSession {
             denoiser,
             backend_options,
             accelerator,
-            true,
-            None,
+            StreamConstruction {
+                daw_host_rate: true,
+                ..StreamConstruction::default()
+            },
         )
     }
 
@@ -202,8 +217,68 @@ impl StreamingBackendSession {
             denoiser,
             backend_options,
             accelerator,
-            daw_host_rate,
-            Some(model),
+            StreamConstruction {
+                daw_host_rate,
+                gtcrn: Some(model),
+                ..StreamConstruction::default()
+            },
+        )
+    }
+
+    /// Construct a DPDFNet-2 stream at the bounded DAW host-rate limit.
+    #[cfg(feature = "dpdfnet")]
+    pub fn new_dpdfnet_for_daw(
+        sample_rate: u32,
+        channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+    ) -> Result<Self, String> {
+        let backend = Backend::Dpdfnet;
+        let accelerator = select_accelerator_for_options(backend, &backend_options)?;
+        Self::new_with_accelerator_inner(
+            backend,
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            accelerator,
+            StreamConstruction {
+                daw_host_rate: true,
+                ..StreamConstruction::default()
+            },
+        )
+    }
+
+    /// Create a prepared DPDFNet-2 stream at the bounded DAW host-rate limit.
+    #[cfg(feature = "dpdfnet")]
+    pub fn new_dpdfnet_for_daw_with_prepared_model(
+        sample_rate: u32,
+        channels: usize,
+        denoiser: DenoiserConfig,
+        backend_options: BackendOptions,
+        model: &super::dpdfnet::DpdfnetModel,
+    ) -> Result<Self, String> {
+        let backend = Backend::Dpdfnet;
+        let accelerator = select_accelerator_for_options(backend, &backend_options)?;
+        if model.runtime() != accelerator.effective() {
+            return Err(format!(
+                "prepared DPDFNet graph uses {}, but the effective stream runtime is {}",
+                model.runtime().name(),
+                accelerator.effective().name()
+            ));
+        }
+        Self::new_with_accelerator_inner(
+            backend,
+            sample_rate,
+            channels,
+            denoiser,
+            backend_options,
+            accelerator,
+            StreamConstruction {
+                daw_host_rate: true,
+                dpdfnet: Some(model),
+                ..StreamConstruction::default()
+            },
         )
     }
 
@@ -214,8 +289,7 @@ impl StreamingBackendSession {
         mut denoiser: DenoiserConfig,
         backend_options: BackendOptions,
         accelerator: AcceleratorSelection,
-        daw_host_rate: bool,
-        #[cfg(feature = "gtcrn")] prepared_gtcrn: Option<&super::gtcrn::GtcrnModel>,
+        construction: StreamConstruction<'_>,
     ) -> Result<Self, String> {
         if channels == 0 || channels > MAX_STREAM_CHANNELS {
             return Err(format!(
@@ -226,7 +300,7 @@ impl StreamingBackendSession {
             return Err("selected backend does not support stateful streaming".into());
         }
         denoiser.sample_rate = sample_rate;
-        if daw_host_rate {
+        if construction.daw_host_rate {
             denoiser
                 .validate_daw_config()
                 .map_err(|error| error.to_string())?;
@@ -270,8 +344,7 @@ impl StreamingBackendSession {
             &processor_denoiser,
             &backend_options,
             accelerator,
-            #[cfg(feature = "gtcrn")]
-            prepared_gtcrn,
+            &construction,
         )?;
         Ok(Self {
             backend,
@@ -389,6 +462,20 @@ impl StreamingBackendSession {
                         resource: "GTCRN stream state",
                     })
             }
+            #[cfg(feature = "dpdfnet")]
+            Backend::Dpdfnet => {
+                let resamplers = resampler_pair_bytes(
+                    processor_channels,
+                    sample_rate,
+                    super::dpdfnet::SAMPLE_RATE,
+                    "DPDFNet stream resamplers",
+                )?;
+                resamplers
+                    .checked_add(super::dpdfnet::streaming_state_bytes(processor_channels)?)
+                    .ok_or(ConfigError::ResourceOverflow {
+                        resource: "DPDFNet stream state",
+                    })
+            }
             #[allow(unreachable_patterns)]
             _ => Err(ConfigError::invalid(
                 "backend",
@@ -439,6 +526,8 @@ impl StreamingBackendSession {
             StreamingBackend::Mossformer2(processor) => processor.finish(),
             #[cfg(feature = "gtcrn")]
             StreamingBackend::Gtcrn(processor) => processor.finish(),
+            #[cfg(feature = "dpdfnet")]
+            StreamingBackend::Dpdfnet(processor) => processor.finish(),
         }?;
         let output = self.restore_channel_mode(processed)?;
         let output = if let Some(vad) = &mut self.vad {
@@ -473,6 +562,8 @@ impl StreamingBackendSession {
             StreamingBackend::Mossformer2(processor) => processor.reset(),
             #[cfg(feature = "gtcrn")]
             StreamingBackend::Gtcrn(processor) => processor.reset(),
+            #[cfg(feature = "dpdfnet")]
+            StreamingBackend::Dpdfnet(processor) => processor.reset(),
         }
         self.linked_original.clear();
         if let Some(vad) = &mut self.vad {
@@ -489,7 +580,7 @@ impl StreamingBackendSession {
         denoiser: &DenoiserConfig,
         backend_options: &BackendOptions,
         accelerator: AcceleratorSelection,
-        #[cfg(feature = "gtcrn")] prepared_gtcrn: Option<&super::gtcrn::GtcrnModel>,
+        construction: &StreamConstruction<'_>,
     ) -> Result<StreamingBackend, String> {
         let _ = (sample_rate, backend_options, accelerator);
         match backend {
@@ -525,7 +616,7 @@ impl StreamingBackendSession {
                     .onnx
                     .as_ref()
                     .ok_or_else(|| "GTCRN streaming requires the managed ONNX model".to_string())?;
-                let processor = if let Some(prepared) = prepared_gtcrn {
+                let processor = if let Some(prepared) = construction.gtcrn {
                     super::gtcrn::StreamingProcessor::new_with_model(
                         prepared,
                         sample_rate,
@@ -540,6 +631,27 @@ impl StreamingBackendSession {
                     )?
                 };
                 Ok(StreamingBackend::Gtcrn(Box::new(processor)))
+            }
+            #[cfg(feature = "dpdfnet")]
+            Backend::Dpdfnet => {
+                let model = backend_options.onnx.as_ref().ok_or_else(|| {
+                    "DPDFNet streaming requires the managed ONNX model".to_string()
+                })?;
+                let processor = if let Some(prepared) = construction.dpdfnet {
+                    super::dpdfnet::StreamingProcessor::new_with_model(
+                        prepared,
+                        sample_rate,
+                        channels,
+                    )?
+                } else {
+                    super::dpdfnet::StreamingProcessor::new_with_accelerator(
+                        model,
+                        sample_rate,
+                        channels,
+                        accelerator.effective(),
+                    )?
+                };
+                Ok(StreamingBackend::Dpdfnet(Box::new(processor)))
             }
             #[allow(unreachable_patterns)]
             _ => Err("selected backend does not support stateful streaming".into()),
@@ -609,6 +721,8 @@ impl StreamingBackendSession {
             StreamingBackend::Mossformer2(processor) => processor.process_block(&backend_input),
             #[cfg(feature = "gtcrn")]
             StreamingBackend::Gtcrn(processor) => processor.process_block(&backend_input),
+            #[cfg(feature = "dpdfnet")]
+            StreamingBackend::Dpdfnet(processor) => processor.process_block(&backend_input),
         }?;
         let processed = self.restore_channel_mode(processed)?;
         if let Some(vad) = &mut self.vad {
@@ -671,7 +785,8 @@ impl StreamingBackendSession {
     feature = "rnnoise",
     feature = "deepfilter",
     feature = "mossformer2",
-    feature = "gtcrn"
+    feature = "gtcrn",
+    feature = "dpdfnet"
 ))]
 fn resampler_pair_bytes(
     channels: usize,

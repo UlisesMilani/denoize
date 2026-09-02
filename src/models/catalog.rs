@@ -430,7 +430,7 @@ pub fn active_catalog() -> Result<ModelCatalog, String> {
 /// This is used by read-only execution planning. A concurrent catalog update
 /// may make the snapshot stale, so execution always resolves and fences its
 /// own catalog/model state again before publishing output.
-#[cfg(feature = "gtcrn")]
+#[cfg(any(feature = "gtcrn", feature = "dpdfnet"))]
 pub(crate) fn active_catalog_read_only() -> Result<ModelCatalog, String> {
     validate_catalog_storage_path()?;
     let directory = catalog_directory()?;
@@ -1649,13 +1649,13 @@ mod tests {
     }
 
     #[test]
-    fn production_catalog_sequence_two_authenticates_offline_bundle_evidence() {
+    fn production_catalog_sequence_three_authenticates_offline_bundle_evidence() {
         let catalog = parse_catalog(
             include_bytes!("../../models/catalog-v1.json"),
             CatalogOrigin::Embedded,
         )
         .unwrap();
-        assert_eq!(catalog.sequence(), 2);
+        assert_eq!(catalog.sequence(), 3);
         assert_eq!(catalog.issued_at_unix_seconds(), Some(1_786_665_600));
         assert_eq!(catalog.expires_at_unix_seconds(), Some(1_802_217_600));
         let model = catalog.find("gtcrn-dns3").unwrap();
@@ -1667,10 +1667,21 @@ mod tests {
             "c467165e5860b4a7494ef4a6e2788e4115d95b5b8989bb5f86287089adddf794"
         );
         assert_eq!(bundle.provenance().filename(), "gtcrn-dns3.json");
+
+        let dpdfnet = catalog.find("dpdfnet").unwrap();
+        assert_eq!(dpdfnet.name(), "dpdfnet2-48khz-hr");
+        assert_eq!(dpdfnet.sample_rate(), 48_000);
+        assert_eq!(dpdfnet.license(), "Apache-2.0");
+        let bundle = dpdfnet.offline_bundle().unwrap();
+        assert_eq!(
+            bundle.license().filename(),
+            "dpdfnet2-48khz-hr-Apache-2.0.txt"
+        );
+        assert_eq!(bundle.provenance().filename(), "dpdfnet2-48khz-hr.json");
         assert_eq!(bundle.provenance().size_bytes(), 749);
         assert_eq!(
             bundle.provenance().sha256(),
-            "af0b088d7a32abb626750e753d1d19bdffe86d0a5cd06651ef0ef9ad0a291c41"
+            "b10eee2338468ac824dcb6f76517b2e5b1d58ae286e1c1e371a83da8dab45c71"
         );
     }
 

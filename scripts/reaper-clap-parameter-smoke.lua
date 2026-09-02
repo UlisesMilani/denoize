@@ -31,6 +31,28 @@ if track == nil then
   return
 end
 
+-- Neural inference is a live, stateful path.  REAPER normally permits track
+-- FX to run anticipatively, which deliberately invokes the processor faster
+-- than wall clock and is therefore not a real-time deadline measurement.
+-- Keep media buffering unchanged, but force this test track onto REAPER's
+-- live-FX scheduling path before adding media or the plug-in.
+local performance_flags = math.floor(
+  reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
+)
+local performance_set = reaper.SetMediaTrackInfo_Value(
+  track,
+  "I_PERFFLAGS",
+  performance_flags | 2
+)
+local observed_performance_flags = math.floor(
+  reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
+)
+write_line(
+  "performance",
+  "no-anticipative-fx",
+  tostring(performance_set and (observed_performance_flags & 2) == 2)
+)
+
 local audio_path = os.getenv("DENOIZE_REAPER_AUDIO")
 if audio_path ~= nil and audio_path ~= "" then
   reaper.SetOnlyTrackSelected(track)
@@ -156,6 +178,11 @@ local function verify_after_host_flush()
   end
 
   write_line("summary", failures)
+  if os.getenv("DENOIZE_REAPER_REMOVE_FX") == "1" then
+    local removed = reaper.TrackFX_Delete(track, fx)
+    write_line("removed", tostring(removed))
+  end
+  write_line("complete", failures)
   result:close()
 end
 
@@ -249,8 +276,17 @@ if set_delay <= 0 then
 end
 
 local play_delay = tonumber(os.getenv("DENOIZE_REAPER_PLAY_DELAY") or "0") or 0
+local playback_started = nil
 local function start_playback()
+  local repeat_enabled = os.getenv("DENOIZE_REAPER_REPEAT") == "1"
+  reaper.GetSetRepeat(repeat_enabled and 1 or 0)
+  write_line(
+    "transport",
+    "repeat",
+    tostring(reaper.GetSetRepeat(-1) == 1)
+  )
   reaper.Main_OnCommand(1007, 0)
+  playback_started = reaper.time_precise()
   write_line("play", reaper.GetPlayState())
 end
 
@@ -271,9 +307,9 @@ if os.getenv("DENOIZE_REAPER_PLAY") == "1" then
 end
 
 if set_delay > 0 then
-  local play_started = reaper.time_precise()
   local function set_after_delay()
-    if reaper.time_precise() - play_started < set_delay then
+    if playback_started == nil or
+      reaper.time_precise() - playback_started < set_delay then
       reaper.defer(set_after_delay)
       return
     end

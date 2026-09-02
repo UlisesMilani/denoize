@@ -18,10 +18,15 @@ use crossbeam_queue::ArrayQueue;
 use denoize::{
     AcceleratorRuntime, Backend, BackendOptions, ChannelMode, DenoiserConfig, GtcrnModel,
     NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID,
-    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NeuralDawOverloadFallback as OverloadFallback,
-    NeuralDawParameters as NeuralParameters, NeuralDawPortConfiguration as NeuralPortConfiguration,
+    NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, NeuralDawModel,
+    NeuralDawOverloadFallback as OverloadFallback, NeuralDawParameters as NeuralParameters,
+    NeuralDawPortConfiguration as NeuralPortConfiguration,
     NeuralDawSessionState as NeuralSessionState, OnnxModelConfig, StreamingBackendSession,
     neural_daw_chunk_frames, select_accelerator_for_options,
+};
+#[cfg(feature = "experimental-dpdfnet-hq")]
+use denoize::{
+    DpdfnetModel, NEURAL_HQ_DAW_MODEL_ID, NEURAL_HQ_DAW_MODEL_SHA256, NEURAL_HQ_DAW_PLUGIN_ID,
 };
 use denoize_plugin_editor::{ControlKind, DisplayUnit, EditorModel, ParameterSpec, PluginEditor};
 use std::collections::VecDeque;
@@ -34,14 +39,18 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub(crate) const NEURAL_PLUGIN_ID: &str = NEURAL_DAW_PLUGIN_ID;
+#[cfg(feature = "experimental-dpdfnet-hq")]
+pub(crate) const NEURAL_HQ_PLUGIN_ID: &str = NEURAL_HQ_DAW_PLUGIN_ID;
 const STATE_LIMIT_BYTES: u64 = 64 * 1024;
 const MODEL_ID: &str = NEURAL_DAW_MODEL_ID;
 const LATENCY_CHUNKS: u32 = NEURAL_DAW_LATENCY_CHUNKS;
 const QUEUE_BLOCKS: usize = 16;
 const BLOCK_POOL_SIZE: usize = 40;
+const WORKER_WARMUP_EXTRA_BLOCKS: usize = QUEUE_BLOCKS + 8;
 const WORKER_POLL: Duration = Duration::from_micros(100);
 const MAX_SAMPLE_RATE: u32 = NEURAL_DAW_MAX_SAMPLE_RATE;
 const MAX_OUTPUT_PEAK: f64 = 4.0;
+const HOST_EVIDENCE_WARMUP_LATENCIES: u64 = 4;
 
 const MONO_CONFIG_ID: ClapId = ClapId::new(101);
 const STEREO_CONFIG_ID: ClapId = ClapId::new(102);
@@ -104,6 +113,8 @@ const EDITOR_PARAMETERS: &[ParameterSpec] = &[
 ];
 
 pub(crate) struct NeuralPlugin;
+#[cfg(feature = "experimental-dpdfnet-hq")]
+pub(crate) struct NeuralHqPlugin;
 
 impl Plugin for NeuralPlugin {
     type AudioProcessor<'a> = NeuralAudioProcessor<'a>;
@@ -138,7 +149,62 @@ impl DefaultPluginFactory for NeuralPlugin {
     }
 
     fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {
-        NeuralShared::new()
+        NeuralShared::new_for_model(NeuralDawModel::Gtcrn)
+    }
+
+    fn new_main_thread<'a>(
+        host: HostMainThreadHandle<'a>,
+        shared: &'a Self::Shared<'a>,
+    ) -> Result<Self::MainThread<'a>, PluginError> {
+        let host_gui = host.get_extension::<HostGui>();
+        Ok(NeuralMainThread {
+            host,
+            shared,
+            host_gui,
+            editor: None,
+            pending_automation: None,
+            port_configuration: NeuralPortConfiguration::Stereo,
+            latency_frames: 0,
+        })
+    }
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+impl Plugin for NeuralHqPlugin {
+    type AudioProcessor<'a> = NeuralAudioProcessor<'a>;
+    type Shared<'a> = NeuralShared;
+    type MainThread<'a> = NeuralMainThread<'a>;
+
+    fn declare_extensions(
+        builder: &mut PluginExtensions<Self>,
+        _shared: Option<&Self::Shared<'_>>,
+    ) {
+        builder
+            .register::<PluginAudioPorts>()
+            .register::<PluginAudioPortsConfig>()
+            .register::<PluginAudioPortsConfigInfo>()
+            .register::<super::gui_contract::DenoizePluginGui>()
+            .register::<PluginParams>()
+            .register::<PluginState>()
+            .register::<PluginLatency>();
+    }
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+impl DefaultPluginFactory for NeuralHqPlugin {
+    fn get_descriptor() -> PluginDescriptor {
+        use clack_plugin::plugin::features::*;
+
+        PluginDescriptor::new(NEURAL_HQ_PLUGIN_ID, "denoize Neural HQ")
+            .with_vendor("denoize")
+            .with_url("https://github.com/penguin425/denoize")
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_description("Experimental off-callback DPDFNet-2 fullband speech restoration")
+            .with_features([AUDIO_EFFECT, RESTORATION, MONO, STEREO])
+    }
+
+    fn new_shared(_host: HostSharedHandle<'_>) -> Result<Self::Shared<'_>, PluginError> {
+        NeuralShared::new_for_model(NeuralDawModel::Dpdfnet2)
     }
 
     fn new_main_thread<'a>(
@@ -159,6 +225,7 @@ impl DefaultPluginFactory for NeuralPlugin {
 }
 
 pub(crate) struct NeuralShared {
+    model: NeuralDawModel,
     parameters: SharedParameters,
     reset_generation: AtomicU64,
     overload_blocks: AtomicU64,
@@ -167,10 +234,37 @@ pub(crate) struct NeuralShared {
     worker_errors: Arc<AtomicU64>,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct WorkerMetrics {
+    overload_blocks: u64,
+    late_blocks: u64,
+    invalid_blocks: u64,
+    worker_errors: u64,
+}
+
+impl WorkerMetrics {
+    fn saturating_since(self, baseline: Self) -> Self {
+        Self {
+            overload_blocks: self
+                .overload_blocks
+                .saturating_sub(baseline.overload_blocks),
+            late_blocks: self.late_blocks.saturating_sub(baseline.late_blocks),
+            invalid_blocks: self.invalid_blocks.saturating_sub(baseline.invalid_blocks),
+            worker_errors: self.worker_errors.saturating_sub(baseline.worker_errors),
+        }
+    }
+}
+
 impl NeuralShared {
+    #[cfg(test)]
     fn new() -> Result<Self, PluginError> {
+        Self::new_for_model(NeuralDawModel::Gtcrn)
+    }
+
+    fn new_for_model(model: NeuralDawModel) -> Result<Self, PluginError> {
         Ok(Self {
-            parameters: SharedParameters::new(NeuralParameters::default())?,
+            model,
+            parameters: SharedParameters::new(NeuralParameters::default(), model.display_name())?,
             reset_generation: AtomicU64::new(1),
             overload_blocks: AtomicU64::new(0),
             late_blocks: AtomicU64::new(0),
@@ -182,6 +276,15 @@ impl NeuralShared {
     fn restore(&self, parameters: NeuralParameters) {
         self.parameters.store(parameters);
         self.reset_generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn worker_metrics(&self) -> WorkerMetrics {
+        WorkerMetrics {
+            overload_blocks: self.overload_blocks.load(Ordering::Relaxed),
+            late_blocks: self.late_blocks.load(Ordering::Relaxed),
+            invalid_blocks: self.invalid_blocks.load(Ordering::Relaxed),
+            worker_errors: self.worker_errors.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -428,9 +531,12 @@ impl PluginLatencyImpl for NeuralMainThread<'_> {
 
 impl PluginStateImpl for NeuralMainThread<'_> {
     fn save(&mut self, output: &mut OutputStream) -> Result<(), PluginError> {
-        let state =
-            NeuralSessionState::new(self.port_configuration, self.shared.parameters.snapshot())
-                .map_err(invalid_state)?;
+        let state = NeuralSessionState::new_for_model(
+            self.shared.model,
+            self.port_configuration,
+            self.shared.parameters.snapshot(),
+        )
+        .map_err(invalid_state)?;
         let bytes = state.to_canonical_bytes().map_err(invalid_state)?;
         if bytes.len() as u64 > STATE_LIMIT_BYTES {
             return Err(PluginError::Message("denoize Neural state exceeds 64 KiB"));
@@ -446,6 +552,9 @@ impl PluginStateImpl for NeuralMainThread<'_> {
             return Err(PluginError::Message("denoize Neural state exceeds 64 KiB"));
         }
         let state = NeuralSessionState::from_bytes(&bytes).map_err(invalid_state)?;
+        state
+            .validate_for_model(self.shared.model)
+            .map_err(invalid_state)?;
         let changed_ports = state.port_configuration != self.port_configuration;
         self.port_configuration = state.port_configuration;
         self.shared.restore(state.parameters);
@@ -474,9 +583,9 @@ struct SharedParameters {
 }
 
 impl SharedParameters {
-    fn new(parameters: NeuralParameters) -> Result<Self, PluginError> {
+    fn new(parameters: NeuralParameters, display_name: &'static str) -> Result<Self, PluginError> {
         let editor = EditorModel::new(
-            "denoize Neural",
+            display_name,
             EDITOR_PARAMETERS,
             &[
                 f64::from(bool_value(parameters.bypass)),
@@ -761,8 +870,8 @@ impl<'a> PluginAudioProcessor<'a, NeuralShared, NeuralMainThread<'a>> for Neural
     ) -> Result<Self, PluginError> {
         let sample_rate = validated_sample_rate(audio_config.sample_rate).map_err(invalid_state)?;
         let channels = main_thread.port_configuration.channels();
-        let engine =
-            NeuralEngine::new_gtcrn(sample_rate, channels, shared).map_err(invalid_state)?;
+        let engine = NeuralEngine::new_model(shared.model, sample_rate, channels, shared)
+            .map_err(invalid_state)?;
         main_thread.latency_frames = engine.latency_frames;
         Ok(Self {
             shared,
@@ -932,6 +1041,32 @@ trait BlockProcessor: Send {
     fn reset(&mut self) -> Result<(), String>;
 }
 
+fn warm_up_block_processor(
+    processor: &mut dyn BlockProcessor,
+    channels: usize,
+    frames: usize,
+) -> Result<(), String> {
+    let input = vec![vec![0.0; frames]; channels];
+    let output = processor
+        .process(&input)
+        .map_err(|error| format!("warm up neural inference worker: {error}"))?;
+    // Streaming backends may retain their look-ahead tail until `finish`, so a
+    // successful warm-up can legitimately return fewer frames than it accepts.
+    let output_frames = output.first().map_or(0, Vec::len);
+    if output.len() != channels
+        || output_frames == 0
+        || output_frames > frames
+        || output.iter().any(|channel| {
+            channel.len() != output_frames || channel.iter().any(|sample| !sample.is_finite())
+        })
+    {
+        return Err("neural inference worker returned invalid warm-up output".to_owned());
+    }
+    processor
+        .reset()
+        .map_err(|error| format!("reset neural inference worker after warm-up: {error}"))
+}
+
 struct GtcrnProcessor(StreamingBackendSession);
 
 static GTCRN_MODEL_CACHE: OnceLock<Mutex<Option<GtcrnModel>>> = OnceLock::new();
@@ -1013,6 +1148,93 @@ fn gtcrn_model() -> Result<&'static denoize::models::ModelInfo, String> {
         .ok_or_else(|| "this build does not contain the pinned GTCRN model identity".to_owned())
 }
 
+#[cfg(feature = "experimental-dpdfnet-hq")]
+struct DpdfnetProcessor(StreamingBackendSession);
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+static DPDFNET_MODEL_CACHE: OnceLock<Mutex<Option<DpdfnetModel>>> = OnceLock::new();
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+impl DpdfnetProcessor {
+    fn new(sample_rate: u32, channels: usize) -> Result<Self, String> {
+        let model = dpdfnet_model()?;
+        let path = denoize::models::verify(model).map_err(|error| {
+            format!(
+                "DPDFNet model is unavailable ({error}); run `denoize models install dpdfnet` before activating denoize Neural HQ"
+            )
+        })?;
+        let mut options = BackendOptions {
+            onnx: Some(OnnxModelConfig {
+                path,
+                sample_rate: model.sample_rate,
+            }),
+            deterministic: true,
+            ..BackendOptions::default()
+        };
+        if channels == 2 {
+            options.channel_mode = ChannelMode::StereoLinked;
+        }
+        let accelerator = select_accelerator_for_options(Backend::Dpdfnet, &options)?;
+        let Some(model_config) = options.onnx.as_ref() else {
+            return Err("internal DPDFNet model options are unavailable".to_owned());
+        };
+        let prepared = prepared_dpdfnet_model(model_config, accelerator.effective())?;
+        let mut denoiser = DenoiserConfig::default(sample_rate);
+        denoiser.vad = false;
+        Ok(Self(
+            StreamingBackendSession::new_dpdfnet_for_daw_with_prepared_model(
+                sample_rate,
+                channels,
+                denoiser,
+                options,
+                &prepared,
+            )?,
+        ))
+    }
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+fn prepared_dpdfnet_model(
+    config: &OnnxModelConfig,
+    runtime: AcceleratorRuntime,
+) -> Result<DpdfnetModel, String> {
+    let cache = DPDFNET_MODEL_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "denoize Neural HQ compiled-model cache lock was poisoned".to_owned())?;
+    if let Some(cached) = cached.as_ref()
+        && cached.runtime() == runtime
+    {
+        return Ok(cached.clone());
+    }
+    let model = DpdfnetModel::load_dpdfnet2_with_accelerator(config, runtime)?;
+    *cached = Some(model.clone());
+    Ok(model)
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+impl BlockProcessor for DpdfnetProcessor {
+    fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        self.0.process_block(channels)
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        self.0.reset()
+    }
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+fn dpdfnet_model() -> Result<&'static denoize::models::ModelInfo, String> {
+    denoize::models::MODELS
+        .iter()
+        .find(|model| {
+            model.name == NEURAL_HQ_DAW_MODEL_ID
+                && model.backend == "dpdfnet"
+                && model.sha256 == NEURAL_HQ_DAW_MODEL_SHA256
+        })
+        .ok_or_else(|| "this build does not contain the pinned DPDFNet model identity".to_owned())
+}
+
 struct NeuralEngine<'a> {
     channels: usize,
     chunk_frames: usize,
@@ -1027,14 +1249,31 @@ struct NeuralEngine<'a> {
     dry_delay: Vec<f64>,
     dry_cursor: usize,
     input_frame: u64,
+    processed_frames: u64,
+    activated_at: std::time::Instant,
+    host_evidence_warmup_frames: u64,
+    host_evidence_baseline: Option<WorkerMetrics>,
     generation: u64,
     last_safe_gain: [f64; 2],
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    worker_started: bool,
     metrics: &'a NeuralShared,
 }
 
 impl<'a> NeuralEngine<'a> {
+    fn new_model(
+        model: NeuralDawModel,
+        sample_rate: f64,
+        channels: usize,
+        metrics: &'a NeuralShared,
+    ) -> Result<Self, String> {
+        match model {
+            NeuralDawModel::Gtcrn => Self::new_gtcrn(sample_rate, channels, metrics),
+            NeuralDawModel::Dpdfnet2 => Self::new_dpdfnet(sample_rate, channels, metrics),
+        }
+    }
+
     fn new_gtcrn(
         sample_rate: f64,
         channels: usize,
@@ -1045,6 +1284,28 @@ impl<'a> NeuralEngine<'a> {
             GtcrnProcessor::new(backend_sample_rate, channels)
                 .map(|processor| Box::new(processor) as Box<dyn BlockProcessor>)
         })
+    }
+
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn new_dpdfnet(
+        sample_rate: f64,
+        channels: usize,
+        metrics: &'a NeuralShared,
+    ) -> Result<Self, String> {
+        let backend_sample_rate = sample_rate.round() as u32;
+        Self::new_with_factory(sample_rate, channels, metrics, move || {
+            DpdfnetProcessor::new(backend_sample_rate, channels)
+                .map(|processor| Box::new(processor) as Box<dyn BlockProcessor>)
+        })
+    }
+
+    #[cfg(not(feature = "experimental-dpdfnet-hq"))]
+    fn new_dpdfnet(
+        _sample_rate: f64,
+        _channels: usize,
+        _metrics: &'a NeuralShared,
+    ) -> Result<Self, String> {
+        Err("this CLAP build does not enable the experimental DPDFNet HQ descriptor".to_owned())
     }
 
     fn new_with_factory<F>(
@@ -1066,6 +1327,10 @@ impl<'a> NeuralEngine<'a> {
             .ok_or_else(|| "neural plug-in latency geometry overflow".to_owned())?;
         let latency_frames = u32::try_from(latency_frames_usize)
             .map_err(|_| "neural plug-in latency exceeds the CLAP contract".to_owned())?;
+        let warmup_frames = chunk_frames
+            .checked_mul(WORKER_WARMUP_EXTRA_BLOCKS)
+            .and_then(|extra| latency_frames_usize.checked_add(extra))
+            .ok_or_else(|| "neural worker warm-up geometry overflow".to_owned())?;
         let samples_per_block = chunk_frames
             .checked_mul(channels)
             .ok_or_else(|| "neural plug-in block geometry overflow".to_owned())?;
@@ -1114,10 +1379,15 @@ impl<'a> NeuralEngine<'a> {
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
-                let mut processor = match factory() {
-                    Ok(processor) => {
+                let (mut processor, priority_guard) = match factory().and_then(|mut processor| {
+                    warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
+                    let priority_guard =
+                        denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+                    Ok((processor, priority_guard))
+                }) {
+                    Ok(initialized) => {
                         let _ = ready_tx.send(Ok(()));
-                        processor
+                        initialized
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -1132,22 +1402,40 @@ impl<'a> NeuralEngine<'a> {
                     worker_running,
                     worker_errors,
                 );
+                drop(priority_guard);
             })
             .map_err(|error| format!("start neural inference worker: {error}"))?;
         let worker = match ready_rx.recv() {
             Ok(Ok(())) => Some(worker),
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(error)) => {
                 // Some hosts only deliver parameter changes while the audio
                 // processor is active. Keep the fixed-latency fallback path
                 // alive when the authenticated model cannot be prepared so
                 // their generic and accessibility parameter surfaces remain
                 // usable; no neural inference runs in this state.
+                eprintln!("denoize Neural worker startup error: {error}");
+                metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+                running.store(false, Ordering::Release);
+                let _ = worker.join();
+                None
+            }
+            Err(error) => {
+                eprintln!("denoize Neural worker startup handshake error: {error}");
                 metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
                 running.store(false, Ordering::Release);
                 let _ = worker.join();
                 None
             }
         };
+        let worker_started = worker.is_some();
+        let host_evidence_warmup_frames =
+            if std::env::var_os("DENOIZE_NEURAL_HOST_EVIDENCE").is_some() {
+                u64::from(latency_frames).saturating_mul(HOST_EVIDENCE_WARMUP_LATENCIES)
+            } else {
+                0
+            };
+        let host_evidence_baseline =
+            (host_evidence_warmup_frames == 0).then(WorkerMetrics::default);
 
         Ok(Self {
             channels,
@@ -1163,10 +1451,15 @@ impl<'a> NeuralEngine<'a> {
             dry_delay,
             dry_cursor: 0,
             input_frame: 0,
+            processed_frames: 0,
+            activated_at: std::time::Instant::now(),
+            host_evidence_warmup_frames,
+            host_evidence_baseline,
             generation: 1,
             last_safe_gain: [1.0; 2],
             running,
             worker,
+            worker_started,
             metrics,
         })
     }
@@ -1234,6 +1527,12 @@ impl<'a> NeuralEngine<'a> {
 
         self.capture_frames += 1;
         self.input_frame = self.input_frame.wrapping_add(1);
+        self.processed_frames = self.processed_frames.saturating_add(1);
+        if self.host_evidence_baseline.is_none()
+            && self.processed_frames >= self.host_evidence_warmup_frames
+        {
+            self.host_evidence_baseline = Some(self.metrics.worker_metrics());
+        }
         if self.capture_frames == self.chunk_frames {
             self.submit_capture();
         }
@@ -1338,6 +1637,14 @@ impl<'a> NeuralEngine<'a> {
         while let Some(result) = self.ready.pop_front() {
             self.recycle(result.block);
         }
+        // A transport reset starts a new stream generation. Reclaim queued
+        // input from the previous generation immediately so the worker does
+        // not spend the new stream's latency budget processing stale audio.
+        // The queue is fixed-size and CLAP only calls reset while processing
+        // is stopped, so this remains bounded and cannot race a new callback.
+        while let Some(block) = self.input_queue.pop() {
+            self.recycle(block);
+        }
         while let Some(result) = self.output_queue.pop() {
             self.recycle(result.block);
         }
@@ -1354,6 +1661,84 @@ impl<'a> NeuralEngine<'a> {
 impl Drop for NeuralEngine<'_> {
     fn drop(&mut self) {
         self.stop();
+        // REAPER may activate and immediately deactivate the processor while
+        // changing audio devices. That zero-frame probe must not claim the
+        // single evidence path before the activation that actually ran audio.
+        if self.should_write_host_evidence() {
+            self.write_host_evidence();
+        }
+    }
+}
+
+impl NeuralEngine<'_> {
+    fn should_write_host_evidence(&self) -> bool {
+        self.processed_frames > self.host_evidence_warmup_frames
+    }
+
+    fn write_host_evidence(&self) {
+        let Ok(path) = std::env::var("DENOIZE_NEURAL_HOST_EVIDENCE") else {
+            return;
+        };
+        let lifetime_metrics = self.metrics.worker_metrics();
+        let baseline = self.host_evidence_baseline.unwrap_or(lifetime_metrics);
+        let measured_metrics = lifetime_metrics.saturating_since(baseline);
+        let measured_frames = self
+            .processed_frames
+            .saturating_sub(self.host_evidence_warmup_frames);
+        let document = serde_json::json!({
+            "schema": "denoize-dpdfnet-clap-host-run-v1",
+            "schema_version": 1,
+            "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
+            "model_id": self.metrics.model.model_id(),
+            "model_sha256": self.metrics.model.model_sha256(),
+            "plugin_id": self.metrics.model.plugin_id(),
+            "sample_rate_hz": self.chunk_frames * 100,
+            "channels": self.channels,
+            "chunk_frames": self.chunk_frames,
+            "latency_frames": self.latency_frames,
+            "processed_frames": self.processed_frames,
+            "active_seconds": self.activated_at.elapsed().as_secs_f64(),
+            "measurement": {
+                "warmup_frames": self.host_evidence_warmup_frames,
+                "measured_frames": measured_frames,
+            },
+            // `deactivate()` stops and joins the worker before `Drop`. Keep
+            // the successful startup fact independently of the live handle.
+            "worker_started": self.worker_started,
+            "finished_gracefully": true,
+            "metrics": {
+                "overload_blocks": measured_metrics.overload_blocks,
+                "late_blocks": measured_metrics.late_blocks,
+                "invalid_blocks": measured_metrics.invalid_blocks,
+                "worker_errors": measured_metrics.worker_errors,
+            },
+            "lifetime_metrics": {
+                "overload_blocks": lifetime_metrics.overload_blocks,
+                "late_blocks": lifetime_metrics.late_blocks,
+                "invalid_blocks": lifetime_metrics.invalid_blocks,
+                "worker_errors": lifetime_metrics.worker_errors,
+            },
+            "environment": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+            },
+        });
+        let result = (|| -> Result<(), String> {
+            let bytes = serde_json::to_vec_pretty(&document)
+                .map_err(|error| format!("encode host evidence: {error}"))?;
+            let mut destination = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|error| format!("create host evidence {path}: {error}"))?;
+            destination
+                .write_all(&bytes)
+                .and_then(|()| destination.write_all(b"\n"))
+                .map_err(|error| format!("write host evidence {path}: {error}"))
+        })();
+        if let Err(error) = result {
+            eprintln!("denoize Neural host evidence error: {error}");
+        }
     }
 }
 
@@ -1396,10 +1781,13 @@ fn worker_loop(
                     valid: false,
                 });
             }
-            failed = processor.reset().is_err();
-            if failed {
+            failed = if let Err(error) = processor.reset() {
+                eprintln!("denoize Neural worker reset error: {error}");
                 worker_errors.fetch_add(1, Ordering::Relaxed);
-            }
+                true
+            } else {
+                false
+            };
         }
         next_start = block.start_frame.saturating_add(block.frames as u64);
         if failed {
@@ -1411,12 +1799,17 @@ fn worker_loop(
         }
 
         let planar = block_to_planar(&block, channels);
-        match processor.process(&planar) {
-            Ok(processed) if append_ready(&mut ready, &processed, channels).is_ok() => {
+        let processed = processor.process(&planar).and_then(|processed| {
+            append_ready(&mut ready, &processed, channels)
+                .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
+        });
+        match processed {
+            Ok(()) => {
                 pending.push_back(block);
                 complete_ready_blocks(&mut pending, &mut completed, &mut ready, channels);
             }
-            _ => {
+            Err(error) => {
+                eprintln!("denoize Neural worker processing error: {error}");
                 failed = true;
                 worker_errors.fetch_add(1, Ordering::Relaxed);
                 completed.push_back(ProcessedBlock {
@@ -1588,9 +1981,9 @@ mod tests {
     struct StalledProcessor;
 
     impl BlockProcessor for StalledProcessor {
-        fn process(&mut self, _channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
             thread::sleep(Duration::from_millis(250));
-            Ok(vec![Vec::new()])
+            Ok(channels.to_vec())
         }
 
         fn reset(&mut self) -> Result<(), String> {
@@ -1619,6 +2012,15 @@ mod tests {
         let mut object = serde_json::to_value(state).unwrap();
         object["future"] = serde_json::json!(true);
         assert!(serde_json::from_value::<NeuralSessionState>(object).is_err());
+
+        let hq = NeuralSessionState::new_for_model(
+            NeuralDawModel::Dpdfnet2,
+            NeuralPortConfiguration::Mono,
+            NeuralParameters::default(),
+        )
+        .unwrap();
+        hq.validate_for_model(NeuralDawModel::Dpdfnet2).unwrap();
+        assert!(hq.validate_for_model(NeuralDawModel::Gtcrn).is_err());
     }
 
     #[test]
@@ -1723,6 +2125,93 @@ mod tests {
     }
 
     #[test]
+    fn host_evidence_retains_worker_start_after_deactivation() {
+        let mut engine = test_engine(1, || Ok(Box::new(IdentityProcessor)));
+        assert!(engine.worker_started);
+        assert_eq!(engine.processed_frames, 0);
+        assert!(!engine.should_write_host_evidence());
+
+        engine.process_frame(
+            [0.1, 0.0],
+            RuntimeParameters::from(NeuralParameters::default()),
+        );
+        engine.stop();
+
+        assert!(engine.worker.is_none());
+        assert!(engine.worker_started);
+        assert_eq!(engine.processed_frames, 1);
+        assert!(engine.should_write_host_evidence());
+    }
+
+    #[test]
+    fn host_evidence_separates_priming_from_the_measured_window() {
+        let mut engine = test_engine(1, || Ok(Box::new(IdentityProcessor)));
+        engine.host_evidence_warmup_frames = 1;
+        engine.host_evidence_baseline = None;
+        engine.metrics.overload_blocks.store(3, Ordering::Relaxed);
+
+        engine.process_frame(
+            [0.1, 0.0],
+            RuntimeParameters::from(NeuralParameters::default()),
+        );
+        assert_eq!(
+            engine.host_evidence_baseline,
+            Some(WorkerMetrics {
+                overload_blocks: 3,
+                ..WorkerMetrics::default()
+            })
+        );
+
+        engine.metrics.overload_blocks.store(5, Ordering::Relaxed);
+        let lifetime = engine.metrics.worker_metrics();
+        let measured = lifetime.saturating_since(engine.host_evidence_baseline.unwrap());
+        assert_eq!(lifetime.overload_blocks, 5);
+        assert_eq!(measured.overload_blocks, 2);
+    }
+
+    #[test]
+    fn activation_warms_and_resets_the_worker_before_returning() {
+        struct WarmupProbe {
+            process_calls: Arc<AtomicU64>,
+            reset_calls: Arc<AtomicU64>,
+        }
+
+        impl BlockProcessor for WarmupProbe {
+            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+                self.process_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(channels
+                    .iter()
+                    .map(|channel| channel[..channel.len() - 1].to_vec())
+                    .collect())
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                self.reset_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let process_calls = Arc::new(AtomicU64::new(0));
+        let reset_calls = Arc::new(AtomicU64::new(0));
+        let observed_process_calls = Arc::clone(&process_calls);
+        let observed_reset_calls = Arc::clone(&reset_calls);
+        let mut engine = test_engine(2, move || {
+            Ok(Box::new(WarmupProbe {
+                process_calls,
+                reset_calls,
+            }))
+        });
+
+        assert!(engine.worker_started);
+        assert_eq!(observed_process_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_reset_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.processed_frames, 0);
+        assert_eq!(engine.input_queue.len(), 0);
+        assert_eq!(engine.output_queue.len(), 0);
+        engine.stop();
+    }
+
+    #[test]
     fn callback_path_allocates_zero_bytes_after_activation() {
         let mut engine = test_engine(2, || Ok(Box::new(IdentityProcessor)));
         let parameters = RuntimeParameters::from(NeuralParameters::default());
@@ -1749,6 +2238,61 @@ mod tests {
         for _ in 0..engine.latency_frames as usize + engine.chunk_frames * 2 {
             assert_eq!(engine.process_frame([0.0, 0.0], parameters)[0], 0.0);
         }
+    }
+
+    #[test]
+    fn reset_reclaims_queued_input_from_the_previous_generation() {
+        struct ResetBlockingProcessor {
+            warmed: bool,
+            started: mpsc::SyncSender<()>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl BlockProcessor for ResetBlockingProcessor {
+            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+                if self.warmed {
+                    let _ = self.started.send(());
+                    let _ = self.release.recv();
+                }
+                Ok(channels.to_vec())
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                self.warmed = true;
+                Ok(())
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut engine = test_engine(1, move || {
+            Ok(Box::new(ResetBlockingProcessor {
+                warmed: false,
+                started: started_tx,
+                release: release_rx,
+            }))
+        });
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+
+        for _ in 0..engine.chunk_frames {
+            engine.process_frame([0.1, 0.0], parameters);
+        }
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not begin processing the first generation");
+        for _ in 0..engine.chunk_frames * 4 {
+            engine.process_frame([0.2, 0.0], parameters);
+        }
+
+        let queued = engine.input_queue.len();
+        let free_before_reset = engine.free_blocks.len();
+        assert!(queued >= 4);
+        engine.reset();
+        assert!(engine.input_queue.is_empty());
+        assert_eq!(engine.free_blocks.len(), free_before_reset + queued);
+
+        release_tx.send(()).unwrap();
+        engine.stop();
     }
 
     #[test]
@@ -1780,33 +2324,32 @@ mod tests {
     #[test]
     #[ignore = "requires the pinned managed GTCRN model and cargo test --release"]
     fn pinned_gtcrn_release_worker_meets_sustained_deadlines() {
+        assert_pinned_release_worker(NeuralDawModel::Gtcrn);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned managed DPDFNet model and cargo test --release"]
+    #[cfg(feature = "experimental-dpdfnet-hq")]
+    fn pinned_dpdfnet2_release_worker_meets_sustained_deadlines() {
+        assert_pinned_release_worker(NeuralDawModel::Dpdfnet2);
+    }
+
+    fn assert_pinned_release_worker(model: NeuralDawModel) {
         assert!(
             !cfg!(debug_assertions),
-            "the sustained GTCRN deadline gate must exercise the release profile"
+            "the sustained neural deadline gate must exercise the release profile"
         );
-        let shared = Box::leak(Box::new(NeuralShared::new().unwrap()));
-        let mut engine = NeuralEngine::new_gtcrn(48_000.0, 1, shared).unwrap();
+        let shared = Box::leak(Box::new(NeuralShared::new_for_model(model).unwrap()));
+        let mut engine = NeuralEngine::new_model(model, 48_000.0, 1, shared).unwrap();
         let parameters = RuntimeParameters::from(NeuralParameters::default());
 
-        // Tract performs one-time kernel selection and cache population during
-        // the first inference calls.  Hosts activate a prepared plug-in before
-        // recording sustained processing, so exercise that same lifecycle and
-        // exclude only startup work from the deadline counters.
-        let warmup_frames =
-            engine.latency_frames as usize + engine.chunk_frames * (QUEUE_BLOCKS + 8);
-        for frame in 0..warmup_frames {
-            engine.process_frame([0.01, 0.0], parameters);
-            if frame % engine.chunk_frames == 0 {
-                thread::sleep(Duration::from_millis(
-                    u64::from(denoize::NEURAL_DAW_CHUNK_MILLIS) * 2,
-                ));
-            }
-        }
+        // Activation does the one-time tract kernel selection off the audio
+        // callback and resets recurrent state before the worker is published.
         assert_eq!(shared.worker_errors.load(Ordering::Relaxed), 0);
-        engine.reset();
-        shared.overload_blocks.store(0, Ordering::Relaxed);
-        shared.late_blocks.store(0, Ordering::Relaxed);
-        shared.invalid_blocks.store(0, Ordering::Relaxed);
+        assert!(engine.worker_started);
+        assert_eq!(shared.overload_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
 
         let latency = engine.latency_frames as usize;
         let frames = latency + engine.chunk_frames * 100;
@@ -1814,6 +2357,7 @@ mod tests {
         let mut neural_frames = 0usize;
         let mut inputs = Vec::with_capacity(frames);
         let mut noise_state = 0x5eed_1234_9876_abcd_u64;
+        let measurement_started = Instant::now();
         for frame in 0..frames {
             let phase = frame as f64 * 440.0 * std::f64::consts::TAU / 48_000.0;
             noise_state = noise_state
@@ -1833,6 +2377,7 @@ mod tests {
                 )));
             }
         }
+        let measurement_wall_seconds = measurement_started.elapsed().as_secs_f64();
         assert_eq!(finite, frames);
         assert!(
             neural_frames >= engine.chunk_frames,
@@ -1849,5 +2394,79 @@ mod tests {
         assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(shared.overload_blocks.load(Ordering::Relaxed), 0);
         assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
+        write_worker_evidence(
+            model,
+            &engine,
+            frames,
+            finite,
+            neural_frames,
+            measurement_wall_seconds,
+            shared,
+        );
+    }
+
+    fn write_worker_evidence(
+        model: NeuralDawModel,
+        engine: &NeuralEngine<'_>,
+        measured_frames: usize,
+        finite_frames: usize,
+        neural_frames: usize,
+        measurement_wall_seconds: f64,
+        shared: &NeuralShared,
+    ) {
+        let Ok(path) = std::env::var("DENOIZE_NEURAL_WORKER_EVIDENCE") else {
+            return;
+        };
+        let document = serde_json::json!({
+            "schema": "denoize-dpdfnet-worker-run-v1",
+            "schema_version": 1,
+            "source_commit": std::env::var("DENOIZE_EVIDENCE_SOURCE_COMMIT").unwrap_or_default(),
+            "model_id": model.model_id(),
+            "model_sha256": model.model_sha256(),
+            "plugin_id": model.plugin_id(),
+            "sample_rate_hz": 48_000,
+            "channels": 1,
+            "chunk_frames": engine.chunk_frames,
+            "latency_frames": engine.latency_frames,
+            "paced_blocks": 100,
+            "measured_frames": measured_frames,
+            "finite_frames": finite_frames,
+            "neural_frames": neural_frames,
+            "measurement_wall_seconds": measurement_wall_seconds,
+            "metrics": {
+                "overload_blocks": shared.overload_blocks.load(Ordering::Relaxed),
+                "late_blocks": shared.late_blocks.load(Ordering::Relaxed),
+                "invalid_blocks": shared.invalid_blocks.load(Ordering::Relaxed),
+                "worker_errors": shared.worker_errors.load(Ordering::Relaxed),
+            },
+            "queues_after_run": {
+                "input": engine.input_queue.len(),
+                "output": engine.output_queue.len(),
+                "ready": engine.ready.len(),
+            },
+            "environment": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "logical_parallelism": std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(0),
+                "target": std::env::var("DENOIZE_EVIDENCE_TARGET").unwrap_or_default(),
+                "cpu_model": std::env::var("DENOIZE_EVIDENCE_CPU_MODEL").unwrap_or_default(),
+                "hardware_tier": std::env::var("DENOIZE_EVIDENCE_HARDWARE_TIER").unwrap_or_default(),
+                "runner_label": std::env::var("DENOIZE_EVIDENCE_RUNNER_LABEL").unwrap_or_default(),
+            },
+        });
+        let bytes = serde_json::to_vec_pretty(&document).expect("encode worker evidence");
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_or_else(|error| panic!("create worker evidence {path}: {error}"));
+        destination
+            .write_all(&bytes)
+            .unwrap_or_else(|error| panic!("write worker evidence {path}: {error}"));
+        destination
+            .write_all(b"\n")
+            .unwrap_or_else(|error| panic!("finish worker evidence {path}: {error}"));
     }
 }

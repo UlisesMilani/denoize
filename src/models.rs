@@ -8,7 +8,7 @@ pub use bundle::{
     build_offline_bundle, import_offline_bundle, import_offline_bundle_if_sha256,
     inspect_offline_bundle, OfflineBundleImportReport, OfflineBundleInfo, OfflineBundleModelInfo,
 };
-#[cfg(feature = "gtcrn")]
+#[cfg(any(feature = "gtcrn", feature = "dpdfnet"))]
 pub(crate) use catalog::active_catalog_read_only;
 pub use catalog::{
     active_catalog, catalog_status, embedded_catalog, import_catalog, import_trust_root,
@@ -205,17 +205,30 @@ impl ModelDownloadOptions {
     }
 }
 
-pub const MODELS: &[ModelInfo] = &[ModelInfo {
-    name: "gtcrn-dns3",
-    backend: "gtcrn",
-    filename: "gtcrn_simple.onnx",
-    url: "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/stream/onnx_models/gtcrn_simple.onnx",
-    revision: "3862c44808dca492ea5a8a145d2dc2a1028d08c8",
-    sha256: "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
-    size_bytes: 535_190,
-    license: "MIT",
-    sample_rate: 16_000,
-}];
+pub const MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        name: "gtcrn-dns3",
+        backend: "gtcrn",
+        filename: "gtcrn_simple.onnx",
+        url: "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/3862c44808dca492ea5a8a145d2dc2a1028d08c8/stream/onnx_models/gtcrn_simple.onnx",
+        revision: "3862c44808dca492ea5a8a145d2dc2a1028d08c8",
+        sha256: "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87",
+        size_bytes: 535_190,
+        license: "MIT",
+        sample_rate: 16_000,
+    },
+    ModelInfo {
+        name: "dpdfnet2-48khz-hr",
+        backend: "dpdfnet",
+        filename: "dpdfnet2_48khz_hr.onnx",
+        url: "https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet2_48khz_hr.onnx",
+        revision: "dd6818d00f50c836fed43a6243ebe49116de5964",
+        sha256: "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+        size_bytes: 10_493_337,
+        license: "Apache-2.0",
+        sample_rate: 48_000,
+    },
+];
 
 #[derive(Clone)]
 struct ModelSpec<'a> {

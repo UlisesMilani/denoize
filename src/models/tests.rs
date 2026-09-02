@@ -595,6 +595,13 @@ fn assert_manifest_progress(progress: &[(u64, Option<u64>)], expected_size: u64)
 
 #[test]
 fn manifest_has_pinned_integrity_and_metadata() {
+    let production_catalog = catalog::parse_catalog(
+        include_bytes!("../../models/catalog-v1.json"),
+        CatalogOrigin::Embedded,
+    )
+    .unwrap();
+    assert_eq!(production_catalog.models().len(), MODELS.len());
+
     for model in MODELS {
         assert_eq!(model.sha256.len(), 64);
         assert!(model.size_bytes > 0);
@@ -602,9 +609,28 @@ fn manifest_has_pinned_integrity_and_metadata() {
         assert!(model.url.contains(model.revision));
         assert!(model.sample_rate > 0);
         assert!(!model.license.is_empty());
-        assert!(ModelSpec::legacy(model).catalog.is_some());
+
+        let catalog_model = production_catalog
+            .find(model.name)
+            .unwrap_or_else(|| panic!("production catalog is missing {}", model.name));
+        assert_eq!(catalog_model.backend(), model.backend);
+        assert_eq!(catalog_model.filename(), model.filename);
+        assert_eq!(catalog_model.url(), model.url);
+        assert_eq!(catalog_model.revision(), model.revision);
+        assert_eq!(catalog_model.sha256(), model.sha256);
+        assert_eq!(catalog_model.size_bytes(), model.size_bytes);
+        assert_eq!(catalog_model.license(), model.license);
+        assert_eq!(catalog_model.sample_rate(), model.sample_rate);
     }
+
+    // Unit tests intentionally retain the historical sequence-1 catalog as
+    // the embedded fixture for signature-rotation coverage. Its GTCRN entry
+    // must still map to the legacy static manifest.
+    assert!(ModelSpec::legacy(find("gtcrn-dns3").unwrap())
+        .catalog
+        .is_some());
     assert_eq!(find("gtcrn-dns3").unwrap().size_bytes, 535_190);
+    assert_eq!(find("dpdfnet2-48khz-hr").unwrap().size_bytes, 10_493_337);
 }
 
 #[test]

@@ -273,7 +273,7 @@ pub(super) fn load_active_trust_root_locked() -> Result<ActiveTrustRoot, String>
     load_active_trust_root(false)
 }
 
-#[cfg(feature = "gtcrn")]
+#[cfg(any(feature = "gtcrn", feature = "dpdfnet"))]
 pub(super) fn load_active_trust_root_read_only() -> Result<ActiveTrustRoot, String> {
     load_active_trust_root(true)
 }

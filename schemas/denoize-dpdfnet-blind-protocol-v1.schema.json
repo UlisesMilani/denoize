@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-blind-protocol-v1.schema.json",
+  "title": "denoize DPDFNet blinded-listening protocol v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "bundle_id", "source_matrix_sha256", "policy", "trials"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-blind-protocol-v1" },
+    "schema_version": { "const": 1 },
+    "bundle_id": { "$ref": "#/$defs/id" },
+    "source_matrix_sha256": { "$ref": "#/$defs/sha256" },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "core_trials", "repeat_trials", "minimum_retained_listeners",
+        "maximum_listener_duplicate_inconsistency", "maximum_aggregate_duplicate_inconsistency",
+        "minimum_overall_dpdfnet_preference", "minimum_overall_bootstrap_95ci_lower",
+        "minimum_stratum_dpdfnet_preference", "tie_score", "listener_cluster_bootstrap_resamples"
+      ],
+      "properties": {
+        "core_trials": { "const": 12 },
+        "repeat_trials": { "const": 4 },
+        "minimum_retained_listeners": { "const": 20 },
+        "maximum_listener_duplicate_inconsistency": { "const": 0.5 },
+        "maximum_aggregate_duplicate_inconsistency": { "const": 0.25 },
+        "minimum_overall_dpdfnet_preference": { "const": 0.55 },
+        "minimum_overall_bootstrap_95ci_lower": { "const": 0.5 },
+        "minimum_stratum_dpdfnet_preference": {
+          "const": {
+            "recorded-noise": 0.5,
+            "babble": 0.4,
+            "source-preservation": 0.45,
+            "synthetic-noise": 0.5
+          }
+        },
+        "tie_score": { "const": 0.5 },
+        "listener_cluster_bootstrap_resamples": { "const": 20000 }
+      }
+    },
+    "trials": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/trial" }
+    }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{24}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "size_bytes", "sha256", "sample_rate_hz", "channels", "frames"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^audio/[0-9a-f]{24}/(reference|input|a|b)\\.wav$" },
+        "size_bytes": { "type": "integer", "minimum": 44, "maximum": 67108864 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "sample_rate_hz": { "const": 48000 },
+        "channels": { "const": 1 },
+        "frames": { "type": "integer", "minimum": 1, "maximum": 2880000 }
+      }
+    },
+    "trial": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_id", "stratum", "question", "audio"],
+      "properties": {
+        "trial_id": { "$ref": "#/$defs/id" },
+        "stratum": { "enum": ["recorded-noise", "babble", "source-preservation", "synthetic-noise"] },
+        "question": { "enum": ["noise-reduction", "source-preservation"] },
+        "audio": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "input", "a", "b"],
+          "properties": {
+            "reference": { "$ref": "#/$defs/audio" },
+            "input": { "$ref": "#/$defs/audio" },
+            "a": { "$ref": "#/$defs/audio" },
+            "b": { "$ref": "#/$defs/audio" }
+          }
+        }
+      }
+    }
+  }
+}

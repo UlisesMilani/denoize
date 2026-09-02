@@ -25,6 +25,20 @@ To build a local host-target binary:
 cargo build --release -p denoize-clap
 ```
 
+An opt-in direct CLAP build adds the experimental `denoize Neural HQ`
+descriptor (`org.penguin425.denoize.neural-hq`) backed by the pinned
+DPDFNet-2 48 kHz HR graph:
+
+```sh
+denoize models install dpdfnet
+cargo build --release -p denoize-clap --features experimental-dpdfnet-hq
+```
+
+This third descriptor is not in normal release archives and does not expand
+the released VST3, AUv3, or LV2 identities. GTCRN remains the default Neural
+profile while Windows/REAPER, blinded-listening, and lower-tier CPU gates are
+open. See the [issue #221 comparison](dpdfnet-gtcrn-poc.md).
+
 On Linux, the resulting shared library can be copied to
 `~/.clap/denoize.clap`.
 

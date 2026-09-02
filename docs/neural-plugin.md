@@ -28,11 +28,33 @@ model, then reactivate or reload the effect to enable neural inference. When
 the model is available, it is verified and the tract graph is prepared on the
 permanent neural worker before activation returns.
 
+## Experimental DPDFNet-2 HQ descriptor
+
+An explicit source-build feature adds `denoize Neural HQ` with the independent
+ID `org.penguin425.denoize.neural-hq` and pinned model
+`dpdfnet2-48khz-hr`:
+
+```sh
+denoize models install dpdfnet
+cargo build --release -p denoize-clap --features experimental-dpdfnet-hq
+```
+
+The worker accepts arbitrary host blocks and sample rates, compensates the
+authenticated model's four-hop/40 ms content offset, and preserves exact input
+length. It uses the same fixed scheduler latency and safety fallback as GTCRN,
+but a distinct plug-in/model/digest state identity. The two descriptors reject
+each other's snapshots.
+
+This descriptor is not part of normal release archives or the VST3, AUv3, and
+LV2 format claims. GTCRN remains the released default until Windows/REAPER,
+blinded-listening, and lower-tier CPU gates pass. The measurements and open
+gates are in the [issue #221 evaluation](dpdfnet-gtcrn-poc.md).
+
 ## Scheduling contract
 
-At activation the plug-in fixes the finite host sample rate, mono/stereo layout,
-10 ms scheduler block, 16-block input and result queues, 40 preallocated audio
-blocks, model profile, and reported latency. The latency is:
+At activation each neural descriptor fixes the finite host sample rate,
+mono/stereo layout, 10 ms scheduler block, 16-block input and result queues, 40
+preallocated audio blocks, model profile, and reported latency. The latency is:
 
 ```text
 chunk_frames   = ceil(sample_rate * 0.010)
@@ -58,11 +80,14 @@ machine can finish inference before every deadline. The CLAP latency extension
 reports this value only after activation, as required by the stabilized CLAP
 contract.
 
-The release-profile reference gate measured RTF 0.567 over 100 consecutive
-blocks. The first resampler/WOLA-aligned output requires eleven input blocks,
-so the former 120 ms prototype left only one scheduler quantum of startup
-headroom. The 240 ms contract is intentional; a machine that cannot sustain
-RTF below one remains safe but will use the selected overload fallback.
+The GTCRN release-profile reference gate measured RTF 0.567 over 100
+consecutive blocks. The first resampler/WOLA-aligned output requires eleven
+input blocks, so the former 120 ms prototype left only one scheduler quantum
+of startup headroom. The 240 ms contract is intentional; a machine that cannot
+sustain RTF below one remains safe but will use the selected overload fallback.
+The opt-in DPDFNet-2 release-profile gate also completed 100 paced 48 kHz
+blocks with zero overload, late, invalid, stale-generation, or worker-error
+failures on the evaluation host.
 
 The host audio thread performs only these bounded operations:
 
@@ -77,6 +102,21 @@ resampling, recurrent state, output validation, and any temporary allocation
 stay on one named worker. The official CLAP thread-pool extension is not used:
 its own specification warns that synchronization may violate hard real-time
 rules and `request_exec` waits for completion.
+
+On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
+Service task after model preparation and warm-up, and before activation reports
+it ready. If registration fails, neural inference stays unavailable and the
+fixed-latency fallback remains active. The worker leaves the task when it exits;
+other platforms retain their native scheduler behavior.
+
+Automated REAPER evidence separates device priming from sustained processing.
+REAPER's Dummy Audio device can request about one output-buffer horizon faster
+than wall clock when playback starts, even with anticipative FX disabled. The
+evidence keeps those lifetime counters for diagnosis, then measures at least 60
+seconds after a bounded four-latency (960 ms) warm-up. Promotion still requires
+zero overload, late, invalid, and worker-error counters in that measured window;
+worker errors also remain forbidden during priming. Human reporter runs use a
+real audio device and do not discard any events.
 
 Each block carries a generation and absolute input-frame start. A host reset or
 dropped input block cold-resets recurrent and resampler state. Results from an
@@ -112,7 +152,8 @@ CLAP events are consumed in sample-offset batches. Host snapshots and portable
 files use the same closed
 [`denoize-neural-daw-session-v1`](../schemas/denoize-neural-daw-session-v1.schema.json)
 document. It binds plug-in ID, exact model ID and digest, latency policy, port
-configuration, and every parameter; unknown fields and future versions fail.
+configuration, and every parameter. Only the exact GTCRN and DPDFNet-2 identity
+tuples are accepted; mixed identities, unknown fields, and future versions fail.
 Standalone creation is no-clobber by default:
 
 ```sh

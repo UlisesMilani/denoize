@@ -1,0 +1,876 @@
+#!/usr/bin/env python3
+"""Exercise the DPDFNet blind-listening and promotion evidence contracts."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+import wave
+
+from jsonschema import Draft202012Validator
+
+
+ROOT = Path(__file__).resolve().parent.parent
+PREPARE = ROOT / "scripts/prepare-dpdfnet-blind-listening.py"
+SCORE = ROOT / "scripts/score-dpdfnet-blind-listening.py"
+PLATFORM = ROOT / "scripts/generate-dpdfnet-platform-evidence.py"
+PROMOTION = ROOT / "scripts/generate-dpdfnet-promotion-evidence.py"
+SCHEMAS = {
+    "protocol": ROOT / "schemas/denoize-dpdfnet-blind-protocol-v1.schema.json",
+    "answer": ROOT / "schemas/denoize-dpdfnet-blind-answer-key-v1.schema.json",
+    "response": ROOT / "schemas/denoize-dpdfnet-blind-listener-response-v1.schema.json",
+    "result": ROOT / "schemas/denoize-dpdfnet-blind-listening-result-v1.schema.json",
+    "worker": ROOT / "schemas/denoize-dpdfnet-worker-run-v1.schema.json",
+    "clap_host": ROOT / "schemas/denoize-dpdfnet-clap-host-run-v1.schema.json",
+    "platform": ROOT / "schemas/denoize-dpdfnet-platform-evidence-v1.schema.json",
+    "reaper": ROOT / "schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
+    "reporter": ROOT / "schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
+    "promotion": ROOT / "schemas/denoize-dpdfnet-promotion-evidence-v1.schema.json",
+}
+
+
+def run(arguments: list[str], *, success: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(arguments, check=False, capture_output=True, text=True)
+    if success and result.returncode != 0:
+        raise AssertionError(f"command failed ({result.returncode}): {' '.join(arguments)}\n{result.stderr}")
+    if not success and result.returncode == 0:
+        raise AssertionError(f"command unexpectedly passed: {' '.join(arguments)}")
+    return result
+
+
+def write_wav(path: Path, seed: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(48_000)
+        samples = [((index * 997 + seed * 101) % 20_000) - 10_000 for index in range(480)]
+        output.writeframes(b"".join(struct.pack("<h", sample) for sample in samples))
+
+
+def fixture(root: Path) -> tuple[Path, Path]:
+    matrix = root / "matrix-result.json"
+    audio = root / "candidates"
+    definitions = [
+        (f"recorded-{index}", "noise-matrix", f"freesound-{2530 + index}")
+        for index in range(4)
+    ]
+    definitions.extend(
+        (f"babble-{index}", "noise-matrix", "three-talker-babble") for index in range(3)
+    )
+    definitions.extend((f"clean-{index}", "clean-preservation", None) for index in range(3))
+    definitions.extend((f"synthetic-{index}", "noise-matrix", "pink") for index in range(2))
+    cases = []
+    for case_index, (identifier, kind, noise) in enumerate(definitions):
+        cases.append({"id": identifier, "kind": kind, "noise": noise})
+        for file_index, name in enumerate(("clean", "noisy", "dpdfnet2", "gtcrn")):
+            write_wav(audio / identifier / f"{name}.wav", case_index * 10 + file_index)
+    matrix.write_text(json.dumps({"cases": cases}, sort_keys=True) + "\n", encoding="utf-8")
+    return matrix, audio
+
+
+def prepare(root: Path, matrix: Path, audio: Path) -> tuple[Path, Path]:
+    key = root / "randomization.key"
+    key.write_bytes(bytes(range(32)))
+    bundle = root / "public-bundle"
+    answer = root / "private-answer-key.json"
+    run(
+        [
+            sys.executable,
+            str(PREPARE),
+            "--matrix-result",
+            str(matrix),
+            "--audio-dir",
+            str(audio),
+            "--randomization-key",
+            str(key),
+            "--output-dir",
+            str(bundle),
+            "--answer-key",
+            str(answer),
+        ]
+    )
+    return bundle, answer
+
+
+def responses(root: Path, protocol: dict, answer: dict, *, candidate: bool) -> Path:
+    output = root / ("candidate-responses" if candidate else "baseline-responses")
+    output.mkdir()
+    answer_by_id = {trial["trial_id"]: trial for trial in answer["trials"]}
+    target = "dpdfnet2-48khz-hr" if candidate else "gtcrn-dns3"
+    for listener_index in range(20):
+        trials = []
+        for trial in protocol["trials"]:
+            key = answer_by_id[trial["trial_id"]]
+            preference = "a" if key["a_model"] == target else "b"
+            trials.append({"trial_id": trial["trial_id"], "preference": preference})
+        document = {
+            "schema": "denoize-dpdfnet-blind-listener-response-v1",
+            "schema_version": 1,
+            "protocol_sha256": answer["protocol_sha256"],
+            "listener_id": f"listener-{listener_index:02d}",
+            "consent": True,
+            "trials": trials,
+        }
+        (output / f"listener-{listener_index:02d}.json").write_text(
+            json.dumps(document, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    return output
+
+
+def platform_fixture(root: Path) -> tuple[Path, Path]:
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    stress = {
+        "schema": "denoize-dpdfnet-gtcrn-stress-v1",
+        "model": "dpdfnet2_48khz_stereo_linked_daw_path",
+        "model_file_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+        "state_size": 56_436,
+        "parallel_streams": 1,
+        "requested_seconds_per_stream": 60,
+        "calls": 6_000,
+        "timing": {
+            "p99_9_ms": 8.0,
+            "maximum_ms": 9.0,
+            "budget_ms": 10.0,
+            "calls_over_budget": 0,
+            "summed_compute_rtf": 0.5,
+        },
+        "memory": {"peak_rss_bytes": 128 * 1024 * 1024},
+        "robustness": {
+            "independent_stream_bit_exact": True,
+            "empty_input_exact": True,
+            "finite_geometry": [
+                {"sample_rate": rate, "exact_length": True, "all_finite": True}
+                for rate in (8_000, 16_000, 44_100, 48_000, 96_000)
+            ],
+        },
+        "environment": {
+            "source_commit": commit,
+            "os": "linux",
+            "target": "x86_64-unknown-linux-gnu",
+            "os_version": "fixture-linux",
+            "cpu_model": "fixture-cpu",
+            "hardware_tier": "portable-ci",
+            "runner_label": "ubuntu-24.04",
+            "logical_parallelism": 2,
+            "arch": "x86_64",
+        },
+    }
+    worker = {
+        "schema": "denoize-dpdfnet-worker-run-v1",
+        "schema_version": 1,
+        "source_commit": commit,
+        "model_id": "dpdfnet2-48khz-hr",
+        "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+        "plugin_id": "org.penguin425.denoize.neural-hq",
+        "sample_rate_hz": 48_000,
+        "channels": 1,
+        "chunk_frames": 480,
+        "latency_frames": 11_520,
+        "paced_blocks": 100,
+        "measured_frames": 59_520,
+        "finite_frames": 59_520,
+        "neural_frames": 48_000,
+        "measurement_wall_seconds": 1.25,
+        "metrics": {
+            "overload_blocks": 0,
+            "late_blocks": 0,
+            "invalid_blocks": 0,
+            "worker_errors": 0,
+        },
+        "queues_after_run": {"input": 0, "output": 0, "ready": 0},
+        "environment": {
+            "os": "linux",
+            "arch": "x86_64",
+            "logical_parallelism": 2,
+            "target": "x86_64-unknown-linux-gnu",
+            "cpu_model": "fixture-cpu",
+            "hardware_tier": "portable-ci",
+            "runner_label": "ubuntu-24.04",
+        },
+    }
+    stress_path = root / "stress.json"
+    worker_path = root / "worker.json"
+    stress_path.write_text(json.dumps(stress) + "\n", encoding="utf-8")
+    worker_path.write_text(json.dumps(worker) + "\n", encoding="utf-8")
+    return stress_path, worker_path
+
+
+def load_promotion_module():
+    specification = importlib.util.spec_from_file_location(
+        "denoize_dpdfnet_promotion", PROMOTION
+    )
+    assert specification is not None and specification.loader is not None
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def file_record(name: str) -> dict[str, object]:
+    return {"name": name, "size_bytes": 1, "sha256": "0" * 64}
+
+
+def composite_fixtures(
+    root: Path, listening: dict, platform: dict, validators: dict
+) -> tuple[SimpleNamespace, object]:
+    module = load_promotion_module()
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    summary = {
+        "schema": "denoize-dpdfnet-gtcrn-evaluation-summary-v1",
+        "source_commit": commit,
+        "matrix_result_sha256": listening["source_matrix_sha256"],
+        "models": {
+            "dpdfnet2-48khz-hr": module.MODEL_SHA256,
+            "gtcrn-dns3": module.GTCRN_SHA256,
+        },
+        "quality": {
+            "case_counts": {
+                "noise_matrix": 280,
+                "clean_preservation": 10,
+                "speakers": 10,
+                "noises": 7,
+            },
+            "dpdfnet2_vs_gtcrn": {
+                "si_sdr_improvement_db": {
+                    "speaker_cluster_bootstrap_95ci": [0.1, 0.3]
+                },
+                "stoi_improvement": {
+                    "speaker_cluster_bootstrap_95ci": [0.01, 0.03]
+                },
+                "musical_noise": {
+                    "speaker_cluster_bootstrap_95ci": [0.01, 0.03]
+                },
+            },
+            "strata": {
+                "noise": {
+                    "three-talker-babble": {
+                        "speaker_cluster_bootstrap_95ci": [0.01, 0.03]
+                    }
+                }
+            },
+        },
+    }
+    summary_path = root / "evaluation-summary.json"
+    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    listening_path = root / "listening-result.json"
+    listening_path.write_text(json.dumps(listening) + "\n", encoding="utf-8")
+
+    reaper = {
+        "schema": "denoize-dpdfnet-reaper-automated-evidence-v1",
+        "schema_version": 1,
+        "source_commit": commit,
+        "model_id": "dpdfnet2-48khz-hr",
+        "model_sha256": module.MODEL_SHA256,
+        "host": {
+            "name": "REAPER",
+            "version": "7.79",
+            "operating_system": "windows",
+            "sample_rate_hz": 48_000,
+            "buffer_frames": 480,
+            "active_seconds": 60.0,
+        },
+        "accessibility_api": {
+            "osara_style_parameter_path": True,
+            "parameters_readable_and_adjustable": 4,
+            "nvda_human_verified": False,
+        },
+        "measurement": {
+            "warmup_frames": 46_080,
+            "measured_frames": 2_880_000,
+        },
+        "worker_metrics": {
+            "overload_blocks": 0,
+            "late_blocks": 0,
+            "invalid_blocks": 0,
+            "worker_errors": 0,
+        },
+        "lifetime_worker_metrics": {
+            "overload_blocks": 24,
+            "late_blocks": 6,
+            "invalid_blocks": 5,
+            "worker_errors": 0,
+        },
+        "process": {
+            "wall_seconds": 60.0,
+            "cpu_seconds": 10.0,
+            "peak_working_set_bytes": 128 * 1024 * 1024,
+            "logical_processors": 2,
+        },
+        "inputs": {
+            "parameters": file_record("parameters.tsv"),
+            "clap_host_run": file_record("clap-host-run.json"),
+            "process_metrics": file_record("process.json"),
+        },
+        "accepted_automated": True,
+    }
+    validators["reaper"].validate(reaper)
+    reaper_path = root / "reaper-automated.json"
+    reaper_path.write_text(json.dumps(reaper) + "\n", encoding="utf-8")
+
+    artifact = root / "experimental.zip"
+    artifact.write_bytes(b"attested experimental archive fixture")
+    artifact_sha256 = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    reporter = {
+        "schema": "denoize-dpdfnet-reporter-evidence-v1",
+        "schema_version": 1,
+        "github": {
+            "repository": "penguin425/denoize",
+            "issue": 221,
+            "comment_id": 1,
+            "comment_url": "https://github.com/penguin425/denoize/issues/221#issuecomment-1",
+            "author": "UlisesMilani",
+            "created_at": "2026-09-02T00:00:00Z",
+            "updated_at": "2026-09-02T00:00:00Z",
+            "comment_body_sha256": "1" * 64,
+        },
+        "payload": {
+            "schema": "denoize-dpdfnet-reporter-submission-v1",
+            "schema_version": 1,
+            "source_commit": commit,
+            "artifact_sha256": artifact_sha256,
+            "environment": {
+                "windows_version": "fixture",
+                "cpu_model": "fixture",
+                "audio_device": "fixture",
+                "audio_driver": "fixture",
+                "reaper_version": "7.79",
+                "nvda_version": "fixture",
+                "osara_version": "fixture",
+            },
+            "runs": [
+                {
+                    "buffer_frames": frames,
+                    "sample_rate_hz": 48_000,
+                    "duration_seconds": 300,
+                    "overload_events": 0,
+                    "late_events": 0,
+                    "audible_xruns": 0,
+                    "continuous_audio": True,
+                }
+                for frames in (128, 480, 1024)
+            ],
+            "accessibility": {
+                "nvda_active": True,
+                "osara_active": True,
+                "parameters_announced": [
+                    "Bypass",
+                    "Mix",
+                    "Output Gain",
+                    "Overload Fallback",
+                ],
+                "values_announced": True,
+                "all_adjustable": True,
+                "focus_stable": True,
+                "host_or_plugin_crashes": 0,
+            },
+            "quality_observation": "dpdfnet-better",
+            "consent_to_publish": True,
+        },
+        "accepted": True,
+    }
+    validators["reporter"].validate(reporter)
+    reporter_path = root / "reporter.json"
+    reporter_path.write_text(json.dumps(reporter) + "\n", encoding="utf-8")
+
+    platform_paths = []
+    platform_bundles = []
+    configurations = [
+        (
+            "linux",
+            "x86_64-unknown-linux-gnu",
+            "x86_64",
+            "portable-ci",
+            "ubuntu-24.04",
+            2,
+        ),
+        (
+            "macos",
+            "aarch64-apple-darwin",
+            "aarch64",
+            "portable-ci",
+            "macos-14",
+            3,
+        ),
+        (
+            "windows",
+            "x86_64-pc-windows-msvc",
+            "x86_64",
+            "portable-ci",
+            "windows-2025",
+            4,
+        ),
+        (
+            "linux",
+            "x86_64-unknown-linux-gnu",
+            "x86_64",
+            "lowest-supported",
+            "ubuntu-slim",
+            1,
+        ),
+    ]
+    for index, (
+        operating_system,
+        target,
+        arch,
+        tier,
+        runner_label,
+        logical_cpus,
+    ) in enumerate(configurations):
+        document = json.loads(json.dumps(platform))
+        document["platform"].update(
+            {
+                "os": operating_system,
+                "os_version": f"fixture-{operating_system}",
+                "target": target,
+                "arch": arch,
+                "cpu_model": f"fixture-{operating_system}-{tier}",
+                "hardware_tier": tier,
+                "runner_label": runner_label,
+                "logical_cpus": logical_cpus,
+            }
+        )
+        validators["platform"].validate(document)
+        path = root / f"platform-{index}.json"
+        path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        bundle = root / f"platform-{index}.sigstore.json"
+        bundle.write_text("{}\n", encoding="utf-8")
+        platform_paths.append(path)
+        platform_bundles.append(bundle)
+
+    artifact_bundle = root / "artifact.sigstore.json"
+    artifact_bundle.write_text("{}\n", encoding="utf-8")
+
+    def verify_attestation(subject: Path, bundle: Path, source_commit: str):
+        assert source_commit == commit
+        return {
+            "subject_sha256": hashlib.sha256(subject.read_bytes()).hexdigest(),
+            "bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+            "verified_attestations": 1,
+            "repository": "penguin425/denoize",
+            "signer_workflow": module.SIGNER_WORKFLOW,
+            "source_commit": commit,
+        }
+
+    def inspect_windows_archive(path: Path, source_commit: str):
+        assert source_commit == commit and path == artifact
+        return {
+            "archive": module.file_record(path, path.read_bytes()),
+            "package_manifest_sha256": "2" * 64,
+            "target": "x86_64-pc-windows-msvc",
+            "plugin_sha256": "3" * 64,
+            "model_sha256": module.MODEL_SHA256,
+            "descriptor_count": 3,
+        }
+
+    module.verify_attestation = verify_attestation
+    module.inspect_windows_archive = inspect_windows_archive
+    arguments = SimpleNamespace(
+        source_commit=commit,
+        evaluation_summary=summary_path,
+        listening_result=listening_path,
+        reaper_automated=reaper_path,
+        reporter_evidence=reporter_path,
+        artifact=artifact,
+        artifact_attestation=artifact_bundle,
+        platform_evidence=platform_paths,
+        platform_attestation=platform_bundles,
+        output=root / "promotion.json",
+        allow_rejected=False,
+    )
+    return arguments, module
+
+
+def main() -> int:
+    validators = {}
+    for name, path in SCHEMAS.items():
+        document = json.loads(path.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(document)
+        validators[name] = Draft202012Validator(document)
+    with tempfile.TemporaryDirectory(prefix="denoize-dpdfnet-promotion-") as temporary:
+        root = Path(temporary)
+        clap_host = {
+            "schema": "denoize-dpdfnet-clap-host-run-v1",
+            "schema_version": 1,
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "model_id": "dpdfnet2-48khz-hr",
+            "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+            "plugin_id": "org.penguin425.denoize.neural-hq",
+            "sample_rate_hz": 48_000,
+            "channels": 2,
+            "chunk_frames": 480,
+            "latency_frames": 11_520,
+            "processed_frames": 2_976_000,
+            "active_seconds": 61.8,
+            "measurement": {
+                "warmup_frames": 46_080,
+                "measured_frames": 2_929_920,
+            },
+            "worker_started": True,
+            "finished_gracefully": True,
+            "metrics": {
+                "overload_blocks": 0,
+                "late_blocks": 0,
+                "invalid_blocks": 0,
+                "worker_errors": 0,
+            },
+            "lifetime_metrics": {
+                "overload_blocks": 24,
+                "late_blocks": 6,
+                "invalid_blocks": 5,
+                "worker_errors": 0,
+            },
+            "environment": {"os": "windows", "arch": "x86_64"},
+        }
+        validators["clap_host"].validate(clap_host)
+        matrix, audio = fixture(root)
+        bundle, answer_path = prepare(root, matrix, audio)
+        protocol_path = bundle / "protocol.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        answer = json.loads(answer_path.read_text(encoding="utf-8"))
+        validators["protocol"].validate(protocol)
+        validators["answer"].validate(answer)
+        public_payload = protocol_path.read_text(encoding="utf-8") + (bundle / "index.html").read_text(encoding="utf-8")
+        assert "dpdfnet2-48khz-hr" not in public_payload
+        assert "gtcrn-dns3" not in public_payload
+        assert len(protocol["trials"]) == 16
+        assert sum(trial["role"] == "core" for trial in answer["trials"]) == 12
+        assert sum(trial["role"] == "repeat" for trial in answer["trials"]) == 4
+
+        passing_responses = responses(root, protocol, answer, candidate=True)
+        for path in passing_responses.glob("*.json"):
+            validators["response"].validate(json.loads(path.read_text(encoding="utf-8")))
+        passing_result = root / "passing-result.json"
+        run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(answer_path),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(passing_result),
+            ]
+        )
+        passing = json.loads(passing_result.read_text(encoding="utf-8"))
+        validators["result"].validate(passing)
+        assert passing["accepted"] is True
+        assert passing["listeners"]["retained"] == 20
+        assert passing["overall"]["dpdfnet_preference_score"] == 1.0
+        assert passing["duplicate_consistency"]["inconsistencies"] == 0
+
+        rejected_responses = responses(root, protocol, answer, candidate=False)
+        rejected_result = root / "rejected-result.json"
+        run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(answer_path),
+                "--responses",
+                str(rejected_responses),
+                "--output",
+                str(rejected_result),
+                "--allow-rejected",
+            ]
+        )
+        rejected = json.loads(rejected_result.read_text(encoding="utf-8"))
+        validators["result"].validate(rejected)
+        assert rejected["accepted"] is False
+        assert rejected["overall"]["dpdfnet_preference_score"] == 0.0
+
+        duplicate = run(
+            [
+                sys.executable,
+                str(PREPARE),
+                "--matrix-result",
+                str(matrix),
+                "--audio-dir",
+                str(audio),
+                "--randomization-key",
+                str(root / "randomization.key"),
+                "--output-dir",
+                str(bundle),
+                "--answer-key",
+                str(root / "another-answer.json"),
+            ],
+            success=False,
+        )
+        assert "refusing to replace" in duplicate.stderr
+
+        matrix_link = root / "matrix-link.json"
+        matrix_link.symlink_to(matrix)
+        linked_matrix = run(
+            [
+                sys.executable,
+                str(PREPARE),
+                "--matrix-result",
+                str(matrix_link),
+                "--audio-dir",
+                str(audio),
+                "--randomization-key",
+                str(root / "randomization.key"),
+                "--output-dir",
+                str(root / "linked-matrix-bundle"),
+                "--answer-key",
+                str(root / "linked-matrix-answer.json"),
+            ],
+            success=False,
+        )
+        assert "not a regular file" in linked_matrix.stderr
+
+        answer_link = root / "answer-link.json"
+        answer_link.symlink_to(answer_path)
+        linked_answer = run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(protocol_path),
+                "--answer-key",
+                str(answer_link),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(root / "linked-answer-result.json"),
+            ],
+            success=False,
+        )
+        assert "not a regular file" in linked_answer.stderr
+
+        tampered_bundle = root / "tampered-bundle"
+        shutil.copytree(bundle, tampered_bundle)
+        with (tampered_bundle / protocol["trials"][0]["audio"]["a"]["path"]).open("ab") as output:
+            output.write(b"tamper")
+        tampered = run(
+            [
+                sys.executable,
+                str(SCORE),
+                "--protocol",
+                str(tampered_bundle / "protocol.json"),
+                "--answer-key",
+                str(answer_path),
+                "--responses",
+                str(passing_responses),
+                "--output",
+                str(root / "tampered-result.json"),
+            ],
+            success=False,
+        )
+        assert "fingerprint mismatch" in tampered.stderr
+
+        platform_root = root / "platform"
+        platform_root.mkdir()
+        stress_path, worker_path = platform_fixture(platform_root)
+        validators["worker"].validate(json.loads(worker_path.read_text(encoding="utf-8")))
+        platform_result = platform_root / "platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(stress_path),
+                "--worker",
+                str(worker_path),
+                "--output",
+                str(platform_result),
+            ]
+        )
+        platform = json.loads(platform_result.read_text(encoding="utf-8"))
+        validators["platform"].validate(platform)
+        assert platform["accepted"] is True
+        assert len(platform["checks"]) == 11
+
+        preempted_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        preempted_stress["timing"].update(
+            {
+                "p99_9_ms": 8.654417,
+                "maximum_ms": 13.000958,
+                "calls_over_budget": 1,
+                "calls_over_budget_fraction": 1 / 6000,
+            }
+        )
+        preempted_stress_path = platform_root / "preempted-stress.json"
+        preempted_stress_path.write_text(
+            json.dumps(preempted_stress) + "\n", encoding="utf-8"
+        )
+        preempted_platform_path = platform_root / "preempted-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(preempted_stress_path),
+                "--worker",
+                str(worker_path),
+                "--output",
+                str(preempted_platform_path),
+            ]
+        )
+        preempted_platform = json.loads(
+            preempted_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(preempted_platform)
+        assert preempted_platform["accepted"] is True
+        by_id = {item["id"]: item for item in preempted_platform["checks"]}
+        assert by_id["stress-maximum-ms"]["limit"] == 20.0
+        assert by_id["stress-deadline-misses"]["limit"] == 6
+
+        lowest_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        lowest_stress["environment"].update(
+            {
+                "logical_parallelism": 1,
+                "hardware_tier": "lowest-supported",
+                "runner_label": "ubuntu-slim",
+            }
+        )
+        lowest_worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        lowest_worker["environment"].update(
+            {
+                "logical_parallelism": 1,
+                "hardware_tier": "lowest-supported",
+                "runner_label": "ubuntu-slim",
+            }
+        )
+        lowest_stress_path = platform_root / "lowest-stress.json"
+        lowest_worker_path = platform_root / "lowest-worker.json"
+        lowest_stress_path.write_text(
+            json.dumps(lowest_stress) + "\n", encoding="utf-8"
+        )
+        lowest_worker_path.write_text(
+            json.dumps(lowest_worker) + "\n", encoding="utf-8"
+        )
+        lowest_platform_path = platform_root / "lowest-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(lowest_stress_path),
+                "--worker",
+                str(lowest_worker_path),
+                "--output",
+                str(lowest_platform_path),
+            ]
+        )
+        lowest_platform = json.loads(
+            lowest_platform_path.read_text(encoding="utf-8")
+        )
+        validators["platform"].validate(lowest_platform)
+        assert lowest_platform["accepted"] is True
+        assert lowest_platform["platform"]["logical_cpus"] == 1
+        assert lowest_platform["platform"]["runner_label"] == "ubuntu-slim"
+
+        false_lowest = json.loads(json.dumps(lowest_stress))
+        false_lowest["environment"]["logical_parallelism"] = 2
+        false_lowest_path = platform_root / "false-lowest-stress.json"
+        false_lowest_path.write_text(
+            json.dumps(false_lowest) + "\n", encoding="utf-8"
+        )
+        false_lowest_result = run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(false_lowest_path),
+                "--worker",
+                str(lowest_worker_path),
+                "--output",
+                str(platform_root / "false-lowest-platform.json"),
+            ],
+            success=False,
+        )
+        assert "one logical CPU" in false_lowest_result.stderr
+
+        rejected_stress = json.loads(stress_path.read_text(encoding="utf-8"))
+        rejected_stress["timing"]["p99_9_ms"] = 11.0
+        rejected_stress_path = platform_root / "rejected-stress.json"
+        rejected_stress_path.write_text(json.dumps(rejected_stress) + "\n", encoding="utf-8")
+        rejected_platform_path = platform_root / "rejected-platform.json"
+        run(
+            [
+                sys.executable,
+                str(PLATFORM),
+                "--stress",
+                str(rejected_stress_path),
+                "--worker",
+                str(worker_path),
+                "--output",
+                str(rejected_platform_path),
+                "--allow-rejected",
+            ]
+        )
+        rejected_platform = json.loads(rejected_platform_path.read_text(encoding="utf-8"))
+        validators["platform"].validate(rejected_platform)
+        assert rejected_platform["accepted"] is False
+
+        promotion_root = root / "promotion"
+        promotion_root.mkdir()
+        arguments, module = composite_fixtures(
+            promotion_root, passing, platform, validators
+        )
+        assert module.generate(arguments) is True
+        promotion = json.loads(arguments.output.read_text(encoding="utf-8"))
+        validators["promotion"].validate(promotion)
+        assert promotion["accepted"] is True
+        assert len(promotion["platforms"]) == 4
+        assert {entry["os"] for entry in promotion["platforms"]} == {
+            "linux",
+            "macos",
+            "windows",
+        }
+        assert sum(
+            entry["hardware_tier"] == "lowest-supported"
+            for entry in promotion["platforms"]
+        ) == 1
+
+        no_lowest = SimpleNamespace(**vars(arguments))
+        no_lowest.platform_evidence = arguments.platform_evidence[:3]
+        no_lowest.platform_attestation = arguments.platform_attestation[:3]
+        no_lowest.output = promotion_root / "promotion-no-lowest.json"
+        assert module.generate(no_lowest) is False
+        rejected_promotion = json.loads(
+            no_lowest.output.read_text(encoding="utf-8")
+        )
+        validators["promotion"].validate(rejected_promotion)
+        assert rejected_promotion["accepted"] is False
+        lowest_check = next(
+            check
+            for check in rejected_promotion["checks"]
+            if check["id"] == "lowest-supported-hardware"
+        )
+        assert lowest_check["passed"] is False
+
+        duplicate_platform = SimpleNamespace(**vars(arguments))
+        duplicate_platform.platform_evidence = [
+            *arguments.platform_evidence[:3],
+            arguments.platform_evidence[0],
+        ]
+        duplicate_platform.platform_attestation = [
+            *arguments.platform_attestation[:3],
+            arguments.platform_attestation[0],
+        ]
+        duplicate_platform.output = promotion_root / "promotion-duplicate.json"
+        try:
+            module.generate(duplicate_platform)
+        except module.PromotionError as error:
+            assert "duplicate portable-ci platform evidence for linux" in str(error)
+        else:
+            raise AssertionError("duplicate platform evidence unexpectedly passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

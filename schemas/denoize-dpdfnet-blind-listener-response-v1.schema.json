@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-blind-listener-response-v1.schema.json",
+  "title": "denoize DPDFNet blinded-listening listener response v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "protocol_sha256", "listener_id", "consent", "trials"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-blind-listener-response-v1" },
+    "schema_version": { "const": 1 },
+    "protocol_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "listener_id": { "type": "string", "pattern": "^[A-Za-z0-9._-]{3,64}$" },
+    "consent": { "const": true },
+    "trials": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["trial_id", "preference"],
+        "properties": {
+          "trial_id": { "type": "string", "pattern": "^[0-9a-f]{24}$" },
+          "preference": { "enum": ["a", "b", "tie"] }
+        }
+      }
+    }
+  }
+}

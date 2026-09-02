@@ -162,6 +162,8 @@ pub fn consumed_model_config(
         Backend::Sgmse => true,
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => true,
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => true,
         _ => false,
     };
     if !uses_model {
@@ -765,6 +767,8 @@ fn backend_id(backend: Backend) -> u8 {
         Backend::Sgmse => 8,
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => 9,
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => 10,
     }
 }
 

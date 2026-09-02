@@ -1,0 +1,372 @@
+name: DPDFNet promotion evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      stress_seconds:
+        description: Sustained DPDFNet DAW measurement duration
+        required: true
+        default: "60"
+  push:
+    branches:
+      - poc/dpdfnet-comparison
+    paths:
+      - ".github/workflows/dpdfnet-promotion.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "examples/dpdfnet_gtcrn_stress.rs"
+      - "models/**"
+      - "plugins/denoize-clap/**"
+      - "schemas/denoize-dpdfnet-*"
+      - "scripts/*dpdfnet*"
+      - "scripts/reaper-clap-parameter-smoke.lua"
+      - "src/backend/dpdfnet.rs"
+      - "src/neural_daw.rs"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/dpdfnet-promotion.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "examples/dpdfnet_gtcrn_stress.rs"
+      - "models/**"
+      - "plugins/denoize-clap/**"
+      - "schemas/denoize-dpdfnet-*"
+      - "scripts/*dpdfnet*"
+      - "scripts/reaper-clap-parameter-smoke.lua"
+      - "src/backend/dpdfnet.rs"
+      - "src/neural_daw.rs"
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  DPDFNET_MODEL_SHA256: 7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b
+  DPDFNET_MODEL_URL: https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet2_48khz_hr.onnx
+
+concurrency:
+  group: dpdfnet-promotion-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  platform:
+    name: ${{ matrix.target }} portable evidence
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/libdenoize_clap.so
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/libdenoize_clap.dylib
+            archive: tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/denoize_clap.dll
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Select minimum supported Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add "${{ matrix.target }}"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends libasound2-dev python3-jsonschema
+
+      - name: Record evidence environment
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              cpu_model=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)
+              os_version=$(uname -srmo)
+              # RUNNER_TEMP is below /home on GitHub's Linux images. The
+              # runner grants service accounts access to that ancestor with
+              # an extended ACL, which the production atomic-output guard
+              # correctly rejects for model provenance. Use a private child
+              # of the sticky system temp directory instead.
+              model_root=$(mktemp -d /tmp/denoize-models.XXXXXX)
+              ;;
+            macOS)
+              cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model)
+              os_version=$(sw_vers -productName)-$(sw_vers -productVersion)-$(sw_vers -buildVersion)
+              model_root="$RUNNER_TEMP/denoize-models"
+              ;;
+            Windows)
+              cpu_model=$(powershell.exe -NoProfile -Command '(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name).Trim()' | tr -d '\r')
+              os_version=$(powershell.exe -NoProfile -Command '[System.Environment]::OSVersion.VersionString' | tr -d '\r')
+              model_root="$RUNNER_TEMP/denoize-models"
+              ;;
+            *) exit 1 ;;
+          esac
+          {
+            echo "DENOIZE_EVIDENCE_SOURCE_COMMIT=$GITHUB_SHA"
+            echo "DENOIZE_EVIDENCE_TARGET=${{ matrix.target }}"
+            echo "DENOIZE_EVIDENCE_OS_VERSION=$os_version"
+            echo "DENOIZE_EVIDENCE_CPU_MODEL=$cpu_model"
+            echo "DENOIZE_EVIDENCE_HARDWARE_TIER=portable-ci"
+            echo "DENOIZE_EVIDENCE_RUNNER_LABEL=${{ matrix.os }}"
+            echo "DENOIZE_MODEL_DIR=$model_root"
+            echo "DENOIZE_EVIDENCE_DIR=$RUNNER_TEMP/dpdfnet-evidence"
+          } >> "$GITHUB_ENV"
+
+      - name: Install pinned DPDFNet model
+        shell: bash
+        run: |
+          model_dir="$DENOIZE_MODEL_DIR/dpdfnet2-48khz-hr"
+          mkdir -p "$model_dir" "$DENOIZE_EVIDENCE_DIR"
+          model="$model_dir/dpdfnet2_48khz_hr.onnx"
+          curl --fail --location --retry 5 --output "$model" "$DPDFNET_MODEL_URL"
+          if command -v sha256sum >/dev/null 2>&1; then
+            observed=$(sha256sum < "$model" | awk '{print $1}')
+          else
+            observed=$(shasum -a 256 < "$model" | awk '{print $1}')
+          fi
+          test "$observed" = "$DPDFNET_MODEL_SHA256"
+          echo "DPDFNET_MODEL=$model" >> "$GITHUB_ENV"
+
+      - name: Measure production DPDFNet DAW path
+        shell: bash
+        env:
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          seconds="${{ inputs.stress_seconds || '60' }}"
+          cargo run --locked --release --target "${{ matrix.target }}" \
+            --features dpdfnet,gtcrn --example dpdfnet_gtcrn_stress -- \
+            --model dpdfnet-daw --model-path "$DPDFNET_MODEL" \
+            --seconds "$seconds" --parallel 1 \
+            --json "$DENOIZE_EVIDENCE_DIR/stress.json"
+
+      - name: Exercise paced experimental CLAP worker
+        shell: bash
+        env:
+          DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-evidence/worker.json
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --features experimental-dpdfnet-hq \
+            neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \
+            -- --ignored --exact --nocapture
+
+      - name: Generate closed platform evidence
+        shell: bash
+        run: |
+          python3 scripts/generate-dpdfnet-platform-evidence.py \
+            --stress "$DENOIZE_EVIDENCE_DIR/stress.json" \
+            --worker "$DENOIZE_EVIDENCE_DIR/worker.json" \
+            --output "$DENOIZE_EVIDENCE_DIR/platform.json"
+
+      - name: Preserve rejected platform diagnostics
+        if: failure()
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dpdfnet-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Build and package experimental CLAP
+        shell: bash
+        run: |
+          cargo build --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --features experimental-dpdfnet-hq
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p denoize-clap --features experimental-dpdfnet-hq \
+            tests::bundle_exposes_stable_realtime_and_neural_plugin_ids -- --exact
+          archive=$(bash scripts/package-dpdfnet-experimental-clap.sh \
+            "${{ matrix.target }}" "$GITHUB_SHA" "$DENOIZE_EVIDENCE_DIR" \
+            "${{ matrix.binary }}" "$DPDFNET_MODEL")
+          echo "DPDFNET_ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Export prebuilt Linux executables for the one-CPU gate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mapfile -t worker_gates < <(
+            find "target/${{ matrix.target }}/release/deps" -maxdepth 1 \
+              -type f -name 'denoize_clap-*' -perm /111 -print
+          )
+          test "${#worker_gates[@]}" -eq 1
+          install -m 755 "${worker_gates[0]}" \
+            "$DENOIZE_EVIDENCE_DIR/dpdfnet-worker-gate"
+          install -m 755 \
+            "target/${{ matrix.target }}/release/examples/dpdfnet_gtcrn_stress" \
+            "$DENOIZE_EVIDENCE_DIR/dpdfnet-stress-gate"
+
+      - name: Exercise DPDFNet in REAPER with the OSARA parameter path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & scripts/test-reaper-dpdfnet-clap.ps1 `
+            -PluginBinary "${{ matrix.binary }}" `
+            -ModelRoot "$env:DENOIZE_MODEL_DIR" `
+            -OutputDirectory "$env:DENOIZE_EVIDENCE_DIR" `
+            -SourceCommit "$env:GITHUB_SHA" `
+            -DurationSeconds 60
+
+      - name: Preserve rejected Windows host diagnostics
+        if: failure() && runner.os == 'Windows'
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-rejected-host-${{ matrix.target }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dpdfnet-evidence
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Attest experimental artifact and measurements
+        if: github.event_name != 'pull_request'
+        id: attest
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/dpdfnet-evidence/*
+
+      - name: Preserve Sigstore bundle
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" \
+            "$DENOIZE_EVIDENCE_DIR/dpdfnet-${{ matrix.target }}.sigstore.json"
+
+      - name: Upload experimental artifact and evidence
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-experimental-${{ matrix.target }}
+          path: ${{ runner.temp }}/dpdfnet-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  lowest-supported:
+    name: One-CPU lowest-supported evidence
+    if: github.event_name != 'pull_request'
+    needs: platform
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        # actions/checkout v6.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      - name: Download attested Linux gate executables
+        # actions/download-artifact v7.
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: dpdfnet-experimental-x86_64-unknown-linux-gnu
+          path: ${{ runner.temp }}/portable-linux
+
+      - name: Verify downloaded gate executables
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          portable="$RUNNER_TEMP/portable-linux"
+          bundle="$portable/dpdfnet-x86_64-unknown-linux-gnu.sigstore.json"
+          for executable in dpdfnet-stress-gate dpdfnet-worker-gate; do
+            gh attestation verify "$portable/$executable" \
+              --repo penguin425/denoize \
+              --bundle "$bundle" \
+              --signer-workflow penguin425/denoize/.github/workflows/dpdfnet-promotion.yml \
+              --source-digest "$GITHUB_SHA"
+          done
+
+      - name: Record lowest-tier environment
+        shell: bash
+        run: |
+          cpu_model=$(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)
+          os_version=$(uname -srmo)
+          evidence_dir="$RUNNER_TEMP/dpdfnet-lowest-supported"
+          model_root=$(mktemp -d /tmp/denoize-lowest-models.XXXXXX)
+          test "$(nproc)" -eq 1
+          {
+            echo "DENOIZE_EVIDENCE_SOURCE_COMMIT=$GITHUB_SHA"
+            echo "DENOIZE_EVIDENCE_TARGET=x86_64-unknown-linux-gnu"
+            echo "DENOIZE_EVIDENCE_OS_VERSION=$os_version"
+            echo "DENOIZE_EVIDENCE_CPU_MODEL=$cpu_model"
+            echo "DENOIZE_EVIDENCE_HARDWARE_TIER=lowest-supported"
+            echo "DENOIZE_EVIDENCE_RUNNER_LABEL=ubuntu-slim"
+            echo "DENOIZE_MODEL_DIR=$model_root"
+            echo "DENOIZE_EVIDENCE_DIR=$evidence_dir"
+          } >> "$GITHUB_ENV"
+
+      - name: Install pinned DPDFNet model
+        shell: bash
+        run: |
+          model_dir="$DENOIZE_MODEL_DIR/dpdfnet2-48khz-hr"
+          mkdir -p "$model_dir" "$DENOIZE_EVIDENCE_DIR"
+          model="$model_dir/dpdfnet2_48khz_hr.onnx"
+          curl --fail --location --retry 5 --output "$model" "$DPDFNET_MODEL_URL"
+          test "$(sha256sum < "$model" | awk '{print $1}')" = "$DPDFNET_MODEL_SHA256"
+          echo "DPDFNET_MODEL=$model" >> "$GITHUB_ENV"
+
+      - name: Measure lowest-supported production path
+        shell: bash
+        env:
+          DENOIZE_NEURAL_WORKER_EVIDENCE: ${{ runner.temp }}/dpdfnet-lowest-supported/worker.json
+          RAYON_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: |
+          portable="$RUNNER_TEMP/portable-linux"
+          chmod 755 "$portable/dpdfnet-stress-gate" "$portable/dpdfnet-worker-gate"
+          "$portable/dpdfnet-stress-gate" \
+            --model dpdfnet-daw --model-path "$DPDFNET_MODEL" \
+            --seconds "${{ inputs.stress_seconds || '60' }}" --parallel 1 \
+            --json "$DENOIZE_EVIDENCE_DIR/stress.json"
+          "$portable/dpdfnet-worker-gate" \
+            neural::tests::pinned_dpdfnet2_release_worker_meets_sustained_deadlines \
+            --ignored --exact --nocapture
+          python3 scripts/generate-dpdfnet-platform-evidence.py \
+            --stress "$DENOIZE_EVIDENCE_DIR/stress.json" \
+            --worker "$DENOIZE_EVIDENCE_DIR/worker.json" \
+            --output "$DENOIZE_EVIDENCE_DIR/platform.json"
+
+      - name: Attest lowest-supported measurement
+        id: attest-lowest
+        # actions/attest v4.
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: ${{ runner.temp }}/dpdfnet-lowest-supported/*.json
+
+      - name: Upload lowest-supported evidence
+        shell: bash
+        run: |
+          cp "${{ steps.attest-lowest.outputs.bundle-path }}" \
+            "$DENOIZE_EVIDENCE_DIR/dpdfnet-lowest-supported.sigstore.json"
+
+      - name: Preserve lowest-supported evidence
+        # actions/upload-artifact v6.
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: dpdfnet-lowest-supported
+          path: ${{ runner.temp }}/dpdfnet-lowest-supported
+          if-no-files-found: error
+          retention-days: 30

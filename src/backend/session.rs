@@ -49,6 +49,8 @@ enum PreparedBackend {
     Sgmse(super::sgmse::SgmseModel),
     #[cfg(feature = "gtcrn")]
     Gtcrn(super::gtcrn::GtcrnModel),
+    #[cfg(feature = "dpdfnet")]
+    Dpdfnet(super::dpdfnet::DpdfnetModel),
 }
 
 impl BackendSession {
@@ -152,6 +154,13 @@ impl BackendSession {
                     accelerator.effective(),
                 )?)
             }
+            #[cfg(feature = "dpdfnet")]
+            Backend::Dpdfnet => PreparedBackend::Dpdfnet(
+                super::dpdfnet::DpdfnetModel::load_dpdfnet2_with_accelerator(
+                    required_model(&options, "DPDFNet-2")?,
+                    accelerator.effective(),
+                )?,
+            ),
         };
         Ok(Self {
             backend,
@@ -303,6 +312,8 @@ impl BackendSession {
             ),
             #[cfg(feature = "gtcrn")]
             PreparedBackend::Gtcrn(model) => model.process(channels, sample_rate),
+            #[cfg(feature = "dpdfnet")]
+            PreparedBackend::Dpdfnet(model) => model.process_aligned(channels, sample_rate),
         }
     }
 }
@@ -313,7 +324,8 @@ impl BackendSession {
     feature = "bsrnn",
     feature = "mossformer2",
     feature = "sgmse",
-    feature = "gtcrn"
+    feature = "gtcrn",
+    feature = "dpdfnet"
 ))]
 fn required_model<'a>(
     options: &'a BackendOptions,

@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-blind-listening-result-v1.schema.json",
+  "title": "denoize DPDFNet blinded-listening aggregate result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "bundle_id", "source_matrix_sha256", "protocol_sha256", "answer_key_sha256",
+    "response_set_sha256", "models", "listeners", "duplicate_consistency", "overall",
+    "strata", "checks", "accepted"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-blind-listening-result-v1" },
+    "schema_version": { "const": 1 },
+    "bundle_id": { "$ref": "#/$defs/id" },
+    "source_matrix_sha256": { "$ref": "#/$defs/sha256" },
+    "protocol_sha256": { "$ref": "#/$defs/sha256" },
+    "answer_key_sha256": { "$ref": "#/$defs/sha256" },
+    "response_set_sha256": { "$ref": "#/$defs/sha256" },
+    "models": {
+      "const": { "candidate": "dpdfnet2-48khz-hr", "baseline": "gtcrn-dns3" }
+    },
+    "listeners": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["submitted", "retained", "excluded_by_predeclared_consistency_screen"],
+      "properties": {
+        "submitted": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "retained": { "type": "integer", "minimum": 1, "maximum": 100000 },
+        "excluded_by_predeclared_consistency_screen": { "type": "integer", "minimum": 0, "maximum": 100000 }
+      }
+    },
+    "duplicate_consistency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["comparisons", "inconsistencies", "inconsistency_fraction", "maximum", "passed"],
+      "properties": {
+        "comparisons": { "type": "integer", "minimum": 4, "maximum": 400000 },
+        "inconsistencies": { "type": "integer", "minimum": 0, "maximum": 400000 },
+        "inconsistency_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+        "maximum": { "const": 0.25 },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "overall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ratings", "dpdfnet_preference_score", "listener_cluster_bootstrap_95ci", "tie_score"],
+      "properties": {
+        "ratings": { "type": "integer", "minimum": 12, "maximum": 1200000 },
+        "dpdfnet_preference_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "listener_cluster_bootstrap_95ci": {
+          "type": "array", "minItems": 2, "maxItems": 2,
+          "items": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "tie_score": { "const": 0.5 }
+      }
+    },
+    "strata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["recorded-noise", "babble", "source-preservation", "synthetic-noise"],
+      "properties": {
+        "recorded-noise": { "$ref": "#/$defs/stratum" },
+        "babble": { "$ref": "#/$defs/stratum" },
+        "source-preservation": { "$ref": "#/$defs/stratum" },
+        "synthetic-noise": { "$ref": "#/$defs/stratum" }
+      }
+    },
+    "checks": {
+      "type": "array", "minItems": 8, "maxItems": 8,
+      "items": { "$ref": "#/$defs/check" }
+    },
+    "accepted": { "type": "boolean" }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{24}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "stratum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["core_trials", "ratings", "dpdfnet_preference_score", "minimum", "passed"],
+      "properties": {
+        "core_trials": { "type": "integer", "minimum": 2, "maximum": 4 },
+        "ratings": { "type": "integer", "minimum": 2, "maximum": 400000 },
+        "dpdfnet_preference_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "minimum": { "type": "number", "minimum": 0.4, "maximum": 0.5 },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "observed", "operator", "limit", "passed"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+        "observed": { "type": "number" },
+        "operator": { "enum": ["greater-or-equal", "less-or-equal"] },
+        "limit": { "type": "number" },
+        "passed": { "type": "boolean" }
+      }
+    }
+  }
+}
