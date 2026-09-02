@@ -6,7 +6,8 @@
   "additionalProperties": false,
   "required": [
     "schema", "schema_version", "source_commit", "model_id", "model_sha256", "host",
-    "accessibility_api", "worker_metrics", "process", "inputs", "accepted_automated"
+    "accessibility_api", "measurement", "worker_metrics", "lifetime_worker_metrics",
+    "process", "inputs", "accepted_automated"
   ],
   "properties": {
     "schema": { "const": "denoize-dpdfnet-reaper-automated-evidence-v1" },
@@ -35,7 +36,16 @@
         "nvda_human_verified": { "const": false }
       }
     },
+    "measurement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["warmup_frames", "measured_frames"],
+      "properties": {
+        "warmup_frames": { "const": 46080 },
+        "measured_frames": { "type": "integer", "minimum": 2880000, "maximum": 9007199254740991 }
+      }
+    },
     "worker_metrics": { "$ref": "#/$defs/metrics" },
+    "lifetime_worker_metrics": { "$ref": "#/$defs/lifetime_metrics" },
     "process": {
       "type": "object", "additionalProperties": false,
       "required": ["wall_seconds", "cpu_seconds", "peak_working_set_bytes", "logical_processors"],
@@ -67,6 +77,16 @@
         "late_blocks": { "const": 0 },
         "invalid_blocks": { "const": 0 },
         "worker_errors": { "const": 0 }
+      }
+    },
+    "lifetime_metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["overload_blocks", "late_blocks", "invalid_blocks", "worker_errors"],
+      "properties": {
+        "overload_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "late_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "invalid_blocks": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "worker_errors": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
       }
     },
     "file": {

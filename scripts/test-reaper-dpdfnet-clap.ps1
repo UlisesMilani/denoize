@@ -68,6 +68,8 @@ Copy-Item -LiteralPath $PluginBinary -Destination $plugin
 ) | Set-Content -LiteralPath (Join-Path $resourceDir "reaper.ini") -Encoding ascii
 
 $sampleRate = 48000
+$evidenceWarmupFrames = 46080
+$measurementDelaySeconds = $DurationSeconds + 1
 # Keep the media item longer than the measured interval. A repeated short item
 # introduces transport discontinuities and recurrent-state resets into what is
 # intended to be a sustained real-time scheduling measurement.
@@ -134,7 +136,7 @@ $env:DENOIZE_REAPER_PLUGIN = "denoize Neural HQ"
 $env:DENOIZE_REAPER_OSARA_STYLE = "1"
 $env:DENOIZE_REAPER_NORMALIZED = "0"
 $env:DENOIZE_REAPER_PLAY_DELAY = "3"
-$env:DENOIZE_REAPER_SET_DELAY = [string]$DurationSeconds
+$env:DENOIZE_REAPER_SET_DELAY = [string]$measurementDelaySeconds
 $env:DENOIZE_REAPER_AUDIO = $tone
 $env:DENOIZE_REAPER_PLAY = "1"
 $env:DENOIZE_REAPER_REPEAT = "0"
@@ -238,9 +240,13 @@ $hostEvidence = Get-Content -LiteralPath $hostRun -Raw | ConvertFrom-Json
 if ($hostEvidence.model_id -ne "dpdfnet2-48khz-hr" -or
   $hostEvidence.source_commit -ne $SourceCommit -or
   -not $hostEvidence.worker_started -or -not $hostEvidence.finished_gracefully -or
-  $hostEvidence.active_seconds -lt $DurationSeconds -or
+  $hostEvidence.active_seconds -lt $measurementDelaySeconds -or
+  $hostEvidence.measurement.warmup_frames -ne $evidenceWarmupFrames -or
+  $hostEvidence.measurement.measured_frames -lt ($DurationSeconds * $sampleRate) -or
+  $hostEvidence.measurement.measured_frames -ne ($hostEvidence.processed_frames - $hostEvidence.measurement.warmup_frames) -or
   $hostEvidence.metrics.overload_blocks -ne 0 -or $hostEvidence.metrics.late_blocks -ne 0 -or
-  $hostEvidence.metrics.invalid_blocks -ne 0 -or $hostEvidence.metrics.worker_errors -ne 0) {
+  $hostEvidence.metrics.invalid_blocks -ne 0 -or $hostEvidence.metrics.worker_errors -ne 0 -or
+  $hostEvidence.lifetime_metrics.worker_errors -ne 0) {
   Write-Host "Rejected real REAPER host evidence:"
   Write-Host ($hostEvidence | ConvertTo-Json -Depth 10)
   throw "real REAPER DPDFNet worker evidence did not pass"
@@ -274,7 +280,12 @@ $evidence = [ordered]@{
     parameters_readable_and_adjustable = 4
     nvda_human_verified = $false
   }
+  measurement = [ordered]@{
+    warmup_frames = [int64]$hostEvidence.measurement.warmup_frames
+    measured_frames = [int64]$hostEvidence.measurement.measured_frames
+  }
   worker_metrics = $hostEvidence.metrics
+  lifetime_worker_metrics = $hostEvidence.lifetime_metrics
   process = [ordered]@{
     wall_seconds = [double]$processResult.wall_seconds
     cpu_seconds = [double]$processResult.cpu_seconds

@@ -282,10 +282,20 @@ def composite_fixtures(
             "parameters_readable_and_adjustable": 4,
             "nvda_human_verified": False,
         },
+        "measurement": {
+            "warmup_frames": 46_080,
+            "measured_frames": 2_880_000,
+        },
         "worker_metrics": {
             "overload_blocks": 0,
             "late_blocks": 0,
             "invalid_blocks": 0,
+            "worker_errors": 0,
+        },
+        "lifetime_worker_metrics": {
+            "overload_blocks": 24,
+            "late_blocks": 6,
+            "invalid_blocks": 5,
             "worker_errors": 0,
         },
         "process": {
@@ -486,6 +496,40 @@ def main() -> int:
         validators[name] = Draft202012Validator(document)
     with tempfile.TemporaryDirectory(prefix="denoize-dpdfnet-promotion-") as temporary:
         root = Path(temporary)
+        clap_host = {
+            "schema": "denoize-dpdfnet-clap-host-run-v1",
+            "schema_version": 1,
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "model_id": "dpdfnet2-48khz-hr",
+            "model_sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+            "plugin_id": "org.penguin425.denoize.neural-hq",
+            "sample_rate_hz": 48_000,
+            "channels": 2,
+            "chunk_frames": 480,
+            "latency_frames": 11_520,
+            "processed_frames": 2_976_000,
+            "active_seconds": 61.8,
+            "measurement": {
+                "warmup_frames": 46_080,
+                "measured_frames": 2_929_920,
+            },
+            "worker_started": True,
+            "finished_gracefully": True,
+            "metrics": {
+                "overload_blocks": 0,
+                "late_blocks": 0,
+                "invalid_blocks": 0,
+                "worker_errors": 0,
+            },
+            "lifetime_metrics": {
+                "overload_blocks": 24,
+                "late_blocks": 6,
+                "invalid_blocks": 5,
+                "worker_errors": 0,
+            },
+            "environment": {"os": "windows", "arch": "x86_64"},
+        }
+        validators["clap_host"].validate(clap_host)
         matrix, audio = fixture(root)
         bundle, answer_path = prepare(root, matrix, audio)
         protocol_path = bundle / "protocol.json"

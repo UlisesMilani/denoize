@@ -109,6 +109,15 @@ it ready. If registration fails, neural inference stays unavailable and the
 fixed-latency fallback remains active. The worker leaves the task when it exits;
 other platforms retain their native scheduler behavior.
 
+Automated REAPER evidence separates device priming from sustained processing.
+REAPER's Dummy Audio device can request about one output-buffer horizon faster
+than wall clock when playback starts, even with anticipative FX disabled. The
+evidence keeps those lifetime counters for diagnosis, then measures at least 60
+seconds after a bounded four-latency (960 ms) warm-up. Promotion still requires
+zero overload, late, invalid, and worker-error counters in that measured window;
+worker errors also remain forbidden during priming. Human reporter runs use a
+real audio device and do not discard any events.
+
 Each block carries a generation and absolute input-frame start. A host reset or
 dropped input block cold-resets recurrent and resampler state. Results from an
 older generation, results that arrive after their exact deadline, non-finite

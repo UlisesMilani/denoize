@@ -50,6 +50,7 @@ const WORKER_WARMUP_EXTRA_BLOCKS: usize = QUEUE_BLOCKS + 8;
 const WORKER_POLL: Duration = Duration::from_micros(100);
 const MAX_SAMPLE_RATE: u32 = NEURAL_DAW_MAX_SAMPLE_RATE;
 const MAX_OUTPUT_PEAK: f64 = 4.0;
+const HOST_EVIDENCE_WARMUP_LATENCIES: u64 = 4;
 
 const MONO_CONFIG_ID: ClapId = ClapId::new(101);
 const STEREO_CONFIG_ID: ClapId = ClapId::new(102);
@@ -233,6 +234,27 @@ pub(crate) struct NeuralShared {
     worker_errors: Arc<AtomicU64>,
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct WorkerMetrics {
+    overload_blocks: u64,
+    late_blocks: u64,
+    invalid_blocks: u64,
+    worker_errors: u64,
+}
+
+impl WorkerMetrics {
+    fn saturating_since(self, baseline: Self) -> Self {
+        Self {
+            overload_blocks: self
+                .overload_blocks
+                .saturating_sub(baseline.overload_blocks),
+            late_blocks: self.late_blocks.saturating_sub(baseline.late_blocks),
+            invalid_blocks: self.invalid_blocks.saturating_sub(baseline.invalid_blocks),
+            worker_errors: self.worker_errors.saturating_sub(baseline.worker_errors),
+        }
+    }
+}
+
 impl NeuralShared {
     #[cfg(test)]
     fn new() -> Result<Self, PluginError> {
@@ -254,6 +276,15 @@ impl NeuralShared {
     fn restore(&self, parameters: NeuralParameters) {
         self.parameters.store(parameters);
         self.reset_generation.fetch_add(1, Ordering::Release);
+    }
+
+    fn worker_metrics(&self) -> WorkerMetrics {
+        WorkerMetrics {
+            overload_blocks: self.overload_blocks.load(Ordering::Relaxed),
+            late_blocks: self.late_blocks.load(Ordering::Relaxed),
+            invalid_blocks: self.invalid_blocks.load(Ordering::Relaxed),
+            worker_errors: self.worker_errors.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -1220,6 +1251,8 @@ struct NeuralEngine<'a> {
     input_frame: u64,
     processed_frames: u64,
     activated_at: std::time::Instant,
+    host_evidence_warmup_frames: u64,
+    host_evidence_baseline: Option<WorkerMetrics>,
     generation: u64,
     last_safe_gain: [f64; 2],
     running: Arc<AtomicBool>,
@@ -1395,6 +1428,14 @@ impl<'a> NeuralEngine<'a> {
             }
         };
         let worker_started = worker.is_some();
+        let host_evidence_warmup_frames =
+            if std::env::var_os("DENOIZE_NEURAL_HOST_EVIDENCE").is_some() {
+                u64::from(latency_frames).saturating_mul(HOST_EVIDENCE_WARMUP_LATENCIES)
+            } else {
+                0
+            };
+        let host_evidence_baseline =
+            (host_evidence_warmup_frames == 0).then(WorkerMetrics::default);
 
         Ok(Self {
             channels,
@@ -1412,6 +1453,8 @@ impl<'a> NeuralEngine<'a> {
             input_frame: 0,
             processed_frames: 0,
             activated_at: std::time::Instant::now(),
+            host_evidence_warmup_frames,
+            host_evidence_baseline,
             generation: 1,
             last_safe_gain: [1.0; 2],
             running,
@@ -1485,6 +1528,11 @@ impl<'a> NeuralEngine<'a> {
         self.capture_frames += 1;
         self.input_frame = self.input_frame.wrapping_add(1);
         self.processed_frames = self.processed_frames.saturating_add(1);
+        if self.host_evidence_baseline.is_none()
+            && self.processed_frames >= self.host_evidence_warmup_frames
+        {
+            self.host_evidence_baseline = Some(self.metrics.worker_metrics());
+        }
         if self.capture_frames == self.chunk_frames {
             self.submit_capture();
         }
@@ -1624,13 +1672,19 @@ impl Drop for NeuralEngine<'_> {
 
 impl NeuralEngine<'_> {
     fn should_write_host_evidence(&self) -> bool {
-        self.processed_frames > 0
+        self.processed_frames > self.host_evidence_warmup_frames
     }
 
     fn write_host_evidence(&self) {
         let Ok(path) = std::env::var("DENOIZE_NEURAL_HOST_EVIDENCE") else {
             return;
         };
+        let lifetime_metrics = self.metrics.worker_metrics();
+        let baseline = self.host_evidence_baseline.unwrap_or(lifetime_metrics);
+        let measured_metrics = lifetime_metrics.saturating_since(baseline);
+        let measured_frames = self
+            .processed_frames
+            .saturating_sub(self.host_evidence_warmup_frames);
         let document = serde_json::json!({
             "schema": "denoize-dpdfnet-clap-host-run-v1",
             "schema_version": 1,
@@ -1644,15 +1698,25 @@ impl NeuralEngine<'_> {
             "latency_frames": self.latency_frames,
             "processed_frames": self.processed_frames,
             "active_seconds": self.activated_at.elapsed().as_secs_f64(),
+            "measurement": {
+                "warmup_frames": self.host_evidence_warmup_frames,
+                "measured_frames": measured_frames,
+            },
             // `deactivate()` stops and joins the worker before `Drop`. Keep
             // the successful startup fact independently of the live handle.
             "worker_started": self.worker_started,
             "finished_gracefully": true,
             "metrics": {
-                "overload_blocks": self.metrics.overload_blocks.load(Ordering::Relaxed),
-                "late_blocks": self.metrics.late_blocks.load(Ordering::Relaxed),
-                "invalid_blocks": self.metrics.invalid_blocks.load(Ordering::Relaxed),
-                "worker_errors": self.metrics.worker_errors.load(Ordering::Relaxed),
+                "overload_blocks": measured_metrics.overload_blocks,
+                "late_blocks": measured_metrics.late_blocks,
+                "invalid_blocks": measured_metrics.invalid_blocks,
+                "worker_errors": measured_metrics.worker_errors,
+            },
+            "lifetime_metrics": {
+                "overload_blocks": lifetime_metrics.overload_blocks,
+                "late_blocks": lifetime_metrics.late_blocks,
+                "invalid_blocks": lifetime_metrics.invalid_blocks,
+                "worker_errors": lifetime_metrics.worker_errors,
             },
             "environment": {
                 "os": std::env::consts::OS,
@@ -2077,6 +2141,32 @@ mod tests {
         assert!(engine.worker_started);
         assert_eq!(engine.processed_frames, 1);
         assert!(engine.should_write_host_evidence());
+    }
+
+    #[test]
+    fn host_evidence_separates_priming_from_the_measured_window() {
+        let mut engine = test_engine(1, || Ok(Box::new(IdentityProcessor)));
+        engine.host_evidence_warmup_frames = 1;
+        engine.host_evidence_baseline = None;
+        engine.metrics.overload_blocks.store(3, Ordering::Relaxed);
+
+        engine.process_frame(
+            [0.1, 0.0],
+            RuntimeParameters::from(NeuralParameters::default()),
+        );
+        assert_eq!(
+            engine.host_evidence_baseline,
+            Some(WorkerMetrics {
+                overload_blocks: 3,
+                ..WorkerMetrics::default()
+            })
+        );
+
+        engine.metrics.overload_blocks.store(5, Ordering::Relaxed);
+        let lifetime = engine.metrics.worker_metrics();
+        let measured = lifetime.saturating_since(engine.host_evidence_baseline.unwrap());
+        assert_eq!(lifetime.overload_blocks, 5);
+        assert_eq!(measured.overload_blocks, 2);
     }
 
     #[test]
