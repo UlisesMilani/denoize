@@ -32,16 +32,17 @@ use denoize::{
     AcceleratorSelection, Algorithm, AtomicOutput, AudioStreamWriter, Backend, BackendOptions,
     BackendSession, ChannelMode, CommitMode, DawParameters, DawPortConfiguration, DawPreset,
     DawRealtimeProcessor, DawSessionState, DownmixMode, EncodeOptions, ExecutionKind,
-    ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, NeuralDawOverloadFallback,
-    NeuralDawParameters, NeuralDawPortConfiguration, NeuralDawSessionState, OnnxModelConfig,
-    OutputFormat, PlannedArtifact, PlannedOutput, PlannedResources, ReceiptItem, ReceiptPublicKey,
-    ReceiptSecretKey, ReceiptTrustPolicy, RecommendationGoal, RecommendationOptions,
-    ResourceGovernor, ResourceLimits, ResourcePermit, ResourceRequest, RuntimeModelPackage,
-    SgmseProfile, SignedExecutionReceipt, SpooledAudioStreamWriter, StreamEncodeLimits,
-    StreamEncodeSpec, StreamPcmSpool, StreamSpoolLimits, StreamingBackendSession, WatchCycleReport,
-    WatchFolder, WatchFolderConfig, WatchFolderJob, WatchProcessError, WindowType,
-    DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY, DAW_PLUGIN_ID, NEURAL_DAW_LATENCY_POLICY,
-    NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID, WATCH_CYCLE_SCHEMA,
+    ExecutionPlan, ExecutionPlanItem, ExecutionReceiptPayload, NeuralDawModel,
+    NeuralDawOverloadFallback, NeuralDawParameters, NeuralDawPortConfiguration,
+    NeuralDawSessionState, OnnxModelConfig, OutputFormat, PlannedArtifact, PlannedOutput,
+    PlannedResources, ReceiptItem, ReceiptPublicKey, ReceiptSecretKey, ReceiptTrustPolicy,
+    RecommendationGoal, RecommendationOptions, ResourceGovernor, ResourceLimits, ResourcePermit,
+    ResourceRequest, RuntimeModelPackage, SgmseProfile, SignedExecutionReceipt,
+    SpooledAudioStreamWriter, StreamEncodeLimits, StreamEncodeSpec, StreamPcmSpool,
+    StreamSpoolLimits, StreamingBackendSession, WatchCycleReport, WatchFolder, WatchFolderConfig,
+    WatchFolderJob, WatchProcessError, WindowType, DAW_FIXED_LATENCY_MILLIS, DAW_LATENCY_POLICY,
+    DAW_PLUGIN_ID, NEURAL_DAW_LATENCY_POLICY, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256,
+    NEURAL_DAW_PLUGIN_ID, WATCH_CYCLE_SCHEMA,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
@@ -434,8 +435,9 @@ USAGE:
     denoize sdk <COMMAND> [OPTIONS]  (run `denoize sdk --help`)
 
 LIVE:
-    Low-latency live processing supports classical, rnnoise, and gtcrn when
-    compiled; other backends are rejected before capture or playback starts.
+    Low-latency live processing supports classical, rnnoise, gtcrn, and
+    dpdfnet when compiled; other backends are rejected before capture or
+    playback starts.
 
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
@@ -521,6 +523,7 @@ BACKENDS (build with --features full for all):
     mossformer2 ClearerVoice MossFormer2 for files and --stream (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
     gtcrn       Official causal GTCRN for files, --stream, and live processing
+    dpdfnet     Official DPDFNet-2 48 kHz HR for files, --stream, and live
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP
@@ -3426,6 +3429,7 @@ fn run_neural_plugin_session_read(args: &[String], validate: bool) -> Result<(),
         },
     )?;
     let state = read_neural_daw_session(path)?;
+    state.validate_for_model(NeuralDawModel::Gtcrn)?;
     if output != PluginOutputMode::Human {
         if validate {
             return print_plugin_json(

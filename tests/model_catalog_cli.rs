@@ -48,17 +48,23 @@ fn automation_snapshot_is_complete_stable_and_network_free() {
         "denoize-batch-recipe-v3"
     );
     assert_eq!(value["recipe_identity"]["version"], 3);
-    assert_eq!(value["catalog"]["sequence"], 2);
-    assert_eq!(value["catalog"]["model_count"], 1);
+    assert_eq!(value["catalog"]["sequence"], 3);
+    assert_eq!(value["catalog"]["model_count"], 2);
     assert_eq!(value["trust_root"]["version"], 1);
     assert_eq!(value["cache"]["clean"], true);
-    assert_eq!(value["cache"]["missing_models"], 1);
+    assert_eq!(value["cache"]["missing_models"], 2);
     assert_eq!(value["models"][0]["name"], "gtcrn-dns3");
     assert_eq!(value["models"][0]["status"], "missing");
     assert!(value["models"][0]["provenance"].is_null());
     assert_eq!(
         value["models"][0]["artifact_sha256"],
         "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+    );
+    assert_eq!(value["models"][1]["name"], "dpdfnet2-48khz-hr");
+    assert_eq!(value["models"][1]["status"], "missing");
+    assert_eq!(
+        value["models"][1]["artifact_sha256"],
+        "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
     );
 
     let schema: serde_json::Value =
@@ -93,13 +99,13 @@ fn embedded_catalog_status_list_and_info_are_visible() {
         String::from_utf8_lossy(&status.stderr)
     );
     let status = String::from_utf8(status.stdout).unwrap();
-    assert!(status.contains("sequence: 2\n"), "{status}");
+    assert!(status.contains("sequence: 3\n"), "{status}");
     assert!(
         status.contains("signing-key: F5AE02E7593C64D9\n"),
         "{status}"
     );
     assert!(status.contains("origin: embedded\n"), "{status}");
-    assert!(status.contains("models: 1\n"), "{status}");
+    assert!(status.contains("models: 2\n"), "{status}");
     assert!(status.contains("trust-root-version: 1\n"), "{status}");
     assert!(status.contains("acquisition-allowed: true\n"), "{status}");
 
@@ -122,7 +128,7 @@ fn embedded_catalog_status_list_and_info_are_visible() {
         String::from_utf8_lossy(&info.stderr)
     );
     let info = String::from_utf8(info.stdout).unwrap();
-    assert!(info.contains("catalog-sequence: 2\n"), "{info}");
+    assert!(info.contains("catalog-sequence: 3\n"), "{info}");
     assert!(
         info.contains("catalog-signing-key: F5AE02E7593C64D9\n"),
         "{info}"
@@ -158,7 +164,7 @@ fn offline_catalog_update_never_requires_network() {
     );
     assert!(String::from_utf8(output.stdout)
         .unwrap()
-        .contains("sequence: 2\n"));
+        .contains("sequence: 3\n"));
     assert!(!directory.path().join(".catalog").exists());
 }
 
@@ -175,10 +181,10 @@ fn first_embedded_catalog_acquisition_persists_the_sequence_floor() {
     );
     let state: serde_json::Value =
         serde_json::from_slice(&std::fs::read(cache.join(".catalog/state.json")).unwrap()).unwrap();
-    assert_eq!(state["highest_sequence"], 2);
+    assert_eq!(state["highest_sequence"], 3);
     assert_eq!(
         state["catalog_sha256"],
-        "9508b6d99af30f73e8a783e606fe9934ff41cefcf4268aca4b9e0ec5d66ff6eb"
+        "57c59c467c953977c3e14c8e93efb1268346dd72125fc700b365b21ca8c16fe8"
     );
 }
 
@@ -303,8 +309,9 @@ fn model_doctor_treats_a_fresh_optional_cache_as_clean() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("gtcrn-dns3\tmissing\t"), "{stdout}");
+    assert!(stdout.contains("dpdfnet2-48khz-hr\tmissing\t"), "{stdout}");
     assert!(
-        stdout.contains("doctor-summary: 0 healthy, 1 missing, 0 attention, 0 cache issues"),
+        stdout.contains("doctor-summary: 0 healthy, 2 missing, 0 attention, 0 cache issues"),
         "{stdout}"
     );
     assert!(!cache.exists(), "doctor unexpectedly created the cache");

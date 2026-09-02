@@ -858,7 +858,8 @@ fn build_candidates(
     hardware: &HardwareCapabilities,
 ) -> Result<Vec<RecommendationCandidate>, String> {
     let managed_catalog = Backend::available_names()
-        .contains(&"gtcrn")
+        .iter()
+        .any(|name| matches!(*name, "gtcrn" | "dpdfnet"))
         .then(crate::models::embedded_catalog);
     let mut candidates = Vec::new();
     for &name in Backend::available_names() {
@@ -884,10 +885,10 @@ fn build_candidates(
                 -100,
                 "backend requires a caller-supplied model path, which recommendation reports intentionally do not serialize",
             ));
-        } else if name == "gtcrn" {
+        } else if matches!(name, "gtcrn" | "dpdfnet") {
             let catalog = managed_catalog
                 .as_ref()
-                .expect("GTCRN availability created an embedded catalog");
+                .expect("managed-model availability created an embedded catalog");
             match catalog.find(name) {
                 Some(model) => {
                     model_name = Some(model.name().to_string());
@@ -925,6 +926,14 @@ fn build_candidates(
                         "no unambiguous managed model is present in the embedded signed catalog",
                     ));
                 }
+            }
+            if name == "dpdfnet" {
+                eligible = false;
+                reasons.push(reason(
+                    "promotion-pending",
+                    -100,
+                    "DPDFNet-2 remains explicit-only until Windows host and blinded listening promotion gates pass",
+                ));
             }
         }
 
@@ -1154,6 +1163,7 @@ fn backend_traits(name: &str) -> BackendTraits {
         "rnnoise" => traits(78, 48, 62, 55, 92, 2),
         "deepfilter" => traits(94, 68, 82, 64, 68, 10),
         "gtcrn" => traits(91, 58, 76, 60, 76, 7),
+        "dpdfnet" => traits(91, 58, 76, 60, 76, 20),
         "mpsenet" => traits(96, 58, 78, 58, 38, 28),
         "bsrnn" => traits(95, 67, 83, 60, 52, 18),
         "mossformer2" => traits(97, 62, 82, 58, 30, 45),
@@ -1203,10 +1213,14 @@ fn material_adjustment(name: &str, material: RecommendationMaterial) -> i32 {
     match (name, material) {
         ("classical", RecommendationMaterial::Music | RecommendationMaterial::Quiet) => 8,
         (
-            "rnnoise" | "deepfilter" | "gtcrn" | "mpsenet" | "bsrnn" | "mossformer2" | "sgmse",
+            "rnnoise" | "deepfilter" | "gtcrn" | "dpdfnet" | "mpsenet" | "bsrnn" | "mossformer2"
+            | "sgmse",
             RecommendationMaterial::Speech,
         ) => 8,
-        ("rnnoise" | "gtcrn" | "mpsenet" | "mossformer2", RecommendationMaterial::Music) => -12,
+        (
+            "rnnoise" | "gtcrn" | "dpdfnet" | "mpsenet" | "mossformer2",
+            RecommendationMaterial::Music,
+        ) => -12,
         ("sgmse", RecommendationMaterial::Quiet) => -10,
         _ => 0,
     }

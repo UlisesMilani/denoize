@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-reporter-evidence-v1.schema.json",
+  "title": "denoize DPDFNet issue-reporter human evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "github", "payload", "accepted"],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-reporter-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "github": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "issue", "comment_id", "comment_url", "author", "created_at", "updated_at", "comment_body_sha256"],
+      "properties": {
+        "repository": { "const": "penguin425/denoize" },
+        "issue": { "const": 221 },
+        "comment_id": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "comment_url": { "type": "string", "pattern": "^https://github\\.com/penguin425/denoize/issues/221#issuecomment-[1-9][0-9]*$" },
+        "author": { "const": "UlisesMilani" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "comment_body_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "payload": { "$ref": "#/$defs/payload" },
+    "accepted": { "const": true }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "bounded": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "payload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "schema_version", "source_commit", "artifact_sha256", "environment", "runs", "accessibility", "quality_observation", "consent_to_publish"],
+      "properties": {
+        "schema": { "const": "denoize-dpdfnet-reporter-submission-v1" },
+        "schema_version": { "const": 1 },
+        "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "artifact_sha256": { "$ref": "#/$defs/sha256" },
+        "environment": {
+          "type": "object", "additionalProperties": false,
+          "required": ["windows_version", "cpu_model", "audio_device", "audio_driver", "reaper_version", "nvda_version", "osara_version"],
+          "properties": {
+            "windows_version": { "$ref": "#/$defs/bounded" },
+            "cpu_model": { "$ref": "#/$defs/bounded" },
+            "audio_device": { "$ref": "#/$defs/bounded" },
+            "audio_driver": { "$ref": "#/$defs/bounded" },
+            "reaper_version": { "$ref": "#/$defs/bounded" },
+            "nvda_version": { "$ref": "#/$defs/bounded" },
+            "osara_version": { "$ref": "#/$defs/bounded" }
+          }
+        },
+        "runs": { "type": "array", "minItems": 3, "maxItems": 16, "items": { "$ref": "#/$defs/run" } },
+        "accessibility": {
+          "type": "object", "additionalProperties": false,
+          "required": ["nvda_active", "osara_active", "parameters_announced", "values_announced", "all_adjustable", "focus_stable", "host_or_plugin_crashes"],
+          "properties": {
+            "nvda_active": { "const": true },
+            "osara_active": { "const": true },
+            "parameters_announced": { "const": ["Bypass", "Mix", "Output Gain", "Overload Fallback"] },
+            "values_announced": { "const": true },
+            "all_adjustable": { "const": true },
+            "focus_stable": { "const": true },
+            "host_or_plugin_crashes": { "const": 0 }
+          }
+        },
+        "quality_observation": { "enum": ["dpdfnet-better", "equivalent", "gtcrn-better"] },
+        "consent_to_publish": { "const": true }
+      }
+    },
+    "run": {
+      "type": "object", "additionalProperties": false,
+      "required": ["buffer_frames", "sample_rate_hz", "duration_seconds", "overload_events", "late_events", "audible_xruns", "continuous_audio"],
+      "properties": {
+        "buffer_frames": { "type": "integer", "minimum": 16, "maximum": 8192 },
+        "sample_rate_hz": { "const": 48000 },
+        "duration_seconds": { "type": "integer", "minimum": 300, "maximum": 86400 },
+        "overload_events": { "const": 0 },
+        "late_events": { "const": 0 },
+        "audible_xruns": { "const": 0 },
+        "continuous_audio": { "const": true }
+      }
+    }
+  }
+}

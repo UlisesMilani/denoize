@@ -34,6 +34,21 @@ path = "src/lib.rs"
 name = "denoize"
 path = "src/main.rs"
 
+[[example]]
+name = "dpdfnet_gtcrn_poc"
+path = "examples/dpdfnet_gtcrn_poc.rs"
+required-features = ["dpdfnet", "gtcrn"]
+
+[[example]]
+name = "dpdfnet_gtcrn_matrix"
+path = "examples/dpdfnet_gtcrn_matrix.rs"
+required-features = ["dpdfnet", "gtcrn"]
+
+[[example]]
+name = "dpdfnet_gtcrn_stress"
+path = "examples/dpdfnet_gtcrn_stress.rs"
+required-features = ["dpdfnet", "gtcrn"]
+
 [dependencies]
 hound = "3.5"
 nnnoiseless = { version = "0.5.2", optional = true, default-features = false }
@@ -99,6 +114,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
 
@@ -113,12 +129,13 @@ bsrnn = ["onnx", "dep:rustfft"]
 mossformer2 = ["onnx", "dep:rustfft", "dep:kaldi-native-fbank"]
 sgmse = ["onnx", "dep:rustfft"]
 gtcrn = ["onnx", "dep:rustfft"]
+dpdfnet = ["onnx", "dep:rustfft"]
 accelerators = ["onnx", "dep:tract-metal", "dep:metal", "dep:tract-cuda", "dep:cudarc"]
 visqol = ["dep:audio_samples", "dep:audio_samples_qoe", "dep:ndarray"]
 m4a-encode = ["dep:oxideav-aac-encoder"]
 live = ["dep:cpal"]
 fdk-aac-encoder = ["m4a-encode", "dep:fdk-aac-rust"]
-full = ["rnnoise", "deepfilter", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "accelerators", "m4a-encode", "visqol", "live"]
+full = ["rnnoise", "deepfilter", "onnx", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "dpdfnet", "accelerators", "m4a-encode", "visqol", "live"]
 
 [dev-dependencies]
 minisign = "0.9.1"
@@ -142,5 +159,5 @@ panic = "unwind"
 opt-level = 1
 
 [package.metadata.docs.rs]
-features = ["rnnoise", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "visqol"]
+features = ["rnnoise", "aec", "mpsenet", "bsrnn", "mossformer2", "sgmse", "gtcrn", "dpdfnet", "visqol"]
 rustdoc-args = ["--cfg", "docsrs"]

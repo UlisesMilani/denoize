@@ -305,7 +305,7 @@ impl EvaluationRecipe {
         }
         let needs_model = matches!(
             self.backend.as_str(),
-            "onnx" | "mpsenet" | "bsrnn" | "mossformer2" | "sgmse" | "gtcrn"
+            "onnx" | "mpsenet" | "bsrnn" | "mossformer2" | "sgmse" | "gtcrn" | "dpdfnet"
         );
         if needs_model != self.model.is_some() || needs_model != self.model_sample_rate.is_some() {
             return Err(
@@ -872,6 +872,7 @@ fn known_backend_name(name: &str) -> bool {
             | "mossformer2"
             | "sgmse"
             | "gtcrn"
+            | "dpdfnet"
     )
 }
 
@@ -1290,7 +1291,7 @@ impl EvaluationEnvironment {
         }
         let needs_model = matches!(
             self.backend.as_str(),
-            "onnx" | "mpsenet" | "bsrnn" | "mossformer2" | "sgmse" | "gtcrn"
+            "onnx" | "mpsenet" | "bsrnn" | "mossformer2" | "sgmse" | "gtcrn" | "dpdfnet"
         );
         if needs_model != self.model.is_some() {
             return Err("evaluation environment model fingerprint is inconsistent".into());

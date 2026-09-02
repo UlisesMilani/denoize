@@ -21,7 +21,8 @@ pub(crate) mod target_speaker;
     feature = "bsrnn",
     feature = "mossformer2",
     feature = "sgmse",
-    feature = "gtcrn"
+    feature = "gtcrn",
+    feature = "dpdfnet"
 ))]
 mod tract_runtime;
 
@@ -74,6 +75,9 @@ pub enum Backend {
     /// Official streaming GTCRN speech enhancement model.
     #[cfg(feature = "gtcrn")]
     Gtcrn,
+    /// Official DPDFNet-2 48 kHz HR streaming speech enhancement model.
+    #[cfg(feature = "dpdfnet")]
+    Dpdfnet,
 }
 
 /// Configuration for a waveform-to-waveform ONNX enhancement model.
@@ -349,6 +353,8 @@ fn requires_any_model(backend: Backend) -> bool {
     match backend {
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => true,
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => true,
         _ => false,
     }
 }
@@ -365,6 +371,8 @@ fn validate_named_model_rate(backend: Backend, sample_rate: u32) -> Result<(), C
         Backend::Sgmse => Some((16_000, "exactly 16000 Hz for SGMSE+")),
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => Some((16_000, "exactly 16000 Hz for GTCRN")),
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => Some((48_000, "exactly 48000 Hz for DPDFNet-2 HR")),
         _ => None,
     };
     if let Some((required, description)) = expected {
@@ -398,6 +406,8 @@ impl Backend {
             "sgmse" | "sgmse+" | "sgmse-plus" => Backend::Sgmse,
             #[cfg(feature = "gtcrn")]
             "gtcrn" => Backend::Gtcrn,
+            #[cfg(feature = "dpdfnet")]
+            "dpdfnet" | "dpdfnet2" | "dpdfnet-2" => Backend::Dpdfnet,
             #[cfg(not(feature = "rnnoise"))]
             "rnnoise" | "rnn" => return None,
             #[cfg(not(feature = "deepfilter"))]
@@ -414,6 +424,8 @@ impl Backend {
             "sgmse" | "sgmse+" | "sgmse-plus" => return None,
             #[cfg(not(feature = "gtcrn"))]
             "gtcrn" => return None,
+            #[cfg(not(feature = "dpdfnet"))]
+            "dpdfnet" | "dpdfnet2" | "dpdfnet-2" => return None,
             _ => return None,
         })
     }
@@ -437,6 +449,8 @@ impl Backend {
             "sgmse",
             #[cfg(feature = "gtcrn")]
             "gtcrn",
+            #[cfg(feature = "dpdfnet")]
+            "dpdfnet",
         ]
     }
 }
@@ -479,6 +493,9 @@ pub mod sgmse;
 
 #[cfg(feature = "gtcrn")]
 pub mod gtcrn;
+
+#[cfg(feature = "dpdfnet")]
+pub mod dpdfnet;
 
 #[cfg(test)]
 mod channel_tests {
@@ -654,6 +671,8 @@ mod channel_tests {
         cases.push((Backend::Sgmse, 16_000));
         #[cfg(feature = "gtcrn")]
         cases.push((Backend::Gtcrn, 16_000));
+        #[cfg(feature = "dpdfnet")]
+        cases.push((Backend::Dpdfnet, 48_000));
 
         for (backend, required) in cases {
             assert!(model_options(required).validate_config(backend).is_ok());
@@ -701,6 +720,20 @@ mod channel_tests {
         assert!(options.validate_config(Backend::Gtcrn).is_ok());
         assert!(matches!(
             options.validate_resolved_config(Backend::Gtcrn),
+            Err(ConfigError::InvalidValue {
+                field: "backend_options.onnx",
+                ..
+            })
+        ));
+    }
+
+    #[cfg(feature = "dpdfnet")]
+    #[test]
+    fn managed_dpdfnet_may_be_missing_only_before_resolution() {
+        let options = BackendOptions::default();
+        assert!(options.validate_config(Backend::Dpdfnet).is_ok());
+        assert!(matches!(
+            options.validate_resolved_config(Backend::Dpdfnet),
             Err(ConfigError::InvalidValue {
                 field: "backend_options.onnx",
                 ..

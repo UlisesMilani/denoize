@@ -1,7 +1,7 @@
 //! Shared application service used by the CLI and graphical frontends.
 
 use crate::loudness::LoudnessReport;
-#[cfg(feature = "gtcrn")]
+#[cfg(any(feature = "gtcrn", feature = "dpdfnet"))]
 use crate::OnnxModelConfig;
 use crate::{
     select_accelerator_for_options, AcceleratorSelection, Audio, Backend, BackendOptions,
@@ -167,6 +167,8 @@ pub fn backend_name(backend: Backend) -> &'static str {
         Backend::Sgmse => "sgmse",
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => "gtcrn",
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => "dpdfnet",
     }
 }
 
@@ -271,6 +273,30 @@ fn resolve_backend_options_with_mode(
             path: path.map_err(|error| {
                 format!(
                     "GTCRN managed model is unavailable ({error}); run `denoize models install gtcrn`"
+                )
+            })?,
+            sample_rate: model.sample_rate(),
+        });
+    }
+    #[cfg(feature = "dpdfnet")]
+    if _backend == Backend::Dpdfnet && options.onnx.is_none() {
+        let catalog = if _read_only {
+            crate::models::active_catalog_read_only()?
+        } else {
+            crate::models::active_catalog()?
+        };
+        let model = catalog
+            .find("dpdfnet")
+            .ok_or_else(|| "active model catalog has no unambiguous DPDFNet package".to_string())?;
+        let path = if _read_only {
+            crate::models::verify_catalog_model_read_only(model)
+        } else {
+            crate::models::verify_catalog_model(model)
+        };
+        options.onnx = Some(OnnxModelConfig {
+            path: path.map_err(|error| {
+                format!(
+                    "DPDFNet managed model is unavailable ({error}); run `denoize models install dpdfnet`"
                 )
             })?,
             sample_rate: model.sample_rate(),

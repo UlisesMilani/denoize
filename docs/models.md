@@ -46,7 +46,18 @@ denoize models install gtcrn-dns3 --offline
 
 # Air-gapped install. The file must match the catalog's exact size and SHA-256.
 denoize models install gtcrn-dns3 --from /media/models/gtcrn_simple.onnx
+
+# The full-band DPDFNet-2 entry accepts either its exact name or backend alias.
+denoize models install dpdfnet
+denoize models install dpdfnet2-48khz-hr --offline
+denoize models install dpdfnet --from /media/models/dpdfnet2_48khz_hr.onnx
 ```
+
+The embedded catalog binds `gtcrn-dns3` to its 16 kHz MIT graph and
+`dpdfnet2-48khz-hr` to CEVA's 48 kHz Apache-2.0 graph. `gtcrn` and `dpdfnet`
+are unambiguous aliases. DPDFNet-8 is intentionally absent: the issue #221
+evaluation found no material quality gain and it missed the tract CPU deadline.
+See the [DPDFNet comparison](dpdfnet-gtcrn-poc.md).
 
 `denoize models info MODEL` prints the catalog's exact length as a decimal
 `size-bytes` field alongside `sha256`, catalog sequence/digest/signing key, and

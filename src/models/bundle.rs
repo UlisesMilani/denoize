@@ -1281,15 +1281,25 @@ mod tests {
             crate::models::CatalogOrigin::Embedded,
         )
         .unwrap();
-        let model = catalog.find("gtcrn-dns3").unwrap();
-        let metadata = require_bundle_metadata(model).unwrap();
-        let license = include_bytes!("../../models/licenses/gtcrn-dns3-MIT.txt");
-        let provenance = include_bytes!("../../models/provenance/gtcrn-dns3.json");
-
-        assert_eq!(license.len() as u64, metadata.license().size_bytes());
-        assert_eq!(sha256_bytes(license), metadata.license().sha256());
-        assert_eq!(provenance.len() as u64, metadata.provenance().size_bytes());
-        assert_eq!(sha256_bytes(provenance), metadata.provenance().sha256());
-        validate_source_provenance(model, metadata, provenance).unwrap();
+        for (name, license, provenance) in [
+            (
+                "gtcrn-dns3",
+                include_bytes!("../../models/licenses/gtcrn-dns3-MIT.txt").as_slice(),
+                include_bytes!("../../models/provenance/gtcrn-dns3.json").as_slice(),
+            ),
+            (
+                "dpdfnet2-48khz-hr",
+                include_bytes!("../../models/licenses/dpdfnet2-48khz-hr-Apache-2.0.txt").as_slice(),
+                include_bytes!("../../models/provenance/dpdfnet2-48khz-hr.json").as_slice(),
+            ),
+        ] {
+            let model = catalog.find(name).unwrap();
+            let metadata = require_bundle_metadata(model).unwrap();
+            assert_eq!(license.len() as u64, metadata.license().size_bytes());
+            assert_eq!(sha256_bytes(license), metadata.license().sha256());
+            assert_eq!(provenance.len() as u64, metadata.provenance().size_bytes());
+            assert_eq!(sha256_bytes(provenance), metadata.provenance().sha256());
+            validate_source_provenance(model, metadata, provenance).unwrap();
+        }
     }
 }

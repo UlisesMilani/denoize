@@ -14,10 +14,67 @@ pub const NEURAL_DAW_SESSION_SCHEMA_VERSION: u32 = 1;
 pub const NEURAL_DAW_MODEL_ID: &str = "gtcrn-dns3";
 pub const NEURAL_DAW_MODEL_SHA256: &str =
     "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87";
+pub const NEURAL_HQ_DAW_PLUGIN_ID: &str = "org.penguin425.denoize.neural-hq";
+pub const NEURAL_HQ_DAW_MODEL_ID: &str = "dpdfnet2-48khz-hr";
+pub const NEURAL_HQ_DAW_MODEL_SHA256: &str =
+    "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b";
 pub const NEURAL_DAW_CHUNK_MILLIS: u32 = 10;
 pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
 pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
 pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
+
+/// Closed model identities exposed by the off-callback neural plug-ins.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NeuralDawModel {
+    #[default]
+    Gtcrn,
+    Dpdfnet2,
+}
+
+impl NeuralDawModel {
+    pub const fn plugin_id(self) -> &'static str {
+        match self {
+            Self::Gtcrn => NEURAL_DAW_PLUGIN_ID,
+            Self::Dpdfnet2 => NEURAL_HQ_DAW_PLUGIN_ID,
+        }
+    }
+
+    pub const fn model_id(self) -> &'static str {
+        match self {
+            Self::Gtcrn => NEURAL_DAW_MODEL_ID,
+            Self::Dpdfnet2 => NEURAL_HQ_DAW_MODEL_ID,
+        }
+    }
+
+    pub const fn model_sha256(self) -> &'static str {
+        match self {
+            Self::Gtcrn => NEURAL_DAW_MODEL_SHA256,
+            Self::Dpdfnet2 => NEURAL_HQ_DAW_MODEL_SHA256,
+        }
+    }
+
+    pub const fn backend(self) -> &'static str {
+        match self {
+            Self::Gtcrn => "gtcrn",
+            Self::Dpdfnet2 => "dpdfnet",
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Gtcrn => "denoize Neural",
+            Self::Dpdfnet2 => "denoize Neural HQ",
+        }
+    }
+
+    fn from_identity(plugin_id: &str, model_id: &str, model_sha256: &str) -> Option<Self> {
+        [Self::Gtcrn, Self::Dpdfnet2].into_iter().find(|model| {
+            plugin_id == model.plugin_id()
+                && model_id == model.model_id()
+                && model_sha256 == model.model_sha256()
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -130,12 +187,20 @@ impl NeuralDawSessionState {
         port_configuration: NeuralDawPortConfiguration,
         parameters: NeuralDawParameters,
     ) -> Result<Self, String> {
+        Self::new_for_model(NeuralDawModel::Gtcrn, port_configuration, parameters)
+    }
+
+    pub fn new_for_model(
+        model: NeuralDawModel,
+        port_configuration: NeuralDawPortConfiguration,
+        parameters: NeuralDawParameters,
+    ) -> Result<Self, String> {
         let state = Self {
             schema: NEURAL_DAW_SESSION_SCHEMA.to_owned(),
             schema_version: NEURAL_DAW_SESSION_SCHEMA_VERSION,
-            plugin_id: NEURAL_DAW_PLUGIN_ID.to_owned(),
-            model_id: NEURAL_DAW_MODEL_ID.to_owned(),
-            model_sha256: NEURAL_DAW_MODEL_SHA256.to_owned(),
+            plugin_id: model.plugin_id().to_owned(),
+            model_id: model.model_id().to_owned(),
+            model_sha256: model.model_sha256().to_owned(),
             latency_policy: NEURAL_DAW_LATENCY_POLICY.to_owned(),
             port_configuration,
             parameters,
@@ -156,15 +221,8 @@ impl NeuralDawSessionState {
                 NEURAL_DAW_SESSION_SCHEMA_VERSION
             ));
         }
-        if self.plugin_id != NEURAL_DAW_PLUGIN_ID {
-            return Err(format!(
-                "neural DAW session targets {}, expected {NEURAL_DAW_PLUGIN_ID}",
-                self.plugin_id
-            ));
-        }
-        if self.model_id != NEURAL_DAW_MODEL_ID || self.model_sha256 != NEURAL_DAW_MODEL_SHA256 {
-            return Err("neural DAW session model identity does not match this build".into());
-        }
+        NeuralDawModel::from_identity(&self.plugin_id, &self.model_id, &self.model_sha256)
+            .ok_or_else(|| "neural DAW session identity does not match this build".to_string())?;
         if self.latency_policy != NEURAL_DAW_LATENCY_POLICY {
             return Err(format!(
                 "unsupported neural DAW latency policy {}; expected {}",
@@ -172,6 +230,23 @@ impl NeuralDawSessionState {
             ));
         }
         self.parameters.validate()
+    }
+
+    pub fn validate_for_model(&self, model: NeuralDawModel) -> Result<(), String> {
+        self.validate()?;
+        if self.plugin_id != model.plugin_id()
+            || self.model_id != model.model_id()
+            || self.model_sha256 != model.model_sha256()
+        {
+            return Err(format!(
+                "neural DAW session targets {}/{}, expected {}/{}",
+                self.plugin_id,
+                self.model_id,
+                model.plugin_id(),
+                model.model_id()
+            ));
+        }
+        Ok(())
     }
 
     pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, String> {
@@ -265,6 +340,19 @@ mod tests {
         let mut mismatch = state;
         mismatch.model_sha256.replace_range(..1, "0");
         assert!(mismatch.validate().is_err());
+
+        let hq = NeuralDawSessionState::new_for_model(
+            NeuralDawModel::Dpdfnet2,
+            NeuralDawPortConfiguration::Mono,
+            NeuralDawParameters::default(),
+        )
+        .unwrap();
+        hq.validate_for_model(NeuralDawModel::Dpdfnet2).unwrap();
+        assert!(hq.validate_for_model(NeuralDawModel::Gtcrn).is_err());
+        assert_eq!(
+            NeuralDawSessionState::from_bytes(&hq.to_canonical_bytes().unwrap()).unwrap(),
+            hq
+        );
     }
 
     #[test]

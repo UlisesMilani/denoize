@@ -108,6 +108,30 @@ def main() -> None:
         state_validator.validate(state)
         assert json.loads(state_path.read_text(encoding="utf-8")) == state
 
+        hq_state = dict(state)
+        hq_state.update(
+            plugin_id="org.penguin425.denoize.neural-hq",
+            model_id="dpdfnet2-48khz-hr",
+            model_sha256="7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+        )
+        state_validator.validate(hq_state)
+        mismatched_hq_state = dict(hq_state, model_id="gtcrn-dns3")
+        assert list(state_validator.iter_errors(mismatched_hq_state))
+        hq_state_path = directory / "hq-session.json"
+        hq_state_path.write_text(json.dumps(hq_state), encoding="utf-8")
+        rejected_hq = run(
+            binary,
+            model_dir,
+            "plugin",
+            "neural",
+            "session",
+            "validate",
+            str(hq_state_path),
+            "--json",
+            success=False,
+        )
+        assert rejected_hq.stdout == b""
+
         validation = json.loads(
             run(
                 binary,

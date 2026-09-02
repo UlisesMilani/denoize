@@ -23,6 +23,7 @@ behavior, contracts, limits, and verification procedures live here.
 - [Anonymous meeting speaker tracks](meeting-speakers.md)
 - [Music and general-audio restoration](music-restoration.md)
 - [Research and acceptance review](restoration-research.md)
+- [DPDFNet issue #221 evaluation](dpdfnet-gtcrn-poc.md)
 
 ## DAW plug-ins
 

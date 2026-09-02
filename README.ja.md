@@ -62,7 +62,7 @@ denoize restore damaged.wav restored.wav --report restoration.json
 
 | 分野 | 内容 |
 |---|---|
-| ノイズ除去 | 古典DSP、RNNoise、DeepFilterNet、GTCRN、外部ONNXバックエンド |
+| ノイズ除去 | 古典DSP、RNNoise、DeepFilterNet、GTCRN、DPDFNet、外部ONNXバックエンド |
 | 解析・修復 | 劣化診断、参照音源なしの評価、決定的な修復、安全確認付きのモデル修復 |
 | 運用 | メモリ上限付きストリーミング、再開、バッチ、監視フォルダ、プロジェクト、安定JSON、署名付き実行記録 |
 | 音声処理 | 対象話者・対象音の抽出、エコー除去、マイクアレイ、会議話者トラック、音楽修復 |

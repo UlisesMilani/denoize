@@ -7,7 +7,7 @@ use super::*;
 use crate::state_compat::CompatibleStateDescriptor;
 use denoize::{
     AcceleratorRuntime, Backend, BackendOptions, ChannelMode, DenoiserConfig, GtcrnModel,
-    NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256,
+    NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NeuralDawModel,
     NeuralDawOverloadFallback as OverloadFallback, NeuralDawParameters as NeuralParameters,
     NeuralDawPortConfiguration as NeuralPortConfiguration,
     NeuralDawSessionState as NeuralSessionState, OnnxModelConfig, StreamingBackendSession,
@@ -798,6 +798,9 @@ impl State for DenoizeNeuralLv2 {
             .read(self.urids.atom.string, ())?;
         let state =
             NeuralSessionState::from_bytes(json.as_bytes()).map_err(|_| StateErr::BadData)?;
+        state
+            .validate_for_model(NeuralDawModel::Gtcrn)
+            .map_err(|_| StateErr::BadData)?;
         if state.port_configuration != NeuralPortConfiguration::Stereo {
             return Err(StateErr::BadData);
         }

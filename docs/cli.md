@@ -39,8 +39,9 @@ USAGE:
     denoize sdk <COMMAND> [OPTIONS]  (run `denoize sdk --help`)
 
 LIVE:
-    Low-latency live processing supports classical, rnnoise, and gtcrn when
-    compiled; other backends are rejected before capture or playback starts.
+    Low-latency live processing supports classical, rnnoise, gtcrn, and
+    dpdfnet when compiled; other backends are rejected before capture or
+    playback starts.
 
 OPTIONS:
         --config <PATH>      load TOML defaults (CLI options take precedence)
@@ -126,6 +127,7 @@ BACKENDS (build with --features full for all):
     mossformer2 ClearerVoice MossFormer2 for files and --stream (requires --features mossformer2)
     sgmse       SGMSE+ diffusion model (requires --features sgmse)
     gtcrn       Official causal GTCRN for files, --stream, and live processing
+    dpdfnet     Official DPDFNet-2 48 kHz HR for files, --stream, and live
 
 PRESETS:
     hifi        Flagship transparency: OMLSA + protections + advanced DSP

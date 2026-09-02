@@ -375,12 +375,16 @@ required `matches_reported: true` result. Preset/session inspect and create
 commands emit their native contracts; validate commands emit the corresponding
 CLI validation event.
 
-`denoize-neural-daw-session-v1` is the separate state document for
-`org.penguin425.denoize.neural`. It binds `gtcrn-dns3`, the exact graph
-SHA-256, `fixed-24x10ms-worker-v1`, mono/stereo layout, bypass, mix, output
-gain, and the explicit overload fallback. Paths, model bytes, audio, worker
-metrics, and enrollment material are not state. The same 64 KiB, closed-field,
-finite-number, regular-file, atomic no-clobber rules apply.
+`denoize-neural-daw-session-v1` is the separate neural state document. It
+accepts only two closed identity tuples: released
+`org.penguin425.denoize.neural` with `gtcrn-dns3`, or opt-in experimental
+`org.penguin425.denoize.neural-hq` with `dpdfnet2-48khz-hr`, each with its exact
+graph SHA-256. It also binds `fixed-24x10ms-worker-v1`, mono/stereo layout,
+bypass, mix, output gain, and the explicit overload fallback. Mixing fields
+from the two identities fails. Paths, model bytes, audio, worker metrics, and
+enrollment material are not state. The same 64 KiB, closed-field,
+finite-number, regular-file, atomic no-clobber rules apply. The existing
+`denoize plugin neural` CLI remains GTCRN-specific and rejects HQ state.
 
 `denoize plugin neural info --json` emits `plugin-neural-info` under
 `denoize-cli-output-v1`: model install status, stable identity, reference-port

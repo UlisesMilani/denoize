@@ -16,11 +16,9 @@
   "properties": {
     "schema": { "const": "denoize-neural-daw-session-v1" },
     "schema_version": { "const": 1 },
-    "plugin_id": { "const": "org.penguin425.denoize.neural" },
-    "model_id": { "const": "gtcrn-dns3" },
-    "model_sha256": {
-      "const": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
-    },
+    "plugin_id": { "type": "string" },
+    "model_id": { "type": "string" },
+    "model_sha256": { "type": "string" },
     "latency_policy": { "const": "fixed-24x10ms-worker-v1" },
     "port_configuration": { "enum": ["mono", "stereo"] },
     "parameters": {
@@ -37,5 +35,29 @@
       "additionalProperties": false
     }
   },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "plugin_id": { "const": "org.penguin425.denoize.neural" },
+            "model_id": { "const": "gtcrn-dns3" },
+            "model_sha256": {
+              "const": "b4718df6228e7bdf1a8a435cf98f838636eb2fd331acabf86ba87c5192ebcb87"
+            }
+          }
+        },
+        {
+          "properties": {
+            "plugin_id": { "const": "org.penguin425.denoize.neural-hq" },
+            "model_id": { "const": "dpdfnet2-48khz-hr" },
+            "model_sha256": {
+              "const": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b"
+            }
+          }
+        }
+      ]
+    }
+  ],
   "additionalProperties": false
 }

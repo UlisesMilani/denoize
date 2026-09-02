@@ -156,6 +156,11 @@ local function verify_after_host_flush()
   end
 
   write_line("summary", failures)
+  if os.getenv("DENOIZE_REAPER_REMOVE_FX") == "1" then
+    local removed = reaper.TrackFX_Delete(track, fx)
+    write_line("removed", tostring(removed))
+  end
+  write_line("complete", failures)
   result:close()
 end
 
@@ -250,6 +255,9 @@ end
 
 local play_delay = tonumber(os.getenv("DENOIZE_REAPER_PLAY_DELAY") or "0") or 0
 local function start_playback()
+  if os.getenv("DENOIZE_REAPER_REPEAT") == "1" then
+    reaper.GetSetRepeat(1)
+  end
   reaper.Main_OnCommand(1007, 0)
   write_line("play", reaper.GetPlayState())
 end

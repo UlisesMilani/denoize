@@ -119,6 +119,8 @@ pub use audio::{
     write_wav, write_wav_bytes, write_wav_channel_mask, Audio, WavStreamInfo, WavStreamReader,
     WavStreamWriter,
 };
+#[cfg(feature = "dpdfnet")]
+pub use backend::dpdfnet::{DpdfnetMetadata, DpdfnetModel, DpdfnetStream};
 #[cfg(feature = "gtcrn")]
 pub use backend::gtcrn::{GtcrnModel, GtcrnStream};
 #[cfg(feature = "onnx")]
@@ -278,11 +280,12 @@ pub use music_restoration::{
 };
 pub use neural_daw::{
     neural_daw_chunk_frames, neural_daw_latency_frames, neural_daw_latency_millis,
-    read_neural_daw_session, write_neural_daw_session, NeuralDawOverloadFallback,
+    read_neural_daw_session, write_neural_daw_session, NeuralDawModel, NeuralDawOverloadFallback,
     NeuralDawParameters, NeuralDawPortConfiguration, NeuralDawSessionState,
     NEURAL_DAW_CHUNK_MILLIS, NEURAL_DAW_LATENCY_CHUNKS, NEURAL_DAW_LATENCY_POLICY,
     NEURAL_DAW_MAX_SAMPLE_RATE, NEURAL_DAW_MODEL_ID, NEURAL_DAW_MODEL_SHA256, NEURAL_DAW_PLUGIN_ID,
-    NEURAL_DAW_SESSION_SCHEMA, NEURAL_DAW_SESSION_SCHEMA_VERSION,
+    NEURAL_DAW_SESSION_SCHEMA, NEURAL_DAW_SESSION_SCHEMA_VERSION, NEURAL_HQ_DAW_MODEL_ID,
+    NEURAL_HQ_DAW_MODEL_SHA256, NEURAL_HQ_DAW_PLUGIN_ID,
 };
 pub use project::{
     assemble_project_timeline, build_project_bundle, import_project_bundle, inspect_project_bundle,

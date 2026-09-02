@@ -461,6 +461,8 @@ pub const fn backend_supports_acceleration(backend: Backend) -> bool {
         Backend::Sgmse => true,
         #[cfg(feature = "gtcrn")]
         Backend::Gtcrn => true,
+        #[cfg(feature = "dpdfnet")]
+        Backend::Dpdfnet => true,
         _ => false,
     }
 }

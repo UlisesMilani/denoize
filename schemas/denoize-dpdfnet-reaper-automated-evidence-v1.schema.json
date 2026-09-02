@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/penguin425/denoize/raw/main/schemas/denoize-dpdfnet-reaper-automated-evidence-v1.schema.json",
+  "title": "denoize DPDFNet automated REAPER evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "source_commit", "model_id", "model_sha256", "host",
+    "accessibility_api", "worker_metrics", "process", "inputs", "accepted_automated"
+  ],
+  "properties": {
+    "schema": { "const": "denoize-dpdfnet-reaper-automated-evidence-v1" },
+    "schema_version": { "const": 1 },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "model_id": { "const": "dpdfnet2-48khz-hr" },
+    "model_sha256": { "const": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b" },
+    "host": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "version", "operating_system", "sample_rate_hz", "buffer_frames", "active_seconds"],
+      "properties": {
+        "name": { "const": "REAPER" },
+        "version": { "const": "7.79" },
+        "operating_system": { "const": "windows" },
+        "sample_rate_hz": { "const": 48000 },
+        "buffer_frames": { "const": 480 },
+        "active_seconds": { "type": "number", "minimum": 60, "maximum": 1000000 }
+      }
+    },
+    "accessibility_api": {
+      "type": "object", "additionalProperties": false,
+      "required": ["osara_style_parameter_path", "parameters_readable_and_adjustable", "nvda_human_verified"],
+      "properties": {
+        "osara_style_parameter_path": { "const": true },
+        "parameters_readable_and_adjustable": { "const": 4 },
+        "nvda_human_verified": { "const": false }
+      }
+    },
+    "worker_metrics": { "$ref": "#/$defs/metrics" },
+    "process": {
+      "type": "object", "additionalProperties": false,
+      "required": ["wall_seconds", "cpu_seconds", "peak_working_set_bytes", "logical_processors"],
+      "properties": {
+        "wall_seconds": { "type": "number", "minimum": 60, "maximum": 1000000 },
+        "cpu_seconds": { "type": "number", "minimum": 0, "maximum": 1000000 },
+        "peak_working_set_bytes": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "logical_processors": { "type": "integer", "minimum": 1, "maximum": 1024 }
+      }
+    },
+    "inputs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["parameters", "clap_host_run", "process_metrics"],
+      "properties": {
+        "parameters": { "$ref": "#/$defs/file" },
+        "clap_host_run": { "$ref": "#/$defs/file" },
+        "process_metrics": { "$ref": "#/$defs/file" }
+      }
+    },
+    "accepted_automated": { "const": true }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "metrics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["overload_blocks", "late_blocks", "invalid_blocks", "worker_errors"],
+      "properties": {
+        "overload_blocks": { "const": 0 },
+        "late_blocks": { "const": 0 },
+        "invalid_blocks": { "const": 0 },
+        "worker_errors": { "const": 0 }
+      }
+    },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "size_bytes", "sha256"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9._+-]{1,255}$" },
+        "size_bytes": { "type": "integer", "minimum": 1, "maximum": 16777216 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

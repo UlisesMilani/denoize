@@ -48,6 +48,18 @@ against the signed denoize model catalog. The complete upstream notice is
 included at
 [`models/licenses/gtcrn-dns3-MIT.txt`](models/licenses/gtcrn-dns3-MIT.txt).
 
+## DPDFNet-2 48 kHz HR model
+
+The signed offline model release bundle contains CEVA's official
+`dpdfnet2_48khz_hr` speech-enhancement graph from the DPDFNet model revision
+`dd6818d00f50c836fed43a6243ebe49116de5964`. The corresponding source is pinned
+to [`ceva-ip/DPDFNet` revision
+`1333776d470f01ecf4a533f098f4e8aeb3d00b89`](https://github.com/ceva-ip/DPDFNet/tree/1333776d470f01ecf4a533f098f4e8aeb3d00b89).
+CEVA distributes the source and model under Apache-2.0. The bundle
+authenticates the exact model, license, and source-provenance bytes against the
+signed denoize model catalog. The complete upstream license is included at
+[`models/licenses/dpdfnet2-48khz-hr-Apache-2.0.txt`](models/licenses/dpdfnet2-48khz-hr-Apache-2.0.txt).
+
 ## minisign-verify 0.2.5
 
 denoize uses the unmodified `minisign-verify` implementation by Frank Denis

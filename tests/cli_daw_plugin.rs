@@ -280,10 +280,15 @@ fn checked_in_schemas_match_runtime_contracts() {
         "../schemas/denoize-neural-daw-session-v1.schema.json"
     ))
     .unwrap();
-    assert_eq!(
-        neural["properties"]["plugin_id"]["const"],
-        "org.penguin425.denoize.neural"
-    );
+    let neural_identities = neural["allOf"][0]["oneOf"].as_array().unwrap();
+    assert!(neural_identities.iter().any(|identity| {
+        identity["properties"]["plugin_id"]["const"] == "org.penguin425.denoize.neural"
+            && identity["properties"]["model_id"]["const"] == "gtcrn-dns3"
+    }));
+    assert!(neural_identities.iter().any(|identity| {
+        identity["properties"]["plugin_id"]["const"] == "org.penguin425.denoize.neural-hq"
+            && identity["properties"]["model_id"]["const"] == "dpdfnet2-48khz-hr"
+    }));
     assert_eq!(
         neural["properties"]["latency_policy"]["const"],
         "fixed-24x10ms-worker-v1"

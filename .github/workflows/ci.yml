@@ -85,6 +85,9 @@ jobs:
       - name: Validate neural DAW JSON contracts
         run: python3 scripts/test-neural-daw-schemas.py --denoize target/debug/denoize
 
+      - name: Validate DPDFNet promotion evidence contracts
+        run: python3 scripts/test-dpdfnet-promotion-evidence.py
+
       - name: Validate target-speaker JSON contracts
         run: python3 scripts/test-target-speaker-schemas.py
 
@@ -138,6 +141,7 @@ jobs:
             scripts/package-c-sdk.sh \
             scripts/package-ios-sdk.sh \
             scripts/package-clap-plugin.sh \
+            scripts/package-dpdfnet-experimental-clap.sh \
             scripts/package-lv2-plugin.sh \
             scripts/package-vst3-plugin.sh \
             scripts/package-web-sdk.sh \
@@ -170,6 +174,12 @@ jobs:
           python3 -c 'compile(open("scripts/test-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-universal-restoration-schemas.py", encoding="utf-8").read(), "scripts/test-universal-restoration-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-neural-daw-schemas.py", encoding="utf-8").read(), "scripts/test-neural-daw-schemas.py", "exec")'
+          python3 -c 'compile(open("scripts/prepare-dpdfnet-blind-listening.py", encoding="utf-8").read(), "scripts/prepare-dpdfnet-blind-listening.py", "exec")'
+          python3 -c 'compile(open("scripts/score-dpdfnet-blind-listening.py", encoding="utf-8").read(), "scripts/score-dpdfnet-blind-listening.py", "exec")'
+          python3 -c 'compile(open("scripts/generate-dpdfnet-platform-evidence.py", encoding="utf-8").read(), "scripts/generate-dpdfnet-platform-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/generate-dpdfnet-promotion-evidence.py", encoding="utf-8").read(), "scripts/generate-dpdfnet-promotion-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/fetch-dpdfnet-reporter-evidence.py", encoding="utf-8").read(), "scripts/fetch-dpdfnet-reporter-evidence.py", "exec")'
+          python3 -c 'compile(open("scripts/test-dpdfnet-promotion-evidence.py", encoding="utf-8").read(), "scripts/test-dpdfnet-promotion-evidence.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-speaker-schemas.py", encoding="utf-8").read(), "scripts/test-target-speaker-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-target-sound-schemas.py", encoding="utf-8").read(), "scripts/test-target-sound-schemas.py", "exec")'
           python3 -c 'compile(open("scripts/test-causal-target-sound-schemas.py", encoding="utf-8").read(), "scripts/test-causal-target-sound-schemas.py", "exec")'
@@ -200,6 +210,7 @@ jobs:
           python3 scripts/test-release-updater-metadata.py
           python3 scripts/test-vst3-host-matrix.py
           python3 scripts/test-auv3-host-evidence.py
+          python3 scripts/test-dpdfnet-promotion-evidence.py
           bash scripts/test-release-evidence.sh
 
   clap-plugin:

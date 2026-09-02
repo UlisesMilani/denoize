@@ -62,7 +62,7 @@ Run `denoize --help` for the command list and see the
 
 | Area | Highlights |
 |---|---|
-| Denoising | Classical DSP plus optional RNNoise, DeepFilterNet, GTCRN, and external ONNX backends |
+| Denoising | Classical DSP plus optional RNNoise, DeepFilterNet, GTCRN, DPDFNet, and external ONNX backends |
 | Analysis and repair | Diagnosis, no-reference assessment, deterministic restoration, and optional model-based repair |
 | Production workflows | Bounded streaming, resume, batch processing, watch folders, projects, stable JSON, and signed receipts |
 | Audio applications | Target-speaker and target-sound extraction, echo cancellation, microphone arrays, meeting tracks, and music restoration |

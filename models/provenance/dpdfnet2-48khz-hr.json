@@ -1,0 +1,17 @@
+{
+  "schema": "denoize-model-source-provenance-v1",
+  "model_name": "dpdfnet2-48khz-hr",
+  "upstream_repository": "https://huggingface.co/Ceva-IP/DPDFNet",
+  "upstream_revision": "dd6818d00f50c836fed43a6243ebe49116de5964",
+  "artifact": {
+    "url": "https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet2_48khz_hr.onnx",
+    "sha256": "7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b",
+    "size_bytes": 10493337
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "url": "https://raw.githubusercontent.com/ceva-ip/DPDFNet/1333776d470f01ecf4a533f098f4e8aeb3d00b89/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "size_bytes": 11357
+  }
+}
