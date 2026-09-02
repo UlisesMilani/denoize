@@ -254,11 +254,13 @@ if set_delay <= 0 then
 end
 
 local play_delay = tonumber(os.getenv("DENOIZE_REAPER_PLAY_DELAY") or "0") or 0
+local playback_started = nil
 local function start_playback()
   if os.getenv("DENOIZE_REAPER_REPEAT") == "1" then
     reaper.GetSetRepeat(1)
   end
   reaper.Main_OnCommand(1007, 0)
+  playback_started = reaper.time_precise()
   write_line("play", reaper.GetPlayState())
 end
 
@@ -279,9 +281,9 @@ if os.getenv("DENOIZE_REAPER_PLAY") == "1" then
 end
 
 if set_delay > 0 then
-  local play_started = reaper.time_precise()
   local function set_after_delay()
-    if reaper.time_precise() - play_started < set_delay then
+    if playback_started == nil or
+      reaper.time_precise() - playback_started < set_delay then
       reaper.defer(set_after_delay)
       return
     end

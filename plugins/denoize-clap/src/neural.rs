@@ -1197,6 +1197,7 @@ struct NeuralEngine<'a> {
     last_safe_gain: [f64; 2],
     running: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    worker_started: bool,
     metrics: &'a NeuralShared,
 }
 
@@ -1356,6 +1357,7 @@ impl<'a> NeuralEngine<'a> {
                 None
             }
         };
+        let worker_started = worker.is_some();
 
         Ok(Self {
             channels,
@@ -1377,6 +1379,7 @@ impl<'a> NeuralEngine<'a> {
             last_safe_gain: [1.0; 2],
             running,
             worker,
+            worker_started,
             metrics,
         })
     }
@@ -1564,14 +1567,22 @@ impl<'a> NeuralEngine<'a> {
 
 impl Drop for NeuralEngine<'_> {
     fn drop(&mut self) {
-        let worker_started = self.worker.is_some();
         self.stop();
-        self.write_host_evidence(worker_started);
+        // REAPER may activate and immediately deactivate the processor while
+        // changing audio devices. That zero-frame probe must not claim the
+        // single evidence path before the activation that actually ran audio.
+        if self.should_write_host_evidence() {
+            self.write_host_evidence();
+        }
     }
 }
 
 impl NeuralEngine<'_> {
-    fn write_host_evidence(&self, worker_started: bool) {
+    fn should_write_host_evidence(&self) -> bool {
+        self.processed_frames > 0
+    }
+
+    fn write_host_evidence(&self) {
         let Ok(path) = std::env::var("DENOIZE_NEURAL_HOST_EVIDENCE") else {
             return;
         };
@@ -1588,7 +1599,9 @@ impl NeuralEngine<'_> {
             "latency_frames": self.latency_frames,
             "processed_frames": self.processed_frames,
             "active_seconds": self.activated_at.elapsed().as_secs_f64(),
-            "worker_started": worker_started,
+            // `deactivate()` stops and joins the worker before `Drop`. Keep
+            // the successful startup fact independently of the live handle.
+            "worker_started": self.worker_started,
             "finished_gracefully": true,
             "metrics": {
                 "overload_blocks": self.metrics.overload_blocks.load(Ordering::Relaxed),
@@ -2000,6 +2013,25 @@ mod tests {
         assert_eq!(engine.input_queue.len(), 0);
         assert_eq!(engine.output_queue.len(), 0);
         assert_eq!(shared.overload_blocks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn host_evidence_retains_worker_start_after_deactivation() {
+        let mut engine = test_engine(1, || Ok(Box::new(IdentityProcessor)));
+        assert!(engine.worker_started);
+        assert_eq!(engine.processed_frames, 0);
+        assert!(!engine.should_write_host_evidence());
+
+        engine.process_frame(
+            [0.1, 0.0],
+            RuntimeParameters::from(NeuralParameters::default()),
+        );
+        engine.stop();
+
+        assert!(engine.worker.is_none());
+        assert!(engine.worker_started);
+        assert_eq!(engine.processed_frames, 1);
+        assert!(engine.should_write_host_evidence());
     }
 
     #[test]
