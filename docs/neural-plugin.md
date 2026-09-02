@@ -103,6 +103,12 @@ stay on one named worker. The official CLAP thread-pool extension is not used:
 its own specification warns that synchronization may violate hard real-time
 rules and `request_exec` waits for completion.
 
+On Windows, the named worker joins the `Pro Audio` Multimedia Class Scheduler
+Service task after model preparation and warm-up, and before activation reports
+it ready. If registration fails, neural inference stays unavailable and the
+fixed-latency fallback remains active. The worker leaves the task when it exits;
+other platforms retain their native scheduler behavior.
+
 Each block carries a generation and absolute input-frame start. A host reset or
 dropped input block cold-resets recurrent and resampler state. Results from an
 older generation, results that arrive after their exact deadline, non-finite

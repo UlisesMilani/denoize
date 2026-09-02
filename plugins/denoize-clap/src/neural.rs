@@ -1346,13 +1346,15 @@ impl<'a> NeuralEngine<'a> {
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
-                let mut processor = match factory().and_then(|mut processor| {
+                let (mut processor, priority_guard) = match factory().and_then(|mut processor| {
                     warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
-                    Ok(processor)
+                    let priority_guard =
+                        denoize::neural_daw::NeuralDawWorkerPriorityGuard::acquire()?;
+                    Ok((processor, priority_guard))
                 }) {
-                    Ok(processor) => {
+                    Ok(initialized) => {
                         let _ = ready_tx.send(Ok(()));
-                        processor
+                        initialized
                     }
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
@@ -1367,6 +1369,7 @@ impl<'a> NeuralEngine<'a> {
                     worker_running,
                     worker_errors,
                 );
+                drop(priority_guard);
             })
             .map_err(|error| format!("start neural inference worker: {error}"))?;
         let worker = match ready_rx.recv() {

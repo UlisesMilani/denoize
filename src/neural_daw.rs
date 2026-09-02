@@ -23,6 +23,79 @@ pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;
 pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";
 pub const NEURAL_DAW_MAX_SAMPLE_RATE: u32 = crate::daw::DAW_MAX_SAMPLE_RATE;
 
+/// Keeps the neural inference worker in the Windows `Pro Audio` MMCSS task.
+///
+/// The CLAP audio callback only exchanges bounded queue entries with the
+/// worker, but Windows DAWs can run that callback in the `Pro Audio` class.
+/// Keeping the dependent inference worker at ordinary priority can therefore
+/// starve it even when the model's measured compute time is below its buffered
+/// deadline. Other platforms deliberately keep their existing scheduling.
+#[doc(hidden)]
+#[must_use = "dropping the guard releases the neural worker scheduling class"]
+pub struct NeuralDawWorkerPriorityGuard {
+    #[cfg(windows)]
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    // AvRevertMmThreadCharacteristics must run on the thread that acquired the
+    // handle. Make that invariant a type property instead of relying on callers.
+    #[cfg(windows)]
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl NeuralDawWorkerPriorityGuard {
+    /// Enters the scheduling class appropriate for a neural audio worker.
+    ///
+    /// On Windows, activation fails closed if MMCSS cannot register the current
+    /// thread. On other platforms this is a no-op guard.
+    pub fn acquire() -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::AvSetMmThreadCharacteristicsW;
+
+            let mut task_index = 0u32;
+            // SAFETY: `w!` supplies a process-lifetime, NUL-terminated UTF-16
+            // string and `task_index` is a valid writable DWORD. The returned
+            // handle is owned by this guard and reverted on this same thread.
+            let handle = unsafe {
+                AvSetMmThreadCharacteristicsW(windows_sys::w!("Pro Audio"), &mut task_index)
+            };
+            if handle.is_null() {
+                return Err(format!(
+                    "register neural inference worker with Windows Pro Audio MMCSS: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self {
+                handle,
+                _not_send: std::marker::PhantomData,
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(Self {})
+        }
+    }
+}
+
+impl Drop for NeuralDawWorkerPriorityGuard {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::AvRevertMmThreadCharacteristics;
+
+            // SAFETY: the guard is !Send, so it is dropped on the acquiring
+            // thread, and `handle` is the live handle returned by the matching
+            // AvSetMmThreadCharacteristicsW call above.
+            if unsafe { AvRevertMmThreadCharacteristics(self.handle) } == 0 {
+                eprintln!(
+                    "denoize Neural worker could not leave Windows Pro Audio MMCSS: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
+}
+
 /// Closed model identities exposed by the off-callback neural plug-ins.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NeuralDawModel {
