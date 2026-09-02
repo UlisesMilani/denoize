@@ -1589,6 +1589,14 @@ impl<'a> NeuralEngine<'a> {
         while let Some(result) = self.ready.pop_front() {
             self.recycle(result.block);
         }
+        // A transport reset starts a new stream generation. Reclaim queued
+        // input from the previous generation immediately so the worker does
+        // not spend the new stream's latency budget processing stale audio.
+        // The queue is fixed-size and CLAP only calls reset while processing
+        // is stopped, so this remains bounded and cannot race a new callback.
+        while let Some(block) = self.input_queue.pop() {
+            self.recycle(block);
+        }
         while let Some(result) = self.output_queue.pop() {
             self.recycle(result.block);
         }
@@ -2140,6 +2148,61 @@ mod tests {
         for _ in 0..engine.latency_frames as usize + engine.chunk_frames * 2 {
             assert_eq!(engine.process_frame([0.0, 0.0], parameters)[0], 0.0);
         }
+    }
+
+    #[test]
+    fn reset_reclaims_queued_input_from_the_previous_generation() {
+        struct ResetBlockingProcessor {
+            warmed: bool,
+            started: mpsc::SyncSender<()>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl BlockProcessor for ResetBlockingProcessor {
+            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+                if self.warmed {
+                    let _ = self.started.send(());
+                    let _ = self.release.recv();
+                }
+                Ok(channels.to_vec())
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                self.warmed = true;
+                Ok(())
+            }
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut engine = test_engine(1, move || {
+            Ok(Box::new(ResetBlockingProcessor {
+                warmed: false,
+                started: started_tx,
+                release: release_rx,
+            }))
+        });
+        let parameters = RuntimeParameters::from(NeuralParameters::default());
+
+        for _ in 0..engine.chunk_frames {
+            engine.process_frame([0.1, 0.0], parameters);
+        }
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker did not begin processing the first generation");
+        for _ in 0..engine.chunk_frames * 4 {
+            engine.process_frame([0.2, 0.0], parameters);
+        }
+
+        let queued = engine.input_queue.len();
+        let free_before_reset = engine.free_blocks.len();
+        assert!(queued >= 4);
+        engine.reset();
+        assert!(engine.input_queue.is_empty());
+        assert_eq!(engine.free_blocks.len(), free_before_reset + queued);
+
+        release_tx.send(()).unwrap();
+        engine.stop();
     }
 
     #[test]
