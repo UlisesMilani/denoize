@@ -229,13 +229,13 @@ if ($parameters.Count -ne 4 -or $osara.Count -ne 4 -or
   $lines -notcontains "removed`ttrue" -or $lines -notcontains "complete`t0") {
   throw "REAPER/OSARA-style parameter evidence did not pass"
 }
-$host = Get-Content -LiteralPath $hostRun -Raw | ConvertFrom-Json
-if ($host.model_id -ne "dpdfnet2-48khz-hr" -or
-  $host.source_commit -ne $SourceCommit -or
-  -not $host.worker_started -or -not $host.finished_gracefully -or
-  $host.active_seconds -lt $DurationSeconds -or
-  $host.metrics.overload_blocks -ne 0 -or $host.metrics.late_blocks -ne 0 -or
-  $host.metrics.invalid_blocks -ne 0 -or $host.metrics.worker_errors -ne 0) {
+$hostEvidence = Get-Content -LiteralPath $hostRun -Raw | ConvertFrom-Json
+if ($hostEvidence.model_id -ne "dpdfnet2-48khz-hr" -or
+  $hostEvidence.source_commit -ne $SourceCommit -or
+  -not $hostEvidence.worker_started -or -not $hostEvidence.finished_gracefully -or
+  $hostEvidence.active_seconds -lt $DurationSeconds -or
+  $hostEvidence.metrics.overload_blocks -ne 0 -or $hostEvidence.metrics.late_blocks -ne 0 -or
+  $hostEvidence.metrics.invalid_blocks -ne 0 -or $hostEvidence.metrics.worker_errors -ne 0) {
   throw "real REAPER DPDFNet worker evidence did not pass"
 }
 $processResult = Get-Content -LiteralPath $processMetrics -Raw | ConvertFrom-Json
@@ -260,14 +260,14 @@ $evidence = [ordered]@{
     operating_system = "windows"
     sample_rate_hz = 48000
     buffer_frames = 480
-    active_seconds = [double]$host.active_seconds
+    active_seconds = [double]$hostEvidence.active_seconds
   }
   accessibility_api = [ordered]@{
     osara_style_parameter_path = $true
     parameters_readable_and_adjustable = 4
     nvda_human_verified = $false
   }
-  worker_metrics = $host.metrics
+  worker_metrics = $hostEvidence.metrics
   process = [ordered]@{
     wall_seconds = [double]$processResult.wall_seconds
     cpu_seconds = [double]$processResult.cpu_seconds

@@ -1336,12 +1336,20 @@ impl<'a> NeuralEngine<'a> {
             .map_err(|error| format!("start neural inference worker: {error}"))?;
         let worker = match ready_rx.recv() {
             Ok(Ok(())) => Some(worker),
-            Ok(Err(_)) | Err(_) => {
+            Ok(Err(error)) => {
                 // Some hosts only deliver parameter changes while the audio
                 // processor is active. Keep the fixed-latency fallback path
                 // alive when the authenticated model cannot be prepared so
                 // their generic and accessibility parameter surfaces remain
                 // usable; no neural inference runs in this state.
+                eprintln!("denoize Neural worker startup error: {error}");
+                metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
+                running.store(false, Ordering::Release);
+                let _ = worker.join();
+                None
+            }
+            Err(error) => {
+                eprintln!("denoize Neural worker startup handshake error: {error}");
                 metrics.worker_errors.fetch_add(1, Ordering::Relaxed);
                 running.store(false, Ordering::Release);
                 let _ = worker.join();
