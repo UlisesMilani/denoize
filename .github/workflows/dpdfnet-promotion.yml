@@ -131,9 +131,9 @@ jobs:
           model="$model_dir/dpdfnet2_48khz_hr.onnx"
           curl --fail --location --retry 5 --output "$model" "$DPDFNET_MODEL_URL"
           if command -v sha256sum >/dev/null 2>&1; then
-            observed=$(sha256sum "$model" | awk '{print $1}')
+            observed=$(sha256sum < "$model" | awk '{print $1}')
           else
-            observed=$(shasum -a 256 "$model" | awk '{print $1}')
+            observed=$(shasum -a 256 < "$model" | awk '{print $1}')
           fi
           test "$observed" = "$DPDFNET_MODEL_SHA256"
           echo "DPDFNET_MODEL=$model" >> "$GITHUB_ENV"
@@ -297,7 +297,7 @@ jobs:
           mkdir -p "$model_dir" "$DENOIZE_EVIDENCE_DIR"
           model="$model_dir/dpdfnet2_48khz_hr.onnx"
           curl --fail --location --retry 5 --output "$model" "$DPDFNET_MODEL_URL"
-          test "$(sha256sum "$model" | awk '{print $1}')" = "$DPDFNET_MODEL_SHA256"
+          test "$(sha256sum < "$model" | awk '{print $1}')" = "$DPDFNET_MODEL_SHA256"
           echo "DPDFNET_MODEL=$model" >> "$GITHUB_ENV"
 
       - name: Measure lowest-supported production path
