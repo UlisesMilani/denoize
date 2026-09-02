@@ -31,6 +31,28 @@ if track == nil then
   return
 end
 
+-- Neural inference is a live, stateful path.  REAPER normally permits track
+-- FX to run anticipatively, which deliberately invokes the processor faster
+-- than wall clock and is therefore not a real-time deadline measurement.
+-- Keep media buffering unchanged, but force this test track onto REAPER's
+-- live-FX scheduling path before adding media or the plug-in.
+local performance_flags = math.floor(
+  reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
+)
+local performance_set = reaper.SetMediaTrackInfo_Value(
+  track,
+  "I_PERFFLAGS",
+  performance_flags | 2
+)
+local observed_performance_flags = math.floor(
+  reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
+)
+write_line(
+  "performance",
+  "no-anticipative-fx",
+  tostring(performance_set and (observed_performance_flags & 2) == 2)
+)
+
 local audio_path = os.getenv("DENOIZE_REAPER_AUDIO")
 if audio_path ~= nil and audio_path ~= "" then
   reaper.SetOnlyTrackSelected(track)

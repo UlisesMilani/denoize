@@ -226,6 +226,7 @@ $names = @($parameters | ForEach-Object { ($_ -split "`t")[2] })
 $expectedNames = @("Bypass", "Mix", "Output Gain", "Overload Fallback")
 if ($parameters.Count -ne 4 -or $osara.Count -ne 4 -or
   @(Compare-Object $expectedNames $names).Count -ne 0 -or
+  $lines -notcontains "performance`tno-anticipative-fx`ttrue" -or
   $lines -notcontains "removed`ttrue" -or $lines -notcontains "complete`t0") {
   throw "REAPER/OSARA-style parameter evidence did not pass"
 }
