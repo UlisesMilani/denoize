@@ -46,6 +46,7 @@ const MODEL_ID: &str = NEURAL_DAW_MODEL_ID;
 const LATENCY_CHUNKS: u32 = NEURAL_DAW_LATENCY_CHUNKS;
 const QUEUE_BLOCKS: usize = 16;
 const BLOCK_POOL_SIZE: usize = 40;
+const WORKER_WARMUP_EXTRA_BLOCKS: usize = QUEUE_BLOCKS + 8;
 const WORKER_POLL: Duration = Duration::from_micros(100);
 const MAX_SAMPLE_RATE: u32 = NEURAL_DAW_MAX_SAMPLE_RATE;
 const MAX_OUTPUT_PEAK: f64 = 4.0;
@@ -1009,6 +1010,32 @@ trait BlockProcessor: Send {
     fn reset(&mut self) -> Result<(), String>;
 }
 
+fn warm_up_block_processor(
+    processor: &mut dyn BlockProcessor,
+    channels: usize,
+    frames: usize,
+) -> Result<(), String> {
+    let input = vec![vec![0.0; frames]; channels];
+    let output = processor
+        .process(&input)
+        .map_err(|error| format!("warm up neural inference worker: {error}"))?;
+    // Streaming backends may retain their look-ahead tail until `finish`, so a
+    // successful warm-up can legitimately return fewer frames than it accepts.
+    let output_frames = output.first().map_or(0, Vec::len);
+    if output.len() != channels
+        || output_frames == 0
+        || output_frames > frames
+        || output.iter().any(|channel| {
+            channel.len() != output_frames || channel.iter().any(|sample| !sample.is_finite())
+        })
+    {
+        return Err("neural inference worker returned invalid warm-up output".to_owned());
+    }
+    processor
+        .reset()
+        .map_err(|error| format!("reset neural inference worker after warm-up: {error}"))
+}
+
 struct GtcrnProcessor(StreamingBackendSession);
 
 static GTCRN_MODEL_CACHE: OnceLock<Mutex<Option<GtcrnModel>>> = OnceLock::new();
@@ -1267,6 +1294,10 @@ impl<'a> NeuralEngine<'a> {
             .ok_or_else(|| "neural plug-in latency geometry overflow".to_owned())?;
         let latency_frames = u32::try_from(latency_frames_usize)
             .map_err(|_| "neural plug-in latency exceeds the CLAP contract".to_owned())?;
+        let warmup_frames = chunk_frames
+            .checked_mul(WORKER_WARMUP_EXTRA_BLOCKS)
+            .and_then(|extra| latency_frames_usize.checked_add(extra))
+            .ok_or_else(|| "neural worker warm-up geometry overflow".to_owned())?;
         let samples_per_block = chunk_frames
             .checked_mul(channels)
             .ok_or_else(|| "neural plug-in block geometry overflow".to_owned())?;
@@ -1315,7 +1346,10 @@ impl<'a> NeuralEngine<'a> {
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
             .spawn(move || {
-                let mut processor = match factory() {
+                let mut processor = match factory().and_then(|mut processor| {
+                    warm_up_block_processor(&mut *processor, channels, warmup_frames)?;
+                    Ok(processor)
+                }) {
                     Ok(processor) => {
                         let _ = ready_tx.send(Ok(()));
                         processor
@@ -1872,9 +1906,9 @@ mod tests {
     struct StalledProcessor;
 
     impl BlockProcessor for StalledProcessor {
-        fn process(&mut self, _channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
             thread::sleep(Duration::from_millis(250));
-            Ok(vec![Vec::new()])
+            Ok(channels.to_vec())
         }
 
         fn reset(&mut self) -> Result<(), String> {
@@ -2035,6 +2069,48 @@ mod tests {
     }
 
     #[test]
+    fn activation_warms_and_resets_the_worker_before_returning() {
+        struct WarmupProbe {
+            process_calls: Arc<AtomicU64>,
+            reset_calls: Arc<AtomicU64>,
+        }
+
+        impl BlockProcessor for WarmupProbe {
+            fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+                self.process_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(channels
+                    .iter()
+                    .map(|channel| channel[..channel.len() - 1].to_vec())
+                    .collect())
+            }
+
+            fn reset(&mut self) -> Result<(), String> {
+                self.reset_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let process_calls = Arc::new(AtomicU64::new(0));
+        let reset_calls = Arc::new(AtomicU64::new(0));
+        let observed_process_calls = Arc::clone(&process_calls);
+        let observed_reset_calls = Arc::clone(&reset_calls);
+        let mut engine = test_engine(2, move || {
+            Ok(Box::new(WarmupProbe {
+                process_calls,
+                reset_calls,
+            }))
+        });
+
+        assert!(engine.worker_started);
+        assert_eq!(observed_process_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_reset_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.processed_frames, 0);
+        assert_eq!(engine.input_queue.len(), 0);
+        assert_eq!(engine.output_queue.len(), 0);
+        engine.stop();
+    }
+
+    #[test]
     fn callback_path_allocates_zero_bytes_after_activation() {
         let mut engine = test_engine(2, || Ok(Box::new(IdentityProcessor)));
         let parameters = RuntimeParameters::from(NeuralParameters::default());
@@ -2111,25 +2187,13 @@ mod tests {
         let mut engine = NeuralEngine::new_model(model, 48_000.0, 1, shared).unwrap();
         let parameters = RuntimeParameters::from(NeuralParameters::default());
 
-        // Tract performs one-time kernel selection and cache population during
-        // the first inference calls.  Hosts activate a prepared plug-in before
-        // recording sustained processing, so exercise that same lifecycle and
-        // exclude only startup work from the deadline counters.
-        let warmup_frames =
-            engine.latency_frames as usize + engine.chunk_frames * (QUEUE_BLOCKS + 8);
-        for frame in 0..warmup_frames {
-            engine.process_frame([0.01, 0.0], parameters);
-            if frame % engine.chunk_frames == 0 {
-                thread::sleep(Duration::from_millis(
-                    u64::from(denoize::NEURAL_DAW_CHUNK_MILLIS) * 2,
-                ));
-            }
-        }
+        // Activation does the one-time tract kernel selection off the audio
+        // callback and resets recurrent state before the worker is published.
         assert_eq!(shared.worker_errors.load(Ordering::Relaxed), 0);
-        engine.reset();
-        shared.overload_blocks.store(0, Ordering::Relaxed);
-        shared.late_blocks.store(0, Ordering::Relaxed);
-        shared.invalid_blocks.store(0, Ordering::Relaxed);
+        assert!(engine.worker_started);
+        assert_eq!(shared.overload_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.late_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.invalid_blocks.load(Ordering::Relaxed), 0);
 
         let latency = engine.latency_frames as usize;
         let frames = latency + engine.chunk_frames * 100;
