@@ -1651,10 +1651,13 @@ fn worker_loop(
                     valid: false,
                 });
             }
-            failed = processor.reset().is_err();
-            if failed {
+            failed = if let Err(error) = processor.reset() {
+                eprintln!("denoize Neural worker reset error: {error}");
                 worker_errors.fetch_add(1, Ordering::Relaxed);
-            }
+                true
+            } else {
+                false
+            };
         }
         next_start = block.start_frame.saturating_add(block.frames as u64);
         if failed {
@@ -1666,12 +1669,17 @@ fn worker_loop(
         }
 
         let planar = block_to_planar(&block, channels);
-        match processor.process(&planar) {
-            Ok(processed) if append_ready(&mut ready, &processed, channels).is_ok() => {
+        let processed = processor.process(&planar).and_then(|processed| {
+            append_ready(&mut ready, &processed, channels)
+                .map_err(|()| "neural worker returned invalid channel geometry".to_owned())
+        });
+        match processed {
+            Ok(()) => {
                 pending.push_back(block);
                 complete_ready_blocks(&mut pending, &mut completed, &mut ready, channels);
             }
-            _ => {
+            Err(error) => {
+                eprintln!("denoize Neural worker processing error: {error}");
                 failed = true;
                 worker_errors.fetch_add(1, Ordering::Relaxed);
                 completed.push_back(ProcessedBlock {
