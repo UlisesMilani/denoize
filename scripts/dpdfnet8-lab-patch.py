@@ -14,7 +14,7 @@ replacements = [
     ('pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 24;',
      'pub const NEURAL_DAW_LATENCY_CHUNKS: u32 = 50;'),
     ('pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-24x10ms-worker-v1";',
-     'pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-50x10ms-dpdfnet8-lab-v1";'),
+     'pub const NEURAL_DAW_LATENCY_POLICY: &str = "fixed-50x10ms-dpdfnet8-direct-lab-v1";'),
     ('overload_fallback: NeuralDawOverloadFallback::DelayedDry,',
      'overload_fallback: NeuralDawOverloadFallback::Silence,'),
 ]
@@ -25,17 +25,6 @@ for old, new in replacements:
 text = text.replace('Self::Dpdfnet2 => "denoize Neural HQ",',
                     'Self::Dpdfnet2 => "DPDFNet-8 Lab",', 1)
 root.write_text(text, encoding="utf-8")
-
-# The upstream model adapter supports DPDFNet-8 geometry, while the production
-# stream intentionally gates DPDFNet-2. Relax only that internal lab gate.
-backend = Path("src/backend/dpdfnet.rs")
-text = backend.read_text(encoding="utf-8")
-old = '        model.require_dpdfnet2()?;\n        if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {'
-new = '        if channels == 0 || channels > crate::config::MAX_STREAM_CHANNELS {'
-if old not in text:
-    raise SystemExit("could not locate DPDFNet-2 managed-stream gate")
-text = text.replace(old, new, 1)
-backend.write_text(text, encoding="utf-8")
 
 neural = Path("plugins/denoize-clap/src/neural.rs")
 text = neural.read_text(encoding="utf-8")
@@ -51,7 +40,7 @@ for old, new in [
 text = text.replace("denoize Neural HQ", "DPDFNet-8 Lab")
 text = text.replace(
     "Experimental off-callback DPDFNet-2 fullband speech restoration",
-    "DPDFNet-8 48 kHz laboratory processor with 500 ms buffered latency",
+    "Direct DPDFNet-8 48 kHz laboratory stream with 500 ms buffered latency",
 )
 text = text.replace('.with_vendor("denoize")', '.with_vendor("DPDFNet Lab")')
 text = text.replace('.with_url("https://github.com/penguin425/denoize")',
@@ -66,14 +55,33 @@ text, count = re.subn(
 if count != 1:
     raise SystemExit("could not set the accessible fallback default to Silence")
 
-pattern = re.compile(
-    r'(?s)#\[cfg\(feature = "experimental-dpdfnet-hq"\)\]\nimpl DpdfnetProcessor \{.*?\n\}\n\n#\[cfg\(feature = "experimental-dpdfnet-hq"\)\]\nfn prepared_dpdfnet_model'
-)
-replacement = '''#[cfg(feature = "experimental-dpdfnet-hq")]
+# Replace Denoize's production DPDFNet-2 StreamingBackendSession wrapper with
+# the model-level DPDFNet stream. The model adapter itself supports both the
+# DPDFNet-2 and DPDFNet-8 state geometries. Stereo input is intentionally
+# downmixed to one model stream and duplicated on output for this quality lab,
+# keeping DPDFNet-8 compute to one stream and avoiding stereo policy as a
+# comparison variable.
+start = text.find('#[cfg(feature = "experimental-dpdfnet-hq")]\nstruct DpdfnetProcessor')
+end = text.find('\nstruct NeuralEngine', start)
+if start < 0 or end < 0:
+    raise SystemExit("could not locate DPDFNet processor section")
+direct = r'''#[cfg(feature = "experimental-dpdfnet-hq")]
+struct DpdfnetProcessor {
+    stream: denoize::DpdfnetStream,
+    channels: usize,
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+static DPDFNET_MODEL_CACHE: OnceLock<Mutex<Option<DpdfnetModel>>> = OnceLock::new();
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
 impl DpdfnetProcessor {
     fn new(sample_rate: u32, channels: usize) -> Result<Self, String> {
         if sample_rate != 48_000 {
             return Err(format!("DPDFNet-8 Lab requires a 48000 Hz host rate, got {sample_rate}"));
+        }
+        if !(1..=2).contains(&channels) {
+            return Err("DPDFNet-8 Lab supports mono or stereo input".to_owned());
         }
         let model_root = if let Some(path) = std::env::var_os("DENOIZE_MODEL_DIR") {
             std::path::PathBuf::from(path)
@@ -91,46 +99,109 @@ impl DpdfnetProcessor {
                 path.display()
             ));
         }
-        let mut options = BackendOptions {
+        let options = BackendOptions {
             onnx: Some(OnnxModelConfig {
-                path,
+                path: path.clone(),
                 sample_rate: 48_000,
             }),
             deterministic: true,
             ..BackendOptions::default()
         };
-        if channels == 2 {
-            options.channel_mode = ChannelMode::StereoLinked;
-        }
         let accelerator = select_accelerator_for_options(Backend::Dpdfnet, &options)?;
-        let Some(model_config) = options.onnx.as_ref() else {
-            return Err("internal DPDFNet-8 model options are unavailable".to_owned());
+        let config = OnnxModelConfig {
+            path,
+            sample_rate: 48_000,
         };
-        let prepared = prepared_dpdfnet_model(model_config, accelerator.effective())?;
-        let mut denoiser = DenoiserConfig::default(sample_rate);
-        denoiser.vad = false;
-        Ok(Self(
-            StreamingBackendSession::new_dpdfnet_for_daw_with_prepared_model(
-                sample_rate,
-                channels,
-                denoiser,
-                options,
-                &prepared,
-            )?,
-        ))
+        let model = prepared_dpdfnet8_model(&config, accelerator.effective())?;
+        if model.metadata().state_size != 90_228 {
+            return Err(format!(
+                "DPDFNet-8 Lab expected 90228 recurrent-state scalars, got {}",
+                model.metadata().state_size
+            ));
+        }
+        Ok(Self {
+            stream: model.stream()?,
+            channels,
+        })
     }
 }
 
 #[cfg(feature = "experimental-dpdfnet-hq")]
-fn prepared_dpdfnet_model'''
-text, count = pattern.subn(replacement, text, count=1)
-if count != 1:
-    raise SystemExit("could not replace temporary DPDFNet processor constructor")
-old = '    let model = DpdfnetModel::load_dpdfnet2_with_accelerator(config, runtime)?;'
-new = '    let model = DpdfnetModel::load_with_accelerator(config, runtime)?;'
-if old not in text:
-    raise SystemExit("could not locate prepared DPDFNet-2 loader")
-text = text.replace(old, new, 1)
+fn prepared_dpdfnet8_model(
+    config: &OnnxModelConfig,
+    runtime: AcceleratorRuntime,
+) -> Result<DpdfnetModel, String> {
+    let cache = DPDFNET_MODEL_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "DPDFNet-8 Lab compiled-model cache lock was poisoned".to_owned())?;
+    if let Some(cached) = cached.as_ref()
+        && cached.runtime() == runtime
+        && cached.metadata().state_size == 90_228
+    {
+        return Ok(cached.clone());
+    }
+    let model = DpdfnetModel::load_with_accelerator(config, runtime)?;
+    if model.metadata().state_size != 90_228 {
+        return Err(format!(
+            "selected model is not DPDFNet-8 48 kHz HR (state size {})",
+            model.metadata().state_size
+        ));
+    }
+    *cached = Some(model.clone());
+    Ok(model)
+}
+
+#[cfg(feature = "experimental-dpdfnet-hq")]
+impl BlockProcessor for DpdfnetProcessor {
+    fn process(&mut self, channels: &[Vec<f64>]) -> Result<Vec<Vec<f64>>, String> {
+        if channels.len() != self.channels {
+            return Err("DPDFNet-8 Lab input channel count changed".to_owned());
+        }
+        let frames = channels.first().map_or(0, Vec::len);
+        if channels.iter().any(|channel| channel.len() != frames) {
+            return Err("DPDFNet-8 Lab input channels are not aligned".to_owned());
+        }
+        if frames % 480 != 0 {
+            return Err(format!(
+                "DPDFNet-8 Lab worker requires 480-sample hops, got {frames} frames"
+            ));
+        }
+        let mut output = (0..self.channels)
+            .map(|_| Vec::with_capacity(frames))
+            .collect::<Vec<_>>();
+        for start in (0..frames).step_by(480) {
+            let mut hop = [0.0f32; 480];
+            if self.channels == 1 {
+                for (offset, sample) in hop.iter_mut().enumerate() {
+                    *sample = channels[0][start + offset].clamp(-4.0, 4.0) as f32;
+                }
+            } else {
+                for (offset, sample) in hop.iter_mut().enumerate() {
+                    let mid = 0.5 * (channels[0][start + offset] + channels[1][start + offset]);
+                    *sample = mid.clamp(-4.0, 4.0) as f32;
+                }
+            }
+            if let Some(enhanced) = self.stream.process_hop(&hop)? {
+                for value in enhanced {
+                    let value = f64::from(value);
+                    output[0].push(value);
+                    if self.channels == 2 {
+                        output[1].push(value);
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        self.stream.reset();
+        Ok(())
+    }
+}
+'''
+text = text[:start] + direct + text[end:]
 neural.write_text(text, encoding="utf-8")
 
 # Expose only the DPDFNet-8 Lab descriptor from this temporary DLL.
