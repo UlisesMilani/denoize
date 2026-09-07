@@ -13,6 +13,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 60
     env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       DPDFNET_MODEL_SHA256: 7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b
       DPDFNET_MODEL_URL: https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet2_48khz_hr.onnx
     steps:
