@@ -36,7 +36,7 @@ use std::io::{Read, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const NEURAL_PLUGIN_ID: &str = NEURAL_DAW_PLUGIN_ID;
 #[cfg(feature = "experimental-dpdfnet-hq")]
@@ -227,6 +227,163 @@ impl DefaultPluginFactory for NeuralHqPlugin {
     }
 }
 
+#[derive(Debug)]
+struct RealtimeDiagnostics {
+    enabled: bool,
+    input_queue_full_blocks: AtomicU64,
+    block_pool_empty_blocks: AtomicU64,
+    output_queue_backpressure_events: AtomicU64,
+    ready_queue_full_blocks: AtomicU64,
+    due_block_missing_blocks: AtomicU64,
+    worker_queue_wait_samples: AtomicU64,
+    worker_queue_wait_us_total: AtomicU64,
+    worker_queue_wait_us_max: AtomicU64,
+    worker_cycle_samples: AtomicU64,
+    worker_cycle_us_total: AtomicU64,
+    worker_cycle_us_max: AtomicU64,
+    inference_samples: AtomicU64,
+    inference_us_total: AtomicU64,
+    inference_us_max: AtomicU64,
+    input_queue_depth_max: AtomicU64,
+    output_queue_depth_max: AtomicU64,
+    ready_depth_max: AtomicU64,
+}
+
+impl RealtimeDiagnostics {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("DENOIZE_NEURAL_RT_DIAGNOSTICS").is_some(),
+            input_queue_full_blocks: AtomicU64::new(0),
+            block_pool_empty_blocks: AtomicU64::new(0),
+            output_queue_backpressure_events: AtomicU64::new(0),
+            ready_queue_full_blocks: AtomicU64::new(0),
+            due_block_missing_blocks: AtomicU64::new(0),
+            worker_queue_wait_samples: AtomicU64::new(0),
+            worker_queue_wait_us_total: AtomicU64::new(0),
+            worker_queue_wait_us_max: AtomicU64::new(0),
+            worker_cycle_samples: AtomicU64::new(0),
+            worker_cycle_us_total: AtomicU64::new(0),
+            worker_cycle_us_max: AtomicU64::new(0),
+            inference_samples: AtomicU64::new(0),
+            inference_us_total: AtomicU64::new(0),
+            inference_us_max: AtomicU64::new(0),
+            input_queue_depth_max: AtomicU64::new(0),
+            output_queue_depth_max: AtomicU64::new(0),
+            ready_depth_max: AtomicU64::new(0),
+        }
+    }
+
+    fn duration_us(duration: Duration) -> u64 {
+        u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn increment(&self, counter: &AtomicU64) {
+        if self.enabled {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn record_depth(&self, maximum: &AtomicU64, depth: usize) {
+        if self.enabled {
+            maximum.fetch_max(depth as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_duration(
+        &self,
+        samples: &AtomicU64,
+        total_us: &AtomicU64,
+        max_us: &AtomicU64,
+        duration: Duration,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let micros = Self::duration_us(duration);
+        samples.fetch_add(1, Ordering::Relaxed);
+        total_us.fetch_add(micros, Ordering::Relaxed);
+        max_us.fetch_max(micros, Ordering::Relaxed);
+    }
+
+    fn record_queue_wait(&self, duration: Duration) {
+        self.record_duration(
+            &self.worker_queue_wait_samples,
+            &self.worker_queue_wait_us_total,
+            &self.worker_queue_wait_us_max,
+            duration,
+        );
+    }
+
+    fn record_worker_cycle(&self, duration: Duration) {
+        self.record_duration(
+            &self.worker_cycle_samples,
+            &self.worker_cycle_us_total,
+            &self.worker_cycle_us_max,
+            duration,
+        );
+    }
+
+    fn record_inference(&self, duration: Duration) {
+        self.record_duration(
+            &self.inference_samples,
+            &self.inference_us_total,
+            &self.inference_us_max,
+            duration,
+        );
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        fn load(value: &AtomicU64) -> u64 {
+            value.load(Ordering::Relaxed)
+        }
+        fn average(total: u64, samples: u64) -> f64 {
+            if samples == 0 {
+                0.0
+            } else {
+                total as f64 / samples as f64
+            }
+        }
+
+        let queue_wait_samples = load(&self.worker_queue_wait_samples);
+        let queue_wait_total = load(&self.worker_queue_wait_us_total);
+        let worker_cycle_samples = load(&self.worker_cycle_samples);
+        let worker_cycle_total = load(&self.worker_cycle_us_total);
+        let inference_samples = load(&self.inference_samples);
+        let inference_total = load(&self.inference_us_total);
+
+        serde_json::json!({
+            "enabled": self.enabled,
+            "failure_causes": {
+                "input_queue_full_blocks": load(&self.input_queue_full_blocks),
+                "block_pool_empty_blocks": load(&self.block_pool_empty_blocks),
+                "output_queue_backpressure_events": load(&self.output_queue_backpressure_events),
+                "ready_queue_full_blocks": load(&self.ready_queue_full_blocks),
+                "due_block_missing_blocks": load(&self.due_block_missing_blocks),
+            },
+            "worker_queue_wait_us": {
+                "samples": queue_wait_samples,
+                "average": average(queue_wait_total, queue_wait_samples),
+                "maximum": load(&self.worker_queue_wait_us_max),
+            },
+            "worker_cycle_us": {
+                "samples": worker_cycle_samples,
+                "average": average(worker_cycle_total, worker_cycle_samples),
+                "maximum": load(&self.worker_cycle_us_max),
+            },
+            "inference_us": {
+                "samples": inference_samples,
+                "average": average(inference_total, inference_samples),
+                "maximum": load(&self.inference_us_max),
+            },
+            "queue_depth_maximum": {
+                "input": load(&self.input_queue_depth_max),
+                "output": load(&self.output_queue_depth_max),
+                "ready": load(&self.ready_depth_max),
+            },
+        })
+    }
+}
+
 pub(crate) struct NeuralShared {
     model: NeuralDawModel,
     parameters: SharedParameters,
@@ -235,6 +392,7 @@ pub(crate) struct NeuralShared {
     late_blocks: AtomicU64,
     invalid_blocks: AtomicU64,
     worker_errors: Arc<AtomicU64>,
+    diagnostics: Arc<RealtimeDiagnostics>,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -273,6 +431,7 @@ impl NeuralShared {
             late_blocks: AtomicU64::new(0),
             invalid_blocks: AtomicU64::new(0),
             worker_errors: Arc::new(AtomicU64::new(0)),
+            diagnostics: Arc::new(RealtimeDiagnostics::new()),
         })
     }
 
@@ -1042,6 +1201,7 @@ struct AudioBlock {
     generation: u64,
     start_frame: u64,
     frames: usize,
+    submitted_at: Option<Instant>,
     samples: Box<[f32]>,
 }
 
@@ -1426,6 +1586,7 @@ impl<'a> NeuralEngine<'a> {
                 generation: 1,
                 start_frame: 0,
                 frames: 0,
+                submitted_at: None,
                 samples: samples.into_boxed_slice(),
             });
         }
@@ -1451,6 +1612,7 @@ impl<'a> NeuralEngine<'a> {
         let worker_input = Arc::clone(&input_queue);
         let worker_output = Arc::clone(&output_queue);
         let worker_errors = Arc::clone(&metrics.worker_errors);
+        let worker_diagnostics = Arc::clone(&metrics.diagnostics);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("denoize-neural".to_owned())
@@ -1480,6 +1642,7 @@ impl<'a> NeuralEngine<'a> {
                     worker_output,
                     worker_running,
                     worker_errors,
+                    worker_diagnostics,
                 );
                 drop(priority_guard);
             })
@@ -1656,8 +1819,14 @@ impl<'a> NeuralEngine<'a> {
                 self.recycle(result.block);
             } else if self.ready.len() < BLOCK_POOL_SIZE {
                 self.ready.push_back(result);
+                self.metrics
+                    .diagnostics
+                    .record_depth(&self.metrics.diagnostics.ready_depth_max, self.ready.len());
             } else {
                 self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .diagnostics
+                    .increment(&self.metrics.diagnostics.ready_queue_full_blocks);
                 self.recycle(result.block);
             }
         }
@@ -1690,6 +1859,9 @@ impl<'a> NeuralEngine<'a> {
             }
         } else {
             self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .diagnostics
+                .increment(&self.metrics.diagnostics.due_block_missing_blocks);
         }
     }
 
@@ -1709,16 +1881,30 @@ impl<'a> NeuralEngine<'a> {
         completed.frames = self.chunk_frames;
         let Some(replacement) = self.free_blocks.pop() else {
             self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .diagnostics
+                .increment(&self.metrics.diagnostics.block_pool_empty_blocks);
             completed.frames = 0;
             self.capture = Some(completed);
             self.capture_frames = 0;
             return;
         };
+        completed.submitted_at = self.metrics.diagnostics.enabled.then(Instant::now);
         match self.input_queue.push(completed) {
-            Ok(()) => self.capture = Some(replacement),
+            Ok(()) => {
+                self.metrics.diagnostics.record_depth(
+                    &self.metrics.diagnostics.input_queue_depth_max,
+                    self.input_queue.len(),
+                );
+                self.capture = Some(replacement);
+            }
             Err(mut returned) => {
                 self.metrics.overload_blocks.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .diagnostics
+                    .increment(&self.metrics.diagnostics.input_queue_full_blocks);
                 returned.frames = 0;
+                returned.submitted_at = None;
                 self.capture = Some(returned);
                 self.free_blocks.push(replacement);
             }
@@ -1729,6 +1915,7 @@ impl<'a> NeuralEngine<'a> {
     #[inline]
     fn recycle(&mut self, mut block: AudioBlock) {
         block.frames = 0;
+        block.submitted_at = None;
         self.free_blocks.push(block);
     }
 
@@ -1839,6 +2026,7 @@ impl NeuralEngine<'_> {
                 "invalid_blocks": lifetime_metrics.invalid_blocks,
                 "worker_errors": lifetime_metrics.worker_errors,
             },
+            "realtime_diagnostics": self.metrics.diagnostics.snapshot(),
             "environment": {
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
@@ -1871,6 +2059,7 @@ fn worker_loop(
     output: Arc<ArrayQueue<ProcessedBlock>>,
     running: Arc<AtomicBool>,
     worker_errors: Arc<AtomicU64>,
+    diagnostics: Arc<RealtimeDiagnostics>,
 ) {
     let mut generation = 0u64;
     let mut next_start = 0u64;
@@ -1884,17 +2073,28 @@ fn worker_loop(
     let mut failed = false;
 
     while running.load(Ordering::Acquire) {
-        if let Some(result) = completed.pop_front()
-            && let Err(result) = output.push(result)
-        {
-            completed.push_front(result);
-            thread::park_timeout(WORKER_POLL);
-            continue;
+        if let Some(result) = completed.pop_front() {
+            match output.push(result) {
+                Ok(()) => {
+                    diagnostics.record_depth(&diagnostics.output_queue_depth_max, output.len())
+                }
+                Err(result) => {
+                    diagnostics.increment(&diagnostics.output_queue_backpressure_events);
+                    completed.push_front(result);
+                    thread::park_timeout(WORKER_POLL);
+                    continue;
+                }
+            }
         }
         let Some(block) = input.pop() else {
             thread::park_timeout(WORKER_POLL);
             continue;
         };
+        diagnostics.record_depth(&diagnostics.input_queue_depth_max, input.len());
+        if let Some(submitted_at) = block.submitted_at.as_ref() {
+            diagnostics.record_queue_wait(submitted_at.elapsed());
+        }
+        let worker_cycle_started = diagnostics.enabled.then(Instant::now);
         // Once a block has been dequeued, all deadline-bound preparation,
         // inference, and output assembly belongs to the same Audio Work
         // Interval. Queue exchange and diagnostics stay outside the interval.
@@ -1929,8 +2129,14 @@ fn worker_loop(
                 return cycle_failure;
             }
 
-            let processed = fill_planar(&block, channels, &mut planar)
-                .and_then(|()| processor.process(std::mem::take(&mut planar)));
+            let processed = fill_planar(&block, channels, &mut planar).and_then(|()| {
+                let inference_started = diagnostics.enabled.then(Instant::now);
+                let result = processor.process(std::mem::take(&mut planar));
+                if let Some(started) = inference_started {
+                    diagnostics.record_inference(started.elapsed());
+                }
+                result
+            });
             let processed = processed.and_then(|processed| {
                 let appended = append_ready(&mut ready, &processed, channels)
                     .map_err(|()| "neural worker returned invalid channel geometry".to_owned());
@@ -1963,6 +2169,9 @@ fn worker_loop(
             }
             cycle_failure
         });
+        if let Some(started) = worker_cycle_started {
+            diagnostics.record_worker_cycle(started.elapsed());
+        }
         if let Some((operation, error)) = cycle_failure {
             eprintln!("denoize Neural worker {operation} error: {error}");
         }
@@ -2237,6 +2446,7 @@ mod tests {
             generation: 1,
             start_frame: 0,
             frames: 1,
+            submitted_at: None,
             samples: vec![0.0].into_boxed_slice(),
         }]);
         let mut completed = VecDeque::new();
