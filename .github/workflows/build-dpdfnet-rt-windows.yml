@@ -1,0 +1,68 @@
+name: Build DPDFNet realtime diagnostics Windows
+
+on:
+  push:
+    branches:
+      - ci/dpdfnet-realtime-windows
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      DPDFNET_MODEL_SHA256: 7f0575a5cec0ba4ffd8f8bd657e06d007e4ccdd955d76faab922b9d3291dc14b
+      DPDFNET_MODEL_URL: https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet2_48khz_hr.onnx
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Rust 1.96
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Install pinned DPDFNet model
+        shell: bash
+        run: |
+          model_dir="$RUNNER_TEMP/denoize-models/dpdfnet2-48khz-hr"
+          output_dir="$RUNNER_TEMP/dpdfnet-build"
+          mkdir -p "$model_dir" "$output_dir"
+          model="$model_dir/dpdfnet2_48khz_hr.onnx"
+          curl --fail --location --retry 5 --output "$model" "$DPDFNET_MODEL_URL"
+          observed=$(powershell.exe -NoProfile -Command "(Get-FileHash -Algorithm SHA256 '$model').Hash.ToLower()" | tr -d '\r')
+          test "$observed" = "$DPDFNET_MODEL_SHA256"
+          echo "DPDFNET_MODEL=$model" >> "$GITHUB_ENV"
+          echo "DPDFNET_OUTPUT=$output_dir" >> "$GITHUB_ENV"
+
+      - name: Build experimental DPDFNet CLAP
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc \
+            -p denoize-clap --features experimental-dpdfnet-hq
+
+      - name: Validate plugin bundle IDs
+        shell: bash
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc \
+            -p denoize-clap --features experimental-dpdfnet-hq \
+            tests::bundle_exposes_stable_realtime_and_neural_plugin_ids -- --exact
+
+      - name: Package Windows diagnostic build
+        shell: bash
+        run: |
+          archive=$(bash scripts/package-dpdfnet-experimental-clap.sh \
+            x86_64-pc-windows-msvc "$GITHUB_SHA" "$DPDFNET_OUTPUT" \
+            target/x86_64-pc-windows-msvc/release/denoize_clap.dll "$DPDFNET_MODEL")
+          echo "DPDFNET_ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Upload Windows diagnostic build
+        uses: actions/upload-artifact@v4
+        with:
+          name: denoize-dpdfnet-realtime-diagnostics-windows
+          path: ${{ env.DPDFNET_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 14
