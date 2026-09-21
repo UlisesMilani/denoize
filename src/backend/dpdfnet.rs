@@ -19,6 +19,11 @@ pub const HOP_SIZE: usize = 480;
 pub const BINS: usize = 481;
 pub const DPDFNET2_STATE_SIZE: usize = 56_436;
 pub const DPDFNET8_STATE_SIZE: usize = 90_228;
+/// The official ONNX export wraps the model with a spectral normalization
+/// factor of 1 / (N^2 / (2 * hop)). At 960/480 this is exactly 1/960.
+/// The wrapper multiplies the model output by the reciprocal before ISTFT.
+const SPECTRUM_WNORM: f32 =
+    1.0 / (FFT_SIZE as f32 * FFT_SIZE as f32 / (2.0 * HOP_SIZE as f32));
 /// Backwards-compatible name for the DPDFNet-2 state size.
 pub const STATE_SIZE: usize = DPDFNET2_STATE_SIZE;
 pub const ERB_NORM_STATE_SIZE: usize = 481;
@@ -223,7 +228,12 @@ impl DpdfnetStream {
 
         let mut model_input = Vec::with_capacity(BINS * 2);
         for value in spectrum.iter().take(BINS) {
-            model_input.extend([value.re, value.im]);
+            // Match the official DPDFNet ONNX export wrapper: normalize the
+            // STFT spectrum before inference, then undo that scale on output.
+            model_input.extend([
+                value.re * SPECTRUM_WNORM,
+                value.im * SPECTRUM_WNORM,
+            ]);
         }
         let enhanced = self.infer(&model_input)?;
         if enhanced.len() != BINS * 2 {
@@ -233,8 +243,12 @@ impl DpdfnetStream {
                 BINS * 2
             ));
         }
+        let inverse_wnorm = 1.0 / SPECTRUM_WNORM;
         for bin in 0..BINS {
-            spectrum[bin] = Complex32::new(enhanced[bin * 2], enhanced[bin * 2 + 1]);
+            spectrum[bin] = Complex32::new(
+                enhanced[bin * 2] * inverse_wnorm,
+                enhanced[bin * 2 + 1] * inverse_wnorm,
+            );
         }
         for bin in BINS..FFT_SIZE {
             spectrum[bin] = spectrum[FFT_SIZE - bin].conj();
@@ -982,6 +996,7 @@ mod tests {
     #[test]
     fn published_contract_sizes_are_consistent() {
         assert_eq!(BINS, FFT_SIZE / 2 + 1);
+        assert!((SPECTRUM_WNORM - (1.0 / 960.0)).abs() < 1.0e-9);
         assert_eq!(MODEL_LOOKAHEAD_SAMPLES, 1_920);
         assert_eq!(STATE_SIZE, DPDFNET2_STATE_SIZE);
         assert!(DPDFNET8_STATE_SIZE > DPDFNET2_STATE_SIZE);
