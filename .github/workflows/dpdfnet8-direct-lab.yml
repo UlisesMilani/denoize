@@ -1,0 +1,98 @@
+name: Build DPDFNet-8 Direct Lab temporary CLAP
+
+on:
+  push:
+    branches:
+      - dpdfnet8-direct-lab
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  DPDFNET8_MODEL_SHA256: 7b3afbb260a08fe9af3d16e3bda992971be1e7e951d1dee7c2d235f5c43f5631
+  DPDFNET8_MODEL_URL: https://huggingface.co/Ceva-IP/DPDFNet/resolve/dd6818d00f50c836fed43a6243ebe49116de5964/onnx/dpdfnet8_48khz_hr.onnx
+
+jobs:
+  build-windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a4865c2a87a8b5b1c5a3d9bb000000000
+
+      - name: Select Rust 1.96
+        shell: bash
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          rustup default 1.96.0
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Build DPDFNet-8 Direct Lab CLAP
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc             -p denoize-clap --features experimental-dpdfnet-hq
+
+      - name: Package plug-in and pinned model
+        shell: bash
+        run: |
+          mkdir -p dist/models/dpdfnet8-48khz-hr
+          cp target/x86_64-pc-windows-msvc/release/denoize_clap.dll dist/DPDFNet-8-Direct-Lab.clap
+          curl --fail --location --retry 5             --output dist/models/dpdfnet8-48khz-hr/dpdfnet8_48khz_hr.onnx             "$DPDFNET8_MODEL_URL"
+          observed=$(sha256sum dist/models/dpdfnet8-48khz-hr/dpdfnet8_48khz_hr.onnx | awk '{print $1}')
+          test "$observed" = "$DPDFNET8_MODEL_SHA256"
+          cat > dist/install-model.cmd <<'CMD'
+          @echo off
+          setlocal
+          set "DEST=%LOCALAPPDATA%\denoize\models\dpdfnet8-48khz-hr"
+          if not exist "%DEST%" mkdir "%DEST%"
+          copy /Y "%~dp0models\dpdfnet8-48khz-hr\dpdfnet8_48khz_hr.onnx" "%DEST%\dpdfnet8_48khz_hr.onnx" >nul
+          if errorlevel 1 (
+            echo Error copying DPDFNet-8 model.
+            exit /b 1
+          )
+          echo DPDFNet-8 model installed in:
+          echo %DEST%
+          endlocal
+          CMD
+          cat > dist/README.txt <<'TXT'
+          DPDFNet-8 Direct Lab - temporary Windows CLAP build
+
+          This test plug-in bypasses denoize's NeuralEngine, StreamingBackendSession,
+          worker queue, and overload-fallback policy. It feeds the official CEVA
+          DPDFNet-8 48 kHz HR stateful stream directly from the CLAP process callback.
+
+          Identity:
+          - CLAP ID: org.ulisesmilani.dpdfnet8-direct-lab
+          - Name: DPDFNet-8 Direct Lab
+          - Vendor shown by REAPER: DPDFNet Lab
+
+          Processing:
+          - Host rate: exactly 48000 Hz
+          - Model state: 90228 scalars
+          - Reported latency: 1920 samples / 40 ms
+          - Parameters: Bypass, Mix, Output Gain
+          - No configurable fallback modes
+          - CPU inference is intentionally synchronous for laboratory validation
+
+          Install:
+          1. Run install-model.cmd once.
+          2. Copy DPDFNet-8-Direct-Lab.clap to a CLAP folder scanned by REAPER.
+          3. Restart REAPER or rescan plug-ins.
+          4. Use a 48000 Hz project.
+          5. Start with Mix at 100% and Output Gain at 0 dB.
+
+          Note:
+          This is a diagnostic build, not a production-safe real-time processor.
+          If the model is computationally too slow for the current REAPER buffer,
+          audible dropouts are expected; that is intentional for this test.
+          TXT
+
+      - name: Upload DPDFNet-8 Direct Lab artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: DPDFNet-8-Direct-Lab-Windows
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
