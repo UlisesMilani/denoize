@@ -1,6 +1,8 @@
 //! CLAP adapter for the allocation-free denoize DAW processing core.
 
 mod apple_factory;
+#[cfg(feature = "experimental-dpdfnet-hq")]
+mod dpdfnet8_direct;
 mod gui_contract;
 mod neural;
 
@@ -1099,7 +1101,7 @@ impl DenoizeFactory {
             realtime: <DenoizePlugin as DefaultPluginFactory>::get_descriptor(),
             neural: <neural::NeuralPlugin as DefaultPluginFactory>::get_descriptor(),
             #[cfg(feature = "experimental-dpdfnet-hq")]
-            neural_hq: <neural::NeuralHqPlugin as DefaultPluginFactory>::get_descriptor(),
+            neural_hq: <dpdfnet8_direct::Dpdfnet8Plugin as DefaultPluginFactory>::get_descriptor(),
         }
     }
 }
@@ -1145,11 +1147,11 @@ impl PluginFactoryImpl for DenoizeFactory {
         } else {
             #[cfg(feature = "experimental-dpdfnet-hq")]
             if plugin_id == self.neural_hq.id().unwrap_or_default() {
-                return Some(PluginInstance::new::<neural::NeuralHqPlugin>(
+                return Some(PluginInstance::new::<dpdfnet8_direct::Dpdfnet8Plugin>(
                     host_info,
                     &self.neural_hq,
-                    <neural::NeuralHqPlugin as DefaultPluginFactory>::new_shared,
-                    <neural::NeuralHqPlugin as DefaultPluginFactory>::new_main_thread,
+                    <dpdfnet8_direct::Dpdfnet8Plugin as DefaultPluginFactory>::new_shared,
+                    <dpdfnet8_direct::Dpdfnet8Plugin as DefaultPluginFactory>::new_main_thread,
                 ));
             }
             None
