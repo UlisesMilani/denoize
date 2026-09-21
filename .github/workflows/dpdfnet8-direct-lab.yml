@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Check out source
-        uses: actions/checkout@d23441a4865c2a87a8b5b1c5a3d9bb000000000
+        uses: actions/checkout@v4
 
       - name: Select Rust 1.96
         shell: bash
