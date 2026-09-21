@@ -748,7 +748,7 @@ impl<'a> PluginAudioProcessor<'a, Shared, MainThread<'a>> for AudioProcessor<'a>
             SampleType::F64(channels) => self.process_channels(channels, events.input)?,
             SampleType::Both(channels, _) => self.process_channels(channels, events.input)?,
         }
-        Ok(ProcessStatus::Continue)
+        Ok(ProcessStatus::ContinueIfNotQuiet)
     }
 
     fn reset(&mut self) {
